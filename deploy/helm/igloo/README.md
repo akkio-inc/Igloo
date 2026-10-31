@@ -186,7 +186,8 @@ pass for each cloud.
   `emptyDir` on the node's disk with a `sizeLimit` of 50Gi
   (`cacheVolume.sizeLimit`), of which the cache takes up to 90%, and never
   more than half of the disk's free space, so a small node disk is not
-  filled; a volume of its own holds a cache of at most half its size. `cacheVolume.type:
+  filled; on a volume of its own (`ephemeral` or `persistentVolumeClaim`,
+  `IGLOO_CACHE_DEDICATED`) it fills to 90% of the volume. `cacheVolume.type:
   ephemeral` gives each pod a volume of its own from `cacheVolume.storageClass`,
   made and deleted with the pod; `persistentVolumeClaim` keeps the cache on
   `cacheVolume.existingClaim` across restarts and scaling to zero, for a
@@ -474,7 +475,7 @@ workers:
 | `duckdb.spillVolume.sizeLimit` | `50Gi` | Size of the spill `emptyDir` |
 | `duckdb.spillVolume.medium` | `""` | `""` (node disk, kubelet's directory; see **Spill disk** above) or `Memory` |
 | `cacheVolume.type` | `emptyDir` | The read cache's volume (see **Read cache** above): `emptyDir`, `ephemeral` (a volume per pod, deleted with it) or `persistentVolumeClaim` (one igloo pod; sets `IGLOO_CACHE_EPHEMERAL=false`) |
-| `cacheVolume.sizeLimit` | `50Gi` | The `emptyDir`'s `sizeLimit` or the ephemeral volume's size; `IGLOO_CACHE_SIZE` is 90% of it, and the cache never takes more than half of the disk's free space. Empty: no `emptyDir` limit, and a cache of up to 100 GiB. Required with `ephemeral`. |
+| `cacheVolume.sizeLimit` | `50Gi` | The `emptyDir`'s `sizeLimit` or the ephemeral volume's size; `IGLOO_CACHE_SIZE` is 90% of it. On an `emptyDir` the cache never takes more than half of the disk's free space; `ephemeral` and claims set `IGLOO_CACHE_DEDICATED`. Empty: no `emptyDir` limit, and a cache of up to 100 GiB. Required with `ephemeral`. |
 | `cacheVolume.storageClass` | `""` | `ephemeral`: the volume's storage class, one with extended attributes; empty for the cluster's default |
 | `cacheVolume.existingClaim` | `""` | `persistentVolumeClaim`: the claim, `ReadWriteOnce` |
 | `tls.existingSecret` | `""` | `kubernetes.io/tls` Secret; sets `IGLOO_TLS_CERT_FILE` / `IGLOO_TLS_KEY_FILE` |

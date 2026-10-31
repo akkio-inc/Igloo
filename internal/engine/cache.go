@@ -69,6 +69,9 @@ type readCache struct {
 	// ephemeral is IGLOO_CACHE_EPHEMERAL: the cache's volume goes with the
 	// pod (see CacheIdentity).
 	ephemeral bool
+	// dedicated is IGLOO_CACHE_DEDICATED: the cache has its volume to
+	// itself (see cacheLimits).
+	dedicated bool
 	// reserve is the free space the extension currently leaves on the disk,
 	// and on whether it caches at all. Once the cache is set up, only
 	// measureCache touches them.
@@ -102,11 +105,11 @@ func (e *Engine) setupCache(exec func(string) error, cfg config.Config, log *slo
 		log.Warn("read cache off: cannot measure its disk", "dir", dir, "err", err)
 		return nil
 	}
-	c := &readCache{dir: dir, maxSize: uint64(cfg.Cache.MaxSize), ephemeral: cfg.Cache.Ephemeral}
+	c := &readCache{dir: dir, maxSize: uint64(cfg.Cache.MaxSize), ephemeral: cfg.Cache.Ephemeral, dedicated: cfg.Cache.Dedicated}
 	// Measuring what is already cached means listing every file, so it
 	// happens in the background once Igloo is up (see measure). Until then
 	// the cache counts as empty.
-	limit, reserve := cacheLimits(total, avail, 0, c.maxSize)
+	limit, reserve := cacheLimits(total, avail, 0, c.maxSize, c.dedicated)
 	c.reserve, c.on = reserve, limit > 0
 	c.limit.Store(limit)
 
@@ -178,18 +181,21 @@ func cacheOffStatements() []string {
 
 // cacheLimits returns how large the cache may grow and the free space the
 // extension must leave on its disk for that, given the disk's size and free
-// space and the bytes already cached. The cache gets at most half of the
-// space nothing else uses, whatever maxSize says, so that a small disk is
-// never filled, as a node's disk under an emptyDir must not be; and at most
-// maxSize, or maxAutoCacheSize without it. Either way the disk keeps at
-// least 5% free, as the extension does by default; when it cannot, the
-// limit is 0.
-func cacheLimits(total, avail, used, maxSize uint64) (limit, reserve uint64) {
+// space and the bytes already cached. On a disk it shares (not dedicated),
+// the cache gets at most half of the space nothing else uses, whatever
+// maxSize says, so that a small disk is never filled, as a node's disk
+// under an emptyDir must not be. Either way it gets at most maxSize, or
+// maxAutoCacheSize without it, and the disk keeps at least 5% free, as the
+// extension does by default; when it cannot, the limit is 0.
+func cacheLimits(total, avail, used, maxSize uint64, dedicated bool) (limit, reserve uint64) {
 	usable := avail + used
 	if maxSize == 0 {
 		maxSize = maxAutoCacheSize
 	}
-	limit = min(usable/2, maxSize)
+	limit = maxSize
+	if !dedicated {
+		limit = min(usable/2, maxSize)
+	}
 	reserve = max(total/20, 1)
 	if usable > limit {
 		reserve = max(reserve, usable-limit)
@@ -252,7 +258,7 @@ func (e *Engine) measureCache(log *slog.Logger) error {
 	if err != nil {
 		return err
 	}
-	limit, reserve := cacheLimits(total, avail, used, c.maxSize)
+	limit, reserve := cacheLimits(total, avail, used, c.maxSize, c.dedicated)
 	c.size.Store(used)
 	c.limit.Store(limit)
 	log.Debug("measured the read cache", "bytes", used, "max_bytes", limit, "disk_free", avail)

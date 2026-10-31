@@ -191,6 +191,10 @@ type Cache struct {
 	// or machine, as a Kubernetes emptyDir or ephemeral volume does, so
 	// erasure requests do not count a replica that is gone as keeping it.
 	Ephemeral bool
+	// Dedicated is IGLOO_CACHE_DEDICATED: Dir's volume holds the cache
+	// alone, so it may fill to MaxSize rather than half the free space
+	// other files leave.
+	Dedicated bool
 }
 
 // Prefetch configures reading ahead into the read cache.
@@ -541,6 +545,9 @@ func Load(lookup func(string) (string, bool)) (Config, error) {
 	}
 	if cfg.Cache.Ephemeral, err = strconv.ParseBool(get("IGLOO_CACHE_EPHEMERAL", "false")); err != nil {
 		addErr("IGLOO_CACHE_EPHEMERAL must be true or false: %w", err)
+	}
+	if cfg.Cache.Dedicated, err = strconv.ParseBool(get("IGLOO_CACHE_DEDICATED", "false")); err != nil {
+		addErr("IGLOO_CACHE_DEDICATED must be true or false: %w", err)
 	}
 
 	enabled, err := strconv.ParseBool(get("IGLOO_MAINTENANCE", "true"))

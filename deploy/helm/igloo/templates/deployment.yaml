@@ -285,6 +285,11 @@ spec:
             # requests count a pod that is gone as holding nothing.
             - name: IGLOO_CACHE_EPHEMERAL
               value: {{ ne $cache.type "persistentVolumeClaim" | quote }}
+            # An ephemeral volume or a claim is the cache's own, which it may
+            # fill to IGLOO_CACHE_SIZE; on an emptyDir it shares the node's
+            # disk, and takes at most half of its free space.
+            - name: IGLOO_CACHE_DEDICATED
+              value: {{ ne $cache.type "emptyDir" | quote }}
             {{- if .Values.tls.existingSecret }}
             - name: IGLOO_TLS_CERT_FILE
               value: /etc/igloo/tls/tls.crt

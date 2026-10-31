@@ -502,8 +502,10 @@ memory, in front of the disk cache.
   Directory listings and file sizes are never cached.
 - **Size.** The cache takes at most half of the disk space that other files
   leave free, and at most 100 GiB, or `IGLOO_CACHE_SIZE`, which can lower or
-  raise that cap but never the half: a cache on a small disk cannot fill it.
-  It never fills the disk past 95%. Igloo remeasures every 5 minutes, so the
+  raise that cap but never the half: a cache on a small disk it shares
+  cannot fill it. On a volume of its own (`IGLOO_CACHE_DEDICATED=true`, as
+  the Helm chart sets for an ephemeral volume or a claim), it fills to
+  `IGLOO_CACHE_SIZE` instead. It never fills the disk past 95%. Igloo remeasures every 5 minutes, so the
   cache gives way when other files (spill files, logs, a local object store)
   grow: it stops adding blocks, and drops the least recently used block each
   time a read misses. If less than 5% of the disk would be free even without
@@ -521,8 +523,9 @@ memory, in front of the disk cache.
   does, so erasure requests count it gone with the pod. Igloo sizes the
   cache from the free space of the filesystem it is on, which an `emptyDir`
   shares with the node: with an `emptyDir`, set `IGLOO_CACHE_SIZE` below its
-  `sizeLimit`, as the chart does. On a volume of its own, the cache takes at
-  most half of it. Instance-store (local NVMe) disks are fast, but empty when
+  `sizeLimit`, as the chart does. On a volume of its own, set
+  `IGLOO_CACHE_DEDICATED=true` and `IGLOO_CACHE_SIZE` below the volume's
+  size. Instance-store (local NVMe) disks are fast, but empty when
   the machine stops. A file share, such as EFS, Filestore or Azure Files,
   keeps no extended attributes, so the cache cannot use it.
 - **Watching it.** `igloo_cache_size_bytes` and `igloo_cache_limit_bytes`

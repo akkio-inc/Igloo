@@ -171,8 +171,8 @@ fi
 echo "the read cache"
 cv() { envf "$1" Deployment igloo "$2"; }
 volume() { docf "$1" Deployment igloo | sed -n '/^      volumes:/,$p' | sed -n "/- name: $2\$/,/- name: /p"; }
-check "igloo pods cache on a 50Gi emptyDir, 90% of it for the cache" 'sizeLimit: 50Gi|"true"|"46080MiB"' \
-  "$(volume "$work/plain.yaml" cache | grep -o 'sizeLimit: .*')|$(cv "$work/plain.yaml" IGLOO_CACHE_EPHEMERAL)|$(cv "$work/plain.yaml" IGLOO_CACHE_SIZE)"
+check "igloo pods cache on a 50Gi emptyDir, 90% of it for the cache, which shares the disk" 'sizeLimit: 50Gi|"true"|"46080MiB"|"false"' \
+  "$(volume "$work/plain.yaml" cache | grep -o 'sizeLimit: .*')|$(cv "$work/plain.yaml" IGLOO_CACHE_EPHEMERAL)|$(cv "$work/plain.yaml" IGLOO_CACHE_SIZE)|$(cv "$work/plain.yaml" IGLOO_CACHE_DEDICATED)"
 check "mounted at the image's cache directory, with a writable /tmp" "mountPath: /var/lib/igloo/cache|mountPath: /tmp" \
   "$(docf "$work/plain.yaml" Deployment igloo | grep -o 'mountPath: /var/lib/igloo/cache')|$(docf "$work/plain.yaml" Deployment igloo | grep -o 'mountPath: /tmp$')"
 render "${bundled[@]}" --set cacheVolume.sizeLimit=20Gi >"$work/cache-sized.yaml"
@@ -182,12 +182,12 @@ render "${bundled[@]}" --set cacheVolume.sizeLimit= >"$work/cache-unsized.yaml"
 check "an emptyDir without a limit, the cache sized from its disk" 'emptyDir:|' \
   "$(volume "$work/cache-unsized.yaml" cache | grep -o 'emptyDir:.*')|$(cv "$work/cache-unsized.yaml" IGLOO_CACHE_SIZE)"
 render "${bundled[@]}" --set cacheVolume.type=ephemeral --set cacheVolume.sizeLimit=100Gi --set cacheVolume.storageClass=gp3 >"$work/cache-ephemeral.yaml"
-check "an ephemeral volume of the pod's own" 'storageClassName: gp3|storage: 100Gi|"92160MiB"|"true"' \
-  "$(volume "$work/cache-ephemeral.yaml" cache | grep -o 'storageClassName: .*')|$(volume "$work/cache-ephemeral.yaml" cache | grep -o 'storage: .*')|$(cv "$work/cache-ephemeral.yaml" IGLOO_CACHE_SIZE)|$(cv "$work/cache-ephemeral.yaml" IGLOO_CACHE_EPHEMERAL)"
+check "an ephemeral volume of the pod's own, which the cache has to itself" 'storageClassName: gp3|storage: 100Gi|"92160MiB"|"true"|"true"' \
+  "$(volume "$work/cache-ephemeral.yaml" cache | grep -o 'storageClassName: .*')|$(volume "$work/cache-ephemeral.yaml" cache | grep -o 'storage: .*')|$(cv "$work/cache-ephemeral.yaml" IGLOO_CACHE_SIZE)|$(cv "$work/cache-ephemeral.yaml" IGLOO_CACHE_EPHEMERAL)|$(cv "$work/cache-ephemeral.yaml" IGLOO_CACHE_DEDICATED)"
 claim=(--set cacheVolume.type=persistentVolumeClaim --set cacheVolume.existingClaim=igloo-cache --set replicaCount=1 --set strategy.type=Recreate)
 render "${bundled[@]}" "${claim[@]}" >"$work/cache-claim.yaml"
-check "a claim, which outlives the pod, for one pod at a time" 'claimName: igloo-cache|"false"|type: Recreate|' \
-  "$(volume "$work/cache-claim.yaml" cache | grep -o 'claimName: .*')|$(cv "$work/cache-claim.yaml" IGLOO_CACHE_EPHEMERAL)|$(docf "$work/cache-claim.yaml" Deployment igloo | sed -n '/^  strategy:/,/^  selector:/p' | grep -o 'type: .*')|$(docf "$work/cache-claim.yaml" Deployment igloo | grep -o 'rollingUpdate' || true)"
+check "a claim, which outlives the pod, for one pod at a time" 'claimName: igloo-cache|"false"|"true"|type: Recreate|' \
+  "$(volume "$work/cache-claim.yaml" cache | grep -o 'claimName: .*')|$(cv "$work/cache-claim.yaml" IGLOO_CACHE_EPHEMERAL)|$(cv "$work/cache-claim.yaml" IGLOO_CACHE_DEDICATED)|$(docf "$work/cache-claim.yaml" Deployment igloo | sed -n '/^  strategy:/,/^  selector:/p' | grep -o 'type: .*')|$(docf "$work/cache-claim.yaml" Deployment igloo | grep -o 'rollingUpdate' || true)"
 if render "${bundled[@]}" "${claim[@]}" --set 'pools[0].name=a' --set 'pools[0].replicaCount=1' --set 'pools[0].cacheVolume.existingClaim=a-cache' >/dev/null 2>&1; then
   pass "a pool with a claim of its own"
 else

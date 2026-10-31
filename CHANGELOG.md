@@ -1597,7 +1597,10 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   rather than object storage. The volume is a 50Gi emptyDir unless
   `cacheVolume.sizeLimit` says otherwise, and the read cache, wherever it
   runs, now takes at most half of its disk's free space whatever
-  `IGLOO_CACHE_SIZE` says, so it cannot fill a small node disk. The chart
+  `IGLOO_CACHE_SIZE` says, so it cannot fill a small node disk, unless it
+  has a volume of its own (`IGLOO_CACHE_DEDICATED`, which the chart sets
+  for an ephemeral volume or a claim), which it fills to
+  `IGLOO_CACHE_SIZE`. The chart
   and the docs say the volume's file system must keep extended attributes (see [read
   cache](docs/operations.md#read-cache)). Erasure requests have every
   running replica empty it with the prefetcher held, as workers do, and,
