@@ -324,7 +324,11 @@ gateway, which starts and stops only that pool. Clients connect to the
 pool's Service (`igloo-pool-acme:5432` above); the release's own Service is
 the `default` pool. A pool takes every value it does not set from the
 release's values; `extraEnv` adds to the release's. With `workers.enabled`,
-each pool also gets its own worker Deployment, `<release>-pool-<name>-workers`.
+each pool also gets its own worker Deployment, `<release>-pool-<name>-workers`,
+and with `workers.large.enabled` its own [large
+worker](distributed-execution.md#a-large-worker),
+`<release>-pool-<name>-workers-large`; a pool sets `workers.large.enabled:
+false` to run without one.
 Pools have no HorizontalPodAutoscaler or PodDisruptionBudget of their own. See
 [the chart's README](../deploy/helm/igloo/README.md#compute-pools).
 

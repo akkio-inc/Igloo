@@ -718,8 +718,18 @@ Deployment up when a statement needs workers (never down while another
 replica uses them) and to zero after `workers.idleAfter` (10 minutes)
 without tasks; the cluster autoscaler or Karpenter then removes their
 nodes. With [scale to zero](scale-to-zero.md), a pool's gateway stops the
-pool's workers along with its igloo pods. See the
+pool's workers along with its igloo pods. `workers.pricePerHour` tells
+auto mode what one worker's machine costs an hour
+(`IGLOO_WORKER_PRICE_PER_HOUR`). See the
 [chart's README](../deploy/helm/igloo/README.md#distributed-execution).
+
+The OpenTofu modules for [AWS](../deploy/aws/README.md#distributed-execution-workers),
+[Azure](../deploy/azure/README.md#distributed-execution-workers) and
+[Google Cloud](../deploy/gcp/README.md#distributed-execution-workers)
+provision the workers' capacity with `workers_enabled = true` (off by
+default): node pools that scale from zero, or on GKE Autopilot a compute
+class, on [Spot capacity with an on-demand fallback](#spot-workers), and
+the chart's `workers` values to match.
 
 ### Docker Compose
 
@@ -747,7 +757,66 @@ file and the Helm chart restart workers that exit. To
 start and stop them on demand, set `IGLOO_WORKER_COMPUTE` to `ec2` with the
 instances' IDs, or to `command` with commands that start and stop them all
 (an instance group, for example), as for the [scale-to-zero
-gateway](scale-to-zero.md#on-google-cloud-or-azure-vms).
+gateway](scale-to-zero.md#on-google-cloud-or-azure-vms). Set
+`IGLOO_WORKER_PRICE_PER_HOUR` to what one worker machine costs an hour, for
+auto mode's estimates.
+
+### A large worker
+
+Besides many small workers, a compute pool can have one large worker, a
+machine of 512 GiB or so, on which auto mode may run a whole statement: it
+does when the large worker's estimate (the statement fits in its memory,
+does not spill, and its price) is within a small margin of the fastest
+option and cheaper (see [when](#when)). The large worker is the same image
+started with `igloo worker`, with the same `IGLOO_WORKER_SECRET` and
+storage settings as the other workers, and is stopped while it has no
+work.
+
+On Kubernetes, `workers.large.enabled: true` adds a second worker
+Deployment, `<release>-workers-large`, of one pod with its own resources,
+volumes and scheduling, starting at zero pods, and gives the igloo pods its
+address and size; each compute pool gets one of its own
+(`<release>-pool-<name>-workers-large`). Give it a node pool that scales
+from zero:
+
+```yaml
+workers:
+  enabled: true
+  pricePerHour: 0.31
+  large:
+    enabled: true
+    pricePerHour: 4.35
+    resources:
+      requests: { cpu: "60", memory: 448Gi }
+      limits: { memory: 448Gi }
+    nodeSelector: { pool: igloo-large-worker }
+```
+
+The OpenTofu modules provision that node pool with `large_worker_enabled =
+true`: an on-demand `r7gd.16xlarge` on AWS, a `Standard_E64pds_v6` on Azure,
+an `n4-highmem-64` through a compute class on GKE Autopilot, each Spot
+first with `large_worker_spot = true`. See the [chart's
+README](../deploy/helm/igloo/README.md#a-large-worker).
+
+On virtual machines, run `igloo worker` on the large machine as on the
+others, and point the server at it:
+
+```sh
+IGLOO_LARGE_WORKER=large-worker.internal          # host[:port], port 7433 by default
+IGLOO_LARGE_WORKER_COMPUTE=ec2                    # or command, or empty when it always runs
+IGLOO_LARGE_WORKER_EC2_INSTANCE_IDS=i-0123456789abcdef0
+IGLOO_LARGE_WORKER_CORES=64
+IGLOO_LARGE_WORKER_MEMORY=400GiB                  # its DuckDB memory limit
+IGLOO_LARGE_WORKER_PRICE_PER_HOUR=4.35
+IGLOO_WORKER_PRICE_PER_HOUR=0.31                  # one small worker
+```
+
+With `IGLOO_LARGE_WORKER_COMPUTE=command`, `IGLOO_LARGE_WORKER_START_COMMAND`
+and `IGLOO_LARGE_WORKER_STOP_COMMAND` start and stop it instead (on Google
+Cloud or Azure, for example). Igloo uses `IGLOO_LARGE_WORKER_CORES` and
+`IGLOO_LARGE_WORKER_MEMORY` for its estimates while the large worker is
+stopped and has never answered, so set them to the machine's cores and the
+worker's `IGLOO_DUCKDB_MEMORY_LIMIT`.
 
 ### Settings
 
@@ -821,15 +890,43 @@ Workers suit Spot capacity, 50 to 75% cheaper on AWS: they keep nothing a
 statement needs once their tasks end, a task a lost worker ran runs again on
 another, and with exchanges in object storage (`IGLOO_EXCHANGES=object`)
 nothing they wrote is lost with them. Keep Igloo itself, the catalog and its
-database on regular capacity. AWS says two minutes ahead that it is taking
-a Spot Instance back; a worker on EC2 watches for that (instance metadata,
-IMDSv2), and from then on takes no more tasks, which coordinators send to
-other workers, and finishes those it runs until ten seconds before the time
-AWS gave. A worker in a container reaches the metadata service only with
-host networking or the instance's hop limit at 2
-(`HttpPutResponseHopLimit`); without it, it logs that it is not watching,
-and a Spot Instance taken back fails its tasks over as a lost worker's.
-On Kubernetes, where a Spot node is drained first, a stopping
+database on regular capacity: igloo pods hold client sessions, and the
+modules keep them on-demand unless asked otherwise. With `workers_enabled`,
+the OpenTofu modules run workers on Spot by default (`workers_spot = true`)
+and fall back to on-demand capacity when Spot has none:
+
+- AWS: a Spot and an on-demand managed node group for workers, both from
+  zero nodes. The Kubernetes cluster autoscaler's priority expander tries
+  the Spot group first; a Spot group whose launch fails, or whose node has
+  not joined within five minutes (`--max-node-provision-time`), is backed
+  off, and the on-demand group gets the worker. EKS drains a Spot node once
+  AWS sends a rebalance recommendation for it.
+- Azure: a Spot and a Regular user node pool for workers, both from zero
+  nodes. The AKS cluster autoscaler's priority expander (the
+  `cluster-autoscaler-priority-expander` ConfigMap) tries the Spot pool
+  first and backs it off the same way, after five minutes at the latest
+  (`max_node_provisioning_time`); worker pods tolerate the Spot taint and
+  select a label both pools carry.
+- Google Cloud (GKE Autopilot): a compute class whose priorities are Spot,
+  then on-demand, of one machine series; Autopilot creates a worker's node
+  from the first it can get.
+
+A statement waits for workers at most `IGLOO_WORKER_START_TIMEOUT` (3
+minutes) and then runs on its replica, so a statement that meets a Spot
+shortage may run without workers while the fallback nodes start. The large
+worker stays on-demand unless `large_worker_spot = true`: it runs whole
+statements, which a reclaimed Spot node would end.
+
+AWS says two minutes ahead that it is taking a Spot Instance back; a
+worker on EC2 watches for that (instance metadata, IMDSv2), and from then
+on takes no more tasks, which coordinators send to other workers, and
+finishes those it runs until ten seconds before the time AWS gave. A worker
+in a container reaches the metadata service only with host networking or
+the instance's hop limit at 2 (`HttpPutResponseHopLimit`); without it, it
+logs that it is not watching, and a Spot Instance taken back fails its
+tasks over as a lost worker's. The AWS module's node groups keep the hop
+limit at 1, so pods cannot take the node's credentials, and rely on EKS
+draining the node. On Kubernetes, where a Spot node is drained first, a stopping
 worker finishes its tasks for up to 30 seconds, within the pod's grace
 period (`workers.terminationGracePeriodSeconds`, 45 by default). Ask for
 several instance types and zones, so that capacity one lacks another has.
