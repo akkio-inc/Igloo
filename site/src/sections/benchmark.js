@@ -1,5 +1,5 @@
 // Benchmark: draws the two charts (seconds and dollars per run, by warehouse size) from the section's table,
-// at each chart's own width, with Igloo's lead under each size and a readout of every value on hover. The
+// at each chart's own width, with Igloo's median lead under each size and a readout of every value on hover. The
 // table stays in the page for screen readers; without JavaScript it shows instead of the charts.
 const section = document.querySelector('.vx-benchmark');
 const table = section?.querySelector('.vx-bm-data');
@@ -10,20 +10,26 @@ const SERIES = [
 	{ name: 'Databricks', color: 'var(--bm-databricks)', cls: 'databricks' },
 ];
 const times = (x) => `${x >= 10 ? Math.round(x) : x.toFixed(1)}×`;
+// Igloo's lead at a size: the median over the other two, Snowflake and Databricks.
+const median = (xs) => {
+	const s = [...xs].sort((a, b) => a - b);
+	return s.length % 2 ? s[(s.length - 1) / 2] : (s[s.length / 2 - 1] + s[s.length / 2]) / 2;
+};
+const lead = (r) => times(median([r[1] / r[0], r[2] / r[0]]));
 const METRICS = {
 	seconds: {
 		max: 140,
 		ticks: [0, 50, 100],
 		tick: (v) => `${v}s`,
 		value: (v) => `${v} s`,
-		lead: (r) => [times(Math.min(r[1], r[2]) / r[0]), 'faster'],
+		lead: (r) => [lead(r), 'faster'],
 	},
 	dollars: {
 		max: 0.85,
 		ticks: [0, 0.25, 0.5, 0.75],
 		tick: (v) => `$${v.toFixed(2)}`,
 		value: (v) => `$${v < 0.01 ? v.toFixed(4) : v.toFixed(3)}`,
-		lead: (r) => [times(Math.min(r[1], r[2]) / r[0]), 'lower cost'],
+		lead: (r) => [lead(r), 'lower cost'],
 	},
 };
 
