@@ -29,8 +29,10 @@ auto_stop_seconds = 300
 minimum_seconds = 0
 
 [igloo]
-# EC2 on-demand, per hour, for the machine Igloo runs on.
-instance_per_hour = { "c7g.2xlarge" = 0.289, "c7g.4xlarge" = 0.578, "c7g.8xlarge" = 1.157, "c7g.16xlarge" = 2.32, "c7gd.4xlarge" = 0.726, "m7g.4xlarge" = 0.653, "r7g.4xlarge" = 0.857, "r7g.8xlarge" = 1.714 }
+# EC2 on-demand, per hour, for the machine Igloo runs on, and for workers
+# (bench/mixed.py; the "d" types with local NVMe from the EC2 Pricing API,
+# October 2026).
+instance_per_hour = { "c7g.2xlarge" = 0.289, "c7g.4xlarge" = 0.578, "c7g.8xlarge" = 1.157, "c7g.16xlarge" = 2.32, "c7gd.4xlarge" = 0.726, "m7g.2xlarge" = 0.3264, "m7g.4xlarge" = 0.653, "m7gd.2xlarge" = 0.4271, "m7gd.4xlarge" = 0.8543, "r7g.4xlarge" = 0.857, "r7g.8xlarge" = 1.714, "r7gd.8xlarge" = 2.1773, "r7gd.16xlarge" = 4.3546 }
 # The machine's disk, which costs the same all month whatever the machine
 # does. In Igloo's single-machine setup (deploy/single-vm) it holds the
 # operating system, the images, the catalog database and the read cache;

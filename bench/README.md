@@ -259,12 +259,58 @@ Report per query: one machine's time, the distributed time per worker
 count, the speedup, and the cost per query; and per worker count, the total
 over the queries that ran distributed. Results go in `bench/results/`.
 
+## Mixed load
+
+`mixed.py` runs dashboards and ELT on Igloo at the same time, as a
+warehouse sees them, and reports per class of work the throughput, the
+latency percentiles (p50, p95, p99), the time statements waited for
+[workload limits](../docs/workload-management.md) (`queued_ms` from the
+query history), errors, how many statements ran on workers, and what the
+window cost:
+
+- **Dashboards:** `--dashboard-users` BI users, each opening one of three
+  dashboards (delivery, reach, and tiles over the tables the ELT jobs
+  build) after another, with an exponential think time (`--think`). A
+  dashboard's tiles run at once, `--tile-concurrency` at a time, and
+  filter by an advertiser from a small pool (`--param-pool`) and one of
+  three date ranges, so dashboards repeat; the result cache stays as the
+  server has it unless `--result-cache off`.
+- **ELT:** `ingest` (`INSERT` of a new batch of impressions), `rollup`
+  (`CREATE OR REPLACE TABLE ... AS`), `increment` (`INSERT ... SELECT` of
+  new batches past a watermark), `merge` (`MERGE` of recent campaign
+  totals) and `refresh` (`REFRESH MATERIALIZED VIEW`), each due every
+  `--elt-every` seconds, run by `--elt-streams` sessions; a job still
+  running when it is due again is skipped, as Igloo's schedules do, and
+  the report counts the skips.
+
+```sh
+python bench/mixed.py setup --rows 2000000                    # synthetic schema "mixed"
+python bench/mixed.py run --duration 120 --warmup 20 --dashboard-users 8 --elt-streams 2 \
+    --metrics-url http://127.0.0.1:8432/metrics --coordinator m7g.4xlarge \
+    --out bench/results/mixed-local.json
+```
+
+Statements run with `IGLOO_DSN`'s user, and their text starts with
+`/* mixed RUN CLASS NAME */`, the same each time a tile repeats, so the
+history can be read per run. Cost is the coordinator's price for the
+window plus each worker's for the seconds it ran: with `--metrics-url`
+the client samples `igloo_distributed_workers` every second, idle tails
+included; without it, workers are billed only for the seconds their
+statements ran there (a lower bound). Prices come from `pricing.toml`
+(`--coordinator`, `--worker` name instance types) or are given per hour;
+`--spot-factor` scales the worker price. On a fleet, raise `--rows` at
+setup (10 billion takes the generator about as long as `load-media.sql`
+does), `--dashboard-users`, `--elt-streams` and `--batch-rows`, and run
+the client next to the coordinator. The data is synthetic, computed from
+row numbers as in `load-media.sql`.
+
 ## What it does not measure yet
 
-- **Concurrency.** Queries run one at a time. Many users at once favor
-  platforms that add clusters automatically (Snowflake multi-cluster,
-  Databricks serverless scaling); Igloo scales out with replicas.
-- **Loading and transformation.** Only queries are timed.
+- **Concurrency against other platforms.** `mixed.py` runs many users and
+  jobs at once on Igloo only; the other platforms' runs are one query at a
+  time. Many users at once favor platforms that add clusters automatically
+  (Snowflake multi-cluster, Databricks serverless scaling); Igloo scales
+  out with replicas and workers.
 - **A real workload.** TPC-H is a stand-in. `python -m migrate report`
   ([migrating](../docs/migrating.md)) now replays a production query mix
   from Snowflake's or Databricks' history on Igloo and compares results,

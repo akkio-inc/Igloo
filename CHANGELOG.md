@@ -1948,7 +1948,10 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   Cloud (GKE, GCS, Cloud SQL) and Azure (AKS, ADLS Gen2, PostgreSQL Flexible
   Server), each able to pull Igloo from a mirror or private registry.
 - A price-performance benchmark (`bench/`) that runs the same TPC-H queries
-  on Igloo, Snowflake and Databricks and prices them by each one's billing.
+  on Igloo, Snowflake and Databricks and prices them by each one's billing,
+  and a mixed-load one (`bench/mixed.py`) that runs dashboards and ELT on
+  Igloo at once and reports each class's throughput, latency percentiles,
+  queueing, errors and cost.
 - A website (`site/`): a landing page and the documentation, built from the
   repository's markdown with search, light and dark themes, and a link check
   in CI (`make site`).
