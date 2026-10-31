@@ -972,8 +972,11 @@ func policyRules(t duckdb.StmtType, query string) error {
 // policyRewrite returns query, a statement of type t, as it must run for
 // user under the policies in force, and how they applied. ran says it ran
 // statements on the session's connection, after which statements prepared
-// earlier must be prepared again (see reprepare).
-func (s *Server) policyRewrite(ctx context.Context, sess *session, user auth.User, t duckdb.StmtType, query string, oids []uint32) (string, *guard, bool, error) {
+// earlier must be prepared again (see reprepare). pins are the bitmap
+// indexes Igloo wrote query to read, whose tables' references it wrote are
+// its own (see refEdit).
+func (s *Server) policyRewrite(ctx context.Context, sess *session, user auth.User, t duckdb.StmtType, query string, oids []uint32,
+	pins []indexPin) (string, *guard, bool, error) {
 	// Applying policies resolves names and runs DESCRIBE and sensitivity
 	// checks, all of which walk the catalog's in-memory set. Most callers
 	// already hold the catalog (preparing or rechecking a statement); a
@@ -1046,6 +1049,7 @@ func (s *Server) policyRewrite(ctx context.Context, sess *session, user auth.Use
 	if err != nil {
 		return "", nil, ran, err
 	}
+	rw.indexTables = indexNames(pins)
 	edits, err := rw.statementEdits(t, query)
 	if err != nil {
 		return "", nil, ran, err
@@ -1966,7 +1970,7 @@ func (s *Server) recheckPolicies(ctx context.Context, sess *session, st *stateme
 	if original == "" {
 		original = st.query
 	}
-	text, ng, ran, err := s.policyRewrite(ctx, sess, user, st.stmtType, original, st.clientOIDs)
+	text, ng, ran, err := s.policyRewrite(ctx, sess, user, st.stmtType, original, st.clientOIDs, st.indexPins)
 	if err == nil {
 		var ranWrites bool
 		ranWrites, err = s.keptWrites(ctx, sess, user, st.stmtType, original)

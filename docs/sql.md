@@ -557,7 +557,9 @@ DROP ID DOMAIN people;
   Sharing](sharing.md), [clean rooms](clean-rooms.md), its Iceberg REST
   endpoint, reads of the warehouse's files). No one may write to, create,
   drop or alter anything in the schema `igloo_domains`, or change that
-  policy; their names still show in listings.
+  policy; their names still show in listings. Nor may anyone put it on the
+  search path or make it the current schema (`SET search_path`, `SET
+  schema`, `USE`), which `igloo_bitmaps` and `igloo_refresh` share.
 - A member column must have the domain's type and carry its tags. `SET ID
   DOMAIN` adds the column `_igloo_id_<column>` (`BIGINT`) beside it and
   records the membership in the table property
@@ -725,7 +727,10 @@ ALTER TABLE crm.segments DROP BITMAP INDEX people_by_segment;
   snapshot, and a prepared statement whose tables changed reads the tables
   until the bitmaps catch up. A statement whose bitmaps do not fit in the
   memory DuckDB has for them (`rb_memory_budget`) runs once more from the
-  tables. No statement may name `igloo_bitmaps`.
+  tables. No statement may name `igloo_bitmaps`, nor reach its tables
+  through the search path; only the reads Igloo writes skip the
+  `igloo_bitmap_index` policy, and any other read of an index's table gets
+  it, and no rows.
 
 
 

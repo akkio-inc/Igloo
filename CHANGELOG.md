@@ -2044,6 +2044,14 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
 
 ### Fixed
 
+- No one may put Igloo's own schemas (`igloo_domains`, `igloo_bitmaps`,
+  `igloo_refresh`) on the search path or make one the current schema, in
+  any case or quoting: through such a path any reader read bitmap
+  indexes' rows, their groups' counts and members, including groups a row
+  access policy on the indexed table hides. Only the reads of an index's
+  table that Igloo writes to answer counts skip its policy; any other
+  gets it and no rows, and writes, drops and policy changes are refused
+  by the table a name resolves to, not only by the names in the text.
 - Maintenance leaves the files of tables that an open transaction block has
   read or written until the block ends (an hour at most): a compaction that
   committed in the middle of a block, as dbt's incremental models and each

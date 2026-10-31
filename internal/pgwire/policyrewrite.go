@@ -72,6 +72,10 @@ type rewriter struct {
 	touched      bool
 	beyondHiding bool
 	applied      []string
+	// indexTables are the bitmap indexes, lower case, whose tables Igloo
+	// wrote the statement to read (its indexPins): the references to them
+	// it wrote, qualified in full, are its own (see refEdit).
+	indexTables map[string]bool
 }
 
 // realRules reports whether o, which rules returns rules for, has rules of
@@ -557,11 +561,12 @@ func (rw *rewriter) refEdit(text string, ref *refNode, view *object, depth int, 
 	at := *ref
 	at.loc = loc
 	switch {
-	case view == nil && strings.EqualFold(o.db, rw.r.catalog) && strings.EqualFold(o.schema, iddomain.IndexSchema):
-		// A bitmap index's table, which only Igloo's own text names (no
-		// user's statement may: see indexReferences), where it answers a
-		// count from it (see bitmaprewrite.go). In a view's body it stays
-		// guarded.
+	case view == nil && rw.ownIndexRead(ref, o):
+		// A bitmap index's table, as Igloo wrote the statement to read it,
+		// to answer a count from it (see bitmaprewrite.go). Any other
+		// reference that resolves to one, as through a search path no user
+		// may set (see iglooOnPath), or in a view's body, gets its policy,
+		// which denies every row.
 		return nil, nil
 	case o.external:
 		// Igloo's own view of an external table (Delta Sharing), over

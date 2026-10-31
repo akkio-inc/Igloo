@@ -604,6 +604,11 @@ func firstNonEmpty(values ...string) string {
 func (s *Server) tableChange(ctx context.Context, sess *session, user auth.User, c *policyCmd, now time.Time) (func(*policy.Catalog) error, error) {
 	attach := c.kind == pcSetMask || c.kind == pcAddRowPolicy || c.kind == pcSetColumnTag
 	catalog, schema, table, cols, err := s.policyTable(ctx, sess, c.table, attach)
+	if err == nil && catalog == "" && isIglooSchema(schema) {
+		// A table of Igloo's own schemas, however it was named (see
+		// iglooPolicyChange, which sees the name only).
+		err = iglooDenied()
+	}
 	if err != nil {
 		if c.ifExists && pgerror.GetCode(err) == codes.UndefinedTable {
 			return nil, nil

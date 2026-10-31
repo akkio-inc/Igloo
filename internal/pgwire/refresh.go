@@ -150,7 +150,7 @@ func (s *Server) refreshView(ctx context.Context, sess *session, user auth.User,
 	_ = st.close()
 	// What runs is the query as policies rewrite it for user, so the view
 	// holds what its owner may see of protected tables.
-	query, g, _, err := s.policyRewrite(ctx, sess, user, duckdb.STATEMENT_TYPE_SELECT, s.rewrite(ctx, sess, user, j.Statement), nil)
+	query, g, _, err := s.policyRewrite(ctx, sess, user, duckdb.STATEMENT_TYPE_SELECT, s.rewrite(ctx, sess, user, j.Statement), nil, nil)
 	if err != nil {
 		return refreshResult{}, pgError(err)
 	}
@@ -1014,7 +1014,7 @@ func (s *Server) guardIglooTable(ctx context.Context, schema, table, name, comme
 // refresh it, can be refreshed incrementally: it returns why not, or "".
 // An error means the query could not be read, which creating it reports.
 func (s *Server) refreshReason(ctx context.Context, sess *session, user auth.User, query string) (string, error) {
-	rewritten, _, _, err := s.policyRewrite(ctx, sess, user, duckdb.STATEMENT_TYPE_SELECT, s.rewrite(ctx, sess, user, query), nil)
+	rewritten, _, _, err := s.policyRewrite(ctx, sess, user, duckdb.STATEMENT_TYPE_SELECT, s.rewrite(ctx, sess, user, query), nil, nil)
 	if err != nil {
 		return "", err
 	}

@@ -2791,7 +2791,7 @@ func (s *Server) prepareCheckedText(ctx context.Context, sess *session, user aut
 	// Apply policies: what runs is the statement rewritten to read
 	// protected tables through them.
 	policies := sess.phase("policies")
-	protected, g, ran, err := s.policyRewrite(ctx, sess, user, st.stmtType, query, oids)
+	protected, g, ran, err := s.policyRewrite(ctx, sess, user, st.stmtType, query, oids, st.indexPins)
 	if err == nil && protected != query {
 		st.original = query
 		err = st.adopt(ctx, sess.conn, protected)
@@ -2836,7 +2836,7 @@ func (s *Server) prepareCheckedText(ctx context.Context, sess *session, user aut
 	if err == nil {
 		// Nothing changes ID domains' dictionaries or bitmap indexes but
 		// Igloo.
-		err = iglooSchemaWrites(st.stmtType, query)
+		err = s.iglooSchemaWrites(ctx, sess, st.stmtType, query)
 	}
 	if err != nil {
 		s.log.Info("statement denied", "user", user.Name, "role", user.Role, "err", err)

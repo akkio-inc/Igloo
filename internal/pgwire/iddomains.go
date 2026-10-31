@@ -552,8 +552,11 @@ func iglooDenied() error {
 // iglooSchemaWrites refuses, whoever the user, a statement of type t that
 // would write, create, drop or alter anything in Igloo's own schemas
 // (dictionaries and bitmap indexes), which only Igloo changes. Any write
-// that names one counts.
-func iglooSchemaWrites(t duckdb.StmtType, query string) error {
+// that names one counts. A name that does not, a table's alone, resolves
+// as DuckDB resolves it on the session's search path and current schema,
+// which reach none of Igloo's schemas (see iglooOnPath); were they to,
+// every write is refused.
+func (s *Server) iglooSchemaWrites(ctx context.Context, sess *session, t duckdb.StmtType, query string) error {
 	if !slices.Contains(tableWrites, t) {
 		return nil
 	}
@@ -563,6 +566,11 @@ func iglooSchemaWrites(t duckdb.StmtType, query string) error {
 	}
 	if tokensOf(query).mentions(names) {
 		return iglooDenied()
+	}
+	if s.catalogName() != "" {
+		if on, err := s.iglooOnPath(ctx, sess); err != nil || on {
+			return iglooDenied()
+		}
 	}
 	return nil
 }

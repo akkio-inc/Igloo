@@ -696,13 +696,15 @@ func (e *sessionEnv) catalogTable(ctx context.Context, parts []string) (o object
 }
 
 // Computes vouches for a statement's reads of bitmap indexes' tables when
-// Igloo wrote them, to answer from the indexes (see bitmaprewrite.go): no
-// user's statement may name those tables (indexReferences), Igloo's own
-// text reads them at the snapshots it pinned, and a row access policy of
-// Igloo's own keeps everyone else, workers among them, from reading them.
-// The coordinator computes such a read for workers.
+// Igloo wrote them, to answer from the indexes (see bitmaprewrite.go): the
+// references its rewrite wrote, in full, to the indexes the statement's
+// pins name (see ownIndexRead), which no user's text may name
+// (indexReferences) nor reach through the search path (iglooOnPath).
+// Igloo's own text reads them at the snapshots it pinned, and a row access
+// policy of Igloo's own keeps everyone else, workers among them, from
+// reading them. The coordinator computes such a read for workers.
 func (e *sessionEnv) Computes(ctx context.Context, parts []string) (bool, error) {
-	if !e.st.readsIndexes() {
+	if !e.st.readsIndexes() || !indexReference(parts, e.s.catalogName(), indexNames(e.st.indexPins)) {
 		return false, nil
 	}
 	o, ok, err := e.catalogTable(ctx, parts)
