@@ -338,8 +338,7 @@ run: the tables section shows each copy's snapshot time.
 records it (queuing and compilation included, on the warehouse sizes
 shown), against one run on Igloo, timed at the client and including
 fetching the result. Run the tool near the Igloo it measures, and read the
-figures as a first look, not a benchmark (see [the benchmark](../bench/README.md)
-for one).
+figures as a first look, not a benchmark.
 
 **Tables**: the tables and views the workload names, most executed first,
 with their rows and size at the source, whether Igloo has them (mirrored,
@@ -390,8 +389,8 @@ workload, so compare like with like: busy time with busy time.
 | `--from-extract`, `--no-source` | | Use a saved extract; with `--no-source`, do not connect to the source at all |
 
 `python -m migrate extract` takes the history options and `--out`, and only
-reads the history. Connection settings come from the environment, as for
-[the benchmark](../bench/README.md): `SNOWFLAKE_ACCOUNT`, `SNOWFLAKE_USER`,
+reads the history. Connection settings come from the environment:
+`SNOWFLAKE_ACCOUNT`, `SNOWFLAKE_USER`,
 `SNOWFLAKE_PRIVATE_KEY_FILE` (or `SNOWFLAKE_TOKEN_FILE` or
 `SNOWFLAKE_PASSWORD`), `SNOWFLAKE_ROLE`, `SNOWFLAKE_WAREHOUSE`; and the
 Databricks SDK's (`DATABRICKS_HOST` with `DATABRICKS_TOKEN`, or a profile

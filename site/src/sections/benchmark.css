@@ -1,4 +1,5 @@
-/* Benchmark, Linear style. Tokens come from base-linear.css; every rule sits under .vx-benchmark. */
+/* Benchmark, Linear style: two charts by warehouse size, drawn by benchmark.js from the section's table.
+   Tokens come from the site; every rule sits under .vx-benchmark. */
 .vx-benchmark {
   position: relative;
   isolation: isolate;
@@ -53,201 +54,229 @@
   text-wrap: pretty;
 }
 
-/* ---------------------------------------------------------------- cards: soft top glow, lit top edge, hairline dividers */
-.vx-benchmark .vx-bm-cards {
-  display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: clamp(24px, 2.6vw, 42px);
-  margin-top: var(--head-gap);
-}
-.vx-benchmark .vx-bm-card {
-  position: relative;
-  container: vx-bm-card / inline-size;
-  display: flex;
-  flex-direction: column;
-  padding: clamp(24px, 2.2vw, 34px) clamp(20px, 2vw, 32px) clamp(22px, 2vw, 30px);
-  border-radius: var(--radius);
-  background:
-    radial-gradient(ellipse 70% 38% at 50% 0%, rgb(40 80 140 / 0.22), transparent 75%),
-    linear-gradient(180deg, var(--surface-2), var(--surface) 60%);
-  box-shadow: 0 0 0 1px rgb(0 0 0 / 0.5), 0 24px 48px -28px rgb(0 0 0 / 0.8);
-}
-.vx-benchmark .vx-bm-card::before {
-  content: '';
-  position: absolute;
-  inset: 0;
-  padding: 1px;
-  border-radius: inherit;
-  pointer-events: none;
-  background: linear-gradient(180deg, #3a414b 0%, var(--line-strong) 35%, var(--line) 100%);
-  -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
-  -webkit-mask-composite: xor;
-  mask: linear-gradient(#000 0 0) content-box exclude, linear-gradient(#000 0 0);
-}
-/* hairline guide in the gutter between cards */
-.vx-benchmark .vx-bm-card + .vx-bm-card::after {
-  content: '';
-  position: absolute;
-  top: 0;
-  bottom: 0;
-  left: calc(-0.5 * clamp(24px, 2.6vw, 42px));
-  width: 1px;
-  background: linear-gradient(180deg, transparent, var(--line-strong) 20%, var(--line-strong) 80%, transparent);
-  pointer-events: none;
-}
-.vx-benchmark .vx-bm-scale {
-  font-family: var(--font-mono);
-  font-size: 0.8125rem;
-  letter-spacing: 0.1em;
-  text-transform: uppercase;
-  color: var(--text-3);
-}
-.vx-benchmark .vx-bm-machine {
-  margin-top: 8px;
-  font-size: clamp(1.0625rem, 0.98rem + 0.3vw, 1.25rem);
-  font-weight: 500;
-  line-height: 1.3;
-  letter-spacing: -0.01em;
-}
-/* the site's isometric drawing of each run, lit warm where the cores are */
-.vx-benchmark .vx-bm-art {
-  height: clamp(160px, 15vw, 210px);
-  margin: clamp(16px, 1.6vw, 22px) 0;
-  padding-bottom: clamp(16px, 1.6vw, 22px);
-  border-bottom: 1px solid var(--line-strong);
-  color: #3a4048;
-}
-.vx-benchmark .vx-bm-art svg {
-  width: 100%;
-  height: 100%;
-  overflow: visible;
-  filter: drop-shadow(0 0 18px rgb(150 100 40 / 0.18));
+/* ---------------------------------------------------------------- series colours (validated for the dark surface) */
+.vx-benchmark {
+  --bm-igloo: #c27f1f;
+  --bm-snowflake: #3d95d8;
+  --bm-databricks: #d06392;
 }
 
-.vx-benchmark .vx-bm-stats {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr);
-  gap: 14px;
-}
-.vx-benchmark .vx-bm-stats div {
+/* ---------------------------------------------------------------- legend: above both charts */
+.vx-benchmark .vx-bm-legend {
   display: flex;
-  flex-direction: column-reverse;
-  min-width: 0;
-}
-.vx-benchmark .vx-bm-stats dd {
-  margin: 0;
-  font-size: clamp(2rem, 1.2rem + 2.1vw, 2.75rem);
-  font-weight: 600;
-  line-height: 1.1;
-  letter-spacing: -0.035em;
-  white-space: nowrap;
-}
-.vx-benchmark .vx-bm-nowrap {
-  white-space: nowrap;
-}
-.vx-benchmark .vx-bm-dash {
-  margin: 0 0.1em;
-  letter-spacing: 0;
-}
-.vx-benchmark .vx-bm-stats div + div dd {
-  color: #f6c477;
-}
-.vx-benchmark .vx-bm-stats dt {
-  margin-top: 4px;
+  flex-wrap: wrap;
+  gap: 8px 24px;
+  margin: var(--head-gap) 0 0;
+  padding: 0;
+  list-style: none;
   font-size: 0.9375rem;
-  color: var(--text-3);
-}
-@container vx-bm-card (min-width: 330px) {
-  .vx-benchmark .vx-bm-stats {
-    grid-template-columns: repeat(2, minmax(0, auto));
-    justify-content: start;
-    column-gap: 0;
-  }
-  .vx-benchmark .vx-bm-stats div + div {
-    margin-left: clamp(18px, 7cqi, 28px);
-    padding-left: clamp(18px, 7cqi, 28px);
-    border-left: 1px solid var(--line-strong);
-  }
-  .vx-benchmark .vx-bm-stats dd {
-    font-size: min(2.75rem, 11.5cqi);
-  }
-}
-.vx-benchmark .vx-bm-against {
-  margin-top: 18px;
-  font-size: 0.9375rem;
-  line-height: 1.55;
   color: var(--text-2);
 }
-
-.vx-benchmark .vx-bm-more {
-  display: inline-block;
-  margin-top: clamp(18px, 2vw, 28px);
-  padding-block: 11px;
-  font-size: 1.0625rem;
-  font-weight: 500;
-  line-height: 1.3;
-  color: var(--accent);
-  text-decoration: none;
+.vx-benchmark .vx-bm-legend li {
+  display: flex;
+  align-items: center;
+  gap: 10px;
 }
-.vx-benchmark .vx-bm-more:hover {
-  text-decoration: underline;
-  text-underline-offset: 4px;
-}
-.vx-benchmark .vx-bm-arrow {
-  display: inline-block;
+.vx-benchmark .vx-bm-swatch {
   width: 18px;
-  height: 18px;
-  margin-left: 6px;
-  vertical-align: -3px;
+  height: 3px;
+  border-radius: 2px;
+}
+.vx-benchmark .vx-bm-swatch--igloo {
+  height: 4px;
+  background: var(--bm-igloo);
+}
+.vx-benchmark .vx-bm-swatch--snowflake {
+  background: var(--bm-snowflake);
+}
+.vx-benchmark .vx-bm-swatch--databricks {
+  background: var(--bm-databricks);
 }
 
-@media (max-width: 767.98px) {
-  .vx-benchmark .vx-bm-cards {
-    grid-template-columns: minmax(0, 1fr);
-    gap: 16px;
-  }
-  .vx-benchmark .vx-bm-card + .vx-bm-card::after {
-    display: none;
-  }
+/* ---------------------------------------------------------------- the two charts, side by side; stacked on phones */
+.vx-benchmark .vx-bm-charts {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: clamp(20px, 2.4vw, 36px);
+  margin-top: 20px;
 }
-
-/* machine: rack units (one per 16 cores) in amber; data: disk platters (one per 10 GB) in ice blue */
-.vx-benchmark .vx-bm-unit {
-  fill: #141210;
-  stroke: rgb(249 187 45 / 0.38);
-  stroke-width: 0.9;
+.vx-benchmark .vx-bm-chart {
+  position: relative;
+  margin: 0;
+  padding: clamp(18px, 2vw, 28px) clamp(14px, 1.6vw, 24px) clamp(12px, 1.4vw, 18px);
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius);
+  background: linear-gradient(180deg, var(--surface-2), var(--surface) 70%);
+}
+.vx-benchmark .vx-bm-chart figcaption {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  padding-left: 6px;
+  font-size: 1.0625rem;
+  color: var(--text);
+}
+.vx-benchmark .vx-bm-chart figcaption strong {
+  font-weight: 600;
+}
+.vx-benchmark .vx-bm-chart figcaption span {
+  font-size: 0.875rem;
+  color: var(--text-3);
+}
+.vx-benchmark .vx-bm-plot {
+  position: relative;
+  margin-top: 8px;
+}
+.vx-benchmark .vx-bm-plot svg {
+  display: block;
+  width: 100%;
+  overflow: visible;
+  font-family: var(--font-sans);
+}
+/* recessive grid and axes; text in text tokens, never the series colour */
+.vx-benchmark .vx-bm-grid {
+  stroke: var(--line);
+  stroke-width: 1;
+}
+.vx-benchmark .vx-bm-axis {
+  fill: var(--text-3);
+  font-size: 12px;
+}
+.vx-benchmark .vx-bm-size {
+  fill: var(--text-2);
+  font-size: 13px;
+}
+.vx-benchmark .vx-bm-lead-at {
+  fill: var(--text);
+  font-size: 14px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+}
+.vx-benchmark .vx-bm-line {
+  fill: none;
+  stroke-width: 2;
+  stroke-linecap: round;
   stroke-linejoin: round;
 }
-.vx-benchmark .vx-bm-unit--front {
-  fill: #1a1610;
-  stroke: rgb(249 187 45 / 0.7);
+.vx-benchmark .vx-bm-line--igloo {
+  stroke-width: 3;
 }
-.vx-benchmark .vx-bm-unit--top {
-  fill: #1f1a12;
-  stroke: rgb(255 214 130 / 0.6);
+.vx-benchmark .vx-bm-dot-mark {
+  stroke: var(--surface);
+  stroke-width: 2;
 }
-.vx-benchmark .vx-bm-vent {
-  stroke: rgb(249 187 45 / 0.35);
-  stroke-width: 0.8;
-  stroke-linecap: round;
+.vx-benchmark .vx-bm-label {
+  fill: var(--text-2);
+  font-size: 13px;
 }
-.vx-benchmark .vx-bm-led {
-  fill: var(--amber);
-  filter: drop-shadow(0 0 2px rgb(249 187 45 / 0.9));
+.vx-benchmark .vx-bm-cross {
+  stroke: var(--text-3);
+  stroke-width: 1;
+  stroke-dasharray: 3 3;
+  opacity: 0;
 }
-.vx-benchmark .vx-bm-disk {
-  fill: #0d141b;
-  stroke: rgb(139 204 246 / 0.55);
-  stroke-width: 0.8;
+.vx-benchmark .vx-bm-hit {
+  fill: transparent;
+  cursor: default;
+  outline: none;
 }
-.vx-benchmark .vx-bm-disk--top {
-  fill: #101b25;
-  stroke: rgb(185 226 255 / 0.8);
+.vx-benchmark .vx-bm-hit:focus-visible {
+  stroke: var(--accent);
+  stroke-width: 1;
 }
-.vx-benchmark .vx-bm-hub {
-  fill: rgb(185 226 255 / 0.18);
-  stroke: rgb(185 226 255 / 0.55);
-  stroke-width: 0.6;
+
+/* ---------------------------------------------------------------- tooltip */
+.vx-benchmark .vx-bm-tip {
+  position: absolute;
+  z-index: 2;
+  min-width: 190px;
+  padding: 10px 12px;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius-sm);
+  background: rgb(13 15 18 / 0.96);
+  box-shadow: 0 12px 32px rgb(0 0 0 / 0.5);
+  font-size: 0.8125rem;
+  line-height: 1.5;
+  color: var(--text-2);
+  pointer-events: none;
+}
+.vx-benchmark .vx-bm-tip[hidden] {
+  display: none;
+}
+.vx-benchmark .vx-bm-tip b {
+  display: block;
+  margin-bottom: 4px;
+  font-weight: 600;
+  color: var(--text);
+}
+.vx-benchmark .vx-bm-tip span {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.vx-benchmark .vx-bm-tip i {
+  flex: none;
+  width: 10px;
+  height: 3px;
+  border-radius: 2px;
+}
+.vx-benchmark .vx-bm-tip em {
+  margin-left: auto;
+  padding-left: 16px;
+  font-style: normal;
+  font-variant-numeric: tabular-nums;
+  color: var(--text);
+}
+
+/* ---------------------------------------------------------------- the data: shown without JavaScript, read by screen readers with it */
+.vx-benchmark .vx-bm-data {
+  width: 100%;
+  margin-top: 20px;
+  border-collapse: collapse;
+  font-size: 0.9375rem;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-2);
+}
+.vx-benchmark .vx-bm-data caption {
+  padding-bottom: 8px;
+  text-align: left;
+  color: var(--text-3);
+}
+.vx-benchmark .vx-bm-data th,
+.vx-benchmark .vx-bm-data td {
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--line);
+  text-align: right;
+}
+.vx-benchmark .vx-bm-data th:first-child {
+  text-align: left;
+}
+.vx-benchmark.is-charted .vx-bm-data {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+.vx-benchmark:not(.is-charted) .vx-bm-charts,
+.vx-benchmark:not(.is-charted) .vx-bm-legend {
+  display: none;
+}
+
+.vx-benchmark .vx-bm-note {
+  max-width: 52em;
+  margin-top: 18px;
+  font-size: 0.875rem;
+  line-height: 1.55;
+  color: var(--text-3);
+}
+
+@media (max-width: 899.98px) {
+  .vx-benchmark .vx-bm-charts {
+    grid-template-columns: minmax(0, 1fr);
+  }
 }
 
 /* section edges: fade */

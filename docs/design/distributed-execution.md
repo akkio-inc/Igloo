@@ -1118,9 +1118,7 @@ Absolute times on that machine vary two- to fourfold with its load, so
 every comparison below is interleaved in one session and reports the
 fastest of several runs. Nothing larger than TPC-H scale factor 1 was run
 there; the measurements that decide price-performance at the sizes this
-design is for are planned for EC2
-([bench/README.md](../../bench/README.md#distributed-execution)) and not
-yet made.
+design is for are planned for EC2 and not yet made.
 
 ### One machine as memory shrinks
 

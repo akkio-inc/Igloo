@@ -86,7 +86,6 @@ export const groups = [
 		label: 'Reference',
 		pages: [
 			{ source: 'docs/configuration.md', label: 'Configuration' },
-			{ source: 'bench/README.md', slug: 'docs/benchmark', label: 'Benchmark' },
 			{ source: 'CHANGELOG.md', slug: 'docs/changelog', label: 'Changelog', toc: 2 },
 			{ source: 'CONTRIBUTING.md', slug: 'docs/contributing', label: 'Contributing' },
 		],

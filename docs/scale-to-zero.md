@@ -60,8 +60,8 @@ between scheduled jobs. A machine that is busy most of the day costs less
 running all the time, and its first query of the day is not slowed by a
 start.
 
-How long a start takes depends on the platform. In the
-[benchmark](../bench/README.md), a stopped c7g.4xlarge with Igloo's
+How long a start takes depends on the platform. On AWS, a stopped
+c7g.4xlarge with Igloo's
 single-machine stack (Igloo, its catalog and local storage under Docker
 Compose) took about 16 seconds from the first connection to the first
 query. Kubernetes pods on a node that is already running start in a few
