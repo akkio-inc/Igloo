@@ -90,8 +90,14 @@ type Engine interface {
 	CatalogChanged()
 	ListingsGeneration() uint64
 	// DataVersion goes up whenever a table of the catalog may have
-	// changed, through this replica or otherwise (see resultcache.go).
+	// changed, through this replica or otherwise, and TablesVersion
+	// changes whenever one of the tables loads loaded may have (see
+	// resultcache.go).
 	DataVersion() uint64
+	TablesVersion(loads []catalogproxy.Load) uint64
+	// OnEmptyCache has the engine empty what purge empties whenever it
+	// empties its read cache for erasure requests.
+	OnEmptyCache(purge func())
 	// RecordLoads records the catalog's tables DuckDB loads until the func
 	// it returns is called, and ReloadTables loads such tables again, so
 	// that DataVersion goes up if any changed meanwhile.
@@ -704,6 +710,10 @@ func New(engine Engine, opts Options, log *slog.Logger) (*Server, error) {
 	s.idDomains, s.idDomainsOn, s.idHolder = opts.IDDomains, opts.IDDomainsOn, newIDHolder()
 	s.idSyncMinRows, s.sortBudget = opts.IDSyncMinRows, opts.SortSpillBudget
 	s.results = newResultCache(opts.ResultCacheSize, opts.Metrics)
+	if s.results != nil {
+		// What erasure requests delete goes from kept results too.
+		engine.OnEmptyCache(s.results.purge)
+	}
 	s.deleteTargets = deletefiles.NewTargets()
 	s.queryMemory = opts.QueryMemory
 	s.scanner, s.prefetcher = opts.Scanner, opts.Prefetcher

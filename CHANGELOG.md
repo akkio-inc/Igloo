@@ -1526,6 +1526,15 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
 
 ### Performance and cost
 
+- The result cache sends a dashboard's repeated queries again more often:
+  it compares statements without their comments and spacing, which BI
+  tools vary per run; shares a result between users when no policy
+  changes the statement; and keeps a result until one of the tables its
+  statement reads changes, not any table. In a test of three users
+  opening a five-chart dashboard three times while a pipe loaded a raw
+  table, 36 of 45 chart queries were answered from the cache, against none
+  before. Erasure requests empty every replica's result cache.
+
 - A replica reads what the past week's statements allocated from the
   query history when it starts, those that ran under its memory limit, so
   a dashboard's first build after a restart reserves memory as later ones

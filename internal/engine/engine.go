@@ -83,6 +83,10 @@ type Engine struct {
 	aiHook atomic.Pointer[aiHookBox]
 	// models scores models and serves their methods' results (see Models).
 	models *models.Runtime
+	// purges are what EmptyCache empties beside the read cache (see
+	// OnEmptyCache).
+	purgeMu sync.Mutex
+	purges  []func()
 	// forecasting forecasts with the model pack's models (see Forecasting).
 	forecasting *tsforecast.Service
 	// catMu keeps binding, walking and changing the attached catalog's
@@ -351,6 +355,10 @@ func (e *Engine) ListingsGeneration() uint64 { return e.proxy.Generation() }
 // DataVersion goes up whenever a table of the catalog may have changed (see
 // catalogproxy.Proxy.DataVersion).
 func (e *Engine) DataVersion() uint64 { return e.proxy.DataVersion() }
+
+// TablesVersion changes whenever one of the tables loads loaded may have
+// changed (see catalogproxy.Proxy.TablesVersion).
+func (e *Engine) TablesVersion(loads []catalogproxy.Load) uint64 { return e.proxy.TablesVersion(loads) }
 
 // RecordLoads records the catalog's tables DuckDB loads until the func it
 // returns is called, which returns them (see catalogproxy's RecordLoads).

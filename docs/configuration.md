@@ -240,7 +240,7 @@ disk, so that queries after a restart read them from there; see
 | `IGLOO_PREFETCH_CONCURRENCY` | `256` | Requests the prefetcher keeps in flight, for all statements together. |
 | `IGLOO_MAX_CONCURRENT_STATEMENTS` | `off` | How many queries and changes of data may run at once on a replica, for every user together, e.g. `8`, or `auto` for as many as its cores; further ones wait in line. See [the replica's limit](workload-management.md#the-replicas-limit). |
 | `IGLOO_STATEMENT_RESERVATIONS` | `auto` | The fraction of what a statement's shape allocated last that it reserves of the replica's memory before it starts, when its role sets no `memory_limit`: `auto` for all of it (1), a fraction up to 4, or `off`. See [reservations from history](workload-management.md#reservations-from-history). |
-| `IGLOO_RESULT_CACHE_SIZE` | `256MiB` | Memory the results of queries Igloo keeps, to send them again to the same query while no table changes, may take; see [the result cache](operations.md#result-cache). `0` or `off` keeps none. |
+| `IGLOO_RESULT_CACHE_SIZE` | `256MiB` | Memory the results of queries Igloo keeps, to send them again to the same query while none of the tables it reads changes, may take; see [the result cache](operations.md#result-cache). `0` or `off` keeps none. |
 
 ## Table maintenance
 

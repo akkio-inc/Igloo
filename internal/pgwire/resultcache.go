@@ -15,6 +15,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	"github.com/duckdb/duckdb-go/v2"
 	"github.com/jackc/pgx/v5/pgtype"
@@ -32,11 +33,15 @@ import (
 // the same question in several of its charts, sends the same query again
 // and again over data that has not changed. Igloo keeps the result of such
 // a query and sends it again, without running the query, to the next
-// statement that is the same text with the same parameters, from the same
-// user with the same roles and settings, as long as no table of the
-// catalog has changed since (see catalogproxy's DataVersion). A statement
-// that arrives while the same one runs waits for that run's result rather
-// than running too.
+// statement that is the same text, but for its comments and spacing, with
+// the same parameters and settings, as long as none of the tables it reads
+// has changed since (see catalogproxy's TablesVersion): writes to other
+// tables, as a pipe's loads into raw tables, leave it be. A statement that
+// no policy changes gives every user who may run it the same rows, and
+// shares its result with them; one that a policy changes, or of a session
+// with temporary objects of its own, keeps its result to its user (or
+// session) and roles. A statement that arrives while the same one runs
+// waits for that run's result rather than running too.
 //
 // Only results that running the statement again would give are kept: those
 // of queries whose plan reads nothing but tables of the catalog and the
@@ -63,6 +68,9 @@ type resultCache struct {
 	// memos are the statements answered before they are prepared, by
 	// statementKey (see memoStatement).
 	memos map[resultKey]memo
+	// gen goes up when the cache is emptied (see purge): no run begun
+	// before keeps its result.
+	gen uint64
 }
 
 // memo is what answering a statement before it is prepared takes: the key
@@ -92,11 +100,13 @@ type cachedResult struct {
 }
 
 // resultFlight is a run of a statement whose result others wait for; res
-// is set, before done closes, if the run's result was kept.
+// is set, before done closes, if the run's result was kept. version is the
+// version of the tables it reads when it began (see dataStamp), and gen
+// the cache's (see purge).
 type resultFlight struct {
-	version uint64
-	done    chan struct{}
-	res     *cachedResult
+	version, gen uint64
+	done         chan struct{}
+	res          *cachedResult
 }
 
 // resultFill takes the rows of a statement's run, for the cache to keep if
@@ -104,9 +114,12 @@ type resultFlight struct {
 type resultFill struct {
 	flight *resultFlight
 	key    resultKey
-	max    int64
-	rows   [][]any
-	size   int64
+	// loads are the tables the statement reads, whose version says
+	// whether any changed while it ran (see dataStamp).
+	loads []catalogproxy.Load
+	max   int64
+	rows  [][]any
+	size  int64
 	// over says the result grew past max, so is not kept.
 	over bool
 	tag  string
@@ -168,7 +181,7 @@ func valueSize(v any) int64 {
 // lookup returns key's kept result at version, if there is one; else the
 // run of key under way at version, whose result to wait for; else a fill
 // for the caller's own run, which others will wait for.
-func (c *resultCache) lookup(key resultKey, version uint64, max int64) (*cachedResult, *resultFlight, *resultFill) {
+func (c *resultCache) lookup(key resultKey, version uint64, loads []catalogproxy.Load, max int64) (*cachedResult, *resultFlight, *resultFill) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if e, ok := c.entries[key]; ok {
@@ -182,14 +195,14 @@ func (c *resultCache) lookup(key resultKey, version uint64, max int64) (*cachedR
 	if f, ok := c.flights[key]; ok && f.version == version {
 		return nil, f, nil
 	}
-	f := &resultFlight{version: version, done: make(chan struct{})}
+	f := &resultFlight{version: version, gen: c.gen, done: make(chan struct{})}
 	c.flights[key] = f
-	return nil, nil, &resultFill{flight: f, key: key, max: max}
+	return nil, nil, &resultFill{flight: f, key: key, loads: loads, max: max}
 }
 
 // finish ends fill's run: it keeps the result if the run succeeded, sent
-// it whole, and no table changed meanwhile (version is the data version
-// now), and lets those waiting for it go.
+// it whole, no table it reads changed meanwhile (version is their version
+// now) and the cache was not emptied, and lets those waiting for it go.
 func (c *resultCache) finish(fill *resultFill, err error, version uint64) {
 	if c == nil || fill == nil || fill.finished {
 		return
@@ -198,6 +211,7 @@ func (c *resultCache) finish(fill *resultFill, err error, version uint64) {
 	f := fill.flight
 	keep := err == nil && !fill.over && fill.tag != "" && version == f.version
 	c.mu.Lock()
+	keep = keep && c.gen == f.gen
 	if c.flights[fill.key] == f {
 		delete(c.flights, fill.key)
 	}
@@ -220,6 +234,25 @@ func (c *resultCache) finish(fill *resultFill, err error, version uint64) {
 		c.metrics.resultCached("kept")
 	}
 	c.metrics.resultCacheBytes(used)
+}
+
+// purge empties the cache: every result it keeps, every statement it
+// answers before preparing, and the result of every run under way, which
+// it keeps none of. Erasure requests have every replica purge it, with its
+// read cache (see engine.Engine.EmptyCache), once they deleted rows.
+func (c *resultCache) purge() {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	c.gen++
+	c.lru.Init()
+	clear(c.entries)
+	clear(c.memos)
+	clear(c.verdicts)
+	c.used = 0
+	c.mu.Unlock()
+	c.metrics.resultCacheBytes(0)
 }
 
 // drop forgets a kept result. The caller holds c.mu.
@@ -258,15 +291,26 @@ func (s *Server) fromCache(ctx context.Context, sess *session, st *statement, ar
 	if err != nil {
 		return false, nil, nil, nil
 	}
-	served, fill, err := c.answer(ctx, key, s.engine.DataVersion(), w)
+	served, fill, err := c.answer(ctx, key, s.dataStamp(st.loads), st.loads, w)
 	return served, fill, &key, err
+}
+
+// dataStamp is the version of the tables loads loaded, which changes when
+// any of them may have changed: of the whole catalog when they are none
+// known.
+func (s *Server) dataStamp(loads []catalogproxy.Load) uint64 {
+	if len(loads) == 0 {
+		return s.engine.DataVersion() ^ 0x9e3779b97f4a7c15
+	}
+	return s.engine.TablesVersion(loads)
 }
 
 // answer sends key's result, kept at version or from the run of it under
 // way, and reports whether it did. Otherwise it returns the fill for the
-// caller's own run, nil if its result is not to be kept.
-func (c *resultCache) answer(ctx context.Context, key resultKey, version uint64, w *tagWriter) (bool, *resultFill, error) {
-	res, flight, fill := c.lookup(key, version, c.entryMax)
+// caller's own run, which reads the tables loads loaded, nil if its result
+// is not to be kept.
+func (c *resultCache) answer(ctx context.Context, key resultKey, version uint64, loads []catalogproxy.Load, w *tagWriter) (bool, *resultFill, error) {
+	res, flight, fill := c.lookup(key, version, loads, c.entryMax)
 	if flight != nil {
 		select {
 		case <-flight.done:
@@ -342,7 +386,7 @@ func (s *Server) statementKey(ctx context.Context, sess *session, user auth.User
 	s.gov.snapshot(ctx)
 	h := sha256.New()
 	writeField(h, "statement")
-	writeField(h, text)
+	writeField(h, normalized(text))
 	writeField(h, string(sess.sqlDialect()))
 	writeField(h, user.Name)
 	writeField(h, string(user.Role))
@@ -409,7 +453,7 @@ func (s *Server) memoStatement(ctx context.Context, sess *session, user auth.Use
 	// Loading its tables again, as preparing it would, shows a change made
 	// through another replica or engine meanwhile; those loads run at once,
 	// holding nothing.
-	if err := s.engine.ReloadTables(ctx, m.loads); err != nil || !c.has(m.key, s.engine.DataVersion()) {
+	if err := s.engine.ReloadTables(ctx, m.loads); err != nil || !c.has(m.key, s.dataStamp(m.loads)) {
 		return nil, false
 	}
 	ps := wire.NewStatement(func(ctx context.Context, w wire.DataWriter, params []wire.Parameter) error {
@@ -420,7 +464,7 @@ func (s *Server) memoStatement(ctx context.Context, sess *session, user auth.Use
 		if arrowWriterOf(w) == nil {
 			cctx, cached := sess.cancelable(ctx, q.Query)
 			var fill *resultFill
-			served, fill, err = c.answer(cctx, m.key, s.engine.DataVersion(), tw)
+			served, fill, err = c.answer(cctx, m.key, s.dataStamp(m.loads), m.loads, tw)
 			err = cached(err)
 			// Not answered: the caller's own run below keeps its result.
 			s.finishResult(fill, errUnfinished)
@@ -462,7 +506,7 @@ var errUnfinished = errors.New("the run did not finish")
 // finishResult ends the run fill took rows of (see resultCache.finish).
 func (s *Server) finishResult(fill *resultFill, err error) {
 	if fill != nil {
-		s.results.finish(fill, err, s.engine.DataVersion())
+		s.results.finish(fill, err, s.dataStamp(fill.loads))
 	}
 }
 
@@ -515,24 +559,31 @@ var resultIgnoredSettings = map[string]bool{
 }
 
 // resultKey tells st apart, with args, as the cache does: by the text
-// DuckDB prepared, its parameters' values, the user with their built-in and
-// custom roles, the session's settings, and the generations of the catalog
-// and of the policies; and by the session itself when it may have
-// temporary objects.
+// DuckDB prepared, but for its comments and spacing (see normalized), its
+// parameters' values, the dialect, the session's settings, and the
+// generations of the catalog and of the policies; by the user with their
+// built-in and custom roles when a policy changed it (see
+// statement.inert); and by the session itself when it may have temporary
+// objects. A statement no policy changes gives the same rows to every user
+// who may run it, as preparing it checked: it reads only tables of the
+// catalog (see keepable), and calls nothing that says who runs it.
 func (s *Server) resultKey(ctx context.Context, sess *session, st *statement, args []driver.NamedValue, settings [sha256.Size]byte) (resultKey, error) {
-	user := sess.currentUser()
-	privs, err := s.privileges(ctx, sess, user)
-	if err != nil {
-		return resultKey{}, err
-	}
 	h := sha256.New()
-	writeField(h, st.prepared)
-	writeField(h, user.Name)
-	writeField(h, string(user.Role))
-	if privs != nil {
-		roles := slices.Sorted(slices.Values(privs.Roles))
-		for _, r := range roles {
-			writeField(h, "role "+r)
+	writeField(h, normalized(st.prepared))
+	writeField(h, string(sess.sqlDialect()))
+	if !st.inert() {
+		user := sess.currentUser()
+		privs, err := s.privileges(ctx, sess, user)
+		if err != nil {
+			return resultKey{}, err
+		}
+		writeField(h, "user "+user.Name)
+		writeField(h, string(user.Role))
+		if privs != nil {
+			roles := slices.Sorted(slices.Values(privs.Roles))
+			for _, r := range roles {
+				writeField(h, "role "+r)
+			}
 		}
 	}
 	h.Write(settings[:])
@@ -551,6 +602,48 @@ func (s *Server) resultKey(ctx context.Context, sess *session, st *statement, ar
 	var k resultKey
 	h.Sum(k[:0])
 	return k, nil
+}
+
+// normalized is text as the cache tells statements apart: without its
+// comments, and with each run of white space in its SQL code as one space,
+// none at its ends nor before a final semicolon. Neither changes what a
+// statement does, and BI tools vary them from one run of a query to the
+// next (a comment with the run's ID, say). String literals and quoted
+// identifiers stay as written: a literal's spelling can change its type.
+func normalized(text string) string {
+	var b strings.Builder
+	space := false
+	put := func(r rune) {
+		if space && b.Len() > 0 {
+			b.WriteByte(' ')
+		}
+		space = false
+		b.WriteRune(r)
+	}
+	for _, seg := range sqllex.Segments(text) {
+		switch seg.Kind {
+		case sqllex.Comment:
+			// A comment parts the words around it, as a space does.
+			space = true
+		case sqllex.Code:
+			for _, r := range seg.Text {
+				if unicode.IsSpace(r) {
+					space = true
+					continue
+				}
+				put(r)
+			}
+		default:
+			for i, r := range seg.Text {
+				if i == 0 {
+					put(r)
+					continue
+				}
+				b.WriteRune(r)
+			}
+		}
+	}
+	return strings.TrimRight(b.String(), "; ")
 }
 
 // writeField writes a length and then s to h, so that no two lists of

@@ -601,11 +601,26 @@ A dashboard that several people open at once, or that asks the same
 question in several of its charts, sends the same query again and again
 over data that has not changed. Igloo keeps the result of such a query in
 memory and sends it again, without running the query, to the next
-statement that is the same text with the same parameters, from the same
-user with the same roles and settings, as long as no table has changed
-since. A statement that arrives while the same one is running waits for
-that run's result instead of running too. Snowflake does the same
-(`USE_CACHED_RESULT`).
+statement that is the same query with the same parameters and settings,
+as long as none of the tables it reads has changed since. A statement
+that arrives while the same one is running waits for that run's result
+instead of running too. Snowflake does the same (`USE_CACHED_RESULT`).
+Three users opening a five-chart dashboard three times, with a BI tool's
+run ID in each query's comment and a pipe loading a raw table between
+openings, had 36 of 45 chart queries answered from the cache, where
+keeping results by exact text and user, until any table changed, had
+none.
+
+- **The same query.** Statements are compared as written but for their
+  comments and spacing, which BI tools vary from one run to the next
+  (Looker's context comment, Metabase's header); string literals and
+  quoted names count as written, since `x = '5'`, `x = 5` and a parameter
+  of 5 can give different rows. A statement that no
+  [policy](security-policies.md) changes gives every user who may run it
+  the same rows, so its result is shared between users, once each
+  user's own statement has been checked against their grants. A
+  statement a row access or masking policy changes keeps its result to
+  its user and roles.
 
 - **What is kept.** Results of queries that read tables of the catalog,
   through views or not, and nothing else: not DuckDB's own tables,
@@ -620,11 +635,14 @@ that run's result instead of running too. Snowflake does the same
 - **Always current.** DuckDB loads every table a statement reads when it
   prepares the statement, through Igloo's [catalog
   proxy](#writes-when-the-catalog-fails), which sees each table's metadata
-  location, and each change Igloo makes. Once a table may have changed,
-  through this replica, another replica or another engine, no result kept
-  before is used again, and a result is kept only if no table changed
-  while its statement ran. A change to the catalog's views or to policies
-  makes the results kept before unused too.
+  location, and each change Igloo makes, with the tables it changes. Once
+  a table may have changed, through this replica, another replica or
+  another engine, no result of a statement that reads it kept before is
+  used again, and a result is kept only if none of its tables changed
+  while its statement ran; results of statements that read other tables
+  stay. A change the proxy cannot tell the tables of (to a namespace or a
+  view, say), to the catalog's views or to policies makes every result
+  kept before unused.
 - **Size.** Results take at most `IGLOO_RESULT_CACHE_SIZE` of memory, 256
   MiB unless set, each at most a sixteenth of it; the least recently used
   go first. `0` turns the cache off.
@@ -636,7 +654,7 @@ that run's result instead of running too. Snowflake does the same
   [concurrency on a replica](#concurrency-on-a-replica)), other statements
   one at a time. An admin's query whose result the cache kept, with no parameters, no
   policy that applies to it and nothing read from a connection, is also
-  known by its text: the next one of the same text, user, roles, dialect
+  known by its text: the next one of the same text (but for comments and spacing), user, roles, dialect
   and settings, with the catalog's tables, views and policies as they
   were, is answered without being prepared. The tables it read are loaded
   from the catalog again first, all at once and holding no lock, so a
@@ -645,6 +663,9 @@ that run's result instead of running too. Snowflake does the same
 - **In the history.** A statement answered from the cache is recorded with
   0 for `cpu_time_ms`, `bytes_read` and `memory_allocated_bytes`;
   `igloo_result_cache_total` counts them.
+- **Erasure.** An [erasure request](privacy.md) that deleted rows has
+  every replica empty its result cache, with its read cache; a statement
+  that began before keeps nothing.
 
 ## Connections to other databases
 

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
@@ -231,13 +232,28 @@ func machineID() string {
 	return strings.ReplaceAll(host, " ", "_") + "/" + strings.TrimSpace(string(id))
 }
 
+// OnEmptyCache has EmptyCache call purge too: it empties what else the
+// process keeps of rows, as the SQL server's result cache.
+func (e *Engine) OnEmptyCache(purge func()) {
+	e.purgeMu.Lock()
+	defer e.purgeMu.Unlock()
+	e.purges = append(e.purges, purge)
+}
+
 // EmptyCache drops everything the read cache on disk holds, and DuckDB's
-// cache of file contents in memory; and the models, pinned ones too, and
+// cache of file contents in memory; the models, pinned ones too, and
 // methods' results the process holds, which can hold what they learned
-// from rows an erasure request erased (see models.Runtime.Purge).
+// from rows an erasure request erased (see models.Runtime.Purge); and
+// whatever else OnEmptyCache was given, as kept query results.
 func (e *Engine) EmptyCache(ctx context.Context) error {
 	if e.models != nil {
 		e.models.Purge()
+	}
+	e.purgeMu.Lock()
+	purges := slices.Clone(e.purges)
+	e.purgeMu.Unlock()
+	for _, purge := range purges {
+		purge()
 	}
 	c, err := e.connector.Connect(ctx)
 	if err != nil {
