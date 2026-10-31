@@ -340,7 +340,11 @@ func (co *Coordinator) PurgeWorkers(ctx context.Context, ledger ErasureLedger) e
 		through = latest.UnixNano()
 		co.noteErased(through)
 	}
+	// The large worker keeps a read cache as the others do.
 	ws := co.pool.answering(ctx)
+	if co.large != nil {
+		ws = append(ws, co.large.answering(ctx)...)
+	}
 	errs := make([]error, len(ws))
 	var wg sync.WaitGroup
 	for i, w := range ws {

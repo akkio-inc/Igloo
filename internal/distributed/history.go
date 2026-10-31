@@ -2,6 +2,7 @@ package distributed
 
 import (
 	clist "container/list"
+	"maps"
 	"sync"
 	"time"
 )
@@ -28,8 +29,13 @@ const maxHistory = 4096
 type runs struct {
 	key         string
 	local, dist float64
-	// distWorkers are the workers its last run on workers ran on.
+	// distWorkers are the workers its last run on workers ran on, and dist
+	// the average of its runs on about as many. fleets are those averages by
+	// how many workers ran it (fleetBucket), for choosing how many next time
+	// (see correct); large is the average of its runs on the large worker.
 	distWorkers int
+	fleets      map[int]float64
+	large       float64
 	explored    time.Time
 	outOfMemory bool
 	// guarded says it ran on one machine far past its estimate, and was
@@ -44,10 +50,11 @@ type runs struct {
 	// machine's memory share, held as heldFactor times its bytes; it is
 	// worked out when the runs are read, not kept.
 	heavy bool
-	// localMemory and distMemory are the memory its runs had: the replica's
-	// limit on one machine, the smallest worker's on workers; zero when not
-	// known. Runs under other conditions are not compared (see comparable).
-	localMemory, distMemory int64
+	// localMemory, distMemory and largeMemory are the memory its runs had:
+	// the replica's limit on one machine, the smallest worker's on workers,
+	// the large worker's on it; zero when not known. Runs under other
+	// conditions are not compared (see comparable).
+	localMemory, distMemory, largeMemory int64
 }
 
 func newHistory() *history {
@@ -63,7 +70,9 @@ func (h *history) get(key string) (runs, bool) {
 		return runs{}, false
 	}
 	h.order.MoveToFront(el)
-	return *el.Value.(*runs), true
+	r := *el.Value.(*runs)
+	r.fleets = maps.Clone(r.fleets)
+	return r, true
 }
 
 // update changes the runs of key, adding them if need be.
@@ -85,38 +94,58 @@ func (h *history) update(key string, fn func(*runs)) {
 	fn(el.Value.(*runs))
 }
 
-// observe records a run of key on workers workers, or on one machine if
-// none, that took seconds. Runs on workers average only with runs on about
-// as many: twice the workers or half make another statement of it.
-func (h *history) observe(key string, workers int, seconds float64, memory int64) {
+// observe records a run of key on workers workers, on the large worker if
+// large, or on one machine if neither, that took seconds. Runs on workers
+// average only with runs on about as many, by fleetBucket: twice the
+// workers or half make another statement of it.
+func (h *history) observe(key string, workers int, large bool, seconds float64, memory int64) {
 	h.update(key, func(r *runs) {
-		avg := &r.local
-		if workers > 0 {
-			avg = &r.dist
-			if r.distWorkers > 0 && (workers >= 2*r.distWorkers || 2*workers <= r.distWorkers) || !alike(memory, r.distMemory) {
-				*avg = 0
+		var avg *float64
+		switch {
+		case large:
+			if !alike(memory, r.largeMemory) {
+				r.large = 0
 			}
-			r.distWorkers, r.distMemory = workers, memory
-		} else {
+			avg, r.largeMemory = &r.large, memory
+		case workers > 0:
+			if !alike(memory, r.distMemory) {
+				r.fleets = nil
+			}
+			if r.fleets == nil {
+				r.fleets = map[int]float64{}
+			}
+			b := fleetBucket(workers)
+			r.fleets[b] = mean(r.fleets[b], seconds)
+			r.dist, r.distWorkers, r.distMemory = r.fleets[b], workers, memory
+			return
+		default:
 			if !alike(memory, r.localMemory) {
-				*avg, r.guarded = 0, false
+				r.local, r.guarded = 0, false
 			}
+			avg = &r.local
 			r.outOfMemory, r.localMemory = false, memory
 		}
-		if *avg == 0 {
-			*avg = seconds
-		} else {
-			*avg = (*avg + seconds) / 2
-		}
+		*avg = mean(*avg, seconds)
 	})
+}
+
+// mean weighs a run of seconds as much as the runs before it, avg, zero
+// for none.
+func mean(avg, seconds float64) float64 {
+	if avg == 0 {
+		return seconds
+	}
+	return (avg + seconds) / 2
 }
 
 // Run is a statement's past run, for auto mode's choice of where it runs
 // next: its plan key (Plan.Key), the workers it ran on (0 for one
 // machine) and how long it took, or that it ran out of memory.
 type Run struct {
-	Key         string
-	Workers     int
+	Key     string
+	Workers int
+	// Large says it ran on the large worker (see OnLarge).
+	Large       bool
 	Duration    time.Duration
 	OutOfMemory bool
 	// Memory is the memory it ran with (see RunMemory); a run that does not
@@ -135,27 +164,37 @@ func alike(a, b int64) bool {
 // this replica if none, had: the replica's limit, or the smallest limit
 // the workers reported; the server records it with the statement's run
 // (see Run.Memory), as the condition under which it took what it took.
-func (co *Coordinator) RunMemory(workers int) int64 {
-	if workers == 0 {
+func (co *Coordinator) RunMemory(workers int) int64 { return co.RunMemoryOn(workers, false) }
+
+// RunMemoryOn is RunMemory of a statement that ran on the large worker if
+// large: the large worker's limit.
+func (co *Coordinator) RunMemoryOn(workers int, large bool) int64 {
+	switch {
+	case large:
+		return co.largeMemory()
+	case workers == 0:
 		return co.opts.MemoryBytes
-	}
-	if co.pool == nil {
+	case co.pool == nil:
 		return 0
 	}
 	return co.pool.lastMemory()
 }
 
 // comparable leaves of r only the runs measured under the conditions
-// statements run under now, the replica's memory m and the workers' w:
-// runs on a replica of 14 GB, or on workers of 6 GB beside it, are no
-// guide on one of 22 GB with workers of their own, and once in the query
-// history they kept a dashboard's statements on workers for a week.
-func comparable(r runs, m, w int64) runs {
+// statements run under now, the replica's memory m, the workers' w and the
+// large worker's l: runs on a replica of 14 GB, or on workers of 6 GB
+// beside it, are no guide on one of 22 GB with workers of their own, and
+// once in the query history they kept a dashboard's statements on workers
+// for a week.
+func comparable(r runs, m, w, l int64) runs {
 	if !alike(r.localMemory, m) {
 		r.local, r.outOfMemory, r.guarded = 0, false, false
 	}
 	if !alike(r.distMemory, w) {
-		r.dist, r.distWorkers, r.exchangeRows, r.exchangeBytes, r.fanout = 0, 0, 0, 0, 0
+		r.dist, r.distWorkers, r.fleets, r.exchangeRows, r.exchangeBytes, r.fanout = 0, 0, nil, 0, 0, 0
+	}
+	if !alike(r.largeMemory, l) {
+		r.large = 0
 	}
 	return r
 }
@@ -163,8 +202,14 @@ func comparable(r runs, m, w int64) runs {
 // Observe records how long a statement whose plan key is key (Plan.Key,
 // PlanKey) took, on workers workers or on one machine.
 func (co *Coordinator) Observe(key string, workers int, d time.Duration) {
+	co.ObserveOn(key, workers, false, d)
+}
+
+// ObserveOn is Observe of a statement that ran on the large worker if
+// large (Execution.Large).
+func (co *Coordinator) ObserveOn(key string, workers int, large bool, d time.Duration) {
 	if key != "" && d > 0 {
-		co.history.observe(key, workers, d.Seconds(), co.RunMemory(workers))
+		co.history.observe(key, workers, large, d.Seconds(), co.RunMemoryOn(workers, large))
 	}
 }
 
@@ -253,7 +298,7 @@ func (co *Coordinator) Seed(rs []Run) {
 		case r.OutOfMemory:
 			co.observeOutOfMemory(r.Key, r.Memory)
 		case r.Duration > 0:
-			co.history.observe(r.Key, r.Workers, r.Duration.Seconds(), r.Memory)
+			co.history.observe(r.Key, r.Workers, r.Large, r.Duration.Seconds(), r.Memory)
 		}
 	}
 }

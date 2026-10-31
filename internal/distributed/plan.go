@@ -167,8 +167,12 @@ type Plan struct {
 	// Key identifies the statement in the history of its runs, for
 	// Coordinator.Observe (see planKey).
 	Key string
-	// workers is how many workers the estimates call for (estimateTimes).
-	workers int
+	// workers is how many workers auto mode chose (see pick), and large
+	// says the large worker, alone; placement says where and why, for the
+	// query history.
+	workers   int
+	large     bool
+	placement string
 	// shortOfMemory says the statement would not fit in the coordinator's
 	// memory: its working set is over its share (estimateTimes), or it ran
 	// out of memory there before.
@@ -196,6 +200,11 @@ type Plan struct {
 // coordinator's memory, so that running it there instead of on workers
 // would fail, slowly.
 func (p *Plan) ShortOfMemory() bool { return p.shortOfMemory }
+
+// Placement says where auto mode, or the session's mode, runs the
+// statement and why: how many workers or the large worker, and the reason,
+// as the query history records it (see OnLarge).
+func (p *Plan) Placement() string { return p.placement }
 
 // job is a candidate on its way to stages: the tables its fragment reads,
 // by the names it reads them as.

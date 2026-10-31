@@ -34,11 +34,10 @@ import (
 // took 251 s on one machine at 10x, estimated at 7 s), and joins through a
 // view's computed keys counted distinct (691 s on one machine and 170 s on
 // workers, estimated at 160 s and 153 s). Those run on one machine first,
-// and their history sends them to workers after (see choose). The worker
-// counts are those of the first estimates (see workerCount).
+// and their history sends them to workers after (see choose). How many
+// workers, or the large worker, is weighed in fleet.go.
 const (
-	coldRate  = 16e6
-	levelCost = 4.0
+	coldRate = 16e6
 	// startCost and stageCost are what a statement on workers takes beside
 	// reading: its own start, and each stage's round of tasks, which write
 	// their exchanges' partitions to object storage, the next stage listing
@@ -80,12 +79,6 @@ const (
 	// filterSelectivity is the share of a table's rows a filter on one of
 	// its columns by a constant is taken to keep (see rowWork).
 	filterSelectivity = 0.01
-	// spillFactor bounds how much longer one machine short of memory is
-	// estimated to take. The working set is guessed from the sizes of the
-	// tables its stages read, whole, where a report reads a few columns of
-	// some and a filtered audience of others: two reports that ran in 15 s
-	// on one machine at 10x were guessed at 7 times its memory.
-	spillFactor = 2
 	// workerThreadsPerCore are the threads a core coldRate is measured at
 	// (see engine's thread defaults).
 	workerThreadsPerCore = 4
@@ -137,12 +130,22 @@ type estimate struct {
 	levels, stages   int
 	rows             float64
 	// oneMachine is the coordinator's time, onWorkers that of workers,
-	// as many as workers says, in seconds.
+	// as many as workers says, or of the large worker if large, in seconds,
+	// by the estimates (see pick for the choice, which what the statement
+	// took before corrects).
 	oneMachine, onWorkers float64
 	workers               int
+	large                 bool
 	// memory says the working set is over memoryShare of the coordinator's
-	// memory, by workingSetFactor, and spills that it is by heldFactor.
+	// memory, by workingSetFactor, and spills that it is by heldFactor, as
+	// local says, whose oom says it should run out of memory there.
 	memory, spills bool
+	local          spill
+	// options are the ways on workers weighed, dollars says their costs are
+	// in dollars, and fleet why the one in workers and large was chosen.
+	options []option
+	dollars bool
+	fleet   string
 }
 
 // coldRateAt is how fast a core reads object storage cold at
@@ -182,9 +185,17 @@ type Footprints interface {
 type fleet struct {
 	// cores are a worker's cores, and threads its DuckDB threads, zero for
 	// unknown; running how many workers run; most how many may run; start
-	// how long starting more takes.
+	// how long starting more takes, and tail how long workers started stay
+	// up idle after.
 	cores, threads, running, most int
-	start                         time.Duration
+	start, tail                   time.Duration
+	// memory is the smallest worker's memory limit, and price what a
+	// worker costs an hour, zero for unknown.
+	memory int64
+	price  float64
+	// large is the compute pool's large worker, if it has one the
+	// statement may run on.
+	large *largeWorker
 }
 
 // estimateTimes estimates a plan's times on the coordinator, m, and on
@@ -196,17 +207,21 @@ func estimateTimes(stages []*Stage, m machine, f fleet) estimate {
 // features are what a plan's estimates are made of.
 type features struct {
 	// bytes are what its stages read of tables, as selective filters leave
-	// them (see filtersSelectively), and unfiltered in full; exchanged what
-	// the stages that write exchanges read of tables in full, and held as
-	// selective filters leave it.
-	bytes, unfiltered, exchanged int64
-	held                         float64
-	// rows are the rows its stages go through, and legacyRows as the first
-	// estimates counted them (see rowWork); levels its stages' longest
-	// chain, and stages how many there are.
-	rows, legacyRows float64
-	levels, stages   int
+	// them (see filtersSelectively); exchanged what the stages that write
+	// exchanges read of tables in full, and held as selective filters leave
+	// it.
+	bytes, exchanged int64
+	held             float64
+	// rows are the rows its stages go through (see rowWork); levels its
+	// stages' longest chain, and stages how many there are.
+	rows           float64
+	levels, stages int
 }
+
+// set is the working set of a plan of features x on one machine:
+// heldFactor times what its exchanges' stages read, as selective filters
+// leave it.
+func (x features) set() float64 { return heldFactor * x.held }
 
 // planFeatures measures a plan for its estimates.
 func planFeatures(stages []*Stage) features {
@@ -238,7 +253,6 @@ func planFeatures(stages []*Stage) features {
 	}
 	for k, cols := range read {
 		b := cols.bytes(tables[k])
-		x.unfiltered += b
 		if selective[k] {
 			b = int64(float64(b) * filterSelectivity)
 		}
@@ -254,7 +268,7 @@ func planFeatures(stages []*Stage) features {
 		}
 	}
 	x.levels, x.stages = levels(stages), len(stages)
-	x.rows, x.legacyRows = rowWork(stages, filtersSelectively), rowWork(stages, filtersByConstant)
+	x.rows = rowWork(stages, filtersSelectively)
 	return x
 }
 
@@ -267,13 +281,11 @@ func (x features) estimate(m machine, f fleet) estimate {
 	// read.
 	share := memoryShare * float64(m.memory)
 	e.memory = m.memory > 0 && float64(workingSetFactor*x.exchanged) > share && !m.ranHere
-	// As many workers as the first estimates gave a statement, so that one
-	// forced onto workers runs as it did.
-	e.workers = workerCount(x.unfiltered, x.legacyRows, x.levels, f)
-	e.onWorkers = math.Inf(1)
-	if e.workers > 0 {
-		e.onWorkers = onWorkers(e, e.workers, f)
-	}
+	// The ways on workers, and the one auto mode would take without what
+	// the statement took before (see plan, which corrects them).
+	e.options = x.options(f)
+	_, _, e.dollars = f.prices()
+	e.pick(runs{}, f)
 
 	// One machine reads cold from object storage at its threads a core: its
 	// read cache holds what it read lately, which a statement's first run
@@ -287,58 +299,37 @@ func (x features) estimate(m machine, f fleet) estimate {
 	// longer: a report that reads 2 GB of a table but joins its 400 million
 	// rows to themselves 16 times is no 1-second statement.
 	e.oneMachine = max(e.oneMachine, e.rows/(cores*rowRate))
-	// Short of memory, it takes longer by as much as its working set,
-	// heldFactor times what its exchanges' stages read as the selective
-	// filters leave it, is over its share of memory, spilling, up to
-	// spillFactor times.
-	if set := heldFactor * x.held; m.memory > 0 && set > share && !(m.ranHere && float64(m.allocated) <= share) {
-		e.spills = true
-		e.oneMachine *= min(set/share, spillFactor)
+	// Short of memory, it takes longer, spilling, as much as its working
+	// set is over its share of memory (see spillOn): heldFactor times what
+	// its exchanges' stages read as the selective filters leave it, or what
+	// a statement of its shape allocated over its run here, which fits if
+	// that is within its share.
+	set := x.set()
+	if m.ranHere {
+		set = float64(m.allocated)
 	}
+	e.local = spillOn(set, m.memory)
+	e.spills = e.local.factor > 1
+	e.oneMachine *= e.local.factor
 	return e
 }
 
-// workerCount is the fewest workers, of f's, whose time is within a fifth
-// of the fastest, by the plan's levels and what its stages read of tables
-// (bytes, and rows as rowWork counts them with filtersByConstant), at the
-// rates of the first scale runs. Execute runs a statement on as many.
-func workerCount(bytes int64, rows float64, levels int, f fleet) int {
-	times := make([]float64, f.most+1)
-	best := math.Inf(1)
-	for n := 1; n <= f.most; n++ {
-		cores := float64(n * max(f.cores, 1))
-		t := float64(levels)*levelCost + max(float64(bytes)/(cores*coldRate), rows/(cores*rowRate))
-		if n > f.running {
-			t += f.start.Seconds()
-		}
-		times[n] = t
-		best = min(best, t)
+// pick chooses the way on workers e's options say, corrected by what the
+// statement took before, r (see correct and pick): workers is how many, or
+// 1 and large for the large worker, and onWorkers its time by the
+// estimates; with no way on workers, workers is zero and onWorkers
+// infinite.
+func (e *estimate) pick(r runs, f fleet) {
+	e.workers, e.large, e.onWorkers, e.fleet = 0, false, math.Inf(1), ""
+	if len(e.options) == 0 {
+		return
 	}
-	for n := 1; n <= f.most; n++ {
-		if times[n] <= best*1.2 {
-			return n
-		}
+	correct(e.options, r, f)
+	best, why, ok := pick(e.options, e.dollars)
+	e.fleet = why
+	if ok {
+		e.workers, e.large, e.onWorkers = best.workers, best.large, best.estimate
 	}
-	return 0
-}
-
-// onWorkers estimates the plan's time on n of f's workers: a statement's
-// own start, each stage's round of tasks and of the exchanges it writes to
-// object storage, and what its stages read cold, or the rows they go
-// through, whichever takes longer, on n workers' cores at their threads a
-// core. At ten times the data on 16 workers, reports of 2 and 3 stages took
-// 12 to 40 s, and of 23 to 26 stages 153 to 183 s, over a few gigabytes.
-func onWorkers(e estimate, n int, f fleet) float64 {
-	cores := float64(n * max(f.cores, 1))
-	threadsPerCore := float64(workerThreadsPerCore)
-	if f.threads > 0 && f.cores > 0 {
-		threadsPerCore = float64(f.threads) / float64(f.cores)
-	}
-	t := startCost + float64(e.stages)*stageCost + max(float64(e.bytes)/(cores*coldRateAt(threadsPerCore)), e.rows/(cores*rowRate))
-	if n > f.running {
-		t += f.start.Seconds()
-	}
-	return t
 }
 
 // rowWork estimates the rows a plan's stages go through: each stage's

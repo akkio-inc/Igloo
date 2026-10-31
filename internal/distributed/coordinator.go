@@ -124,12 +124,26 @@ type Options struct {
 	// Kubernetes, and to object storage otherwise (IGLOO_EXCHANGES=auto;
 	// see localFor).
 	AutoExchanges bool
+	// WorkerPrice is what a worker costs an hour, for weighing how many a
+	// statement runs on (see fleet.go); zero for unknown.
+	WorkerPrice float64
+	// Large, with addresses, is the compute pool's large worker, which a
+	// statement may run on alone (see fleet.go): where it is and how to
+	// start it, its MaxWorkers taken as 1. LargeCores and LargeMemory are
+	// its cores and DuckDB memory limit, for estimates until it has
+	// answered, and LargePrice what it costs an hour, zero for unknown.
+	Large       PoolOptions
+	LargeCores  int
+	LargeMemory int64
+	LargePrice  float64
 }
 
 // Coordinator splits statements into parts that workers run.
 type Coordinator struct {
 	opts Options
 	pool *pool
+	// large is the large worker's, nil without one.
+	large *pool
 	// erased is the latest deletion of erasure requests it knows of, in
 	// Unix nanoseconds, which statements' tasks carry (see erasure.go).
 	erased atomic.Int64
@@ -223,6 +237,13 @@ func NewCoordinator(opts Options, log *slog.Logger) (*Coordinator, error) {
 		pool: newPool(opts.Pool, t, opts.Version, opts.Metrics, log), history: newHistory(), outcomes: &outcomes{byKey: map[string]outcome{}},
 		running: map[string]bool{}, heartbeat: heartbeatEvery, removeCtx: removeCtx, cancelRemovals: cancelRemovals,
 	}
+	if len(opts.Large.Addresses) > 0 {
+		lo := opts.Large
+		lo.MaxWorkers = 1
+		// Its own metrics would take the workers' gauges over.
+		co.large = newPool(lo, t, opts.Version, nil, log.With("worker", "large"))
+		co.background.Go(func() { co.large.run(ctx) })
+	}
 	co.background.Go(func() { co.pool.run(ctx) })
 	co.background.Go(func() { co.sweepLoop(ctx) })
 	return co, nil
@@ -310,8 +331,36 @@ func (co *Coordinator) Plan(ctx context.Context, query string, env Env, mode Mod
 		}
 		return nil, u
 	}
+	plan.placement = d.placement()
 	return plan, nil
 }
+
+// placement describes where the decision runs a statement and why, for
+// the query history (see Plan.Placement).
+func (d *decision) placement() string {
+	switch {
+	case !d.onWorkers:
+		return "this replica: " + d.reason
+	case d.forced:
+		return "workers: " + d.reason
+	}
+	where := fmt.Sprintf("%d workers", d.e.workers)
+	if d.e.large {
+		where = LargePlacement
+	}
+	if d.e.fleet == "" {
+		return where + ": " + d.reason
+	}
+	return where + ": " + d.reason + "; " + d.e.fleet
+}
+
+// LargePlacement begins the placement of a statement that ran on the large
+// worker (Plan.Placement), as the query history records it.
+const LargePlacement = "the large worker"
+
+// OnLarge reports whether a placement the query history recorded is the
+// large worker's, for Run.Large.
+func OnLarge(placement string) bool { return strings.HasPrefix(placement, LargePlacement) }
 
 // decision is where a statement runs and why, with the estimates that
 // decided it.
@@ -324,6 +373,8 @@ type decision struct {
 	// auto mode tries it on one machine after only such runs (see
 	// LocalBudget).
 	tookOnWorkers float64
+	// forced says the session's mode, not auto mode, decided.
+	forced bool
 }
 
 // plan plans query as Plan does, and says where it runs: on workers unless
@@ -331,11 +382,30 @@ type decision struct {
 // leaves the history and the log alone. sizes are relations' sizes
 // measured before (see Execute).
 func (co *Coordinator) plan(ctx context.Context, query string, env Env, mode Mode, dry bool, sizes map[string]knownSize) (*Plan, *decision, error) {
+	plan, d, err := co.planOn(ctx, query, env, mode, dry, sizes, nil)
+	if err != nil || !d.onWorkers || !d.e.large {
+		return plan, d, err
+	}
+	// The large worker holds what a small one could not, so the statement
+	// is planned again for it alone: fewer of its tables partitioned, fewer
+	// exchanges.
+	return co.planOn(ctx, query, env, mode, dry, sizes, d)
+}
+
+// planOn plans query as plan does: for the workers of the fleet, and then
+// auto mode decides where it runs; or, with onLarge, the decision of a
+// plan for the fleet that chose the large worker, for the large worker
+// alone, as decided.
+func (co *Coordinator) planOn(ctx context.Context, query string, env Env, mode Mode, dry bool, sizes map[string]knownSize, onLarge *decision) (*Plan, *decision, error) {
 	if mode == ModeOff {
 		return nil, nil, unsupported("distributed execution is off for this session")
 	}
 	opts := planOptions{force: mode == ModeOn || mode == ModeOnRunning, now: time.Now(), maxBroadcast: defaultBroadcast}
-	ws := co.pool.known(ctx)
+	p := co.pool
+	if onLarge != nil {
+		p = co.large
+	}
+	ws := p.known(ctx)
 	cores := max(co.opts.Cores, 1)
 	rate := int64(float64(cores) * coldRateAt(float64(max(co.opts.Threads, cores))/float64(cores)))
 	switch {
@@ -348,12 +418,16 @@ func (co *Coordinator) plan(ctx context.Context, query string, env Env, mode Mod
 			// take more room than the values they hold.
 			opts.maxBroadcast = mem / 8
 		}
-	case co.pool.canStart():
+	case p.canStart():
 		opts.minBytes = rate * warmSeconds
 		// The workers it would start are those that ran before: a table
 		// of 1.8 GB that workers of 24 GiB read in full would otherwise be
 		// held to defaultBroadcast while they are stopped.
-		if mem := co.pool.lastMemory(); mem > 0 {
+		mem := p.lastMemory()
+		if onLarge != nil && mem == 0 {
+			mem = co.opts.LargeMemory
+		}
+		if mem > 0 {
 			opts.maxBroadcast = mem / 8
 		}
 	default:
@@ -410,25 +484,44 @@ func (co *Coordinator) plan(ctx context.Context, query string, env Env, mode Mod
 	plan.replan = func(sizes map[string]knownSize) (*Plan, error) {
 		// Planned as the statement was, whatever auto mode would choose
 		// now: it runs on workers already.
-		p, _, err := co.plan(ctx, query, env, mode, true, sizes)
+		p, _, err := co.planOn(ctx, query, env, mode, true, sizes, onLarge)
 		if err == nil {
 			p.Key = plan.Key
 		}
 		return p, err
 	}
+	if onLarge != nil {
+		// Decided already, by the plan for the fleet.
+		plan.workers, plan.large, plan.shortOfMemory = 1, true, onLarge.e.memory
+		return plan, &decision{onWorkers: true, reason: onLarge.reason, e: onLarge.e, ws: ws, tookOnWorkers: onLarge.tookOnWorkers}, nil
+	}
 	m := machine{cores: co.opts.Cores, threads: co.opts.Threads, memory: co.opts.MemoryBytes}
 	if fe, ok := env.(Footprints); ok {
 		m.allocated, m.ranHere = fe.Footprint()
 	}
-	e := estimateTimes(plan.Stages, m, co.fleet(ws, plan.mayStart))
-	plan.workers = e.workers
+	// The large worker only where auto mode decides: forced statements run
+	// on the fleet.
+	f := co.fleet(ctx, ws, plan.mayStart, mode == ModeAuto)
+	e := estimateTimes(plan.Stages, m, f)
 	r, found := co.history.get(plan.Key)
 	if found {
-		r = comparable(r, m.memory, co.pool.lastMemory())
-		found = r.local > 0 || r.dist > 0 || r.outOfMemory || r.guarded || !r.explored.IsZero()
+		r = comparable(r, m.memory, co.pool.lastMemory(), co.largeMemory())
+		found = r.local > 0 || r.dist > 0 || r.large > 0 || r.outOfMemory || r.guarded || !r.explored.IsZero()
+		// How many workers, or the large worker, by what it took on each
+		// before (see correct).
+		e.pick(r, f)
+		// What it took on the way chosen, if it ran so, stands for its
+		// runs on workers; otherwise its last run on the fleet does.
+		switch t := r.fleets[fleetBucket(e.workers)]; {
+		case e.large && r.large > 0:
+			r.dist, r.distWorkers = r.large, 1
+		case !e.large && t > 0:
+			r.dist, r.distWorkers = t, e.workers
+		}
 	}
+	plan.workers, plan.large = e.workers, e.large
 	plan.shortOfMemory = e.memory || found && r.outOfMemory
-	d := &decision{onWorkers: true, reason: "distributed_execution is " + string(mode), e: e, ws: ws}
+	d := &decision{onWorkers: true, reason: "distributed_execution is " + string(mode), e: e, ws: ws, forced: mode != ModeAuto}
 	if mode != ModeAuto {
 		return plan, d, nil
 	}
@@ -455,9 +548,9 @@ func (co *Coordinator) plan(ctx context.Context, query string, env Env, mode Mod
 		where = "workers"
 	}
 	co.log.Info("chose where a statement runs", "on", where, "reason", reason, "key", plan.Key,
-		"one_machine_seconds", math.Round(e.oneMachine), "workers_seconds", math.Round(e.onWorkers), "workers", e.workers,
-		"levels", e.levels, "stages", e.stages, "bytes", e.bytes, "exchanged", e.exchanged, "rows", e.rows,
-		"short_of_memory", e.memory, "spills", e.spills,
+		"one_machine_seconds", math.Round(e.oneMachine), "workers_seconds", math.Round(e.onWorkers), "workers", e.workers, "large", e.large,
+		"fleet", e.fleet, "levels", e.levels, "stages", e.stages, "bytes", e.bytes, "exchanged", e.exchanged, "rows", e.rows,
+		"short_of_memory", e.memory, "spills", e.spills, "spill_factor", math.Round(e.local.factor*10)/10, "working_set", int64(e.local.set),
 		"measured_exchanged", r.exchangeBytes, "measured_rows", r.exchangeRows, "measured_fanout", math.Round(r.fanout*10)/10)
 	if explore {
 		co.history.update(plan.Key, func(r *runs) { r.explored = now })
@@ -500,19 +593,55 @@ func (co *Coordinator) aggregates(ctx context.Context, env Env) map[string]bool 
 }
 
 // fleet describes the workers for an estimate: ws, those that answer, and
-// as many more as Compute may start if mayStart.
-func (co *Coordinator) fleet(ws []*worker, mayStart bool) fleet {
-	f := fleet{cores: co.opts.Cores, running: len(ws), most: len(ws)}
+// as many more as Compute may start if mayStart; and with large, the large
+// worker, if it runs or may be started and its size is known.
+func (co *Coordinator) fleet(ctx context.Context, ws []*worker, mayStart, large bool) fleet {
+	f := fleet{cores: co.opts.Cores, running: len(ws), most: len(ws), memory: smallestMemory(ws), price: co.opts.WorkerPrice}
 	for i, w := range ws {
 		if i == 0 || w.status.Cores > f.cores {
 			f.cores, f.threads = w.status.Cores, w.status.Threads
 		}
 	}
+	if f.memory == 0 {
+		f.memory = co.pool.lastMemory()
+	}
 	if mayStart && co.pool.canStart() {
 		f.most = max(f.most, co.opts.Pool.MaxWorkers)
-		f.start = co.pool.startEstimate()
+		f.start, f.tail = co.pool.startEstimate(), co.pool.idleAfter()
+	}
+	if large && mayStart {
+		if l, ok := co.largeWorker(ctx); ok {
+			f.large = &l
+		}
 	}
 	return f
+}
+
+// largeWorker describes the large worker for an estimate, as it answered
+// or, stopped, as Options say; ok is false without one that runs or may be
+// started, or whose size is not known.
+func (co *Coordinator) largeWorker(ctx context.Context) (largeWorker, bool) {
+	if co.large == nil {
+		return largeWorker{}, false
+	}
+	l := largeWorker{cores: co.opts.LargeCores, memory: co.largeMemory(), price: co.opts.LargePrice,
+		start: co.large.startEstimate(), tail: co.large.idleAfter()}
+	if ws := co.large.known(ctx); len(ws) > 0 {
+		st := ws[0].status
+		l.running, l.cores, l.threads, l.memory = true, st.Cores, st.Threads, st.MemoryBytes
+	} else if !co.large.canStart() {
+		return largeWorker{}, false
+	}
+	return l, l.cores > 0 && l.memory > 0
+}
+
+// largeMemory is the large worker's memory limit, as it last answered or
+// as Options say; zero without one.
+func (co *Coordinator) largeMemory() int64 {
+	if co.large == nil {
+		return 0
+	}
+	return cmp.Or(co.large.lastMemory(), co.opts.LargeMemory)
 }
 
 // Execution is a statement whose distributed parts have run.
@@ -520,8 +649,10 @@ type Execution struct {
 	// SQL is the rest of the statement, which reads the parts' combined
 	// results; the session runs it, with the statement's parameters.
 	SQL string
-	// Workers is how many workers ran tasks.
+	// Workers is how many workers ran tasks, and Large says the large
+	// worker did.
 	Workers int
+	Large   bool
 	// Stages is how many stages ran, and Exchanges how many exchanges they
 	// wrote, rows that later stages read.
 	Stages, Exchanges int
@@ -579,7 +710,17 @@ func retryPartitions(parts int, rows int64, workers int) int {
 // Keep keeps the workers from stopping as idle until release is called:
 // the server holds them while a statement that ran tasks runs, on the
 // coordinator too.
-func (co *Coordinator) Keep() (release func()) { return co.pool.keep() }
+func (co *Coordinator) Keep() (release func()) {
+	release = co.pool.keep()
+	if co.large == nil {
+		return release
+	}
+	large := co.large.keep()
+	return func() {
+		release()
+		large()
+	}
+}
 
 // Setting is a session setting a statement runs with.
 type Setting = setting
@@ -589,7 +730,11 @@ type Setting = setting
 // context's, means the statement should run on the coordinator instead.
 func (co *Coordinator) Execute(ctx context.Context, plan *Plan, settings []Setting) (*Execution, error) {
 	start := time.Now()
-	defer co.pool.keep()()
+	p := co.pool
+	if plan.large && co.large != nil {
+		p = co.large
+	}
+	defer p.keep()()
 	// Its tasks carry the latest deletion of erasure requests known before
 	// it reads the tables' snapshots (see erasure.go).
 	erased := co.erased.Load()
@@ -622,18 +767,20 @@ func (co *Coordinator) Execute(ctx context.Context, plan *Plan, settings []Setti
 		}
 	}
 
-	// As many workers as the estimates call for (see estimateTimes), or
-	// every one when an admin forces it. Forced by anyone else, only
-	// workers already running, and no more than the estimates call for.
+	// As many workers as auto mode chose (see pick), or the large worker
+	// alone, or every worker when an admin forces it. Forced by anyone
+	// else, only workers already running, and no more than auto mode would
+	// use. Of more running, those with the fewest tasks: the others serve
+	// other statements, or stop when idle.
 	want := max(1, plan.workers)
 	var ws []*worker
 	if plan.mayStart {
-		if plan.force {
-			want = max(want, co.opts.Pool.MaxWorkers, len(co.pool.ready(ctx)))
+		if plan.force && p == co.pool {
+			want = max(want, co.opts.Pool.MaxWorkers, len(p.ready(ctx)))
 		}
-		ws, err = co.pool.ensure(ctx, want, true)
+		ws, err = p.ensure(ctx, want, true)
 	} else {
-		ws = co.pool.ready(ctx)
+		ws = p.ready(ctx)
 	}
 	if err != nil || len(ws) == 0 {
 		if ctx.Err() != nil {
@@ -641,11 +788,8 @@ func (co *Coordinator) Execute(ctx context.Context, plan *Plan, settings []Setti
 		}
 		return nil, errors.Join(ErrNoWorkers, err)
 	}
-	slices.SortFunc(ws, func(a, b *worker) int { return strings.Compare(a.status.ID, b.status.ID) })
-	if !plan.mayStart && len(ws) > want {
-		ws = ws[:want]
-	}
-	co.pool.touch()
+	ws = leastBusy(ws, want)
+	p.touch()
 	limit := co.spoolLimit()
 
 	snapshots, files, err := co.preflight(ctx, plan)
@@ -814,17 +958,29 @@ func (co *Coordinator) Execute(ctx context.Context, plan *Plan, settings []Setti
 	for _, x := range run.overfull() {
 		co.log.Warn("an exchange has more files than its tasks times its partitions", "query", qid, "exchange", x)
 	}
-	ex.Workers = len(run.used)
+	ex.Workers, ex.Large = len(run.used), p == co.large
 	ex.Stages, ex.Exchanges = len(plan.Stages), len(run.exchanges)
 	ex.Received = run.sp.used.Load()
 	ex.exchanges = run.describe()
-	co.pool.touch()
+	p.touch()
 	co.log.Debug("ran a statement's parts", "query", qid, "stages", len(plan.Stages), "workers", ex.Workers, "exchanges", ex.exchanges,
 		"received_bytes", ex.Received, "local", strings.Join(plan.local, "; "),
 		"snapshots_seconds", loaded.Seconds(), "seconds", time.Since(start).Seconds())
 	co.opts.Metrics.query("ok", start)
 	ok = true
 	return ex, nil
+}
+
+// leastBusy returns n of ws, those running the fewest tasks at their last
+// check, the first by ID on a tie, ordered by ID.
+func leastBusy(ws []*worker, n int) []*worker {
+	ws = slices.Clone(ws)
+	slices.SortFunc(ws, func(a, b *worker) int {
+		return cmp.Or(cmp.Compare(a.status.Running, b.status.Running), strings.Compare(a.status.ID, b.status.ID))
+	})
+	ws = ws[:min(n, len(ws))]
+	slices.SortFunc(ws, func(a, b *worker) int { return strings.Compare(a.status.ID, b.status.ID) })
+	return ws
 }
 
 // checkVersions checks that the snapshots loaded for workers are those the

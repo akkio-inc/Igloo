@@ -32,12 +32,28 @@ func (co *Coordinator) Explain(ctx context.Context, query string, env Env, mode 
 		where = "this replica"
 	}
 	e := d.e
-	estimate := fmt.Sprintf("one machine %.0f s, workers %.0f s on %d; %d levels; reads %s, exchanges %s; %.3g rows",
-		math.Round(e.oneMachine), math.Round(e.onWorkers), e.workers, e.levels, gigabytes(e.bytes), gigabytes(e.exchanged), e.rows)
+	on := fmt.Sprintf("workers %.0f s on %d", math.Round(e.onWorkers), e.workers)
+	if e.large {
+		where = LargePlacement
+		on = fmt.Sprintf("the large worker %.0f s", math.Round(e.onWorkers))
+	}
+	estimate := fmt.Sprintf("one machine %.0f s, %s; %d levels; reads %s, exchanges %s; %.3g rows",
+		math.Round(e.oneMachine), on, e.levels, gigabytes(e.bytes), gigabytes(e.exchanged), e.rows)
 	if plan.shortOfMemory {
 		estimate += "; too large for this replica's memory"
 	}
 	rows := [][2]string{{"runs on", where}, {"reason", d.reason}, {"estimate", estimate}}
+	// What this replica would spill, and the ways on workers weighed:
+	// how many workers, or the large worker, and why (see pick).
+	rows = append(rows, [2]string{"spill", "this replica: " + e.local.String()})
+	for _, o := range e.options {
+		if o.spill.factor > 1 || o.large {
+			rows = append(rows, [2]string{"spill", fmt.Sprintf("%s: %s", o, o.spill)})
+		}
+	}
+	if e.fleet != "" {
+		rows = append(rows, [2]string{"fleet", e.fleet}, [2]string{"options", describeOptions(e.options, e.dollars)})
+	}
 	if r, ok := co.history.get(plan.Key); ok && r.exchangeRows > 0 {
 		rows = append(rows, [2]string{"measured", fmt.Sprintf("its last run on workers exchanged %.3g rows, %s; a stage wrote up to %.1f rows a row it read",
 			float64(r.exchangeRows), gigabytes(r.exchangeBytes), r.fanout)})
@@ -46,12 +62,17 @@ func (co *Coordinator) Explain(ctx context.Context, query string, env Env, mode 
 		rows = append(rows, [2]string{"semi-join estimate", j})
 	}
 
-	// The partitions Execute would give its exchanges.
-	n := len(d.ws)
-	if n == 0 {
-		n = max(1, plan.workers)
+	// The partitions Execute would give its exchanges, on the workers it
+	// would take (see Execute).
+	ws, n := d.ws, max(1, plan.workers)
+	if plan.force && plan.mayStart && !plan.large {
+		n = max(n, co.opts.Pool.MaxWorkers, len(ws))
 	}
-	parts := exchangePartitions(plan.Stages, d.ws, n, uploadBytes(co.opts.Warehouse))
+	if len(ws) > 0 {
+		ws = leastBusy(ws, n)
+		n = len(ws)
+	}
+	parts := exchangePartitions(plan.Stages, ws, n, uploadBytes(co.opts.Warehouse))
 	rows = append(rows, [2]string{"partitions", strconv.Itoa(parts)})
 	rows = append(rows, plan.computeLater()...)
 	for _, s := range plan.Stages {

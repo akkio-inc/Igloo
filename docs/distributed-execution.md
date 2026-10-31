@@ -309,14 +309,50 @@ much. Workers also take about 8 seconds to start a statement and 6 for each
 of its stages, whose tasks write their exchanges to object storage for the
 next to read, plus the time to start workers that are stopped: at ten times
 the data on 16 workers, reports of 2 or 3 stages took 12 to 40 seconds, and
-of 23 to 26 stages 153 to 183 seconds. A replica that would run short of
-memory (the rows its joins and distinct counts hold, estimated at six times
-what feeds them, over 70% of its memory limit) is estimated to take as many
-times longer, spilling, up to twice as long. It runs the statement on
-workers only if the replica would take longer than `IGLOO_WORKER_THRESHOLD`
-(a minute), or would run short of memory, and the workers are estimated to
-be at least 1.5 times faster. It uses the fewest workers estimated within a
-fifth of the fastest time.
+of 23 to 26 stages 153 to 183 seconds. It runs the statement on workers
+only if the replica would take longer than `IGLOO_WORKER_THRESHOLD` (a
+minute), or would run short of memory, and the workers are estimated to be
+at least 1.5 times faster.
+
+**Spilling.** A machine that runs a statement whole spills to disk when the
+rows its joins, groupings and distinct counts hold, its working set, are
+more than the 70% of its memory limit it has for them. Igloo estimates the
+working set at six times what the stages that feed them read, as filters
+leave it (or, for a statement whose shape ran to its end on the replica,
+what that run allocated), and takes a machine whose working set is over its
+room to take longer by the ratio to the power of 0.55: twice its room, 1.5
+times as long; six times, 2.7 times as long. Against the scale runs on a
+replica of 49.3 GiB, by the working sets they reached (what they held at the
+memory limit and what they spilled), eleven reports took 1.2 to 2.9 times
+as long as without spilling, at 2 to 10 times the room, and the curve is
+within a factor of two of all but one, which took 11 times as long at 6.6.
+Past twelve times its room, a machine is taken to run out of memory rather
+than spill: reports that reached 12 to 23 times ran out on that replica,
+after up to 820 GB of spill, where one at 10 times finished. The replica's
+estimate counts its spilling; workers' does not, as their exchanges'
+partitions are sized to their memory and a task that runs out runs again
+over more of them. `EXPLAIN DISTRIBUTED`'s `spill` rows show the working
+set against each machine's room, and what it would spill.
+
+**How many workers.** Igloo weighs the statement on 1, 2, 4 and so on of
+the workers, up to `IGLOO_WORKER_MAX`, and on the workers running now, each
+with its own estimate (its start, its stages' rounds, what its cores read,
+and the start of workers it would start), and on the pool's [large
+worker](#a-large-worker) if it has one. Of those estimated within a fifth of
+the fastest, it takes the cheapest: each machine's seconds at its price an
+hour (`IGLOO_WORKER_PRICE_PER_HOUR` and `IGLOO_LARGE_WORKER_PRICE_PER_HOUR`;
+without prices, a machine's price goes with its cores), counting the idle
+time a worker started for it stays up after (see [sizing and
+cost](#sizing-and-cost)). A statement of a few stages over a few gigabytes
+gains little from more workers, most of its time being their start and its
+stages' rounds: at ten times the data, a report that took 58 s on the
+replica took 50 s on 16 workers, and is estimated within a fifth of that on
+4, for a quarter of the worker-seconds, so it runs on 4. Of more workers
+running, it takes those with the fewest tasks; the others serve other
+statements, or stop when idle. Reports whose stages read a hundred
+gigabytes run on all 16. The reason, in `EXPLAIN DISTRIBUTED`'s `fleet` row
+and in `query_history.placement`, says which it took and why, and its
+`options` row lists each way's time and cost.
 
 Against the scale environment's reports at 1x, 10x and 100x, timed on a
 16-core replica and on 16 workers of 8 cores, the estimates pick the side
@@ -358,11 +394,18 @@ peak, so a heavy statement that fits may still count as spilling: such
 statements of that dashboard, at 20 seconds on the replica, still ran on
 workers. The first time, one that the replica should spill runs on workers
 if they are estimated at no more than half again the replica's estimate,
-which is then a floor. Runs on workers count with runs on about as many: one
-that ran on a quarter of the workers it would run on now, as in an earlier
+which is then a floor. Runs on workers count with runs on about as many
+(1, 2 to 3, 4 to 7, 8 to 15 and so on), kept apart for each, and runs on the
+large worker apart from them: how many workers a statement runs on takes
+what it took on each before for that one's time, and the others' estimates
+times what the nearest it ran on took over its estimate, so a statement
+that took 50 s on 16 workers, estimated at 28, is taken to need 59 s on 4,
+within a fifth, and one that then took 90 s on 4 runs on 8 next. One that
+ran on a quarter of the workers it would run on now, as in an earlier
 session on a smaller fleet, is tried on all of them, at most once a day,
-whatever it took on the replica. The server logs each choice, `chose where a
-statement runs`, with both estimates and the reason.
+whatever it took on the replica. The server logs each choice, `chose where
+a statement runs`, with the estimates, how many workers and why, its
+spilling, and the reason.
 
 A relation filtered by a constant, a subquery's value or `IN`, as an
 audience taken from a lookup of every audience is, is estimated at the size
@@ -629,12 +672,17 @@ object storage there. The default stays `object`.
 
 - **`EXPLAIN DISTRIBUTED`** before a query says how it would run, without
   running it or starting workers, as rows of `explain_key` and
-  `explain_value`: where it would run (`runs on`: `workers` or `this
-  replica`) and why (`reason`: auto mode's choice, the session's
-  `distributed_execution`, or what keeps it here); the `estimate` auto mode
-  weighs (one machine's seconds, workers' seconds and how many, the stages'
-  levels, what they read and exchange, the rows they go through, and
-  whether it is too large for the replica's memory); the `partitions` its
+  `explain_value`: where it would run (`runs on`: `workers`, `the large
+  worker` or `this replica`) and why (`reason`: auto mode's choice, the
+  session's `distributed_execution`, or what keeps it here); the `estimate`
+  auto mode weighs (one machine's seconds, workers' seconds and how many,
+  the stages' levels, what they read and exchange, the rows they go
+  through, and whether it is too large for the replica's memory); `spill`,
+  its working set against the replica's room for it, and the large
+  worker's, and what each would spill and how much longer it would take;
+  `fleet`, how many workers, or the large worker, auto mode would take and
+  why, and `options`, each way it weighed with its time, corrected by what
+  the statement took before, and its cost; the `partitions` its
   exchanges would have with the workers running now; each stage (`stage 0
   split public.events to exchange 1 (join)`) with the SQL its tasks
   run; what `the coordinator` runs over their results; and why parts of it
@@ -664,10 +712,13 @@ object storage there. The default stays `object`.
   `stages` and `exchanges`: how many stages of tasks those parts took, and
   how many exchanges of rows, in object storage, the stages wrote for later
   ones. A statement built in steps waits for each stage that reads what an
-  earlier one wrote.
+  earlier one wrote. `placement` says where a statement that could run on
+  workers ran and why: `this replica`, how many workers or `the large
+  worker`, auto mode's reason and how it chose the workers, and whether the
+  guard moved it.
 
   ```sql
-  SELECT start_time, duration_ms, workers, stages, exchanges, query_text
+  SELECT start_time, duration_ms, workers, stages, exchanges, placement, query_text
   FROM igloo.query_history WHERE workers > 0 ORDER BY start_time DESC LIMIT 20;
   ```
 
@@ -821,13 +872,24 @@ auto mode's estimates.
 ### A large worker
 
 Besides many small workers, a compute pool can have one large worker, a
-machine of 512 GiB or so, on which auto mode may run a whole statement: it
-does when the large worker's estimate (the statement fits in its memory,
-does not spill, and its price) is within a small margin of the fastest
-option and cheaper (see [when](#when)). The large worker is the same image
-started with `igloo worker`, with the same `IGLOO_WORKER_SECRET` and
-storage settings as the other workers, and is stopped while it has no
-work.
+machine of 512 GiB or so, on which auto mode may run a whole statement
+alone. Its estimate is one machine's of its cores and memory, spilling as
+the statement's working set says (see [when](#when)), plus a statement's
+start, 2 seconds a stage, its exchanges staying on its own disk, and its
+own start if it is stopped; a statement that would run out of memory there
+is never run there. Auto mode runs a statement there when that estimate is
+within a fifth of the fastest way and the cheapest of those, at the prices
+the pool gives: at a hundred times the data, a report whose stages read 49
+GB and fed 296 GB of working set, 207 s on 16 workers by the estimates,
+fits a large worker of 440 GiB and is estimated at 133 s there, for a
+third of the fleet's cost. It plans the statement again for it, with its
+memory, so that fewer tables are partitioned. Runs on it are kept apart in
+the history (`query_history.placement` begins `the large worker`), and its
+read cache is purged for [erasure requests](#erasure-requests) as the other
+workers' are. The large worker is the same image started with `igloo
+worker`, with the same `IGLOO_WORKER_SECRET` and storage settings as the
+other workers, and is stopped while it has no work. Statements an admin
+forces onto workers (`distributed_execution = on`) use the small workers.
 
 On Kubernetes, `workers.large.enabled: true` adds a second worker
 Deployment, `<release>-workers-large`, of one pod with its own resources,
@@ -892,6 +954,11 @@ On the Igloo server:
 | `IGLOO_WORKER_K8S_DEPLOYMENT`, `IGLOO_WORKER_K8S_NAMESPACE` | | `kubernetes`: the workers' Deployment, and its namespace if not the server's |
 | `IGLOO_WORKER_EC2_INSTANCE_IDS` | | `ec2`: the workers' instances |
 | `IGLOO_WORKER_START_COMMAND`, `IGLOO_WORKER_STOP_COMMAND` | | `command`: shell commands that start and stop all workers |
+| `IGLOO_WORKER_PRICE_PER_HOUR` | `0` | What a worker costs an hour, for weighing how many workers, or the large worker, a statement runs on (see [when](#when)); `0` for unknown, when a machine's price is taken to go with its cores |
+| `IGLOO_LARGE_WORKER` | | The pool's [large worker](#a-large-worker), `host[:port]` (port 7433 by default), which auto mode may run a statement on alone; empty for none. Needs `IGLOO_WORKERS` |
+| `IGLOO_LARGE_WORKER_COMPUTE` | | How to start and stop it: `kubernetes` (`IGLOO_LARGE_WORKER_K8S_DEPLOYMENT`, in the workers' namespace), `ec2` (`IGLOO_LARGE_WORKER_EC2_INSTANCE_IDS`), `command` (`IGLOO_LARGE_WORKER_START_COMMAND`, `IGLOO_LARGE_WORKER_STOP_COMMAND`), or empty when it always runs |
+| `IGLOO_LARGE_WORKER_CORES`, `IGLOO_LARGE_WORKER_MEMORY` | | Its cores and DuckDB memory limit (a size such as `400GiB`), for estimates while it is stopped and has not answered; required with `IGLOO_LARGE_WORKER_COMPUTE` |
+| `IGLOO_LARGE_WORKER_PRICE_PER_HOUR` | `0` | What it costs an hour; `0` for unknown |
 
 Distributed execution also needs `IGLOO_DUCKDB_TEMP_DIR` (set in the image),
 where partial results are kept while a statement combines them.
