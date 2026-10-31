@@ -2,6 +2,7 @@ package pgwire
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"log/slog"
 	"strings"
@@ -17,8 +18,9 @@ import (
 // TestCreateTableAsInSteps checks CREATE TABLE ... AS of an Iceberg table,
 // which Igloo carries out in steps (see stagedCreate): every form of query
 // fills the table, a table that exists gives DuckDB's error or, with IF NOT
-// EXISTS, is left alone, and a query that fails part way leaves nothing
-// behind.
+// EXISTS, is left alone, a query that fails part way leaves nothing
+// behind, and a table partitioned by bucket, as Snowflake's CLUSTER BY
+// (BUCKET(n, column)) makes one, gets its partition spec.
 func TestCreateTableAsInSteps(t *testing.T) {
 	t.Parallel()
 	env := newCatalogEnv(t)
@@ -60,6 +62,17 @@ func TestCreateTableAsInSteps(t *testing.T) {
 		t.Errorf("after the replace: %d rows, want 9", n)
 	}
 
+	mustExec(t, conn, "CREATE OR REPLACE TABLE "+tbl+" PARTITIONED BY (bucket(4, n)) AS SELECT range AS n FROM range(100)")
+	if n := count(t, conn, "SELECT count(*) FROM "+tbl); n != 100 {
+		t.Errorf("bucketed: %d rows, want 100", n)
+	}
+	if env.fake != nil {
+		if spec := env.fake.Metadata("public", tbl).PartitionSpec(); !strings.Contains(spec.String(), "bucket[4]") {
+			t.Errorf("bucketed: partition spec %s", spec.String())
+		}
+	}
+	mustExec(t, conn, "CREATE OR REPLACE TABLE "+tbl+" AS SELECT range AS n FROM range(9)")
+
 	failing := "SELECT CASE WHEN range = 5 THEN error('boom') ELSE range END AS n FROM range(10)"
 	if err := runQuery(conn, "CREATE TABLE "+tbl+"_failed AS "+failing); err == nil || !strings.Contains(err.Error(), "boom") {
 		t.Errorf("a query that fails: %v", err)
@@ -80,7 +93,8 @@ func TestCreateTableAsInSteps(t *testing.T) {
 // catalog: while it reads a slow table of a connection, another session
 // prepares and runs statements and lists the catalog. As one DuckDB
 // statement it held the lock for as long as it read, and every other
-// session waited.
+// session waited. So did one partitioned by bucket, which ran as one
+// statement for 35 minutes on a large table.
 func TestCreateTableAsDoesNotStopOtherSessions(t *testing.T) {
 	t.Parallel()
 	needExtensions(t)
@@ -108,11 +122,11 @@ func TestCreateTableAsDoesNotStopOtherSessions(t *testing.T) {
 	writer := env.admin(t, pgx.QueryExecModeSimpleProtocol)
 	other := env.admin(t, pgx.QueryExecModeSimpleProtocol)
 
-	for _, create := range []string{"CREATE TABLE ", "CREATE OR REPLACE TABLE "} {
+	for _, create := range []string{"CREATE TABLE %s AS", "CREATE OR REPLACE TABLE %s AS", "CREATE OR REPLACE TABLE %s PARTITIONED BY (bucket(4, n)) AS"} {
 		done := make(chan error, 1)
 		start := time.Now()
 		go func() {
-			_, err := writer.Exec(ctx, create+env.table+" AS SELECT n FROM crm."+schema+".slow")
+			_, err := writer.Exec(ctx, fmt.Sprintf(create, env.table)+" SELECT n FROM crm."+schema+".slow")
 			done <- err
 		}()
 		time.Sleep(time.Second)

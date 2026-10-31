@@ -2122,6 +2122,18 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   commits. A compaction that committed between a MERGE's read and its
   commit made dbt's microbatch batches, each a `BEGIN` ... `COMMIT`, fail
   with `CatalogCommitConflicts`, and had writes outside blocks run again.
+- `CREATE TABLE ... PARTITIONED BY (...) AS`, as Snowflake's `CLUSTER BY
+  (BUCKET(n, column))` makes it, runs in steps like any `CREATE TABLE ...
+  AS`, holding the catalog lock only to create and rename the table: as one
+  statement, a 35-minute copy into a bucketed table kept every other
+  session from preparing a statement or signing in.
+- A write into a table partitioned into more than 100 partitions, such as
+  `bucket(256, column)`, writes a file a partition: DuckDB kept 100 files
+  open and closed and reopened the others, writing thousands of files of a
+  few thousand rows, each a request to object storage (16 times as many
+  files as buckets for 16 million rows), at a fifth of a core. Maintenance
+  sizes the row groups of inserts into bucketed tables for a row group in
+  every partition's file.
 - Connections signing in from a loopback or private address, such as the
   scale-to-zero gateway's, a pooler's or a Kubernetes Service's, which all
   the clients behind it share, count only toward the limit of all

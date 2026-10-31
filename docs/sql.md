@@ -186,6 +186,10 @@ ALTER TABLE lake.public.customers RESET PARTITIONED BY;  -- unpartitioned again
   64, 32 and 32), and their columns hash alike: integers of any width, or
   the same type. Choose counts of a few times the workers' cores at least:
   a statement over the table runs in as many tasks.
+- A write into the table writes a file a bucket, with every bucket's file
+  open at once and a row group of each in memory, for up to 1,024 buckets;
+  more than that make small files. Writes of many buckets take more memory
+  and CPU than writes of an unpartitioned table.
 - Table maintenance compacts each bucket's small files into larger files of
   that bucket. A table partitioned so is compacted, not clustered by its
   [sort order](#sort-orders-and-clustering).

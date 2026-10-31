@@ -455,7 +455,8 @@ func countOf(rows driver.Rows) (int64, error) {
 }
 
 // createsTableAs reports whether query is CREATE [OR REPLACE] [TEMP]
-// TABLE ... AS: it writes rows, which its command tag does not count.
+// TABLE name [PARTITIONED BY (...)] AS: it writes rows, which its command
+// tag does not count.
 func createsTableAs(query string) bool {
 	sc := &scanner{s: query}
 	if !sc.keywords("CREATE") {
@@ -469,6 +470,7 @@ func createsTableAs(query string) bool {
 	if _, ok := sc.name(); !ok {
 		return false
 	}
+	sc.partitionedBy()
 	return sc.keywords("AS")
 }
 

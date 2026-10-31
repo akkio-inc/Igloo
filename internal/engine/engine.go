@@ -103,6 +103,11 @@ type Engine struct {
 	log     *slog.Logger
 }
 
+// OpenPartitionFiles is how many files of a partitioned write DuckDB keeps
+// open, one a partition: a write into a table of more partitions than that,
+// such as bucket(2048, column), makes small files again.
+const OpenPartitionFiles = 1024
+
 // Open starts DuckDB and, when a catalog is configured, attaches it. It keeps
 // retrying the attach until ctx is done. Once set up, DuckDB is locked down
 // so SQL cannot reach files or URLs outside the warehouse. First it deletes
@@ -721,6 +726,17 @@ func (e *Engine) setup(ctx context.Context, cfg config.Config, log *slog.Logger,
 	// DuckDB refuses to write a partitioned table with unless told to
 	// ignore it there, as it does when a table has none.
 	if err := exec("SET GLOBAL ignore_target_file_size_for_partitioned_tables = true"); err != nil {
+		return fmt.Errorf("configure iceberg writes: %w", err)
+	}
+	// DuckDB keeps 100 of a partitioned write's files open, and past that
+	// closes them and starts new ones: a CREATE TABLE ... AS of a table
+	// partitioned by bucket(256, column) wrote thousands of files of a few
+	// thousand rows, each a request to object storage, at a fifth of a
+	// core for 35 minutes, as the shuffle files of distributed execution
+	// did (see distributed's worker). With every partition's file open, a
+	// write makes a file a partition, whose row groups maintenance sizes
+	// for that many (see maintenance's sizeRowGroups).
+	if err := exec(fmt.Sprintf("SET GLOBAL partitioned_write_max_open_files = %d", OpenPartitionFiles)); err != nil {
 		return fmt.Errorf("configure iceberg writes: %w", err)
 	}
 	attach := attachStatement(cfg.Catalog, e.proxy.URL())

@@ -428,6 +428,8 @@ type createTable struct {
 	replace, temporary, ifNotExists bool
 	name                            []string
 	query                           string
+	// partitionedBy is the PARTITIONED BY (...) clause before AS, if any.
+	partitionedBy string
 }
 
 func parseCreateTable(query string) (createTable, bool) {
@@ -451,6 +453,7 @@ func parseCreateTable(query string) (createTable, bool) {
 		return c, false
 	}
 	c.name = name
+	c.partitionedBy = sc.partitionedBy()
 	if i := topLevelKeyword(sc.rest(), "AS"); i >= 0 {
 		q := strings.TrimSpace(sc.rest()[i+2:])
 		q = strings.TrimSpace(strings.TrimSuffix(q, ";"))

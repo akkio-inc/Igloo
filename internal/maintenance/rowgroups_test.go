@@ -84,3 +84,28 @@ func TestSizeRowGroups(t *testing.T) {
 		t.Errorf("a user's size became %q", got)
 	}
 }
+
+// TestOpenPartitions checks how many partitions' files, each holding a row
+// group, an insert into a table holds open: its buckets', and as many as
+// DuckDB keeps open for other transforms or more buckets.
+func TestOpenPartitions(t *testing.T) {
+	bucket := func(id, n int) iceberg.PartitionField {
+		return iceberg.PartitionField{SourceIDs: []int{id}, FieldID: 999 + id, Name: "b" + strconv.Itoa(id),
+			Transform: iceberg.BucketTransform{NumBuckets: n}}
+	}
+	day := iceberg.PartitionField{SourceIDs: []int{3}, FieldID: 1010, Name: "d", Transform: iceberg.DayTransform{}}
+	for _, c := range []struct {
+		fields []iceberg.PartitionField
+		want   int64
+	}{
+		{nil, 1},
+		{[]iceberg.PartitionField{bucket(1, 16)}, 16},
+		{[]iceberg.PartitionField{bucket(1, 16), bucket(2, 8)}, 128},
+		{[]iceberg.PartitionField{bucket(1, 4096)}, openPartitionFiles},
+		{[]iceberg.PartitionField{bucket(1, 4), day}, openPartitionFiles},
+	} {
+		if got := openPartitions(iceberg.NewPartitionSpec(c.fields...)); got != c.want {
+			t.Errorf("%v: %d, want %d", c.fields, got, c.want)
+		}
+	}
+}

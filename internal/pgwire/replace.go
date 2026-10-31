@@ -223,13 +223,16 @@ type stagedCreate struct {
 	replace bool
 	// target is the table, to check that it does not exist yet.
 	target auth.Object
-	// query is the query after AS.
-	query string
+	// query is the query after AS, and partitionedBy the PARTITIONED BY
+	// clause before it, if any (bucketed tables'), which the new table is
+	// given before it is filled.
+	query, partitionedBy string
 }
 
 // stagedCreateOf returns how to carry out query in steps, or nil when it is
-// not CREATE [OR REPLACE] TABLE [IF NOT EXISTS] name AS query of an Iceberg
-// table (with no column list, not TEMP and not WITH NO DATA) on its own.
+// not CREATE [OR REPLACE] TABLE [IF NOT EXISTS] name [PARTITIONED BY (...)]
+// AS query of an Iceberg table (with no column list, not TEMP and not WITH
+// NO DATA) on its own.
 func (s *Server) stagedCreateOf(ctx context.Context, sess *session, query string) *stagedCreate {
 	if !createsTableAs(query) {
 		return nil
@@ -250,8 +253,8 @@ func (s *Server) stagedCreateOf(ctx context.Context, sess *session, query string
 	staging := append(append([]string{}, c.name[:len(c.name)-1]...),
 		c.name[len(c.name)-1]+policy.StagingMark+hex.EncodeToString(b[:]))
 	return &stagedCreate{
-		tableReplace: tableReplace{target: c.name, staging: staging, rest: " AS " + c.query},
-		replace:      c.replace, target: target, query: c.query,
+		tableReplace: tableReplace{target: c.name, staging: staging, rest: strings.TrimRight(" "+c.partitionedBy, " ") + " AS " + c.query},
+		replace:      c.replace, target: target, query: c.query, partitionedBy: c.partitionedBy,
 	}
 }
 
@@ -279,6 +282,12 @@ func (s *Server) runStagedCreate(ctx context.Context, sess *session, c *stagedCr
 	}
 	// On a line of its own, after a query that may end in a comment.
 	err = exec(ctx, "CREATE TABLE "+quoteName(c.staging)+" AS "+c.query+"\nWITH NO DATA")
+	if err == nil && c.partitionedBy != "" {
+		// Its partition spec, by which the fill writes its files.
+		if err = exec(ctx, "ALTER TABLE "+quoteName(c.staging)+" SET "+c.partitionedBy); err != nil {
+			_ = exec(context.WithoutCancel(ctx), "DROP TABLE IF EXISTS "+quoteName(c.staging))
+		}
+	}
 	if err == nil && c.replace {
 		// The new table keeps the columns with policies or tags, which the
 		// statement was checked for too.

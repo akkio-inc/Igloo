@@ -448,8 +448,9 @@ queries for them beyond their bind. So a `dbt` run swapping tables and a BI
 tool browsing schemas take turns with each other and with other sessions'
 statement preparation, for a moment each, while long reads and writes run
 alongside them undisturbed. `CREATE [OR REPLACE] TABLE ... AS` of a catalog
-table runs in steps for that reason: it creates the new table, empty, under
-a temporary name, fills it with an `INSERT`, which holds nothing, and renames
+table, `PARTITIONED BY (...)` before `AS` included, runs in steps for that
+reason: it creates the new table, empty, under a temporary name (with its
+partitioning), fills it with an `INSERT`, which holds nothing, and renames
 it into place, so only the create and the rename take the catalog, and the
 table appears under its name once it is complete. Other DDL holds the catalog
 for its whole run, and so does `CREATE TABLE ... AS` inside a transaction
