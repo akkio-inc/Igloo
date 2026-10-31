@@ -77,6 +77,9 @@ type statement struct {
 	// table, which Igloo carries out in steps so that filling the table
 	// does not hold the catalog lock (see runStagedCreate).
 	staged *stagedCreate
+	// tempFill is set for CREATE [OR REPLACE] TEMP TABLE ... AS, which
+	// Igloo carries out in steps for the same reason (see runTempCreate).
+	tempFill *tempCreate
 	// loads are the catalog's tables DuckDB loaded as it prepared the
 	// statement: those it reads (see prepareChecked).
 	loads []catalogproxy.Load

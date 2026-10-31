@@ -400,6 +400,19 @@ func (s *Server) runStatement(ctx context.Context, sess *session, st *statement,
 	// Maintenance leaves the tables it writes be until it commits (see
 	// txTables).
 	defer sess.useTables(st)()
+	if st.tempFill != nil {
+		rows, err := s.runTempCreate(ctx, sess, st.tempFill)
+		if err != nil {
+			return err
+		}
+		reportRows(w, rows)
+		return w.Complete("CREATE TABLE")
+	}
+	if deallocates.MatchString(st.query) {
+		// Forgotten whether it runs or not: an EXECUTE of the name holds the
+		// lock, as one of a statement prepared some other way does.
+		sess.notePrepared(st.query)
+	}
 	if st.staged != nil && !sess.inTx {
 		rows, done, err := s.runStagedCreate(ctx, sess, st.staged)
 		if done {
@@ -435,6 +448,9 @@ func (s *Server) runStatement(ctx context.Context, sess *session, st *statement,
 	if err == nil && st.ids != nil {
 		// And then those of the values that had none.
 		s.fillIDs(ctx, sess, st.ids, written)
+	}
+	if err == nil && st.stmtType == duckdb.STATEMENT_TYPE_PREPARE {
+		sess.notePrepared(st.query)
 	}
 	if err != nil && st.changesIceberg && s.doneAnyway(ctx, st, err) {
 		return w.Complete(commandTag(st.stmtType, st.query, 0))

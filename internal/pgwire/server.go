@@ -863,6 +863,10 @@ type session struct {
 	// txTables are the tables the open transaction block read, which
 	// maintenance leaves be until it ends.
 	txTables txTables
+	// sqlPrepared says, of each statement prepared in SQL by lower-case
+	// name, whether EXECUTE of it holds the catalog lock (see
+	// executeHolds).
+	sqlPrepared map[string]bool
 	// held, while set, keeps queries recorded for the history (see
 	// holdRecords).
 	held *[]queryRecord
@@ -2351,11 +2355,12 @@ func (s *Server) shareCatalogForLogin(ctx context.Context, sess *session) (func(
 // lock exclusively and run on their own: DDL, by its statement type (create,
 // drop, alter, attach, detach, whatever the database: the last statement of
 // several an admin sends may be one, and the Iceberg DDL Igloo recognizes,
-// changesIceberg, is always one), EXECUTE of a statement prepared in SQL,
-// which may be any of these, and listings (information_schema, pg_catalog,
-// duckdb_tables()/views()/columns(), SHOW, DESCRIBE, PRAGMA; see
-// listsCatalog). Preparing and rechecking any statement take it exclusively
-// too, since Igloo's checks list the catalog (see prepareChecked, recheck).
+// changesIceberg, is always one), EXECUTE of a statement prepared in SQL
+// that may be any of these (see executeHolds), and listings
+// (information_schema, pg_catalog, duckdb_tables()/views()/columns(), SHOW,
+// DESCRIBE, PRAGMA; see listsCatalog). Preparing and rechecking any
+// statement take it exclusively too, since Igloo's checks list the catalog
+// (see prepareChecked, recheck).
 //
 // The run of any other statement holds the lock only while DuckDB binds the
 // statement again to run it, which it does each time for a statement that
@@ -2374,11 +2379,19 @@ func (s *Server) shareCatalogForLogin(ctx context.Context, sess *session) (func(
 // (SET, transaction control) and sessions with no catalog attached hold
 // nothing either.
 //
-// CREATE TABLE ... AS of an Iceberg table outside a transaction block is
-// carried out in steps that take the lock themselves, exclusively only to
-// change the catalog (see runStagedCreate).
+// CREATE TABLE ... AS of an Iceberg table, which runs outside any
+// transaction block, and of a temporary table are carried out in steps that
+// take the lock themselves, exclusively only to change the catalog (see
+// runStagedCreate, runTempCreate): as single statements, a long one, a
+// bucketed copy or dbt's temporary table of an incremental model's new
+// rows, held the lock for its whole run, and no session could sign in.
 func (s *Server) catalogRunLock(sess *session, st *statement) func() {
-	if st.staged != nil && !sess.inTx {
+	// CREATE TABLE ... AS in steps, of an Iceberg table, which runs outside
+	// a transaction block (see outsideTransaction), or of a temporary one.
+	if st.staged != nil || st.tempFill != nil {
+		return func() {}
+	}
+	if st.stmtType == duckdb.STATEMENT_TYPE_EXECUTE && !sess.executeHolds(st.query) {
 		return func() {}
 	}
 	if st.changesIceberg || st.listsCatalog || changesCatalog(st.stmtType) || st.stmtType == duckdb.STATEMENT_TYPE_EXECUTE {
@@ -2541,6 +2554,11 @@ func (s *Server) prepareHeld(ctx context.Context, sess *session, user auth.User,
 			st.ai = sess.aiBound.Load()
 			// DuckDB has read the tables' snapshots for the block.
 			sess.noteTx(st)
+		}
+		if sess.sqlPrepared != nil && len(sqllex.Split(text)) > 1 {
+			// Preparing several ran all but the last, a PREPARE among them
+			// perhaps (see executeHolds).
+			sess.sqlPrepared = nil
 		}
 	}()
 	defer sess.cacheReports()()
@@ -2895,6 +2913,9 @@ func (s *Server) prepareCheckedText(ctx context.Context, sess *session, user aut
 	}
 	if st.changesIceberg && st.stmtType == duckdb.STATEMENT_TYPE_CREATE && len(st.params) == 0 {
 		st.staged = s.stagedCreateOf(ctx, sess, st.query)
+	}
+	if !st.changesIceberg && st.stmtType == duckdb.STATEMENT_TYPE_CREATE && len(st.params) == 0 {
+		st.tempFill = s.tempCreateOf(st.query)
 	}
 	if st.stmtType == duckdb.STATEMENT_TYPE_INSERT {
 		st.ids = ids

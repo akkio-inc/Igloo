@@ -2176,6 +2176,14 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   AS`, holding the catalog lock only to create and rename the table: as one
   statement, a 35-minute copy into a bucketed table kept every other
   session from preparing a statement or signing in.
+- No long query holds the catalog lock past its bind, so none keeps other
+  sessions from preparing statements, listing the catalog or signing in:
+  `CREATE [OR REPLACE] TEMP TABLE ... AS` (which dbt runs for every
+  incremental model) and `CREATE TABLE ... AS` in a transaction block run
+  in steps too, `EXECUTE` of a query prepared in SQL holds no more than the
+  query would, and a materialized view's or dynamic table's refresh holds
+  the lock only to plan and to change the catalog. Each held it for its
+  whole run.
 - A write into a table partitioned into more than 100 partitions, such as
   `bucket(256, column)`, writes a file a partition: DuckDB kept 100 files
   open and closed and reopened the others, writing thousands of files of a

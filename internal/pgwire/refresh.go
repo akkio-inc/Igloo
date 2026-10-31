@@ -181,9 +181,6 @@ type refresher struct {
 	snaps map[string]int64
 	// temps are the temporary views and tables the refresh made.
 	temps []string
-	// release lets go of the refresh's hold of the catalog (see
-	// holdCatalog), which it takes again after.
-	release func()
 	// used adds up what DuckDB measured of the statements it ran.
 	used audit.Resources
 }
@@ -215,14 +212,17 @@ func digest(s string) string {
 }
 
 func (r *refresher) run(ctx context.Context) (refreshResult, error) {
-	// What a refresh runs resolves its tables and commits snapshots, which
-	// reach the catalog's in-memory set; it holds the exclusive side but
-	// while it waits to try a commit again (see write).
-	r.release = r.s.holdCatalog(r.sess)
-	defer func() { r.release() }()
+	// Planning resolves the query's tables and lists their columns, which
+	// walk the catalog's in-memory set: it holds the catalog lock
+	// exclusively. The rest holds it only to change the catalog (temporary
+	// tables, the state table) and while DuckDB binds what it runs, as a
+	// user's statements do (see catalogRunLock): a full refresh runs a
+	// query as long as any read, and held it for its whole run.
 	defer r.dropTemps()
 	r.st.Incremental, r.st.Reason = false, ""
+	release := r.s.holdCatalog(r.sess)
 	reason := r.planQuery(ctx)
+	release()
 	if reason == "" {
 		r.st.Incremental = true
 	} else {
@@ -831,8 +831,10 @@ func (r *refresher) stateColumns() string {
 	return strings.Join(names, ", ")
 }
 
-// viewColumns lists the columns of the view's table.
+// viewColumns lists the columns of the view's table, holding the catalog
+// lock to list them.
 func (r *refresher) viewColumns(ctx context.Context) ([]string, error) {
+	defer r.s.holdCatalog(r.sess)()
 	return queryStrings(ctx, r.sess, `SELECT column_name FROM information_schema.columns
 		WHERE table_catalog = $1 AND table_schema = $2 AND table_name = $3 ORDER BY ordinal_position`, r.s.catalogName(), r.schema, r.table)
 }
@@ -850,19 +852,31 @@ func (r *refresher) pinAt(ctx context.Context, table string, v int64) (increment
 }
 
 // temp makes a temporary view or table, which the refresh drops when it
-// ends.
+// ends: a table empty, holding the catalog lock, and then filled, which
+// holds it only while DuckDB binds the query (see runTempCreate).
 func (r *refresher) temp(ctx context.Context, kind, name, query string) error {
-	if _, err := r.exec(ctx, "CREATE OR REPLACE TEMP "+kind+" "+quoteIdent(name)+" AS "+query); err != nil {
+	create := "CREATE OR REPLACE TEMP " + kind + " " + quoteIdent(name) + " AS " + query
+	if kind == "TABLE" {
+		create += "\nWITH NO DATA"
+	}
+	release := r.s.holdCatalog(r.sess)
+	_, err := r.exec(ctx, create)
+	release()
+	if err != nil {
 		return err
 	}
 	if !slices.Contains(r.temps, kind+" "+name) {
 		r.temps = append(r.temps, kind+" "+name)
 	}
-	return nil
+	if kind == "TABLE" {
+		_, err = r.exec(ctx, "INSERT INTO temp.main."+quoteIdent(name)+"\n"+query)
+	}
+	return err
 }
 
 func (r *refresher) dropTemps() {
 	ctx := context.Background()
+	defer r.s.holdCatalog(r.sess)()
 	for _, t := range slices.Backward(r.temps) {
 		kind, name, _ := strings.Cut(t, " ")
 		_, _ = r.sess.conn.ExecContext(ctx, "DROP "+kind+" IF EXISTS temp.main."+quoteIdent(name), nil)
@@ -917,15 +931,11 @@ func (r *refresher) write(ctx context.Context, stmts ...string) (int64, error) {
 		if !commitConflict(err) || attempt == maxCommitRetries {
 			return -1, pgError(err)
 		}
-		// Let the catalog go during the backoff (see holdCatalog).
-		r.release()
 		select {
 		case <-ctx.Done():
-			r.release = r.s.holdCatalog(r.sess)
 			return -1, ctx.Err()
 		case <-time.After(backoff):
 		}
-		r.release = r.s.holdCatalog(r.sess)
 		backoff = min(2*backoff, time.Second)
 	}
 }

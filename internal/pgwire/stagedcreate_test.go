@@ -2,9 +2,9 @@ package pgwire
 
 import (
 	"context"
-	"fmt"
 	"io"
 	"log/slog"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -86,15 +86,42 @@ func TestCreateTableAsInSteps(t *testing.T) {
 	if n := count(t, conn, "SELECT count(*) FROM information_schema.tables WHERE table_name LIKE '"+tbl+"%'"); n != 1 {
 		t.Errorf("%d tables named %s..., want only %s", n, tbl, tbl)
 	}
+
+	// Temporary tables, in steps too (see tempCreate), as DuckDB makes them.
+	mustExec(t, conn, "CREATE TEMP TABLE steps_tmp AS SELECT range AS n FROM range(5)")
+	if n := count(t, conn, "SELECT count(*) FROM steps_tmp"); n != 5 {
+		t.Errorf("a temporary table: %d rows, want 5", n)
+	}
+	if err := runQuery(conn, "CREATE TEMP TABLE steps_tmp AS SELECT 1 AS n"); err == nil || !strings.Contains(err.Error(), "already exists") {
+		t.Errorf("CREATE TEMP TABLE of a table that exists: %v", err)
+	}
+	mustExec(t, conn, "CREATE OR REPLACE TEMP TABLE steps_tmp AS SELECT range AS n, 'x' AS s FROM range(7)")
+	if got := texts(t, conn, "SELECT count(*), min(s) FROM steps_tmp"); len(got) != 1 || got[0] != "7|x" {
+		t.Errorf("a replaced temporary table: %v", got)
+	}
+	if err := runQuery(conn, "CREATE OR REPLACE TEMP TABLE steps_tmp AS "+failing); err == nil || !strings.Contains(err.Error(), "boom") {
+		t.Errorf("a temporary replace whose query fails: %v", err)
+	}
+	if err := runQuery(conn, "CREATE TEMP TABLE steps_failed AS "+failing); err == nil || !strings.Contains(err.Error(), "boom") {
+		t.Errorf("a temporary table whose query fails: %v", err)
+	}
+	if got := texts(t, conn, "SELECT table_name FROM duckdb_tables() WHERE temporary ORDER BY 1"); !slices.Equal(got, []string{"steps_tmp"}) {
+		t.Errorf("temporary tables %v, want only steps_tmp", got)
+	}
+	if n := count(t, conn, "SELECT count(*) FROM steps_tmp"); n != 7 {
+		t.Errorf("after a failed temporary replace: %d rows, want the 7 of before", n)
+	}
 }
 
 // TestCreateTableAsDoesNotStopOtherSessions checks that CREATE TABLE ... AS
-// of an Iceberg table holds the catalog lock only while it changes the
-// catalog: while it reads a slow table of a connection, another session
-// prepares and runs statements and lists the catalog. As one DuckDB
-// statement it held the lock for as long as it read, and every other
-// session waited. So did one partitioned by bucket, which ran as one
-// statement for 35 minutes on a large table.
+// holds the catalog lock only while it changes the catalog: while it reads
+// a slow table of a connection, another session prepares and runs
+// statements, lists the catalog and signs in. As one DuckDB statement it
+// held the lock for as long as it read, and every other session waited: of
+// an Iceberg table, in a transaction block too, and of a temporary table,
+// as dbt makes one for each incremental model, and of a table partitioned
+// by bucket, which ran as one statement for 35 minutes on a large table.
+// So did EXECUTE of a query prepared in SQL.
 func TestCreateTableAsDoesNotStopOtherSessions(t *testing.T) {
 	t.Parallel()
 	needExtensions(t)
@@ -122,11 +149,26 @@ func TestCreateTableAsDoesNotStopOtherSessions(t *testing.T) {
 	writer := env.admin(t, pgx.QueryExecModeSimpleProtocol)
 	other := env.admin(t, pgx.QueryExecModeSimpleProtocol)
 
-	for _, create := range []string{"CREATE TABLE %s AS", "CREATE OR REPLACE TABLE %s AS", "CREATE OR REPLACE TABLE %s PARTITIONED BY (bucket(4, n)) AS"} {
+	slow := "SELECT n FROM crm." + schema + ".slow"
+	for _, c := range []struct {
+		name, setup, stmt, after, rows string
+	}{
+		{"CREATE TABLE ... AS", "", "CREATE TABLE " + env.table + " AS " + slow, "", env.table},
+		{"CREATE OR REPLACE TABLE ... AS", "", "CREATE OR REPLACE TABLE " + env.table + " AS " + slow, "", env.table},
+		{"a bucketed one", "", "CREATE OR REPLACE TABLE " + env.table + " PARTITIONED BY (bucket(4, n)) AS " + slow, "", env.table},
+		{"one in a transaction block", "BEGIN", "CREATE OR REPLACE TABLE " + env.table + " AS " + slow, "COMMIT", env.table},
+		{"a temporary one", "", "CREATE TEMP TABLE slow_copy AS " + slow, "", "slow_copy"},
+		{"a temporary one replaced", "", "CREATE OR REPLACE TEMP TABLE slow_copy AS " + slow, "", "slow_copy"},
+		{"a temporary one in a block, as dbt makes them", "BEGIN", "CREATE TEMPORARY TABLE slow_tmp AS (" + slow + ")", "COMMIT", "slow_tmp"},
+		{"EXECUTE of a query prepared in SQL", "PREPARE slow_read AS " + slow, "EXECUTE slow_read", "DEALLOCATE slow_read", ""},
+	} {
+		if c.setup != "" {
+			mustExec(t, writer, c.setup)
+		}
 		done := make(chan error, 1)
 		start := time.Now()
 		go func() {
-			_, err := writer.Exec(ctx, fmt.Sprintf(create, env.table)+" SELECT n FROM crm."+schema+".slow")
+			_, err := writer.Exec(ctx, c.stmt)
 			done <- err
 		}()
 		time.Sleep(time.Second)
@@ -136,17 +178,30 @@ func TestCreateTableAsDoesNotStopOtherSessions(t *testing.T) {
 			err := other.QueryRow(qctx, q).Scan(&n)
 			cancel()
 			if err != nil {
-				t.Errorf("%s while %s... reads: %v", q, create, err)
+				t.Errorf("%s while %s reads: %v", q, c.name, err)
 			}
 		}
+		lctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+		login, err := pgx.Connect(lctx, env.url("igloo", adminPassword))
+		cancel()
+		if err != nil {
+			t.Errorf("signing in while %s reads: %v", c.name, err)
+		} else {
+			_ = login.Close(ctx)
+		}
 		if err := <-done; err != nil {
-			t.Fatalf("%s: %v", create, err)
+			t.Fatalf("%s: %v", c.name, err)
 		}
 		if took := time.Since(start); took < 4*time.Second {
-			t.Errorf("%s took %s: the source was not slow", create, took)
+			t.Errorf("%s took %s: the source was not slow", c.name, took)
 		}
-		if n := count(t, other, "SELECT count(*) FROM "+env.table); n != 1 {
-			t.Errorf("%s: %d rows, want 1", create, n)
+		if c.after != "" {
+			mustExec(t, writer, c.after)
+		}
+		if c.rows != "" {
+			if n := count(t, writer, "SELECT count(*) FROM "+c.rows); n != 1 {
+				t.Errorf("%s: %d rows, want 1", c.name, n)
+			}
 		}
 	}
 }

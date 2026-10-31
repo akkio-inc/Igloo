@@ -452,9 +452,14 @@ table, `PARTITIONED BY (...)` before `AS` included, runs in steps for that
 reason: it creates the new table, empty, under a temporary name (with its
 partitioning), fills it with an `INSERT`, which holds nothing, and renames
 it into place, so only the create and the rename take the catalog, and the
-table appears under its name once it is complete. Other DDL holds the catalog
-for its whole run, and so does `CREATE TABLE ... AS` inside a transaction
-block or with parameters.
+table appears under its name once it is complete; inside a transaction
+block it runs so too, outside the block. `CREATE [OR REPLACE] TEMP TABLE ...
+AS`, as dbt makes one for each incremental model, runs in the same steps.
+`EXECUTE` of a query or a change of rows prepared in SQL holds what the
+statement would, nothing past its bind, and a materialized view's or a
+dynamic table's refresh takes the catalog only to plan and to change it.
+Other DDL holds the catalog for its whole run, as do `COPY INTO` and
+`CREATE TABLE ... AS` with parameters.
 
 The turns cost throughput of short queries on a busy replica. On a shared
 18-core test machine, against the same build without them, 8 to 64 sessions

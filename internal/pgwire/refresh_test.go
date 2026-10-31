@@ -39,6 +39,13 @@ type refreshEnv struct {
 
 func startRefreshServer(t *testing.T, configure ...func(*Options)) *refreshEnv {
 	t.Helper()
+	return startRefreshServerWith(t, nil, configure...)
+}
+
+// startRefreshServerWith is startRefreshServer with the engine opened with
+// opts.
+func startRefreshServerWith(t *testing.T, opts []engine.Option, configure ...func(*Options)) *refreshEnv {
+	t.Helper()
 	ext := os.Getenv("IGLOO_TEST_EXTENSION_DIR")
 	if ext == "" {
 		t.Skip("IGLOO_TEST_EXTENSION_DIR not set")
@@ -53,7 +60,7 @@ func startRefreshServer(t *testing.T, configure ...func(*Options)) *refreshEnv {
 		DuckDB:  config.DuckDB{ExtensionDir: ext, TempDir: t.TempDir()},
 	}
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	eng, err := engine.Open(ctx, cfg, log)
+	eng, err := engine.Open(ctx, cfg, log, opts...)
 	if err != nil {
 		t.Fatal(err)
 	}
