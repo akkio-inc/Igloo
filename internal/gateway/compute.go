@@ -111,6 +111,68 @@ func (e *EC2) Start(ctx context.Context) error {
 	}
 }
 
+// StartUpTo starts stopped instances, in the order of their IDs, until n
+// of them run or start; it stops none. An instance still stopping waits
+// for that to finish, as for Start.
+func (e *EC2) StartUpTo(ctx context.Context, n int) error {
+	for {
+		states, err := e.states(ctx)
+		if err != nil {
+			return err
+		}
+		var stopped []string
+		up, stopping := 0, 0
+		for id, st := range states {
+			switch st {
+			case types.InstanceStateNameRunning, types.InstanceStateNamePending:
+				up++
+			case types.InstanceStateNameStopped:
+				stopped = append(stopped, id)
+			case types.InstanceStateNameStopping:
+				stopping++
+			}
+		}
+		if up >= n {
+			return nil
+		}
+		slices.Sort(stopped)
+		start := stopped[:min(n-up, len(stopped))]
+		if len(start) > 0 {
+			_, err := e.client.StartInstances(ctx, &ec2.StartInstancesInput{InstanceIds: start})
+			if err != nil && !strings.Contains(err.Error(), "IncorrectInstanceState") {
+				return fmt.Errorf("start instances: %w", err)
+			}
+			if err == nil && up+len(start) >= n {
+				return nil
+			}
+		} else if stopping == 0 {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(2 * time.Second):
+		}
+	}
+}
+
+// StopInstances stops those of its instances among ids.
+func (e *EC2) StopInstances(ctx context.Context, ids []string) error {
+	var mine []string
+	for _, id := range ids {
+		if slices.Contains(e.ids, id) {
+			mine = append(mine, id)
+		}
+	}
+	if len(mine) == 0 {
+		return nil
+	}
+	if _, err := e.client.StopInstances(ctx, &ec2.StopInstancesInput{InstanceIds: mine}); err != nil {
+		return fmt.Errorf("stop instances: %w", err)
+	}
+	return nil
+}
+
 // Stop stops the instances. Their disks, and so a local catalog database
 // and storage, are kept.
 func (e *EC2) Stop(ctx context.Context) error {
@@ -220,6 +282,27 @@ func (k *Kubernetes) ScaleAtLeast(ctx context.Context, n int) error {
 			return err
 		}
 	}
+}
+
+// ShrinkTo lowers the Deployment to n replicas, if it runs from: as many
+// as the caller saw answer, so that a count that differs, as while pods
+// start for another caller, is left alone, and so is one changed between
+// the read and the change. It reports whether it lowered it. With pods
+// that are not ready among them, as workers that retired are, Kubernetes
+// removes those first.
+func (k *Kubernetes) ShrinkTo(ctx context.Context, n, from int) (bool, error) {
+	current, version, err := k.replicas(ctx)
+	if err != nil {
+		return false, err
+	}
+	if current != from || n >= current || n < 0 {
+		return false, nil
+	}
+	err = k.scale(ctx, n, version)
+	if errors.Is(err, errConflict) {
+		return false, nil
+	}
+	return err == nil, err
 }
 
 // errConflict means the Deployment's scale changed since it was read.

@@ -140,10 +140,10 @@ func (w *watcher) check(ctx context.Context) (Notice, bool) {
 }
 
 // Instance is what the instance metadata service says of the machine: its
-// instance type, its region, and whether it is a Spot Instance.
+// ID, instance type and region, and whether it is a Spot Instance.
 type Instance struct {
-	Type, Region string
-	Spot         bool
+	ID, Type, Region string
+	Spot             bool
 }
 
 // DescribeEC2 asks the instance metadata service at base (IMDSv2) what the
@@ -159,6 +159,7 @@ func DescribeEC2(ctx context.Context, base string) (Instance, error) {
 	if in.Type, err = w.get(ctx, "instance-type"); err != nil {
 		return Instance{}, err
 	}
+	in.ID, _ = w.get(ctx, "instance-id")
 	in.Region, _ = w.get(ctx, "placement/region")
 	lifecycle, _ := w.get(ctx, "instance-life-cycle")
 	in.Spot = lifecycle == "spot"

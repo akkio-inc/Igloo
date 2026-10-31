@@ -91,6 +91,8 @@ func TestDescribeEC2(t *testing.T) {
 			return
 		}
 		switch r.URL.Path {
+		case "/latest/meta-data/instance-id":
+			_, _ = rw.Write([]byte("i-0123456789abcdef0"))
 		case "/latest/meta-data/instance-type":
 			_, _ = rw.Write([]byte("m7gd.2xlarge"))
 		case "/latest/meta-data/placement/region":
@@ -103,7 +105,7 @@ func TestDescribeEC2(t *testing.T) {
 	}))
 	defer srv.Close()
 	in, err := DescribeEC2(context.Background(), srv.URL)
-	if err != nil || in != (Instance{Type: "m7gd.2xlarge", Region: "us-east-2", Spot: true}) {
+	if err != nil || in != (Instance{ID: "i-0123456789abcdef0", Type: "m7gd.2xlarge", Region: "us-east-2", Spot: true}) {
 		t.Errorf("instance %+v, %v", in, err)
 	}
 	if _, err := DescribeEC2(context.Background(), "http://127.0.0.1:1"); !errors.Is(err, ErrNotEC2) {

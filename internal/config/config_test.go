@@ -621,6 +621,24 @@ func TestLargeWorker(t *testing.T) {
 	}
 }
 
+func TestWorkerWarm(t *testing.T) {
+	for v, want := range map[string]int{"": 1, "0": 0, "3": 3, "off": -1, "OFF": -1} {
+		m := map[string]string{"IGLOO_ADMIN_PASSWORD": "password"}
+		if v != "" {
+			m["IGLOO_WORKER_WARM"] = v
+		}
+		cfg, err := Load(env(m))
+		if err != nil || cfg.Workers.Warm != want {
+			t.Errorf("IGLOO_WORKER_WARM=%q: %v %v, want %v", v, cfg.Workers.Warm, err, want)
+		}
+	}
+	for _, v := range []string{"-2", "some"} {
+		if _, err := Load(env(map[string]string{"IGLOO_ADMIN_PASSWORD": "password", "IGLOO_WORKER_WARM": v})); err == nil {
+			t.Errorf("IGLOO_WORKER_WARM=%s should be refused", v)
+		}
+	}
+}
+
 func TestWorkerIdleAfter(t *testing.T) {
 	for v, want := range map[string]struct {
 		after time.Duration

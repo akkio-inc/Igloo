@@ -880,8 +880,9 @@ only igloo pods to the task port, and the secret. Each
 [compute pool](workload-management.md#compute-pools) gets the same of its
 own (`<release>-pool-<name>-workers`), used only by its igloo pods; a pool
 can set `workers` to size them differently, or `workers.enabled: false`. Igloo scales the
-Deployment up when a statement needs workers (never down while another
-replica uses them) and to zero after `workers.idleAfter` (10 minutes)
+Deployment up when a statement needs workers, down to the workers busy
+and one more while some work (see [idle workers](#idle-workers)), never
+below what another replica uses, and to zero after `workers.idleAfter`
 without tasks; the cluster autoscaler or Karpenter then removes their
 nodes. With [scale to zero](scale-to-zero.md), a pool's gateway stops the
 pool's workers along with its igloo pods. `workers.pricePerHour` tells
@@ -1006,6 +1007,7 @@ On the Igloo server:
 | `IGLOO_WORKER_COMPUTE` | | How to start and stop workers: `kubernetes`, `ec2`, `command`, or empty when they always run |
 | `IGLOO_WORKER_MAX` | `4` | The most workers Igloo starts |
 | `IGLOO_WORKER_IDLE_AFTER` | `auto` | Stop workers after this long without tasks; `auto` for three times what their last start took, from 2 to 10 minutes |
+| `IGLOO_WORKER_WARM` | `1` | While some workers work, how many idle ones past them stay up; the others stop alone, on Kubernetes and EC2 (see [idle workers](#idle-workers)); `off` stops workers only all together |
 | `IGLOO_WORKER_START_TIMEOUT` | `3m` | How long a statement waits for workers to start before it runs on the server instead |
 | `IGLOO_WORKER_THRESHOLD` | `1m` | In `auto` mode, how long a statement must take on the server alone before it may run on workers (see [when](#when)) |
 | `IGLOO_EXCHANGES` | `object` | Where workers exchange rows: `object` storage, `local` disks, or `auto`, their disks where every worker has room and runs outside Kubernetes (see [exchanges on workers' disks](#exchanges-on-workers-disks)) |
@@ -1067,6 +1069,31 @@ is what workers cost after their last task until they stop: with
 start took, from 2 to 10 minutes, about as long as a start costs. Workers
 that start in half a minute stop after 2 idle minutes; on a 32-core machine
 at $1.71 an hour, a 10-minute tail cost $0.28 after each burst of work.
+
+### Idle workers
+
+Statements run on as many workers as they need (see [when](#when)), so
+while one runs on 4 of 16, the other 12 may sit idle. While some workers
+work, the workers idle for that tail, by their own count, which any
+replica's tasks reset, stop alone, but for the `IGLOO_WORKER_WARM` of them
+used last (one by default; `off` stops workers only all together): the
+replica retires each, which then takes no more tasks and reports itself
+not ready; 15 seconds later, on Kubernetes, the replica scales the
+Deployment down from the workers that answered to those that remain, and
+Kubernetes removes the pods that are not ready first; on EC2
+(`IGLOO_WORKER_COMPUTE=ec2`) it stops the worker's instance, which the
+worker named from its instance metadata, and a statement that needs
+workers starts only as many instances as it needs. A replica that sees
+pods still starting, or the Deployment changed by another, leaves it for
+the next check, and a retired worker not stopped serves again when a
+statement wants more workers than run, or after three minutes. Workers
+started by `command` stop only all together. When every worker is idle,
+they all stop as before.
+
+A worker stopped alone is one whose read cache goes with it, as a pod's
+volumes do, or that was purged of every deletion of [erasure
+requests](#erasure-requests) its replica knew of: one whose cache outlives
+it and that had not purged would block requests until it ran again.
 
 ### Prices
 

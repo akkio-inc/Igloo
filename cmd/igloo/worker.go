@@ -81,7 +81,7 @@ func serveWorker() error {
 	if cfg.Workers.SpotNotice && os.Getenv("KUBERNETES_SERVICE_HOST") == "" {
 		dctx, dcancel := context.WithTimeout(context.Background(), 2*time.Second)
 		if in, err := spot.DescribeEC2(dctx, spot.EC2); err == nil {
-			opts.InstanceType, opts.Region, opts.Spot = in.Type, in.Region, in.Spot
+			opts.InstanceType, opts.Region, opts.Spot, opts.Instance = in.Type, in.Region, in.Spot, in.ID
 			log.Info("running on EC2", "instance_type", in.Type, "region", in.Region, "spot", in.Spot)
 		}
 		dcancel()
@@ -121,6 +121,13 @@ func serveWorker() error {
 			defer cancel()
 			if stopping.Load() {
 				http.Error(rw, "shutting down", http.StatusServiceUnavailable)
+				return
+			}
+			if w.Retiring() {
+				// Not ready, so that Kubernetes removes this pod first when a
+				// coordinator scales the workers down (see distributed's
+				// pool.shrink).
+				http.Error(rw, "retiring", http.StatusServiceUnavailable)
 				return
 			}
 			if err := eng.Ping(ctx); err != nil {
@@ -227,6 +234,7 @@ func newCoordinator(ctx context.Context, cfg config.Config, source distributed.S
 		Pool: distributed.PoolOptions{
 			Addresses: cfg.Workers.Addresses, Compute: compute, MaxWorkers: cfg.Workers.Max,
 			IdleAfter: cfg.Workers.IdleAfter, IdleAuto: cfg.Workers.IdleAuto, StartTimeout: cfg.Workers.StartTimeout,
+			Warm: cfg.Workers.Warm,
 		},
 		WorkerPrice: cfg.Workers.Price, Large: large, LargeCores: l.Cores, LargeMemory: l.Memory, LargePrice: l.Price,
 		WorkerInstanceType: cfg.Workers.InstanceType, WorkerSpot: cfg.Workers.Spot, Region: cfg.Workers.Region,
@@ -378,16 +386,46 @@ func workerCompute(ctx context.Context, w config.Workers) (distributed.Compute, 
 		if err != nil {
 			return nil, err
 		}
-		return distributed.StartStop{Start: e.Start, Stop: e.Stop}, nil
+		return ec2Workers{e}, nil
 	}
 	return nil, nil
 }
 
 // kubernetesWorkers scales the workers' Deployment up as statements need
-// workers, never below what another Igloo replica asked for.
+// workers, never below what another Igloo replica asked for, and down past
+// workers retired while others work (see distributed.Shrinker), whose pods
+// are not ready and go first.
 type kubernetesWorkers struct{ k *gateway.Kubernetes }
 
 func (k kubernetesWorkers) Scale(ctx context.Context, n int) error { return k.k.ScaleAtLeast(ctx, n) }
+
+func (k kubernetesWorkers) Shrink(ctx context.Context, retired []distributed.RetiredWorker, running int) (bool, error) {
+	return k.k.ShrinkTo(ctx, running-len(retired), running)
+}
+
+// ec2Workers starts as many of the workers' instances as statements need,
+// stops them all when idle, and stops those of workers retired while
+// others work (see distributed.Shrinker), as their instance metadata names
+// them.
+type ec2Workers struct{ e *gateway.EC2 }
+
+func (e ec2Workers) Scale(ctx context.Context, n int) error {
+	if n == 0 {
+		return e.e.Stop(ctx)
+	}
+	return e.e.StartUpTo(ctx, n)
+}
+
+func (e ec2Workers) Shrink(ctx context.Context, retired []distributed.RetiredWorker, _ int) (bool, error) {
+	var ids []string
+	for _, r := range retired {
+		if r.Instance == "" {
+			return false, nil
+		}
+		ids = append(ids, r.Instance)
+	}
+	return true, e.e.StopInstances(ctx, ids)
+}
 
 // prefetchTasks reads ahead, as each task starts, the blocks of the files
 // its tables' views read, until the task ends (see package prefetch).

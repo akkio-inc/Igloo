@@ -33,6 +33,9 @@ const (
 	tasksPath  = "/v1/tasks"
 	statusPath = "/v1/status"
 	purgePath  = "/v1/purge"
+	// retirePath has a worker take no more tasks, so that it can be
+	// stopped alone (see pool.shrink), or take them again.
+	retirePath = "/v1/retire"
 )
 
 // taskRequest is one fragment over one share of the data.
@@ -79,6 +82,11 @@ type taskRequest struct {
 // Through, Unix nanoseconds (see erasure.go).
 type purgeRequest struct {
 	Through int64 `json:"through"`
+}
+
+// retireRequest retires a worker, or with Retire false takes it back.
+type retireRequest struct {
+	Retire bool `json:"retire"`
 }
 
 // setting is a session setting the fragment runs with.
@@ -252,6 +260,11 @@ type workerStatus struct {
 	InstanceType string `json:"instance_type,omitempty"`
 	Region       string `json:"region,omitempty"`
 	Spot         bool   `json:"spot,omitempty"`
+	// Instance is its cloud instance's ID, where its metadata says, for
+	// stopping it alone; Retiring says it takes no more tasks, about to be
+	// stopped (see pool.shrink).
+	Instance string `json:"instance,omitempty"`
+	Retiring bool   `json:"retiring,omitempty"`
 	// Boot is random to each run of the worker.
 	Boot        string  `json:"boot,omitempty"`
 	Running     int     `json:"running"`

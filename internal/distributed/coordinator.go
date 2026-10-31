@@ -257,6 +257,12 @@ func NewCoordinator(opts Options, log *slog.Logger) (*Coordinator, error) {
 		co.large = newPool(lo, t, opts.Version, nil, log.With("worker", "large"))
 		co.background.Go(func() { co.large.run(ctx) })
 	}
+	// Workers whose caches outlive them are stopped alone only once purged
+	// of what erasure requests deleted (see pool.shrink).
+	co.pool.erased = co.erased.Load
+	if co.large != nil {
+		co.large.erased = co.erased.Load
+	}
 	co.background.Go(func() { co.pool.run(ctx) })
 	co.background.Go(func() { co.sweepLoop(ctx) })
 	return co, nil

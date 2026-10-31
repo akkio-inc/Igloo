@@ -77,6 +77,9 @@ type WorkerOptions struct {
 	// prices) where they were not told; empty for unknown.
 	InstanceType, Region string
 	Spot                 bool
+	// Instance is its cloud instance's ID, where its metadata says, which
+	// a coordinator stops when it stops the worker alone.
+	Instance string
 	// ExchangeBytes caps what exchanges on its disk, written or fetched,
 	// may take there (IGLOO_EXCHANGE_MAX_SIZE), as on a volume whose size
 	// its free space does not show; zero leaves them to the free space.
@@ -112,6 +115,9 @@ type Worker struct {
 	// beforeTask, if set, runs before each task; tests use it to make a
 	// worker fail or hang. r's context is the task's.
 	beforeTask func(rw http.ResponseWriter, r *http.Request) bool
+	// retiring says a coordinator retired the worker: it takes no more
+	// tasks and is not ready, so that it is stopped alone (see Retiring).
+	retiring atomic.Bool
 
 	// slots bound the tasks that run at once (see taskSlots); running are
 	// those running, which ShedMemory may cancel.
@@ -211,6 +217,7 @@ func NewWorker(opts WorkerOptions, log *slog.Logger) (*Worker, error) {
 	mux.HandleFunc("POST "+tasksPath, w.serveTask)
 	mux.HandleFunc("GET "+statusPath, w.serveStatus)
 	mux.HandleFunc("POST "+purgePath, w.servePurge)
+	mux.HandleFunc("POST "+retirePath, w.serveRetire)
 	mux.HandleFunc("GET "+exchangesPath+"{qid}/{file...}", w.serveExchangeFile)
 	mux.HandleFunc("POST "+exchangesPath+"{qid}/keep", w.serveExchangeKeep)
 	mux.HandleFunc("DELETE "+exchangesPath+"{qid}", w.serveExchangeRemove)
@@ -249,13 +256,33 @@ func (w *Worker) serveStatus(rw http.ResponseWriter, _ *http.Request) {
 	rw.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(rw).Encode(workerStatus{
 		ID: w.opts.ID, Version: w.opts.Version, Cores: w.opts.Cores, MemoryBytes: w.opts.MemoryBytes, Threads: w.opts.Threads, Slots: cap(w.slots),
-		InstanceType: w.opts.InstanceType, Region: w.opts.Region, Spot: w.opts.Spot,
+		InstanceType: w.opts.InstanceType, Region: w.opts.Region, Spot: w.opts.Spot, Instance: w.opts.Instance, Retiring: w.retiring.Load(),
 		Boot:    w.boot,
 		Running: int(running), IdleSeconds: idle.Seconds(),
 		LocalRoom: w.localRoom(), Kubernetes: os.Getenv("KUBERNETES_SERVICE_HOST") != "",
 		Cache: w.opts.Erasure.Cache, Erased: w.purged.Load(), Alone: w.alone.Load(),
 	})
 }
+
+// serveRetire retires the worker, or takes it back, as a coordinator asks
+// (see pool.shrink), and answers its status.
+func (w *Worker) serveRetire(rw http.ResponseWriter, r *http.Request) {
+	w.hear()
+	var req retireRequest
+	if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&req); err != nil {
+		http.Error(rw, "bad retire: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	if w.retiring.Swap(req.Retire) != req.Retire {
+		w.log.Info("a coordinator changed whether this worker takes tasks", "retiring", req.Retire)
+	}
+	w.serveStatus(rw, r)
+}
+
+// Retiring reports whether a coordinator retired the worker: its
+// readiness fails, so that Kubernetes, scaling its Deployment down, stops
+// it rather than a worker running tasks.
+func (w *Worker) Retiring() bool { return w.retiring.Load() }
 
 // localRoom is the room the worker's disk has for exchanges: the share of
 // its exchange directory's free space a task may take, within
@@ -359,6 +386,11 @@ func (w *Worker) begin(t *runningTask) func() {
 
 func (w *Worker) serveTask(rw http.ResponseWriter, r *http.Request) {
 	w.hear()
+	if w.retiring.Load() {
+		// Retired: the coordinator runs the task on another worker.
+		http.Error(rw, "this worker is retiring", http.StatusServiceUnavailable)
+		return
+	}
 	defer w.activity.Begin()()
 	ctx, cancel := context.WithCancelCause(r.Context())
 	defer cancel(nil)

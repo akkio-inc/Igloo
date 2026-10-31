@@ -31,6 +31,10 @@ type Workers struct {
 	IdleAuto  bool
 	// StartTimeout bounds how long a statement waits for workers to start.
 	StartTimeout time.Duration
+	// Warm is how many idle workers past those busy stay up while some
+	// work, where Compute can stop workers alone (IGLOO_WORKER_WARM, 1);
+	// -1 (off) stops them only all together.
+	Warm int
 	// Threshold is how long a statement must take on one machine before
 	// auto mode runs it on workers, unless it would run short of memory.
 	Threshold time.Duration
@@ -247,6 +251,16 @@ func loadWorkers(lookup func(string) (string, bool), errs *[]error) Workers {
 		w.IdleAfter = duration("IGLOO_WORKER_IDLE_AFTER", "10m")
 	}
 	w.StartTimeout = duration("IGLOO_WORKER_START_TIMEOUT", "3m")
+	switch v := strings.ToLower(get("IGLOO_WORKER_WARM", "1")); v {
+	case "off":
+		w.Warm = -1
+	default:
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 0 {
+			addErr("IGLOO_WORKER_WARM must be a number of workers, or off, got %q", v)
+		}
+		w.Warm = n
+	}
 	w.IsolatedPurgeAfter = duration("IGLOO_WORKER_ISOLATED_PURGE_AFTER", "1m")
 	if w.IsolatedPurgeAfter > 0 && w.IsolatedPurgeAfter < 10*time.Second {
 		addErr("IGLOO_WORKER_ISOLATED_PURGE_AFTER must be at least 10s: coordinators check workers every few seconds, got %s",
