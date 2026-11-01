@@ -1023,7 +1023,7 @@ give the workers more memory.
   the OpenTofu module for AWS gives it none. Google Cloud and Azure have nothing
   DuckDB could use of the kind: their modules give workers an identity that
   can only create files under `_igloo_shuffle/` and directories of that name
-  under tables' locations, and delete none. A worker told no gets the
+  under tables' locations, with no overwrite, move or delete. A worker told no gets the
   statement planned again, the coordinator writing the table
   (`IGLOO_WORKER_WRITES=off` always does), and no worker is asked for ten
   minutes.

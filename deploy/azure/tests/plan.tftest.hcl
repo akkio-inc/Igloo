@@ -494,8 +494,17 @@ run "workers_have_an_identity_of_their_own" {
   }
 
   assert {
-    condition     = azurerm_role_assignment.worker_read[0].role_definition_name == "Storage Blob Data Reader" && azurerm_role_assignment.worker_write[0].condition_version == "2.0" && strcontains(azurerm_role_assignment.worker_write[0].condition, "StringLike 'warehouse/*/data/igloo-write-*'") && strcontains(azurerm_role_assignment.worker_write[0].condition, "StringLike 'warehouse/_igloo_shuffle/*'") && strcontains(azurerm_role_assignment.worker_write[0].condition, "(!(ActionMatches{'Microsoft.Storage/storageAccounts/blobServices/containers/blobs/delete'})) AND")
-    error_message = "Workers may change only exchanges and statements' directories, and delete nothing."
+    condition     = azurerm_role_assignment.worker_read[0].role_definition_name == "Storage Blob Data Reader" && azurerm_role_assignment.worker_write[0].condition_version == "2.0" && strcontains(azurerm_role_assignment.worker_write[0].condition, "StringLike 'warehouse/*/data/igloo-write-*'") && strcontains(azurerm_role_assignment.worker_write[0].condition, "StringLike 'warehouse/_igloo_shuffle/*'")
+    error_message = "Workers may create files only among exchanges and statements' directories."
+  }
+
+  assert {
+    condition = (
+      tolist(azurerm_role_definition.worker_write[0].permissions)[0].data_actions == toset(["Microsoft.Storage/storageAccounts/blobServices/containers/blobs/add/action"]) &&
+      length(coalesce(tolist(azurerm_role_definition.worker_write[0].permissions)[0].actions, [])) == 0 &&
+      azurerm_role_assignment.worker_write[0].role_definition_name != "Storage Blob Data Contributor"
+    )
+    error_message = "Workers' role may create blobs and do nothing else: no overwrite, move, delete or container action."
   }
 }
 
