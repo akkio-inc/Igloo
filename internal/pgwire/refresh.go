@@ -218,11 +218,11 @@ func (r *refresher) rebuild(ctx context.Context) (int64, error) {
 
 // rebuildWriter returns how workers would write the view's rows, in place
 // of the table's files, or nil: where the refresh could not overwrite them
-// itself (see overwritePlan), or would have DuckDB's INSERT write them, as a
-// partitioned view's.
+// itself (see overwritePlan). Workers write a partitioned view's as a table's,
+// where the refresh's own COPY could not.
 func (r *refresher) rebuildWriter(ctx context.Context, src *statement) *tableWrite {
 	o, err := r.overwritePlan(ctx)
-	if err != nil || !o.copies {
+	if err != nil {
 		return nil
 	}
 	w := r.s.tableWriter(ctx, r.sess, r.schema, r.table, src, nil)

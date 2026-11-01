@@ -456,6 +456,22 @@ func TestWorkersWrite(t *testing.T) {
 		same(t, "w_mv", mv)
 		env.checkNoNotes(t)
 	})
+
+	t.Run("partitioned materialized view", func(t *testing.T) {
+		mv := "SELECT i AS id, g, x FROM lake.public.src AS o(i) WHERE g < 5"
+		mustExec(t, admin, "CREATE MATERIALIZED VIEW w_mv_parts AS "+mv)
+		mustExec(t, admin, "ALTER TABLE lake.public.w_mv_parts SET PARTITIONED BY (g)")
+		mustExec(t, admin, "REFRESH MATERIALIZED VIEW w_mv_parts")
+		same(t, "w_mv_parts", mv)
+		env.checkWrote(t, "w_mv_parts")
+		if data, _ := liveFiles(t, admin, "w_mv_parts"); len(data) < 2 {
+			t.Errorf("the rows of a partitioned view are in %d files", len(data))
+		}
+		if got, want := env.local(t, "SELECT count(*) FROM w_mv_parts WHERE g = 2"), env.local(t, "SELECT count(*) FROM src WHERE g = 2"); got != want {
+			t.Errorf("a partition holds %s rows, want %s", got, want)
+		}
+		env.checkNoNotes(t)
+	})
 }
 
 // TestWorkersWritePartitions checks that workers write partitioned tables:
