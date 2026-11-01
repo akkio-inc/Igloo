@@ -46,16 +46,27 @@ func startRefreshServer(t *testing.T, configure ...func(*Options)) *refreshEnv {
 // opts.
 func startRefreshServerWith(t *testing.T, opts []engine.Option, configure ...func(*Options)) *refreshEnv {
 	t.Helper()
+	if os.Getenv("IGLOO_TEST_EXTENSION_DIR") == "" {
+		t.Skip("IGLOO_TEST_EXTENSION_DIR not set")
+	}
+	dir := t.TempDir()
+	fake := icebergtest.NewCatalog(dir)
+	t.Cleanup(fake.Close)
+	return startRefreshServerOn(t, fake, dir, fake.URL, opts, configure...)
+}
+
+// startRefreshServerOn is startRefreshServerWith on the catalog fake, whose
+// tables' files are in dir, reached at uri (fake's URL, or a Faults in
+// front of it), as another replica, or the same one started again, is.
+func startRefreshServerOn(t *testing.T, fake *icebergtest.Catalog, dir, uri string, opts []engine.Option, configure ...func(*Options)) *refreshEnv {
+	t.Helper()
 	ext := os.Getenv("IGLOO_TEST_EXTENSION_DIR")
 	if ext == "" {
 		t.Skip("IGLOO_TEST_EXTENSION_DIR not set")
 	}
 	ctx := context.Background()
-	dir := t.TempDir()
-	fake := icebergtest.NewCatalog(dir)
-	t.Cleanup(fake.Close)
 	cfg := config.Config{
-		Catalog: config.Catalog{URI: fake.URL, Warehouse: "test", Name: "lake", Schema: "public"},
+		Catalog: config.Catalog{URI: uri, Warehouse: "test", Name: "lake", Schema: "public"},
 		Storage: config.Storage{Location: dir, S3: config.S3{Region: "us-east-1", URLStyle: "path", AccessKeyID: "unused", SecretAccessKey: "unused"}},
 		DuckDB:  config.DuckDB{ExtensionDir: ext, TempDir: t.TempDir()},
 	}

@@ -461,6 +461,21 @@ dynamic table's refresh takes the catalog only to plan and to change it.
 Other DDL holds the catalog for its whole run, as do `COPY INTO` and
 `CREATE TABLE ... AS` with parameters.
 
+An Igloo stopped in the middle of `CREATE TABLE ... AS` leaves its half-filled
+table under a temporary name (`name__igloo_new_...`), and one stopped in the
+middle of a create that DuckDB ran as one statement leaves a staged create,
+which Lakekeeper keeps holding the name, unseen: no table of the name can
+be read or dropped, yet no table can be renamed onto it. Igloo notes each
+table it is making in its schema's properties (`igloo.pending.*`) and
+forgets the note once the table is made, so a note left behind by a
+stopped process (an earlier one of the same host, or any process a day
+ago) proves what is under its name is Igloo's own: the next `CREATE TABLE
+... AS` of the name, or `DROP TABLE IF EXISTS` of it, clears it. Before it
+fills anything, `CREATE TABLE ... AS` checks that nothing else holds the
+name unseen, briefly putting an empty table under it when it is free, and
+fails at once if something does; an admin's `DROP TABLE name`, without `IF
+EXISTS`, releases such a hold, whoever left it.
+
 The turns cost throughput of short queries on a busy replica. On a shared
 18-core test machine, against the same build without them, 8 to 64 sessions
 of point lookups ran 18–25% fewer queries a second (with lower tail

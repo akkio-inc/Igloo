@@ -2434,6 +2434,13 @@ func (s *Server) prepareStatement(ctx context.Context, sess *session, user auth.
 		s.beforePrepare(pctx, text)
 	}
 	st, err := s.prepareChecked(pctx, sess, user, text, oids)
+	if err != nil && st == nil {
+		// An admin's DROP TABLE of a name that a create nobody committed
+		// holds releases it (see clearLeftovers).
+		if again := s.dropUnseen(pctx, sess, user, text, err); again != "" {
+			st, err = s.prepareChecked(pctx, sess, user, again, oids)
+		}
+	}
 	if err = prepared(err); err != nil && st != nil {
 		_ = st.close()
 		st = nil

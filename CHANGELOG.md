@@ -2234,6 +2234,16 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   query would, and a materialized view's or dynamic table's refresh holds
   the lock only to plan and to change the catalog. Each held it for its
   whole run.
+- A `CREATE TABLE ... AS` that an earlier, stopped one left something under
+  its name no longer fails after its whole fill: a copy of 833 million rows
+  failed at its rename after 236 s with "Tabular with the same name already
+  exists", over a staged create an Igloo killed mid-statement had left in
+  Lakekeeper, unseen and undroppable. Igloo notes the tables it is making in
+  their schema's properties, and clears what a stopped process of its own
+  left (half-filled staging tables, uncommitted staged creates) at the next
+  `CREATE TABLE ... AS` or `DROP TABLE IF EXISTS` of the name; a create
+  checks before it fills anything that nothing else holds the name, and an
+  admin's `DROP TABLE` of the name releases a hold whoever left it.
 - ELT that makes, replaces, renames or drops tables, makes schemas or
   refreshes materialized views no longer empties the result cache of
   dashboards over other tables: `CREATE OR REPLACE TABLE`, `CREATE SCHEMA

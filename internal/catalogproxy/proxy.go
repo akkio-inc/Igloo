@@ -148,6 +148,8 @@ type Proxy struct {
 	sharedHold
 	// data goes up whenever a table may have changed (see DataVersion).
 	data dataVersion
+	// pending are the notes of staged creates (see pending.go).
+	pending pendingCreates
 	// counts are the distinct counts table loads had (see distinctcounts.go).
 	counts distinctCounts
 
@@ -356,10 +358,17 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	changed()
+	pkey, pnote := p.notePending(r, rest, body)
 	c := p.begin(r, rest, body)
+	settled := func() {
+		if c.res != nil {
+			p.settlePending(r, rest, body, c.res.status, pkey, pnote)
+		}
+	}
 	select {
 	case <-c.done:
 		changed()
+		settled()
 		c.res.write(w)
 	case <-r.Context().Done():
 		// DuckDB gave up waiting; it sends the change again, which joins
@@ -367,6 +376,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		go func() {
 			<-c.done
 			changed()
+			settled()
 		}()
 	}
 }

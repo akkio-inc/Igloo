@@ -6,11 +6,13 @@
 // table, applies its updates with iceberg-go, all tables of a transaction or
 // none, refuses a commit whose requirements fail with 409
 // CatalogCommitConflicts, and honours Idempotency-Key headers, answering a
-// repeat of an applied change with success. Tables' files go wherever their
-// locations say; tests use a local directory. Views are created, replaced,
-// renamed and dropped through the REST API's view endpoints, which it does
-// not list in its configuration, so DuckDB leaves them alone, as Igloo
-// expects of the catalogs it runs on.
+// repeat of an applied change with success. A staged create it keeps as
+// Lakekeeper does: unseen by loads and listings, holding the name against a
+// rename onto it, until a commit makes the table or a create replaces it.
+// Tables' files go wherever their locations say; tests use a local
+// directory. Views are created, replaced, renamed and dropped through the
+// REST API's view endpoints, which it does not list in its configuration,
+// so DuckDB leaves them alone, as Igloo expects of the catalogs it runs on.
 package icebergtest
 
 import (
@@ -47,7 +49,11 @@ type Catalog struct {
 	tables     map[string]*tableState
 	views      map[string]*viewState
 	// keys are the idempotency keys of applied changes.
-	keys       map[string]bool
+	keys map[string]bool
+	// staged are the names of staged creates never committed, which
+	// Lakekeeper keeps unseen: loading and listing do not show them, and
+	// renaming a table onto one fails, but creating one replaces it.
+	staged     map[string]bool
 	ignoreKeys bool
 	// ignoreCase finds tables and views by name whatever its case (see
 	// IgnoreNameCase).
@@ -70,6 +76,40 @@ type Catalog struct {
 type Commit struct {
 	Tables      []string
 	Transaction bool
+}
+
+// NamespaceProperties returns the properties of the namespace ns, one level.
+func (c *Catalog) NamespaceProperties(ns string) map[string]string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	out := map[string]string{}
+	for k, v := range c.namespaces[ns] {
+		out[k] = v
+	}
+	return out
+}
+
+// TableNames returns the names of the tables of the namespace ns, one
+// level, sorted; staged creates never committed are not tables.
+func (c *Catalog) TableNames(ns string) []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	var out []string
+	for _, t := range c.tables {
+		if strings.Join(t.ns, "\x1f") == ns {
+			out = append(out, t.name)
+		}
+	}
+	slices.Sort(out)
+	return out
+}
+
+// Staged reports whether a staged create of ns.name, never committed,
+// holds the name.
+func (c *Catalog) Staged(ns, name string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.staged[c.tableKey([]string{ns}, name)]
 }
 
 // BeforeCommit has fn run ahead of each commit request, before the catalog
@@ -139,6 +179,7 @@ func NewCatalog(location string) *Catalog {
 		tables:     map[string]*tableState{},
 		views:      map[string]*viewState{},
 		keys:       map[string]bool{},
+		staged:     map[string]bool{},
 	}
 	c.srv = httptest.NewServer(c)
 	c.URL = c.srv.URL + "/catalog"
@@ -290,6 +331,39 @@ func (c *Catalog) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"identifiers": ids})
+	case len(p) == 3 && p[0] == "namespaces" && p[2] == "properties" && r.Method == http.MethodPost:
+		props, ok := c.namespaces[p[1]]
+		if !ok {
+			apiError(w, http.StatusNotFound, "NoSuchNamespaceException", "no such namespace")
+			return
+		}
+		var req struct {
+			Removals []string          `json:"removals"`
+			Updates  map[string]string `json:"updates"`
+		}
+		if err := json.Unmarshal(body, &req); err != nil {
+			apiError(w, http.StatusBadRequest, "BadRequestException", err.Error())
+			return
+		}
+		next := map[string]string{}
+		for k, v := range props {
+			next[k] = v
+		}
+		removed, missing, updated := []string{}, []string{}, []string{}
+		for _, k := range req.Removals {
+			if _, ok := next[k]; ok {
+				delete(next, k)
+				removed = append(removed, k)
+			} else {
+				missing = append(missing, k)
+			}
+		}
+		for k, v := range req.Updates {
+			next[k] = v
+			updated = append(updated, k)
+		}
+		c.namespaces[p[1]] = next
+		writeJSON(w, http.StatusOK, map[string]any{"removed": removed, "missing": missing, "updated": updated})
 	case len(p) == 3 && p[0] == "namespaces" && p[2] == "tables" && r.Method == http.MethodPost:
 		c.createTable(w, strings.Split(p[1], "\x1f"), body, key)
 	case len(p) == 4 && p[0] == "namespaces" && p[2] == "tables":
@@ -359,6 +433,9 @@ func (c *Catalog) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		case c.tables[to] != nil || c.views[to] != nil:
 			apiError(w, http.StatusConflict, "AlreadyExistsException", "table exists")
+			return
+		case c.staged[to]:
+			apiError(w, http.StatusConflict, "AlreadyExistsException", "Tabular with the same name already exists in the namespace")
 			return
 		}
 		if _, ok := c.namespaces[strings.Join(req.Destination.Namespace, "\x1f")]; !ok {
@@ -497,7 +574,10 @@ func (c *Catalog) createTable(w http.ResponseWriter, ns []string, body []byte, k
 	}
 	if !req.StageCreate {
 		c.tables[k] = t
+		delete(c.staged, k)
 		c.remember(key)
+	} else {
+		c.staged[k] = true
 	}
 	writeJSON(w, http.StatusOK, loadResult(t))
 }
@@ -553,6 +633,7 @@ func (c *Catalog) commit(changes []tableChange) (int, string, error) {
 	}
 	for _, r := range results {
 		c.tables[r.key] = r.state
+		delete(c.staged, r.key)
 	}
 	c.commits++
 	return 0, "", nil

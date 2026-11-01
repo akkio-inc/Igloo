@@ -16,6 +16,7 @@ import (
 	pgerror "github.com/jeroenrinzema/psql-wire/errors"
 
 	"github.com/akkio-inc/igloo/internal/auth"
+	"github.com/akkio-inc/igloo/internal/catalog"
 	"github.com/akkio-inc/igloo/internal/policy"
 )
 
@@ -280,6 +281,16 @@ func (s *Server) runStagedCreate(ctx context.Context, sess *session, c *stagedCr
 			return 0, false, nil
 		}
 	}
+	// What stopped creates left under the name goes, and nothing else may
+	// hold it, before the fill rather than at the rename after it (see
+	// clearLeftovers).
+	if err := s.clearLeftovers(ctx, sess, c.target.Schema, c.target.Table, true); err != nil {
+		release()
+		return 0, true, err
+	}
+	// Noted while it is made, so a stop leaves what it made to clear.
+	forget := s.notePending(ctx, c.target.Schema, catalog.NewPending(catalog.PendingFill, c.staging[len(c.staging)-1], c.target.Table))
+	defer forget()
 	// On a line of its own, after a query that may end in a comment.
 	err = exec(ctx, "CREATE TABLE "+quoteName(c.staging)+" AS "+c.query+"\nWITH NO DATA")
 	if err == nil && c.partitionedBy != "" {
@@ -372,7 +383,19 @@ func (s *Server) runStagedCreate(ctx context.Context, sess *session, c *stagedCr
 	}
 	_, _, rename := c.statements()
 	if err := exec(ctx, rename); err != nil {
-		// A table of that name was created in the meantime.
+		// A table of that name was created in the meantime, or a create
+		// that never was holds the name since the check: if it is a stopped
+		// create of Igloo's own, it goes, and the rename is tried again.
+		if s.ddl != nil {
+			if there, terr := s.ddl.TableExists(ctx, c.target.Schema, c.target.Table); terr == nil && !there {
+				if s.clearLeftovers(ctx, sess, c.target.Schema, c.target.Table, false) == nil && exec(ctx, rename) == nil {
+					return rows, true, nil
+				}
+				if held, _ := s.ddl.HeldUnseen(ctx, c.target.Schema, c.target.Table); held {
+					err = errHeldUnseen(c.target.Schema, c.target.Table)
+				}
+			}
+		}
 		_ = exec(ctx, "DROP TABLE IF EXISTS "+quoteName(c.staging))
 		return 0, true, err
 	}
@@ -456,6 +479,9 @@ func (s *Server) runStatement(ctx context.Context, sess *session, st *statement,
 	}
 	if err == nil && st.stmtType == duckdb.STATEMENT_TYPE_PREPARE {
 		sess.notePrepared(st.query)
+	}
+	if err == nil && st.stmtType == duckdb.STATEMENT_TYPE_DROP {
+		s.afterDropTable(ctx, sess, st)
 	}
 	if err != nil && st.changesIceberg && s.doneAnyway(ctx, st, err) {
 		return w.Complete(commandTag(st.stmtType, st.query, 0))
