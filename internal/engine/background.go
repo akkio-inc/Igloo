@@ -152,14 +152,18 @@ const (
 	// balanceEvery is how often the limits are weighed.
 	balanceEvery = time.Second
 	// backgroundIdleLimit is the background DuckDB's limit with nothing
-	// running in it, so what it read last gives the first its room back.
+	// running in it while the first reads, so what it read last gives the first
+	// its room back.
 	backgroundIdleLimit = 256 << 20
 )
 
 // ForegroundRead says a statement that reads tables is running in the first
 // DuckDB, whose caches therefore keep their memory for a while.
 func (e *Engine) ForegroundRead() {
-	e.fgRead.Store(time.Now().UnixNano())
+	last := e.fgRead.Swap(time.Now().UnixNano())
+	if time.Since(time.Unix(0, last)) >= foregroundIdle {
+		e.balanceNow()
+	}
 }
 
 // UsingBackground says a statement runs in the background DuckDB until the
@@ -219,8 +223,11 @@ func (e *Engine) balance(ctx context.Context) {
 		e.limit.CompareAndSwap(0, total)
 	}
 	wantMain, wantBg := total, int64(backgroundIdleLimit)
-	if e.bgUsers.Load() > 0 {
-		reading := time.Since(time.Unix(0, e.fgRead.Load())) < foregroundIdle
+	reading := time.Since(time.Unix(0, e.fgRead.Load())) < foregroundIdle
+	// With nothing running in the background DuckDB, what it holds stays for its
+	// next statement until the first reads: a session's reports one after another
+	// read the same files, and one of 24 s took 50 s starting with nothing.
+	if e.bgUsers.Load() > 0 || !reading {
 		query := queryMemory
 		if reading {
 			query = queryAllMemory
