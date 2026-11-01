@@ -321,6 +321,8 @@ func (w *tableWrite) end(ctx context.Context) {
 	dirs := []string{dir}
 	if sealed != "" && !committed {
 		dirs = append(dirs, sealed)
+		// A copy in parts ends what it began, unless the replica stops.
+		s.abortUploads(bg, tbl, sealed)
 	}
 	if !remove(dirs...) {
 		s.writesRunning.Delete(note.Key)
@@ -383,6 +385,7 @@ func (w *tableWrite) seal(ctx context.Context, files []distributed.WrittenFile) 
 		return nil, fmt.Errorf("the store of %s.%s cannot copy a file", w.schema, w.name)
 	}
 	w.sealed = sealedDir(w.dir)
+	parts := uploads.CopierFor(fsys, w.dir)
 	out := make([]distributed.WrittenFile, len(files))
 	start := time.Now()
 	var bytes int64
@@ -392,7 +395,12 @@ func (w *tableWrite) seal(ctx context.Context, files []distributed.WrittenFile) 
 		out[i] = f
 		out[i].Path = w.sealed + "/part_" + strconv.Itoa(i) + ".parquet"
 		bytes += f.Size
-		g.Go(func() error { return store.Copy(gctx, f.Path, out[i].Path) })
+		g.Go(func() error {
+			if parts != nil && f.Size >= uploads.CopyInPartsFrom {
+				return parts.CopyInParts(gctx, f.Path, out[i].Path)
+			}
+			return store.Copy(gctx, f.Path, out[i].Path)
+		})
 	}
 	err = g.Wait()
 	w.s.log.Info("copied the files workers wrote out of their reach", "table", w.schema+"."+w.name, "files", len(files), "bytes", bytes,
