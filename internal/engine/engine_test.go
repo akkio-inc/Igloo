@@ -234,7 +234,7 @@ func TestLockdownNeverAllowsRoot(t *testing.T) {
 
 func TestSettingStatements(t *testing.T) {
 	got := joined(settingStatements(config.DuckDB{MemoryLimit: "6GB", MaxTempSize: "45GiB", Threads: 4}))
-	for _, want := range []string{"SET memory_limit = '6GB'", "SET max_temp_directory_size = '45GiB'", "SET threads = 4"} {
+	for _, want := range []string{"SET parquet_metadata_cache = true", "SET memory_limit = '6GB'", "SET max_temp_directory_size = '45GiB'", "SET threads = 4"} {
 		if !strings.Contains(got, want) {
 			t.Errorf("missing %q in\n%s", want, got)
 		}

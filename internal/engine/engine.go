@@ -1016,7 +1016,11 @@ func settingStatements(d config.DuckDB) []string {
 	if d.Threads > 0 {
 		stmts = append(stmts, fmt.Sprintf("SET threads = %d", d.Threads))
 	}
-	return stmts
+	// Table files never change once written, so their footers can stay parsed.
+	// A dashboard's statements read the same files again and again: 96 of them
+	// at ten times the data took 214 s rather than 233, the slowest tenth 107 s
+	// rather than 132. DuckDB evicts them when memory is short.
+	return append(stmts, "SET parquet_metadata_cache = true")
 }
 
 // storageStatements loads every extension Igloo needs and registers the

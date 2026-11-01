@@ -1906,6 +1906,9 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   large dashboard's statements learned under a twentieth of what they
   allocated, started beside the heavy ones next time and spilled. Runs
   cancelled after ten seconds or more count as needing all the memory.
+- DuckDB keeps table files' parsed footers in memory: a dashboard's 96 queries
+  at ten times the data took 214 s rather than 233, the slowest tenth 107 s
+  rather than 132.
 - A statement's thread sleeps while DuckDB's workers hold all its tasks,
   rather than ask for one again and again without a pause, a core for every
   statement waiting on its workers.
