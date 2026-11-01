@@ -21,19 +21,19 @@ func TestWideTableExchanges(t *testing.T) {
 		cols[i] = fmt.Sprintf("(i * %d) %% 7 AS c%03d", i+1, i)
 	}
 	h.addTable("wide", "(SELECT i AS id, CAST(i % 500 AS VARCHAR) AS hh, "+strings.Join(cols, ", ")+" FROM range(20000) t(i))", 4)
-	h.addTable("extra", "(SELECT CAST(i AS DECIMAL(38,0)) AS luid, i % 3 AS e1, i % 5 AS e2 FROM range(500) t(i))", 1)
+	h.addTable("extra", "(SELECT CAST(i AS DECIMAL(38,0)) AS ext_id, i % 3 AS e1, i % 5 AS e2 FROM range(500) t(i))", 1)
 	// A view of the wide table alone, which the stages read as the table,
 	// and one of it LEFT JOINed to a small table on an expression of its
 	// columns, which they read as a relation its own stages write.
 	h.addView("v_wide", "SELECT * FROM wide")
 	h.addView("v_wide_extra", `SELECT s.*, x.e1, x.e2 FROM wide AS s
-		LEFT JOIN extra AS x ON CAST(s.hh AS DECIMAL(38,0)) = x.luid`)
+		LEFT JOIN extra AS x ON CAST(s.hh AS DECIMAL(38,0)) = x.ext_id`)
 	// The same views as Igloo stores them, each table read through a
 	// subquery of its columns other than those of ids (see ddl.hideIDs).
 	const visible = "COLUMNS(lambda c: NOT starts_with(lower(c), '_igloo_id_'))"
 	h.addView("v_wide_ids", "SELECT "+visible+" FROM wide")
 	h.addView("v_wide_extra_ids", `SELECT s.*, x.e1, x.e2 FROM (SELECT `+visible+` FROM wide) AS s
-		LEFT JOIN (SELECT `+visible+` FROM extra) AS x ON CAST(s.hh AS DECIMAL(38,0)) = x.luid`)
+		LEFT JOIN (SELECT `+visible+` FROM extra) AS x ON CAST(s.hh AS DECIMAL(38,0)) = x.ext_id`)
 	branches := func(view string) (union, factored string) {
 		var bs, styles, channels, strong, chs []string
 		for b := range 4 {
