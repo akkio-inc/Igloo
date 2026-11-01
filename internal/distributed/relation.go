@@ -851,8 +851,9 @@ func (pl *planner) opaque(sel node) string {
 // say, and plans the stages that write it. A common table expression's
 // rows are written once: an exchange keyed otherwise is partitioned again
 // rather than computed again. buckets, if not 0, is the Iceberg buckets of
-// its one key it is written to (see Exchange.Buckets).
-func (pl *planner) relationExchange(r *relUse, keys, casts []string, buckets int) (*Exchange, error) {
+// its one key it is written to, and uuidHash how they hash UUIDs (see
+// Exchange.Buckets).
+func (pl *planner) relationExchange(r *relUse, keys, casts []string, buckets int, uuidHash string) (*Exchange, error) {
 	if err := pl.budget(); err != nil {
 		return nil, err
 	}
@@ -864,7 +865,7 @@ func (pl *planner) relationExchange(r *relUse, keys, casts []string, buckets int
 		}
 		xkeys[i] = r.columns[j].Name
 	}
-	sig := strings.Join(xkeys, "\x00") + "\x01" + strings.Join(casts, "\x00") + "\x01" + strconv.Itoa(buckets)
+	sig := strings.Join(xkeys, "\x00") + "\x01" + strings.Join(casts, "\x00") + "\x01" + strconv.Itoa(buckets) + "\x01" + uuidHash
 	if d := r.def; d != nil {
 		if x := d.outs[sig]; x != nil {
 			r.out = x
@@ -874,7 +875,7 @@ func (pl *planner) relationExchange(r *relUse, keys, casts []string, buckets int
 			// Partitioned otherwise: partition it again. (Written whole, it
 			// is small, and computed again.)
 			x := pl.exchange("relation", xkeys, casts)
-			x.Buckets = buckets
+			x.Buckets, x.UUIDHash = buckets, uuidHash
 			f, err := pl.p.parse("SELECT * FROM " + quoteIdent("__igloo_r"))
 			if err != nil {
 				return nil, err
@@ -904,7 +905,7 @@ func (pl *planner) relationExchange(r *relUse, keys, casts []string, buckets int
 		return nil, unsupported("relations nest more than %d deep", maxRelationDepth)
 	}
 	x := pl.exchange("relation", xkeys, casts)
-	x.Buckets = buckets
+	x.Buckets, x.UUIDHash = buckets, uuidHash
 	if err := pl.produce(r.q, r.scope, x, r.columns, nil); err != nil {
 		return nil, err
 	}

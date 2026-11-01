@@ -535,6 +535,10 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
 
 ### Distributed execution
 
+- Tables bucketed by `UUID` columns stay in place too, and those written by
+  different engines no longer meet by bucket. DuckDB hashes a `UUID` otherwise
+  than Iceberg's spec, so a table's files hold it in a bucket by the hash of the
+  engine that wrote them, which their bounds tell.
 - More shapes of statement run on workers, and return the rows of one machine.
   A correlated subquery over a large table is the join it means, by partition:
   `EXISTS` a semi join, `NOT EXISTS` an anti join, a scalar subquery of `min`,

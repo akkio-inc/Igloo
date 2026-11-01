@@ -138,7 +138,7 @@ func TestBucketedBesideOthersOnWorkers(t *testing.T) {
 		}
 	}
 
-	// A type whose bucket the function does not compute as the spec does.
+	// UUIDs, which DuckDB hashes otherwise than the spec, told from the files.
 	it.exec(
 		"CREATE TABLE lake.public.bkb_id (k UUID, v INTEGER)",
 		"ALTER TABLE lake.public.bkb_id SET PARTITIONED BY (bucket(8, k))",
@@ -146,7 +146,7 @@ func TestBucketedBesideOthersOnWorkers(t *testing.T) {
 		"CREATE TABLE lake.public.bkp_id (k UUID, w INTEGER)",
 		"INSERT INTO lake.public.bkp_id SELECT md5(i::VARCHAR)::UUID, i % 5 FROM range(0, 12000, 2) r(i)",
 	)
-	if rows := same("SELECT o.v, count(*) AS n, sum(p.w) AS s FROM lake.public.bkb_id o JOIN lake.public.bkp_id p ON p.k = o.k GROUP BY 1 ORDER BY 1"); strings.Contains(rows, "buckets of public.") {
+	if rows := same("SELECT o.v, count(*) AS n, sum(p.w) AS s FROM lake.public.bkb_id o JOIN lake.public.bkp_id p ON p.k = o.k GROUP BY 1 ORDER BY 1"); !strings.Contains(rows, "buckets of public.bkb_id") || !strings.Contains(rows, "(join) by bucket[8]") {
 		t.Errorf("UUID: EXPLAIN DISTRIBUTED\n%s", rows)
 	}
 

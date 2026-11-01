@@ -21,6 +21,13 @@ import (
 // bucket alike, as Iceberg's transform does.
 func (h *harness) addBucketedTable(name, source, column string, n int) {
 	h.t.Helper()
+	h.addBucketedUUIDs(name, source, column, n, "")
+}
+
+// addBucketedUUIDs is addBucketedTable for a column of UUIDs its files hash as
+// uuidHash says.
+func (h *harness) addBucketedUUIDs(name, source, column string, n int, uuidHash string) {
+	h.t.Helper()
 	h.addTable(name, source, 1)
 	t := h.tables[strings.ToLower(name)]
 	key := quoteIdent(column)
@@ -41,6 +48,9 @@ func (h *harness) addBucketedTable(name, source, column string, n int) {
 		where := fmt.Sprintf("hash(%s) %% %d = %d", key, n, b)
 		if slices.Contains(h.extensions, "iceberg") {
 			where = fmt.Sprintf("iceberg_bucket(%d, %s) = %d", n, key, b)
+			if uuidHash == uuidSpec {
+				where = fmt.Sprintf("iceberg_bucket(%d, unhex(replace(CAST(%s AS VARCHAR), '-', ''))) = %d", n, key, b)
+			}
 		}
 		if b < 0 {
 			where = quoteIdent(column) + " IS NULL"
@@ -59,7 +69,7 @@ func (h *harness) addBucketedTable(name, source, column string, n int) {
 		fs = append(fs, File{Path: path, Size: info.Size(), Rows: rows, Buckets: []int{b}})
 		t.Bytes += info.Size()
 	}
-	t.Buckets = []Bucketing{{Column: column, N: n}}
+	t.Buckets = []Bucketing{{Column: column, N: n, UUIDHash: uuidHash}}
 	h.exec(fmt.Sprintf("CREATE OR REPLACE VIEW main.%s AS SELECT * FROM read_parquet([%s])", quoteIdent(name), strings.Join(quoted(paths(fs)), ", ")))
 	h.files[t.key()] = fs
 }
@@ -446,7 +456,103 @@ func TestIcebergBucketHash(t *testing.T) {
 			t.Errorf("%s: %d, want %d", q, got, want)
 		}
 	}
-	if bucketHashes("UUID") {
-		t.Error("UUID is written to buckets, by a hash other than the spec's")
+	// A UUID, as the spec and as DuckDB hash it, written both ways.
+	const id = "UUID 'f79c3e09-677c-4bbd-a479-3f349cb785e7'"
+	for _, tc := range []struct {
+		value string
+		want  int32
+	}{
+		{"unhex(replace(CAST(" + id + " AS VARCHAR), '-', ''))", 1488055340},
+		{id, 2132039410},
+	} {
+		var got int32
+		q := "SELECT iceberg_bucket(2147483647, " + tc.value + ")"
+		if err := h.session.QueryRowContext(context.Background(), q).Scan(&got); err != nil {
+			t.Fatalf("%s: %v", q, err)
+		}
+		if got != tc.want {
+			t.Errorf("%s: %d, want %d", q, got, tc.want)
+		}
+	}
+}
+
+// TestUUIDHashOf checks telling how a table's files hash their UUIDs from the
+// buckets of their lowest values: by the spec's value for this one, 12 of 16,
+// and DuckDB's, 2; and not at all from a file that fits both, or neither.
+func TestUUIDHashOf(t *testing.T) {
+	id := []byte{0xf7, 0x9c, 0x3e, 0x09, 0x67, 0x7c, 0x4b, 0xbd, 0xa4, 0x79, 0x3f, 0x34, 0x9c, 0xb7, 0x85, 0xe7}
+	for _, tc := range []struct {
+		name    string
+		samples []uuidSample
+		want    string
+	}{
+		{"by the spec", []uuidSample{{12, id}}, uuidSpec},
+		{"by DuckDB", []uuidSample{{2, id}}, uuidDuckDB},
+		{"neither", []uuidSample{{3, id}}, ""},
+		{"no files", nil, ""},
+		{"not a UUID", []uuidSample{{12, id[:8]}}, ""},
+		{"files of both", []uuidSample{{12, id}, {2, id}}, ""},
+	} {
+		if got := uuidHashOf(16, tc.samples); got != tc.want {
+			t.Errorf("%s: %q, want %q", tc.name, got, tc.want)
+		}
+	}
+}
+
+// TestBucketedUUIDs checks tables bucketed by UUIDs, written by either hash:
+// what they join is written to their buckets by theirs, and they meet by bucket
+// only a table of the same hash. A table whose hash cannot be told is exchanged.
+func TestBucketedUUIDs(t *testing.T) {
+	if os.Getenv("IGLOO_TEST_EXTENSION_DIR") == "" {
+		t.Skip("IGLOO_TEST_EXTENSION_DIR is not set: the iceberg extension's bucket function is not here")
+	}
+	h := newHarnessWith(t, 0.01, 2, 3, "", "iceberg")
+	h.co.maxBroadcast = 1
+	source := func(mod int) string {
+		return fmt.Sprintf("(SELECT CASE WHEN i %% 50 = 0 THEN NULL ELSE md5((i %% %d)::VARCHAR)::UUID END AS id, i AS v FROM range(20000) t(i))", mod)
+	}
+	h.addBucketedUUIDs("spec8", source(9000), "id", 8, uuidSpec)
+	h.addBucketedUUIDs("spec16", source(7000), "id", 16, uuidSpec)
+	h.addBucketedUUIDs("duck8", source(9000), "id", 8, uuidDuckDB)
+	h.addBucketedUUIDs("told8", source(9000), "id", 8, uuidDuckDB)
+	h.tables["told8"].Buckets[0].UUIDHash = ""
+	h.addTable("plain", source(5000), 2)
+	for _, tc := range []struct {
+		name, query string
+		read        []string
+		written     int
+	}{
+		{"beside a table, by the spec", `SELECT count(*) AS n, sum(a.v) AS s FROM spec8 a JOIN plain p ON p.id = a.id`, []string{"spec8"}, 1},
+		{"beside a table, by DuckDB", `SELECT count(*) AS n, sum(a.v) AS s FROM duck8 a JOIN plain p ON p.id = a.id`, []string{"duck8"}, 1},
+		{"beside a relation", `SELECT count(*) AS n, sum(c) AS s FROM spec8 a LEFT JOIN (SELECT id, count(*) AS c FROM plain GROUP BY 1) p ON p.id = a.id`, []string{"spec8"}, 1},
+		{"tables of one hash", `SELECT count(*) AS n, sum(a.v) AS s FROM spec8 a JOIN spec16 b ON b.id = a.id`, []string{"spec16", "spec8"}, 0},
+		{"tables of two", `SELECT count(*) AS n, sum(a.v) AS s FROM spec8 a JOIN duck8 b ON b.id = a.id`, nil, 0},
+		{"a table it cannot tell", `SELECT count(*) AS n, sum(a.v) AS s FROM told8 a JOIN plain p ON p.id = a.id`, nil, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h.t = t
+			if !h.check(tc.query) {
+				t.Fatal("did not run distributed")
+			}
+			p := h.planOf(tc.query)
+			var read []string
+			for _, name := range []string{"duck8", "spec16", "spec8", "told8"} {
+				if strings.Contains(p.describe(), "buckets of main."+name) {
+					read = append(read, name)
+				}
+			}
+			if strings.Join(read, ",") != strings.Join(tc.read, ",") {
+				t.Errorf("read by bucket: %v, want %v:\n%s", read, tc.read, p.describe())
+			}
+			written := 0
+			for _, s := range p.Stages {
+				if s.Out != nil && s.Out.Buckets > 0 {
+					written++
+				}
+			}
+			if written != tc.written {
+				t.Errorf("%d stages write to buckets, want %d:\n%s", written, tc.written, p.describe())
+			}
+		})
 	}
 }

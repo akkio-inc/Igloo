@@ -43,8 +43,10 @@ type keyed struct {
 	bucketed bool
 	bucket   int
 	// into, for an input read beside tables read by bucket, is the buckets
-	// its exchange writes its rows to, the smallest count of theirs.
-	into int
+	// its exchange writes its rows to, the smallest count of theirs, and
+	// intoUUID how their files hash UUIDs.
+	into     int
+	intoUUID string
 	// through, for a table in a subquery read by bucket, says how the
 	// subquery passes its columns on: item is the subquery's, and keys are
 	// its columns (see bucket.go).

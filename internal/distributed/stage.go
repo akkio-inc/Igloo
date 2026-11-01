@@ -114,6 +114,9 @@ type Exchange struct {
 	// which a stage reads them (see bucket.go): by the key's Iceberg bucket
 	// rather than its hash.
 	Buckets int
+	// UUIDHash, for a key of UUIDs written to buckets, is how the table's files
+	// hash them (see bucket.go).
+	UUIDHash string
 	// purpose says what the exchange is for, in logs and tests.
 	purpose string
 }
@@ -197,8 +200,13 @@ func exchangeSQL(s *Stage, parts int) string {
 		}
 		b = fmt.Sprintf("CAST(hash(%s) %% %d AS INTEGER)", strings.Join(keys, ", "), parts)
 		if s.Out.Buckets > 0 {
+			key := keys[0]
+			if s.Out.UUIDHash == uuidSpec {
+				// Its 16 bytes: the function hashes binary values as the spec does.
+				key = "unhex(replace(CAST(" + key + " AS VARCHAR), '-', ''))"
+			}
 			// NULL keys are where a bucketed table's are (see bucketGroups).
-			b = fmt.Sprintf("CAST(COALESCE(iceberg_bucket(%d, %s), 0) %% %d AS INTEGER)", s.Out.Buckets, keys[0], parts)
+			b = fmt.Sprintf("CAST(COALESCE(iceberg_bucket(%d, %s), 0) %% %d AS INTEGER)", s.Out.Buckets, key, parts)
 		}
 	}
 	return "SELECT *, " + b + " AS __b FROM (" + inner + ") AS __igloo_x"

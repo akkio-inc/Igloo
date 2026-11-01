@@ -2282,18 +2282,18 @@ func (pl *planner) emit(j *job, b *jobBuild, out *Exchange) (*Stage, error) {
 			// A stage per partitioned table, writing its rows to an exchange
 			// keyed by its side of the join key.
 			x = pl.exchange("join", k.keys, k.casts)
-			x.Buckets = k.into
+			x.Buckets, x.UUIDHash = k.into, k.intoUUID
 			pl.stage(&Stage{fragment: k.stage, Inputs: []Input{{View: k.view, Table: k.use.table, Split: true}}, Out: x})
 		} else {
 			var err error
-			if x, err = pl.relationExchange(k.rel, k.keys, k.casts, k.into); err != nil {
+			if x, err = pl.relationExchange(k.rel, k.keys, k.casts, k.into, k.intoUUID); err != nil {
 				return nil, err
 			}
 		}
 		last.Inputs = append(last.Inputs, Input{View: k.view, Exchange: x, Partitioned: true})
 	}
 	for _, w := range j.whole {
-		x, err := pl.relationExchange(w.rel, nil, nil, 0)
+		x, err := pl.relationExchange(w.rel, nil, nil, 0, "")
 		if err != nil {
 			return nil, err
 		}
@@ -2624,7 +2624,7 @@ func passesKey(s *Stage, x *Exchange) bool {
 		keyed = in
 		ix := in.Exchange
 		if len(ix.Keys) != len(x.Keys) || len(ix.Casts) != len(ix.Keys) || !strings.EqualFold(ix.Keys[i], parts[len(parts)-1]) ||
-			ix.Casts[i] != "" || x.Casts[i] != "" || ix.Buckets != x.Buckets {
+			ix.Casts[i] != "" || x.Casts[i] != "" || ix.Buckets != x.Buckets || ix.UUIDHash != x.UUIDHash {
 			return false
 		}
 	}

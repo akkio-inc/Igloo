@@ -491,9 +491,11 @@ The other side of a join need not be bucketed:
 
 Both apply to a key of one column, the column itself on the table's side, of
 an integer type, `VARCHAR` without a collation, `DATE`, `TIMESTAMP`,
-`TIMESTAMPTZ` or `DECIMAL`. A key computed from the column (`upper(person)`,
-`id + 1`), a `UUID` (whose bucket DuckDB's function does not compute as
-Iceberg's spec does, so that a table another engine wrote would not meet it), a
+`TIMESTAMPTZ`, `UUID` or `DECIMAL`. DuckDB hashes `UUID`s otherwise than
+Iceberg's spec, so a table's bucket of a `UUID` depends on the engine that wrote
+it: its files' bounds tell which, rows are written to its buckets by that hash,
+and tables written by different engines, or whose files do not tell, are
+exchanged. A key computed from the column (`upper(person)`, `id + 1`), a
 join on two columns, bucket counts that do not divide or columns of types
 that hash apart are exchanged as before, by the hash of the key.
 

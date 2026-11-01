@@ -7,7 +7,9 @@ import (
 	"slices"
 	"strings"
 
+	"github.com/apache/arrow-go/v18/parquet/file"
 	"github.com/apache/iceberg-go"
+	iceio "github.com/apache/iceberg-go/io"
 	"github.com/apache/iceberg-go/table"
 )
 
@@ -36,6 +38,15 @@ import (
 // computed from the column, or counts that do not divide, are exchanged as
 // before.
 //
+// UUIDs are hashed two ways. Iceberg's spec hashes their 16 bytes, and DuckDB
+// the bytes it holds, whose first bit is flipped, so a table's files hold a
+// UUID in one bucket or another as the engine that wrote them did. A table's
+// data files say which (uuidHashOf): the lowest value of a file of a bucket,
+// in its manifest entry or, as DuckDB writes none there, its Parquet footer,
+// falls in that bucket by one hash or the other. Tables written by different
+// engines do not meet by bucket, and rows are written to a table's buckets by
+// its hash (Exchange.UUIDHash).
+//
 // A subquery that keeps its rows' keys as they are makes rows that a bucket
 // of its table holds whole, by filtering and projecting one such table, by
 // joining such tables on the key, or by grouping one with the key among the
@@ -51,6 +62,144 @@ type Bucketing struct {
 	N      int
 	// sourceID is the column's field ID.
 	sourceID int
+	// UUIDHash, for a column of UUIDs, is how the table's files hash them: uuidSpec
+	// or uuidDuckDB, or "" when that cannot be told.
+	UUIDHash string
+}
+
+// The hashes of UUIDs (see the top of this file).
+const (
+	uuidSpec   = "spec"
+	uuidDuckDB = "duckdb"
+)
+
+// maxUUIDSamples is how many data files uuidHash looks at: the two hashes put a
+// value in the same one of N buckets with a chance of 1/N, so a few tell them
+// apart, and more only cost time reading manifests.
+const maxUUIDSamples = 64
+
+// maxUUIDFooters is how many data files' footers uuidHash reads, a request or
+// two each, where their manifest entries hold no bounds.
+const maxUUIDFooters = 8
+
+// uuidSample is a data file's bucket and lowest value of a column of UUIDs.
+type uuidSample struct {
+	bucket int
+	lowest []byte
+}
+
+// uuidHashOf tells how the files of samples, in n buckets, hash their UUIDs; ""
+// if they do not tell one way from the other, or fit neither.
+func uuidHashOf(n int, samples []uuidSample) string {
+	bucket := iceberg.BucketTransform{NumBuckets: n}.Transformer(iceberg.PrimitiveTypes.UUID)
+	spec, duck := len(samples) > 0, len(samples) > 0
+	for _, s := range samples {
+		if len(s.lowest) != 16 {
+			return ""
+		}
+		spec = spec && int(bucket(s.lowest).Val) == s.bucket
+		flipped := slices.Clone(s.lowest)
+		flipped[0] ^= 0x80
+		duck = duck && int(bucket(flipped).Val) == s.bucket
+	}
+	switch {
+	case spec && !duck:
+		return uuidSpec
+	case duck && !spec:
+		return uuidDuckDB
+	}
+	return ""
+}
+
+// uuidHash tells how snap's files hash b, a table's bucketing of a column of
+// UUIDs, from their manifests' bounds; "" if it cannot.
+func uuidHash(ctx context.Context, tbl *table.Table, snap *table.Snapshot, b Bucketing) string {
+	fs, err := tbl.FS(ctx)
+	if err != nil {
+		return ""
+	}
+	manifests, err := snap.Manifests(fs)
+	if err != nil {
+		return ""
+	}
+	var samples []uuidSample
+	footers := 0
+	for _, m := range manifests {
+		if m.ManifestContent() != iceberg.ManifestContentData {
+			continue
+		}
+		entries, err := m.FetchEntries(fs, true)
+		if err != nil {
+			return ""
+		}
+		for _, e := range entries {
+			df := e.DataFile()
+			buckets, ok := fileBuckets(tbl.Metadata(), df, []Bucketing{b})
+			if !ok {
+				return ""
+			}
+			if buckets[0] < 0 {
+				continue
+			}
+			lowest, ok := df.LowerBoundValues()[b.sourceID]
+			if !ok {
+				if footers++; footers > maxUUIDFooters {
+					return uuidHashOf(b.N, samples)
+				}
+				if lowest, ok = footerLowest(fs, df.FilePath(), b.sourceID); !ok {
+					continue
+				}
+			}
+			samples = append(samples, uuidSample{bucket: buckets[0], lowest: lowest})
+			if len(samples) == maxUUIDSamples {
+				return uuidHashOf(b.N, samples)
+			}
+		}
+	}
+	return uuidHashOf(b.N, samples)
+}
+
+// footerLowest returns the lowest value of the column of Iceberg field ID id
+// that the Parquet footer of the file at path holds.
+func footerLowest(fs iceio.IO, path string, id int) ([]byte, bool) {
+	f, err := fs.Open(path)
+	if err != nil {
+		return nil, false
+	}
+	defer f.Close() //nolint:errcheck
+	r, err := file.NewParquetReader(f)
+	if err != nil {
+		return nil, false
+	}
+	defer r.Close() //nolint:errcheck
+	meta := r.MetaData()
+	for c := range meta.Schema.NumColumns() {
+		if int(meta.Schema.Column(c).SchemaNode().FieldID()) != id {
+			continue
+		}
+		for g := range meta.NumRowGroups() {
+			chunk, err := meta.RowGroup(g).ColumnChunk(c)
+			if err != nil {
+				return nil, false
+			}
+			stats, err := chunk.Statistics()
+			if err != nil || stats == nil || !stats.HasMinMax() {
+				continue
+			}
+			return stats.EncodeMin(), true
+		}
+	}
+	return nil, false
+}
+
+// uuidHashes sets how snap's files hash the columns of UUIDs of out.
+func uuidHashes(ctx context.Context, tbl *table.Table, snap *table.Snapshot, out []Bucketing) []Bucketing {
+	for i, b := range out {
+		if f, ok := tbl.Schema().FindFieldByID(b.sourceID); ok && f.Type.Equals(iceberg.PrimitiveTypes.UUID) && snap != nil {
+			out[i].UUIDHash = uuidHash(ctx, tbl, snap, b)
+		}
+	}
+	return out
 }
 
 // String writes the transform as Iceberg does: bucket[16](customer_id).
@@ -75,7 +224,7 @@ func icebergBuckets(ctx context.Context, tbl *table.Table, snap *table.Snapshot)
 		out = append(out, Bucketing{Column: name, N: b.NumBuckets, sourceID: f.SourceIDs[0]})
 	}
 	if len(out) == 0 || snap == nil {
-		return out
+		return uuidHashes(ctx, tbl, snap, out)
 	}
 	// The specs the snapshot's files were written under: all of them must
 	// bucket so.
@@ -94,7 +243,7 @@ func icebergBuckets(ctx context.Context, tbl *table.Table, snap *table.Snapshot)
 			specs[int(m.PartitionSpecID())] = true
 		}
 	}
-	return slices.DeleteFunc(out, func(b Bucketing) bool {
+	return uuidHashes(ctx, tbl, snap, slices.DeleteFunc(out, func(b Bucketing) bool {
 		for id := range specs {
 			s := meta.PartitionSpecByID(id)
 			if s == nil || bucketField(s, b) < 0 {
@@ -102,7 +251,7 @@ func icebergBuckets(ctx context.Context, tbl *table.Table, snap *table.Snapshot)
 			}
 		}
 		return false
-	})
+	}))
 }
 
 // topLevelColumn returns the name of schema's top-level column of field ID
@@ -189,6 +338,7 @@ func (pl *planner) bucketKeyed(c *candidate) {
 	var names, others, why []string
 	var types []string
 	smallest := 0
+	uuid := ""
 	ok := true
 	for _, k := range c.keyed {
 		if len(k.keys) != 1 {
@@ -222,6 +372,13 @@ func (pl *planner) bucketKeyed(c *candidate) {
 		types = append(types, columnType(t, b.Column))
 		if smallest == 0 || b.N < smallest {
 			smallest = b.N
+		}
+		if columnType(t, b.Column) == "UUID" {
+			if b.UUIDHash == "" || uuid != "" && uuid != b.UUIDHash {
+				ok = false
+				why = append(why, fmt.Sprintf("%s hashes its UUIDs in a way that cannot be told or differs from another's", t))
+			}
+			uuid = b.UUIDHash
 		}
 	}
 	for _, k := range c.keyed {
@@ -260,7 +417,7 @@ func (pl *planner) bucketKeyed(c *candidate) {
 		if k.use != nil && bucketOf(k.use.table, k.tableColumn(k.keys[0])) >= 0 {
 			k.bucketed, k.bucket = true, bucketOf(k.use.table, k.tableColumn(k.keys[0]))
 		} else {
-			k.into = smallest
+			k.into, k.intoUUID = smallest, uuid
 		}
 	}
 	note := fmt.Sprintf("no exchange: %s, read by bucket, %d groups of buckets a stage", strings.Join(names, " and "), smallest)
@@ -270,13 +427,13 @@ func (pl *planner) bucketKeyed(c *candidate) {
 	pl.bucketNotes = append(pl.bucketNotes, note)
 }
 
-// bucketHashes reports whether iceberg_bucket hashes values of a key's type
-// as Iceberg's spec has every engine that writes a table hash a column of
-// the type: integers of any width, cast to BIGINT, and others its spec's
-// values show it does (see TestIcebergBucketHash). A UUID it hashes
-// otherwise: a table another engine wrote has its keys in other buckets.
+// bucketHashes reports whether a key's type can be written to a table's
+// buckets: iceberg_bucket hashes it as Iceberg's spec has every engine that
+// writes a table hash a column of the type (see TestIcebergBucketHash), or for
+// a UUID as the table's files do, one way or the other (see Exchange.UUIDHash).
+// Integers of any width are cast to BIGINT.
 func bucketHashes(t string) bool {
-	return slices.Contains(intTypes, t) || t == "VARCHAR" || t == "DATE" || t == "TIMESTAMP" || t == "TIMESTAMP WITH TIME ZONE" || strings.HasPrefix(t, "DECIMAL(")
+	return slices.Contains(intTypes, t) || t == "VARCHAR" || t == "DATE" || t == "TIMESTAMP" || t == "TIMESTAMP WITH TIME ZONE" || t == "UUID" || strings.HasPrefix(t, "DECIMAL(")
 }
 
 // bucketSplit reads a candidate's divided table by bucket instead of by
@@ -372,6 +529,9 @@ func (pl *planner) bucketJoin(c *candidate) bool {
 				}
 				vb, vt := v.table.Buckets[j], columnType(v.table, ic.name)
 				if vt != typ && !(slices.Contains(intTypes, vt) && slices.Contains(intTypes, typ)) {
+					ok = false
+				}
+				if typ == "UUID" && (b.UUIDHash == "" || vb.UUIDHash != b.UUIDHash) {
 					ok = false
 				}
 				ks = append(ks, &keyed{use: v, item: v.item, keys: []string{ic.name}, casts: []string{cast}, bucketed: true, bucket: j})
