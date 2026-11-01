@@ -54,6 +54,13 @@ were removed; the code is otherwise unchanged except for these patches:
   failure left, and reported that instead of the failure.
   `Stmt.QueryArrowStreamContext` in `igloo_arrow.go` reads such a result as
   Arrow record batches.
+- `igloo_pending.go` (new), called from `Stmt.executeBound` (`statement.go`)
+  and `Stmt.executeBoundStreaming` (`igloo_stream.go`): `runPending`, which
+  carries out a statement's tasks with `duckdb_pending_execute_task` and
+  sleeps while DuckDB has none for its thread, before
+  `duckdb_execute_pending`, which then only fetches the result. On its own
+  that call asks for a task again and again without a pause, a core for
+  every statement waiting on DuckDB's workers.
 - `igloo_chunk.go` (new): `DataChunk.ChunkColumn`, for a table function's
   `FillChunk` to write a column at a time: the vector's memory, for values
   of a fixed size copied in bulk, NULLs set in the validity mask, strings of

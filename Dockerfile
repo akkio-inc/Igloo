@@ -36,6 +36,10 @@ FROM gcr.io/distroless/cc-debian12:nonroot
 
 COPY --from=build /out/igloo /usr/local/bin/igloo
 COPY --from=build /out/extensions /usr/local/share/igloo/extensions
+# DuckDB's Azure extension has its own libcurl, which looks for CA certificates
+# here and nowhere else: without this, it reaches no real Azure account ("Problem
+# with the SSL CA cert"). Azurite over HTTP does not show it.
+COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/pki/tls/certs/ca-bundle.crt
 COPY --from=build --chown=nonroot:nonroot /out/tmp /var/lib/igloo/tmp
 # The read cache of object storage files. Mount a volume here to keep it
 # across container restarts; a new named volume takes this ownership.

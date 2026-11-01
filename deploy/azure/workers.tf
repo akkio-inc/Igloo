@@ -80,8 +80,7 @@ locals {
     }
   }
 
-  # Merged into helm_values in helm.tf; nothing without workers_enabled, so
-  # the chart's values stay as before.
+  # Merged into helm_values in helm.tf.
   workers_helm_values = {
     for key, value in {
       workers = merge(local.worker_chart_values["workers"], {
@@ -109,6 +108,9 @@ locals {
       })
     } : key => value if var.workers_enabled
   }
+
+  # The chart runs workers by default: without capacity for them here, it must not.
+  no_workers_helm_values = { for key, value in { workers = { enabled = false } } : key => value if !var.workers_enabled }
 }
 
 resource "azurerm_kubernetes_cluster_node_pool" "worker" {

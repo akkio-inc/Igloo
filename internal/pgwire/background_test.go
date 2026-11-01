@@ -31,7 +31,7 @@ func backgroundReplica(t *testing.T, rows string, cpu time.Duration) (*viewRepli
 		o.Metrics = metrics
 		o.QueryMemory = 1 << 40
 	})
-	r.srv.heavy.cpu = cpu
+	r.srv.heavy.cpu, r.srv.heavy.factor = cpu, 0
 	admin := r.admin(t, pgx.QueryExecModeSimpleProtocol)
 	mustExec(t, admin, "CREATE SCHEMA IF NOT EXISTS lake.public")
 	mustExec(t, admin, "CREATE TABLE lake.public.visits AS SELECT range AS id, CAST(hash(range) % 1000000 AS BIGINT) AS grp, range % 97 AS v FROM range("+rows+")")
@@ -288,5 +288,128 @@ func TestShortQueryBesideHeavyStatement(t *testing.T) {
 	// core.
 	if limit := 2 * idle[6]; beside[3] > limit {
 		t.Errorf("a short query took %s beside a heavy statement and %s to %s alone", beside[3], idle[0], idle[6])
+	}
+}
+
+// TestHeavyHistory checks what makes a shape heavy. CPU as DuckDB measures it
+// counts threads that wait: a dashboard's statement beside a report once measured
+// ten times what it uses, which does not make it heavy, nor keep it so; and what is
+// heavy goes by what else the replica runs.
+func TestHeavyHistory(t *testing.T) {
+	const line = 60 * time.Second
+	h := newHeavyHistory()
+	h.cpu = line
+
+	// One far over the line in the first DuckDB is enough.
+	h.observe("report", 700*time.Second, false)
+	if !h.heavy("report") {
+		t.Error("a report's first run did not make it heavy")
+	}
+	// It stays so, measured in the second, but for a run in the first now and then.
+	first := 0
+	for range heavyProbeEvery * 2 {
+		background, mayMove := h.place("report")
+		if !background {
+			first++
+			if !mayMove {
+				t.Error("a report's run in the first DuckDB may not move")
+			}
+		}
+		h.observe("report", 900*time.Second, true)
+	}
+	if first < 1 || first > 3 {
+		t.Errorf("%d of %d runs in the first DuckDB", first, heavyProbeEvery*2)
+	}
+	if !h.heavy("report") {
+		t.Error("a report stopped being heavy")
+	}
+
+	// One measure over the line in the second, as the first DuckDB's guard moved
+	// it, says nothing yet: it runs in the first, and may move.
+	h.observe("moved", 430*time.Second, true)
+	if background, mayMove := h.place("moved"); h.heavy("moved") || background || !mayMove {
+		t.Errorf("one run moved to the second: heavy %v, background %v, may move %v", h.heavy("moved"), background, mayMove)
+	}
+	// One that started again in the background starts there next time, once.
+	h.moved("unseen")
+	if background, _ := h.place("unseen"); !background {
+		t.Error("the next run of one moved does not start in the second DuckDB")
+	}
+	if background, mayMove := h.place("unseen"); background || !mayMove {
+		t.Errorf("the run after that: background %v, may move %v", background, mayMove)
+	}
+	// In the first it takes what it takes: light, and it stays where it is.
+	h.observe("moved", 40*time.Second, false)
+	h.observe("moved", 45*time.Second, false)
+	if background, mayMove := h.place("moved"); h.heavy("moved") || background || mayMove {
+		t.Errorf("light again: heavy %v, background %v, may move %v", h.heavy("moved"), background, mayMove)
+	}
+
+	// A light statement that one run measures far over the line stays light, and
+	// is not moved for it.
+	for range 3 {
+		h.observe("tile", 40*time.Second, false)
+	}
+	h.observe("tile", 430*time.Second, false)
+	if background, mayMove := h.place("tile"); h.heavy("tile") || background || mayMove {
+		t.Errorf("a tile measured high once: heavy %v, background %v, may move %v", h.heavy("tile"), background, mayMove)
+	}
+	// A shape that all its latest runs measure over the line is heavy, and one that
+	// comes back under it is not: its run in the first DuckDB says so.
+	for range heavyRuns {
+		h.observe("tile", 400*time.Second, true)
+	}
+	if !h.heavy("tile") {
+		t.Error("a shape over the line in all its latest runs is not heavy")
+	}
+	h.observe("tile", 40*time.Second, false)
+	if h.heavy("tile") {
+		t.Error("a shape that took 40 s in the first DuckDB stayed heavy")
+	}
+	// What is heavy goes by what else runs: over the least line, but not many
+	// times what the others use.
+	h = newHeavyHistory()
+	h.cpu = line
+	for range heavyRuns {
+		for _, tile := range []string{"a", "b", "c"} {
+			h.observe(tile, 80*time.Second, false)
+		}
+	}
+	for _, tile := range []string{"a", "b", "c"} {
+		if h.heavy(tile) {
+			t.Errorf("%s is heavy beside what uses as much", tile)
+		}
+	}
+	for range heavyRuns {
+		h.observe("big", 300*time.Second, false)
+	}
+	if h.heavy("big") {
+		t.Error("300 s is heavy beside statements of 80 s")
+	}
+	for range heavyRuns {
+		h.observe("report", 1000*time.Second, false)
+	}
+	if !h.heavy("report") {
+		t.Error("1000 s is not heavy beside statements of 80 s")
+	}
+	// What ran long ago says nothing of it.
+	at := time.Now()
+	h.now = func() time.Time { return at }
+	at = at.Add(heavyRecent + time.Minute)
+	for range heavyRuns {
+		h.observe("big", 300*time.Second, false)
+	}
+	if !h.heavy("big") {
+		t.Error("300 s is not heavy once the statements of 80 s have stopped")
+	}
+	// Small statements say nothing of it.
+	h = newHeavyHistory()
+	h.cpu = line
+	for i := range 20 {
+		h.observe(string(rune('a'+i)), time.Second, false)
+	}
+	h.observe("report", 1000*time.Second, false)
+	if !h.heavy("report") {
+		t.Error("a report is not heavy beside small statements")
 	}
 }

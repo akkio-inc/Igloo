@@ -81,7 +81,7 @@ run "defaults" {
   }
 
   assert {
-    condition     = google_storage_bucket.warehouse.lifecycle_rule[0].action[0].type == "AbortIncompleteMultipartUpload" && google_storage_bucket.warehouse.lifecycle_rule[0].condition[0].age == 1
+    condition     = one(google_storage_bucket.warehouse.lifecycle_rule[0].action).type == "AbortIncompleteMultipartUpload" && one(google_storage_bucket.warehouse.lifecycle_rule[0].condition).age == 1
     error_message = "Unfinished uploads hold rows, so a rule aborts them after a day."
   }
 
@@ -422,15 +422,28 @@ run "spot" {
   }
 }
 
-run "no_workers_by_default" {
+run "workers_can_be_left_out" {
   command = plan
+
+  variables {
+    workers_enabled = false
+  }
 
   assert {
     condition = (
       length(helm_release.compute_classes) == 0 &&
-      !contains(keys(yamldecode(helm_release.igloo[0].values[0])), "workers")
+      yamldecode(helm_release.igloo[0].values[0]).workers == { enabled = false }
     )
-    error_message = "Without workers_enabled there must be no compute classes and no workers values, so existing deployments are unchanged."
+    error_message = "With workers_enabled false there must be no compute classes, and the chart must run no workers."
+  }
+}
+
+run "workers_by_default" {
+  command = plan
+
+  assert {
+    condition     = length(helm_release.compute_classes) == 1 && yamldecode(helm_release.igloo[0].values[0]).workers.enabled == true
+    error_message = "Workers are on by default, with their compute class, which starts no machine until a statement starts a worker."
   }
 }
 
@@ -464,7 +477,7 @@ run "workers_on_spot_with_on_demand_fallback" {
   assert {
     condition = (
       yamldecode(helm_release.igloo[0].values[0]).workers.enabled == true &&
-      yamldecode(helm_release.igloo[0].values[0]).workers.maxReplicas == 4 &&
+      yamldecode(helm_release.igloo[0].values[0]).workers.maxReplicas == 16 &&
       yamldecode(helm_release.igloo[0].values[0]).workers.pricePerHour == 0.25 &&
       yamldecode(helm_release.igloo[0].values[0]).workers.instanceType == "n4-standard-16" &&
       yamldecode(helm_release.igloo[0].values[0]).workers.spot == true &&
@@ -519,8 +532,15 @@ run "workers_have_an_identity_of_their_own" {
   }
 
   assert {
-    condition     = google_storage_bucket_iam_member.worker_write[0].role == "roles/storage.objectCreator" && strcontains(google_storage_bucket_iam_member.worker_write[0].condition[0].expression, "igloo-write-[0-9a-f]+/") && strcontains(google_storage_bucket_iam_member.worker_write[0].condition[0].expression, "_igloo_shuffle/")
+    condition     = google_storage_bucket_iam_member.worker_write[0].role == "roles/storage.objectCreator" && strcontains(google_storage_bucket_iam_member.worker_write[0].condition[0].expression, "extract('/data/igloo-write-{dir}/') != ''") && strcontains(google_storage_bucket_iam_member.worker_write[0].condition[0].expression, "/objects/warehouse/_igloo_shuffle/')")
     error_message = "Workers may only create objects, in exchanges and statements' directories."
+  }
+
+  # A plan does not evaluate the condition; Google refuses one with any other
+  # function when it is applied ("undeclared reference to 'matches'").
+  assert {
+    condition     = length(regexall("\\.[A-Za-z]+\\(", google_storage_bucket_iam_member.worker_write[0].condition[0].expression)) == length(regexall("resource\\.name\\.(startsWith|endsWith|extract)\\(", google_storage_bucket_iam_member.worker_write[0].condition[0].expression))
+    error_message = "IAM Conditions have only startsWith, endsWith and extract on a resource's name."
   }
 
   assert {

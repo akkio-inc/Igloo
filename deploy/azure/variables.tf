@@ -613,7 +613,7 @@ variable "tls_private_key_pem" {
 variable "workers_enabled" {
   description = "Add autoscaling node pools for distributed-execution workers, from zero nodes, and turn workers on in the chart. Also sets the cluster autoscaler's expander to priority. Off by default, so existing deployments are unchanged."
   type        = bool
-  default     = false
+  default     = true
 }
 
 variable "workers_spot" {
@@ -636,7 +636,7 @@ variable "workers_vm_size" {
 variable "workers_max" {
   description = "The most worker pods, and so worker nodes, Igloo starts (the chart's workers.maxReplicas, and each worker pool's maximum)."
   type        = number
-  default     = 4
+  default     = 16
 
   validation {
     condition     = var.workers_max >= 1 && var.workers_max <= 1000 && floor(var.workers_max) == var.workers_max

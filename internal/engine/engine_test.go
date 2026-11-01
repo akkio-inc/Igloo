@@ -234,7 +234,7 @@ func TestLockdownNeverAllowsRoot(t *testing.T) {
 
 func TestSettingStatements(t *testing.T) {
 	got := joined(settingStatements(config.DuckDB{MemoryLimit: "6GB", MaxTempSize: "45GiB", Threads: 4}))
-	for _, want := range []string{"SET memory_limit = '6GB'", "SET max_temp_directory_size = '45GiB'", "SET threads = 4"} {
+	for _, want := range []string{"SET parquet_metadata_cache = true", "SET memory_limit = '6GB'", "SET max_temp_directory_size = '45GiB'", "SET threads = 4"} {
 		if !strings.Contains(got, want) {
 			t.Errorf("missing %q in\n%s", want, got)
 		}
@@ -259,9 +259,14 @@ func TestThreadsFor(t *testing.T) {
 		{"plenty of memory", config.Config{Storage: s3}, int64(4*cores) * minThreadMemory * 2, 4 * cores},
 		{"memory for twice the cores", config.Config{Storage: s3}, int64(2*cores) * minThreadMemory, 2 * cores},
 		{"memory for a thread and a half a core", config.Config{Storage: s3}, int64(3*cores) * minThreadMemory / 2, 3 * cores / 2},
-		{"little memory", config.Config{Storage: s3}, minThreadMemory, cores},
+		{"little memory", config.Config{Storage: s3}, minThreadMemory, min(cores, minThreadMemory/leastThreadMemory)},
 		{"set", config.Config{Storage: s3, DuckDB: config.DuckDB{Threads: 3}}, minThreadMemory, 3},
-		{"no warehouse", config.Config{}, minThreadMemory, 0},
+		{"set past what memory allows", config.Config{Storage: s3, DuckDB: config.DuckDB{Threads: 64}}, 512 << 20, 64},
+		{"a small pod", config.Config{Storage: s3}, 512 << 20, min(cores, 4)},
+		{"too little for a thread", config.Config{Storage: s3}, 64 << 20, 1},
+		{"no warehouse, plenty of memory", config.Config{}, int64(cores) * leastThreadMemory, 0},
+		{"no warehouse, a small pod", config.Config{}, leastThreadMemory, map[bool]int{true: 0, false: 1}[cores <= 1]},
+		{"no warehouse, memory unknown", config.Config{}, 0, 0},
 	} {
 		if got := threadsFor(c.cfg, 4, c.memory); got != c.want {
 			t.Errorf("%s: %d threads, want %d", c.name, got, c.want)

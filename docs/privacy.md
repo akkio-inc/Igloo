@@ -776,8 +776,9 @@ multipart upload and complete it, and on Azure can commit a blob's staged blocks
 A statement's end aborts those under its directories. A request aborts those
 that began by five minutes after the latest deletion under its tables' locations,
 under no table's location and among exchanges, and does not complete while it
-finds one or cannot look: `s3:ListBucketMultipartUploads` on AWS, and a GCS HMAC
-key that may list them. The buckets of the OpenTofu modules for AWS and Google
+finds one or cannot look: `s3:ListBucketMultipartUploads` on AWS, a GCS HMAC key
+that may list them, and on Azure any answer to its listing but a filesystem's refusal
+of it. The buckets of the OpenTofu modules for AWS and Google
 Cloud, and the one of the single-VM deployment, also abort them after a day; give your
 bucket such a rule. A DFS write on an Azure filesystem leaves a file of no length,
 which is a file like the others to all of this.

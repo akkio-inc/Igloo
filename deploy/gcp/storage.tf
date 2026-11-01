@@ -114,10 +114,16 @@ resource "google_storage_hmac_key" "igloo" {
 # Workers (with workers_enabled): an account of their own, which reads the
 # warehouse and may only create objects in the two places workers write: the
 # rows they exchange, and statements' directories of table files, named
-# igloo-write-<hex> under a table's data/. It can overwrite and delete nothing:
+# igloo-write-* under a table's data/. It can overwrite and delete nothing:
 # Google Cloud has no credentials limited to one statement's directory that
 # DuckDB could use, so Igloo checks every file a worker says it wrote before it
 # commits it (docs/distributed-execution.md#security).
+#
+# IAM Conditions have startsWith, endsWith and extract on a resource's name, and
+# no regular expressions, so this cannot say that what follows igloo-write- is
+# hexadecimal, as Igloo's directories are. That gives a worker nothing new: it
+# could always choose hex digits of its own. It is Igloo that keeps to one
+# statement's directory, which is why the files it commits are its own copies.
 # ---------------------------------------------------------------------------
 
 resource "google_service_account" "worker" {
@@ -149,7 +155,7 @@ resource "google_storage_bucket_iam_member" "worker_write" {
   condition {
     title       = "exchanges-and-statement-directories"
     description = "Only the rows workers exchange and statements' directories of table files."
-    expression  = "resource.name.matches('^projects/_/buckets/${local.bucket_name}/objects/warehouse/(_igloo_shuffle/|.+/data/igloo-write-[0-9a-f]+/)')"
+    expression  = "resource.name.startsWith('projects/_/buckets/${local.bucket_name}/objects/warehouse/_igloo_shuffle/') || (resource.name.startsWith('projects/_/buckets/${local.bucket_name}/objects/warehouse/') && resource.name.extract('/data/igloo-write-{dir}/') != '')"
   }
 }
 

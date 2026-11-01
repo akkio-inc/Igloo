@@ -722,12 +722,36 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   later for what its tasks finished meanwhile, the table's next write removes
   what a stopped process left, and erasure requests treat what is
   left as the table's orphan files. A worker refused the write leaves it to
-  the replica. Tables partitioned by bucket stay with the replica. A task
+  the replica. Tables partitioned by bucket or by a decimal stay with the replica. A task
   bounds its row groups by its share of the worker's memory: rows of 10.8 KB,
   which row groups of 122,880 rows took a worker of 1 GB out of memory with, now
   take about a third of it. Auto mode takes rows too wide for a task to the replica, and a
   fill that runs out of memory on workers runs there, or with the replica writing,
-  rather than fail.
+  rather than fail. What is committed is the replica's own copy of each file, in
+  a directory no worker's grant names, read and checked there, with a footer that
+  can say no more than it holds; what a task's statement left unfinished in the
+  store's multipart uploads is aborted when it ends, and an erasure request does
+  not complete while any could hold its rows. Workers also write `INSERT ... BY
+  NAME` and of some of a table's columns, partitioned views' refreshes, and tables
+  with NOT NULL or nested columns.
+- DuckDB gets no more threads than leave each 125 MiB of its memory limit, its own
+  minimum, however many cores the machine has. A pod of 1 GiB on 16 cores ran 16
+  threads under a limit of 512 MiB, which held 190 to 270 MiB past the limit as it
+  spilled, took seven times as long, and had the memory watch cancel about one run in
+  three.
+- Workers exchange rows on their own disks by default on Kubernetes too
+  (`workers.exchanges: auto`), where every worker of a statement has room on its spill
+  volume: 1.8 to 2.8 times faster than object storage on EC2 with NVMe. Object storage
+  takes them otherwise, or with a spill volume in memory.
+- Workers are on by default in the Helm chart and the OpenTofu modules, as they scale
+  from zero and stop when idle, so a deployment with no heavy queries pays nothing
+  for them. Single-VM stays as it was, as it would need more machines.
+- Igloo starts up to 16 workers by default, where it was 4 (`IGLOO_WORKER_MAX`,
+  `workers.maxReplicas`, `workers_max`): a report at ten times the data took 200 s
+  on 4 and 112 s on 8 at about the same cost. Auto mode weighs how many a statement
+  should run on, and idle workers stop on their own.
+- A statement whose last runs keep it on the replica no longer plans for workers
+  again, so that planning it does not take longer than it does.
 - DuckDB's memory limit, where `IGLOO_DUCKDB_MEMORY_LIMIT` does not set it,
   is what Igloo's memory leaves after the eighth it keeps free before it
   lowers DuckDB's limit, its reserve and an eighth of the limit itself,
@@ -1875,8 +1899,21 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   larger dashboard at ten times the data, which ran 80 minutes without
   finishing on 8 cores, takes 2,148 seconds; a smaller one takes 255 seconds
   rather than 301.
+- Statements learn what they hold from what they allocated, the median of
+  their shape's latest runs, not from what the replica held less what the
+  statements beside them reserved, which said next to nothing beside a
+  statement that had reserved much and held little yet: four in ten of a
+  large dashboard's statements learned under a twentieth of what they
+  allocated, started beside the heavy ones next time and spilled. Runs
+  cancelled after ten seconds or more count as needing all the memory.
+- DuckDB keeps table files' parsed footers in memory: a dashboard's 96 queries
+  at ten times the data took 214 s rather than 233, the slowest tenth 107 s
+  rather than 132.
+- A statement's thread sleeps while DuckDB's workers hold all its tasks,
+  rather than ask for one again and again without a pause, a core for every
+  statement waiting on its workers.
 - A `FLATTEN` of a column takes the form DuckDB's estimates point to, then
-  whichever form its shape's latest run took less CPU time in (see
+  whichever form its shape's latest runs took the less CPU time in at best (see
   [Snowflake SQL](docs/snowflake-sql.md)): two dashboard queries over tens
   of millions of rows took 88 seconds and take 56 and 40.
 - A statement's shape includes the session's search path and database, so

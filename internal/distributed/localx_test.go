@@ -752,20 +752,18 @@ func TestExchangeWaits(t *testing.T) {
 }
 
 // With IGLOO_EXCHANGES=auto, workers write a statement's exchanges to their
-// own disks when every one reports room there and runs outside
-// Kubernetes, and to object storage otherwise; the statement returns what
-// one machine does either way.
+// own disks when every one reports room there, and to object storage
+// otherwise; the statement returns what one machine does either way.
 func TestAutoExchanges(t *testing.T) {
 	co := &Coordinator{opts: Options{AutoExchanges: true}}
-	room := func(n int64, k8s bool) *worker { return &worker{status: workerStatus{LocalRoom: n, Kubernetes: k8s}} }
+	room := func(n int64) *worker { return &worker{status: workerStatus{LocalRoom: n}} }
 	for _, c := range []struct {
 		ws   []*worker
 		want bool
 	}{
-		{[]*worker{room(64<<30, false), room(2<<30, false)}, true},
-		{[]*worker{room(64<<30, false), room(minLocalRoom-1, false)}, false},
-		{[]*worker{room(64<<30, false), room(64<<30, true)}, false},
-		{[]*worker{room(64<<30, false), {}}, false},
+		{[]*worker{room(64 << 30), room(2 << 30)}, true},
+		{[]*worker{room(64 << 30), room(minLocalRoom - 1)}, false},
+		{[]*worker{room(64 << 30), {}}, false},
 		{nil, false},
 	} {
 		if got := co.localFor(c.ws); got != c.want {
@@ -773,11 +771,11 @@ func TestAutoExchanges(t *testing.T) {
 		}
 	}
 	co.opts = Options{}
-	if co.localFor([]*worker{room(64<<30, false)}) {
+	if co.localFor([]*worker{room(64 << 30)}) {
 		t.Error("object storage by default")
 	}
 	co.opts.LocalExchanges = true
-	if !co.localFor([]*worker{room(0, true)}) {
+	if !co.localFor([]*worker{room(0)}) {
 		t.Error("IGLOO_EXCHANGES=local writes to workers' disks whatever they report")
 	}
 

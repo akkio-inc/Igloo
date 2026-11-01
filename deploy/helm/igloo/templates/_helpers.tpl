@@ -100,6 +100,13 @@ Images and service accounts
 {{- end -}}
 {{- end -}}
 
+{{/* object, local or auto, for IGLOO_EXCHANGES: see workers.exchanges in
+values.yaml. auto needs a volume that holds them apart from the pod's memory. */}}
+{{- define "igloo.workerExchanges" -}}
+{{- $e := .Values.workers.exchanges | default "auto" -}}
+{{- if and (eq $e "auto") (eq (.Values.workers.duckdb.spillVolume.medium | default "") "Memory") -}}object{{- else -}}{{ $e }}{{- end -}}
+{{- end -}}
+
 {{/* on or off, for IGLOO_WORKER_WRITES: see workers.writes in values.yaml. */}}
 {{- define "igloo.workerWrites" -}}
 {{- $w := .Values.workers.writes | toString | lower -}}

@@ -277,7 +277,7 @@ variable "duckdb_memory_limit" {
 variable "workers_enabled" {
   description = "Turn on distributed-execution workers, with a GKE compute class that runs them on Spot capacity and falls back to on-demand. Off by default, so existing deployments are unchanged."
   type        = bool
-  default     = false
+  default     = true
 }
 
 variable "workers_spot" {
@@ -300,7 +300,7 @@ variable "workers_machine_family" {
 variable "workers_max" {
   description = "The most worker pods Igloo starts (the chart's workers.maxReplicas)."
   type        = number
-  default     = 4
+  default     = 16
 
   validation {
     condition     = var.workers_max >= 1 && var.workers_max <= 100 && floor(var.workers_max) == var.workers_max

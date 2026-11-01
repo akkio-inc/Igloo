@@ -192,6 +192,17 @@ func TestFullRefreshOverwrites(t *testing.T) {
 // through its result cache, which a refresh invalidates once.
 func TestFullRefreshReadersSeeOldOrNew(t *testing.T) {
 	t.Parallel()
+	for name, partition := range map[string]string{"by COPY": "", "by INSERT": "ALTER TABLE lake.public.recent SET PARTITIONED BY (bucket(4, id))"} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			fullRefreshReaders(t, partition)
+		})
+	}
+}
+
+// fullRefreshReaders is TestFullRefreshReadersSeeOldOrNew of a view whose table
+// is made as partition says.
+func fullRefreshReaders(t *testing.T, partition string) {
 	vc := newViewCatalog(t)
 	sched := tasks.NewScheduler(tasks.NewMemoryStore(), tasks.Options{})
 	r1 := vc.replica(t, func(o *Options) { o.Tasks = sched })
@@ -204,8 +215,11 @@ func TestFullRefreshReadersSeeOldOrNew(t *testing.T) {
 		fmt.Sprintf("CREATE TABLE lake.public.events AS SELECT i AS id, i %% 10 AS x FROM range(%d) AS r(i)", batch),
 		"CREATE MATERIALIZED VIEW lake.public.recent AS SELECT id, x FROM lake.public.events",
 		"REFRESH MATERIALIZED VIEW lake.public.recent",
+		partition,
 	} {
-		mustExec(t, admin, q)
+		if q != "" {
+			mustExec(t, admin, q)
+		}
 	}
 	r2 := vc.replica(t, func(o *Options) {
 		o.ResultCacheSize = 64 << 20

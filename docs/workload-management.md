@@ -233,16 +233,20 @@ first's caches giving way to it. While the first reads tables it keeps what
 it holds, up to three quarters of the limit, for its statements not to read
 their files again, and the heavy statement has what is left and spills.
 
-A statement is heavy if the last statement of its shape, its text with the
-literals masked, used 5 seconds of all the replica's cores
-(`cpu_time_ms` in the [history](#resources-in-the-history)). A read not seen
-before runs in the first DuckDB; if it runs long enough to be heavy beside
-the others running, 5 seconds for each statement sharing the cores, within
-its first minute and before it sends the client a row, it starts again in
-the second. A statement alone stays where it is. A write (`INSERT`,
-`UPDATE`, `DELETE`, `MERGE`, the fill of `CREATE TABLE ... AS`) never starts
-again, so runs in the second from the first run after one that was heavy,
-and commits as another replica's would.
+A statement is heavy if its shape, its text with the literals masked, used 5
+seconds of all the replica's cores (`cpu_time_ms` in the
+[history](#resources-in-the-history)) and 8 times what the replica's other
+statements of some size use, in all of its latest three runs, or far more than
+that in one. What DuckDB measures counts threads that wait, so one run says
+little: a dashboard's statement once measured ten times what it uses, beside a
+report. A read not seen before runs in the first DuckDB; if it runs long enough to
+be heavy beside the others running, 5 seconds for each statement sharing the
+cores, within its first minute and before it sends the client a row, it starts
+again in the second. A statement alone stays where it is, and so does one known
+not to be heavy. Every eighth run of a heavy shape starts in the first again, in
+case it no longer is. A write (`INSERT`, `UPDATE`, `DELETE`, `MERGE`, the fill of
+`CREATE TABLE ... AS`) never starts again, so runs in the second from the run
+after it is known to be heavy, and commits as another replica's would.
 
 Only what gives the same result there runs there: a statement outside a
 transaction block, of what the catalog holds, on which no masking or row
@@ -294,15 +298,18 @@ replica started, reserves nothing and starts at once. A role's own
 
 DuckDB measures what a statement allocated over its whole run, counting
 memory it freed and allocated again, and the peak of the whole process,
-not of one statement. So the replica reads what DuckDB holds for running
-statements (their hash tables, sorts and the like, not its caches) every
-100 ms, and charges each statement running then with what the statements
-beside it had not reserved. A statement's shape learns the smaller of that
-peak and what it allocated, or, for a statement too short for a reading,
-what it allocated. A run that ends early, cancelled or out of memory,
-raises its shape's footprint to what it was seen holding, so that heavy
-statements cancelled at their timeout do not start together again, unseen,
-next time. When it starts, a replica reads what the past week's statements
+not of one statement. A statement alone holds at its most between two
+fifths and all of what it allocated, and that holds whatever runs beside
+it, so a run's footprint is two thirds of what it allocated, or what the
+replica saw it hold if that is more: every 100 ms the replica reads what
+DuckDB holds for running statements (their hash tables, sorts and the like,
+not its caches) and shares it among them by what they reserved, which is
+exact only for a statement alone. A shape's footprint is the median of its
+latest eight runs. A run that ends early, cancelled or out of memory, raises
+it to what it was seen holding, or, if it ran ten seconds or more, to all
+the memory, so that heavy statements cancelled at their timeout do not start
+together again, unseen, next time. When it starts, a replica reads what the
+past week's statements
 held from the [query history](sql.md#query-history), those that ran on a
 replica with its memory limit, within a quarter, so that a restart does
 not forget them; a run from before the history kept peaks counts by what it

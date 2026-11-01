@@ -207,7 +207,7 @@ rounded down and at least 1; empty when neither is set. Call with
 - name: IGLOO_WORKER_START_TIMEOUT
   value: {{ .Values.workers.startTimeout | quote }}
 - name: IGLOO_EXCHANGES
-  value: {{ .Values.workers.exchanges | default "object" | quote }}
+  value: {{ include "igloo.workerExchanges" . | quote }}
 - name: IGLOO_WORKER_WRITES
   value: {{ include "igloo.workerWrites" . | quote }}
 {{- with .Values.workers.pricePerHour }}

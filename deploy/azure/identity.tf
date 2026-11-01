@@ -72,9 +72,9 @@ locals {
   blob_action = "Microsoft.Storage/storageAccounts/blobServices/containers/blobs"
   blob_path   = "@Resource[${local.blob_action}:path]"
   worker_write_condition = join(" ", [
-    "(!(ActionMatches{'${local.blob_action}/add/action'}))",
+    "((!(ActionMatches{'${local.blob_action}/add/action'}))",
     "OR",
-    "(${local.blob_path} StringLike 'warehouse/_igloo_shuffle/*' OR ${local.blob_path} StringLike 'warehouse/*/data/igloo-write-*')",
+    "(${local.blob_path} StringLike 'warehouse/_igloo_shuffle/*' OR ${local.blob_path} StringLike 'warehouse/*/data/igloo-write-*'))",
   ])
 }
 

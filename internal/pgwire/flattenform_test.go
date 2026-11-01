@@ -9,7 +9,7 @@ import (
 // TestFlattenForms checks the form each statement shape's FLATTENs take:
 // the estimate's for the first statement, asked for once; the other for
 // the next; either while neither has ended; and from then on the one whose
-// latest run took less CPU time.
+// latest runs took the less CPU time at best.
 func TestFlattenForms(t *testing.T) {
 	var f flattenForms
 	asked := 0
@@ -33,6 +33,18 @@ func TestFlattenForms(t *testing.T) {
 	f.observe("a", true, time.Second)
 	if !f.choose("a", estimate) {
 		t.Error("not the form that became faster")
+	}
+	// A run beside others takes longer: it changes nothing until the faster
+	// run is no longer among the latest.
+	f.observe("a", true, 5*time.Second)
+	if !f.choose("a", estimate) {
+		t.Error("a slower run of the faster form moved the shape off it")
+	}
+	for range formRuns {
+		f.observe("a", true, 5*time.Second)
+	}
+	if f.choose("a", estimate) {
+		t.Error("the form that became slower")
 	}
 	f.observe("unseen", true, time.Second)
 	if f.choose("b", func() bool { return false }) || !f.choose("b", estimate) {

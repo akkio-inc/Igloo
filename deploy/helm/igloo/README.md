@@ -350,8 +350,11 @@ other clients   ──> Service igloo ──────────────
 
 ## Distributed execution
 
-With `workers.enabled=true`, statements that read very large tables run in
-parts on worker pods ([distributed execution](../../../docs/distributed-execution.md)):
+By default, statements that read very large tables run in parts on worker pods
+([distributed execution](../../../docs/distributed-execution.md)).
+No worker machine starts until a statement is worth one, so a deployment with no
+heavy queries pays nothing for them; each running worker then costs its machine's
+price, and stops when idle. `workers.enabled=false` leaves them out.
 
 ```
 igloo pods ──TLS, port 7433──> Service igloo-workers (headless) ──> worker pods (0 to workers.maxReplicas)
@@ -539,11 +542,11 @@ workers:
 | `scaleToZero.nodeSelector`, `tolerations`, `affinity` | | Gateway pod scheduling, separate from igloo's |
 | `pricePerHour` | `0` | `IGLOO_PRICE_PER_HOUR`: what one igloo pod's machine costs an hour, for `igloo.usage`; `0` is unknown |
 | `pools` | `[]` | [Compute pools](#compute-pools), each with `name` and the overrides listed there |
-| `workers.enabled` | `false` | [Distributed execution](#distributed-execution) on worker pods |
-| `workers.maxReplicas` | `4` | `IGLOO_WORKER_MAX`: the most worker pods igloo starts |
+| `workers.enabled` | `true` | [Distributed execution](#distributed-execution) on worker pods, of which none run until a statement is worth it |
+| `workers.maxReplicas` | `16` | `IGLOO_WORKER_MAX`: the most worker pods igloo starts |
 | `workers.idleAfter` | `auto` | `IGLOO_WORKER_IDLE_AFTER`: stop workers after this long without tasks; `auto` for three times their last start, from 2 to 10 minutes |
 | `workers.startTimeout` | `3m` | `IGLOO_WORKER_START_TIMEOUT`: how long a statement waits for workers to start |
-| `workers.exchanges` | `object` | `IGLOO_EXCHANGES`: where workers exchange rows; `local` lets workers reach each other's task port and splits the spill volume 60% spill, 30% exchanges (`IGLOO_EXCHANGE_MAX_SIZE`) |
+| `workers.exchanges` | `auto` | `IGLOO_EXCHANGES`: where workers exchange rows: `object` storage, `local` disks, or `auto`, their disks where each has 1 GiB of room and `object` otherwise, or with a spill volume of medium `Memory`; unless `object`, workers may reach each other's task port and the spill volume is split 60% spill, 30% exchanges ([docs](../../../docs/distributed-execution.md#exchanges-on-workers-disks)) |
 | `workers.writes` | `auto` | `IGLOO_WORKER_WRITES`: whether workers write a table's files for statements that fill it from a query, under a directory of the statement's, which igloo pods commit after checking each file ([docs](../../../docs/distributed-execution.md#workers-writing-tables)); `auto` is on where workers hold nothing of the igloo pods' right to write the warehouse: an account or keys of their own (the next two rows), and no key they share, as the bundled store's; `true` or `false` otherwise |
 | `workers.serviceAccount.create` / `name` / `annotations` | `false` / `<fullname>-worker` / `{}` | The workers' own service account, whose cloud identity should read the warehouse and write only `_igloo_shuffle/`, and `igloo-write-*` directories under tables' locations unless `storage.s3.stsRoleArn` is set; the OpenTofu modules make it. Without `create` or `name`, workers use the igloo pods' account, with its right to write the whole warehouse |
 | `workers.storage.s3.existingSecret`, `gcs`, `azure` | `""` | Static keys for workers in place of `storage.*.existingSecret`, for the same reason |

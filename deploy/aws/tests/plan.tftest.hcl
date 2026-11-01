@@ -432,8 +432,18 @@ run "defaults" {
     condition     = output.sql_endpoint == null && strcontains(output.next_steps, "port-forward svc/igloo 5433:5432")
     error_message = "Without expose_sql, there is no SQL endpoint and next steps use port-forward."
   }
+}
 
-  # --- No workers by default ------------------------------------------------
+################################################################################
+# Distributed-execution workers
+################################################################################
+
+run "workers_can_be_left_out" {
+  command = plan
+
+  variables {
+    workers_enabled = false
+  }
 
   assert {
     condition = (
@@ -441,15 +451,23 @@ run "defaults" {
       keys(module.eks.eks_managed_node_groups) == ["default"] &&
       length(helm_release.cluster_autoscaler) == 0 &&
       length(aws_iam_role.cluster_autoscaler) == 0 &&
-      !contains(keys(yamldecode(helm_release.igloo[0].values[0])), "workers")
+      yamldecode(helm_release.igloo[0].values[0]).workers == { enabled = false }
     )
-    error_message = "Without workers_enabled there must be no worker node groups, no cluster autoscaler and no workers values, so existing deployments are unchanged."
+    error_message = "With workers_enabled false there must be no worker node groups and no cluster autoscaler, and the chart must run no workers."
   }
 }
 
-################################################################################
-# Distributed-execution workers
-################################################################################
+run "workers_by_default_start_from_nothing" {
+  command = plan
+
+  assert {
+    condition = (
+      alltrue([for g in output.worker_node_groups : g.min_size == 0]) &&
+      yamldecode(helm_release.igloo[0].values[0]).workers.enabled == true
+    )
+    error_message = "Workers are on by default, and their node groups start with none, so that no machine runs until a statement starts one."
+  }
+}
 
 run "workers_on_spot_with_on_demand_fallback" {
   command = plan
@@ -482,7 +500,7 @@ run "workers_on_spot_with_on_demand_fallback" {
       keys(output.worker_node_groups) == ["workers-ondemand", "workers-spot"] &&
       output.worker_node_groups["workers-spot"].capacity_type == "SPOT" &&
       output.worker_node_groups["workers-ondemand"].capacity_type == "ON_DEMAND" &&
-      alltrue([for g in output.worker_node_groups : g.min_size == 0 && g.max_size == 4 && g.instance_types == tolist(["m7gd.4xlarge", "m6gd.4xlarge"])])
+      alltrue([for g in output.worker_node_groups : g.min_size == 0 && g.max_size == 16 && g.instance_types == tolist(["m7gd.4xlarge", "m6gd.4xlarge"])])
     )
     error_message = "Workers must get a Spot node group and an on-demand one to fall back to, both from zero to workers_max nodes."
   }
@@ -504,7 +522,7 @@ run "workers_on_spot_with_on_demand_fallback" {
   assert {
     condition = (
       yamldecode(helm_release.igloo[0].values[0]).workers.enabled == true &&
-      yamldecode(helm_release.igloo[0].values[0]).workers.maxReplicas == 4 &&
+      yamldecode(helm_release.igloo[0].values[0]).workers.maxReplicas == 16 &&
       yamldecode(helm_release.igloo[0].values[0]).workers.pricePerHour == 0.35 &&
       yamldecode(helm_release.igloo[0].values[0]).workers.instanceType == "m7gd.4xlarge" &&
       yamldecode(helm_release.igloo[0].values[0]).workers.spot == true &&
@@ -536,8 +554,8 @@ run "workers_on_spot_with_on_demand_fallback" {
   assert {
     condition = (
       yamldecode(helm_release.cluster_autoscaler[0].values[0]).autoscalingGroups == [
-        { name = "eks-workers-ondemand-4567", minSize = 0, maxSize = 4 },
-        { name = "eks-workers-spot-0123", minSize = 0, maxSize = 4 },
+        { name = "eks-workers-ondemand-4567", minSize = 0, maxSize = 16 },
+        { name = "eks-workers-spot-0123", minSize = 0, maxSize = 16 },
       ] &&
       helm_release.cluster_autoscaler[0].namespace == "kube-system" &&
       helm_release.cluster_autoscaler[0].version == "9.59.0"
@@ -1063,6 +1081,7 @@ run "rejects_large_worker_without_workers" {
   command = plan
 
   variables {
+    workers_enabled      = false
     large_worker_enabled = true
   }
 

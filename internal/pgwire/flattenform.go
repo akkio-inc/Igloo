@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -26,8 +27,8 @@ import (
 // Igloo picks for each statement shape (its text with literals masked, see
 // shapeKey). The first statement of a shape takes the form DuckDB's
 // estimates point to (see estimateFlattenLists), the next one the other
-// form, and from then on the shape takes the form whose latest run took the
-// less CPU time.
+// form, and from then on the shape takes the form whose latest runs took the
+// less CPU time at best.
 
 // listsShare is the share of the flattened tables' rows that, estimated to
 // reach the dependent joins, makes the FROM items compute the lists.
@@ -42,14 +43,27 @@ type flattenForms struct {
 	shapes map[string]*flattenForm
 }
 
+// formRuns is how many of each form's latest runs it is judged by.
+const formRuns = 4
+
 // flattenForm is one shape's: whether the estimate picked the FROM items'
 // lists, once made, or is being made; and for each form, the lateral one
-// first, the CPU time of its latest run (zero for none yet) and whether a
-// run of it was started.
+// first, the CPU times of its latest runs and whether a run of it was started.
 type flattenForm struct {
 	estimated, estimating, lists bool
-	cost                         [2]time.Duration
+	runs                         [2][]time.Duration
 	started                      [2]bool
+}
+
+// cost is the least CPU time of the form's latest runs, zero for none yet:
+// DuckDB counts time a thread waits for a core, so one run beside others
+// takes up to several times another alone, and a form judged by its latest
+// run alone went back and forth with what ran beside it.
+func (s *flattenForm) cost(form int) time.Duration {
+	if len(s.runs[form]) == 0 {
+		return 0
+	}
+	return slices.Min(s.runs[form])
 }
 
 // choose says whether a statement of shape key unnests lists its FROM
@@ -65,8 +79,8 @@ func (f *flattenForms) choose(key string, estimate func() bool) bool {
 		f.shapes[key] = s
 	}
 	switch {
-	case s.cost[0] > 0 && s.cost[1] > 0:
-		lists := s.cost[1] < s.cost[0]
+	case s.cost(0) > 0 && s.cost(1) > 0:
+		lists := s.cost(1) < s.cost(0)
 		f.mu.Unlock()
 		return lists
 	case s.estimated && !s.started[0] || s.estimated && !s.started[1]:
@@ -78,7 +92,7 @@ func (f *flattenForms) choose(key string, estimate func() bool) bool {
 	case s.estimated:
 		// Both started, one or neither ended: the one that ended, or else
 		// the estimate's.
-		lists := s.cost[1] > 0 || s.cost[0] == 0 && s.lists
+		lists := s.cost(1) > 0 || s.cost(0) == 0 && s.lists
 		f.mu.Unlock()
 		return lists
 	case s.estimating:
@@ -105,7 +119,11 @@ func (f *flattenForms) observe(key string, lists bool, cpu time.Duration) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if s := f.shapes[key]; s != nil {
-		s.cost[b2i(lists)] = cpu
+		form := b2i(lists)
+		s.runs[form] = append(s.runs[form], cpu)
+		if len(s.runs[form]) > formRuns {
+			s.runs[form] = s.runs[form][1:]
+		}
 	}
 }
 

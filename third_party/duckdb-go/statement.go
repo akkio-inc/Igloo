@@ -795,6 +795,9 @@ func (s *Stmt) executeBound(ctx context.Context) (*mapping.Result, error) {
 	}
 
 	// Phase 2: execute pending
+	if failed, msg := runPending(pendingRes); failed {
+		return nil, errors.Join(ctx.Err(), getDuckDBError(msg))
+	}
 	var res mapping.Result
 	state := mapping.ExecutePending(pendingRes, &res)
 	if state == mapping.StateError {

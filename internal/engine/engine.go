@@ -119,6 +119,9 @@ type Engine struct {
 	// current what it is now set to; fgRead when a statement that reads
 	// tables last ran in it, in Unix nanoseconds.
 	limit, current, fgRead atomic.Int64
+	// bgOver is what the process holds past what the two DuckDBs hold (see
+	// balance).
+	bgOver atomic.Int64
 }
 
 // OpenPartitionFiles is how many files of a partitioned write DuckDB keeps
@@ -910,27 +913,45 @@ const (
 // slows cold scans (see serverThreadsPerCore).
 const minThreadMemory = 2 << 30
 
+// leastThreadMemory is the DuckDB memory every thread must have, or there are
+// fewer of them, whatever the cores: DuckDB's own minimum of 125 MB a thread. A pod
+// is not given fewer cores for having little memory. In a container of 1 GiB on a
+// machine of 16 cores, under a limit of 512 MiB, a grouping that spills 40 million
+// groups held 700 to 780 MiB of anonymous memory on 8 and 16 threads and took 9 to 11
+// s; on 4 it held 570 MiB and took 1.4 s. Past that, its pod's working set went past
+// what the memory watch leaves, which canceled it in about one run in three.
+const leastThreadMemory = 125 << 20
+
 // threadsFor returns DuckDB's threads for cfg: IGLOO_DUCKDB_THREADS if set;
 // when the warehouse is in object storage, perCore threads a core, but no
 // more than leave each minThreadMemory of memory, DuckDB's memory limit in
-// bytes (unknown if 0), and never fewer than the cores; and otherwise 0,
-// DuckDB's own default of one a core.
+// bytes (unknown if 0), and otherwise 0, DuckDB's own default of one a core;
+// and never so many that one has less than leastThreadMemory.
 func threadsFor(cfg config.Config, perCore int, memory int64) int {
 	if cfg.DuckDB.Threads > 0 {
 		return cfg.DuckDB.Threads
 	}
+	// The cores this process may use: a container's CPU limit, if it has one.
+	cores := runtime.GOMAXPROCS(0)
+	n := 0
 	switch cfg.Storage.Type {
 	case config.StorageS3, config.StorageGCS, config.StorageAzure:
-		// The cores this process may use: a container's CPU limit, if it
-		// has one.
-		cores := runtime.GOMAXPROCS(0)
-		n := perCore * cores
+		n = perCore * cores
 		if memory > 0 {
 			n = min(n, max(cores, int(memory/minThreadMemory)))
 		}
+	}
+	if memory <= 0 {
 		return n
 	}
-	return 0
+	most := max(int(memory/leastThreadMemory), 1)
+	switch {
+	case n > most:
+		return most
+	case n == 0 && cores > most:
+		return most
+	}
+	return n
 }
 
 // processMemory is the memory the process may use (memlimit.Total), zero
@@ -995,7 +1016,11 @@ func settingStatements(d config.DuckDB) []string {
 	if d.Threads > 0 {
 		stmts = append(stmts, fmt.Sprintf("SET threads = %d", d.Threads))
 	}
-	return stmts
+	// Table files never change once written, so their footers can stay parsed.
+	// A dashboard's statements read the same files again and again: 96 of them
+	// at ten times the data took 214 s rather than 233, the slowest tenth 107 s
+	// rather than 132. DuckDB evicts them when memory is short.
+	return append(stmts, "SET parquet_metadata_cache = true")
 }
 
 // storageStatements loads every extension Igloo needs and registers the

@@ -4,14 +4,18 @@ import (
 	"bytes"
 	"encoding/binary"
 	"io"
+	"io/fs"
 	"math"
 	"os"
 	"slices"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/apache/iceberg-go"
+	icebergio "github.com/apache/iceberg-go/io"
 
 	"github.com/akkio-inc/igloo/internal/distributed"
 )
@@ -186,6 +190,75 @@ func TestFooterFile(t *testing.T) {
 	}
 	if info, err := file.Stat(); err != nil || info.Size() != 1000 {
 		t.Errorf("stat: %v, %v", info, err)
+	}
+}
+
+// slowFiles is a store whose files take a while to open, saying how many were
+// being opened at a time.
+type slowFiles struct {
+	icebergio.IO
+	data          []byte
+	opens, at, hi atomic.Int64
+	bad           string
+}
+
+func (s *slowFiles) Open(name string) (icebergio.File, error) {
+	s.opens.Add(1)
+	n := s.at.Add(1)
+	defer s.at.Add(-1)
+	for {
+		hi := s.hi.Load()
+		if n <= hi || s.hi.CompareAndSwap(hi, n) {
+			break
+		}
+	}
+	time.Sleep(5 * time.Millisecond)
+	data := s.data
+	if name == s.bad {
+		data = []byte("not a Parquet file")
+	}
+	return &bytesFile{Reader: bytes.NewReader(data)}, nil
+}
+
+// bytesFile is a file of bytes.
+type bytesFile struct{ *bytes.Reader }
+
+func (f *bytesFile) Stat() (fs.FileInfo, error) { return footerInfo{&footerFile{size: f.Size()}}, nil }
+func (f *bytesFile) Close() error               { return nil }
+
+// TestFetchFooters checks that a statement reads its files' footers more at a time
+// than a small replica's cores, once each, and that a bad one refuses them all.
+func TestFetchFooters(t *testing.T) {
+	store := &slowFiles{data: craftedParquet(craftedFooter(1, 1, nil))}
+	paths := make([]string, 100)
+	for i := range paths {
+		paths[i] = "f" + strconv.Itoa(i)
+	}
+	footers := &writtenFooters{IO: store, columns: 2, depth: 2}
+	if err := footers.fetch(t.Context(), paths); err != nil {
+		t.Fatal(err)
+	}
+	if n := store.opens.Load(); n != 100 {
+		t.Errorf("%d files opened, of 100", n)
+	}
+	if hi := store.hi.Load(); hi < 8 || hi > footerReads {
+		t.Errorf("%d read at a time", hi)
+	}
+	for range 2 {
+		f, err := footers.Open(paths[7])
+		if err != nil {
+			t.Fatal(err)
+		}
+		if end, err := f.Seek(0, io.SeekEnd); err != nil || end != int64(len(store.data)) {
+			t.Errorf("the end is at %d, %v", end, err)
+		}
+	}
+	if n := store.opens.Load(); n != 100 {
+		t.Errorf("Open read a footer that was read: %d opens", n)
+	}
+	store.bad = paths[50]
+	if err := (&writtenFooters{IO: store, columns: 2, depth: 2}).fetch(t.Context(), paths); err == nil || !strings.Contains(err.Error(), "footer") && !strings.Contains(err.Error(), "Parquet") {
+		t.Errorf("a file that is not Parquet: %v", err)
 	}
 }
 

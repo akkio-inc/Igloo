@@ -409,9 +409,11 @@ pools: []
 # their number to igloo. Give them their own node pool with a minimum size of
 # zero (nodeSelector, tolerations) so idle workers cost nothing.
 workers:
-  enabled: false
-  # The most worker pods igloo starts -> IGLOO_WORKER_MAX.
-  maxReplicas: 4
+  enabled: true
+  # The most worker pods igloo starts -> IGLOO_WORKER_MAX. It weighs how many a
+  # statement should run on, and stops them when idle; your cluster's nodes and
+  # quota must have room for this many to start.
+  maxReplicas: 16
   # Stop workers after this long without tasks -> IGLOO_WORKER_IDLE_AFTER:
   # auto for three times their last start, from 2 to 10 minutes.
   idleAfter: auto
@@ -420,11 +422,13 @@ workers:
   # autoscaler adding nodes.
   startTimeout: 3m
   # Where workers exchange rows between a statement's stages -> IGLOO_EXCHANGES:
-  # object (the warehouse's object storage) or local (their spill volumes,
-  # from which the workers that read them fetch them; the NetworkPolicy then
-  # lets workers reach each other's task port, and the spill volume is split:
-  # 60% for spill, 30% for exchanges, rather than 90% for spill).
-  exchanges: object
+  # object (the warehouse's object storage), local (their spill volumes, from
+  # which the workers that read them fetch them), or auto: local where every
+  # worker of a statement has 1 GiB of room for them, object otherwise, and always
+  # with a spillVolume of medium Memory. Unless object, the NetworkPolicy lets
+  # workers reach each other's task port, and the spill volume is split: 60% for
+  # spill, 30% for exchanges, rather than 90% for spill.
+  exchanges: auto
   # Whether workers write a table's files for statements that fill it from a
   # query, under a directory of the statement's, which igloo pods commit after
   # checking each file -> IGLOO_WORKER_WRITES (docs/distributed-execution.md):

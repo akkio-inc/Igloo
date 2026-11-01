@@ -489,7 +489,7 @@ variable "tls_private_key_pem" {
 variable "workers_enabled" {
   description = "Provision node groups for distributed-execution workers, which scale from zero, install the Kubernetes cluster autoscaler to scale them, and turn workers on in the chart. Off by default, so existing deployments are unchanged."
   type        = bool
-  default     = false
+  default     = true
 }
 
 variable "workers_spot" {
@@ -517,7 +517,7 @@ variable "workers_instance_types" {
 variable "workers_max" {
   description = "The most worker pods, and so worker nodes, Igloo starts (the chart's workers.maxReplicas)."
   type        = number
-  default     = 4
+  default     = 16
 
   validation {
     condition     = var.workers_max >= 1 && var.workers_max <= 100 && floor(var.workers_max) == var.workers_max

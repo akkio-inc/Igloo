@@ -17,9 +17,9 @@ import (
 // with the memory they ran with, without failed ones or those of other
 // statements; and the workload controller's footprints, of the statements
 // that ran on one machine of this replica's memory, by shape: what they
-// held, the smaller of their peak and what they allocated, and at least
-// what runs that ended early held, or all their memory when those ran a
-// while without a peak.
+// held, from what they allocated or their peak if more, and at least what
+// runs that ended early held, or all their memory when those ran a while
+// without a peak.
 func TestSeedHistory(t *testing.T) {
 	store := audit.NewMemoryStore(audit.MemoryQueries, audit.MemoryLogins)
 	now := time.Now()
@@ -68,10 +68,11 @@ func TestSeedHistory(t *testing.T) {
 	if !slices.Equal(runs, want) {
 		t.Errorf("seeded runs %+v, want %+v", runs, want)
 	}
-	// a's latest run on this replica's memory, 21 GB within a quarter of
-	// 22; not b's, which failed, c's, on 14 GB, d's, which does not say,
+	// a's runs on this replica's memory, 21 GB within a quarter of 22, the
+	// lower of two; not b's, which failed, c's, on 14 GB, d's, which does not say,
 	// nor i's, cancelled after a second.
-	wantHeld := map[string]int64{"a": 2 * gb, "e": 12 * gb, "f": 8 * gb, "g": 10 * gb, "h": 22 * gb}
+	wantHeld := map[string]int64{"a": workload.FootprintOf(2*gb, 0, false), "e": workload.FootprintOf(84*gb, 12*gb, true), "f": 8 * gb,
+		"g": 10 * gb, "h": 22 * gb}
 	for _, shape := range []string{"a", "b", "c", "d", "e", "f", "g", "h", "i"} {
 		got, ok := footprints.Footprint(shape)
 		if w, learned := wantHeld[shape]; ok != learned || got != w {
@@ -89,7 +90,7 @@ func TestSeedHistory(t *testing.T) {
 	// Without a coordinator, footprints all the same.
 	footprints = workload.NewController(22 * gb)
 	seedHistory(context.Background(), nil, footprints, 22*gb, store, slog.New(slog.NewTextHandler(io.Discard, nil)))
-	if got, _ := footprints.Footprint("a"); got != 2*gb {
+	if got, _ := footprints.Footprint("a"); got != workload.FootprintOf(2*gb, 0, false) {
 		t.Errorf("without a coordinator, a's seeded footprint %d", got)
 	}
 }

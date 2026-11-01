@@ -551,6 +551,15 @@ psql_admin -c "SET distributed_execution = 'off'" -c "CREATE TABLE written_parts
   -c "ALTER TABLE written_parts SET PARTITIONED BY (l_returnflag, month(l_shipdate))" >/dev/null
 psql_admin -c "SET distributed_execution = 'on'" -c "INSERT INTO written_parts $copy_of" >/dev/null
 wrote_by_workers "a partitioned table" written_parts "$copy_of"
+# Rows in order of their partitions, whatever the files a small worker's task
+# keeps open: a file of a partition a task, and a retry or two with smaller tasks.
+parts_files="$(files_of written_parts | wc -l)"
+parts_want="$(psql_admin -c "SET distributed_execution = 'off'" -c "SELECT count(DISTINCT (l_returnflag, month(l_shipdate), year(l_shipdate))) FROM written_parts" | grep -v '^SET$')"
+if [ "$parts_files" -le "$((parts_want * workers * 2))" ]; then
+  pass "a partitioned table: $parts_files files of $parts_want partitions"
+else
+  fail "a partitioned table: $parts_files files of $parts_want partitions, on $workers workers"
+fi
 # Read whole first: grep -q closing the pipe early would fail compose, and with
 # it the pipeline.
 igloo_log="$(compose logs --no-color igloo)"

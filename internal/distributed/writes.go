@@ -139,6 +139,7 @@ type writeRequest struct {
 	Dir         string            `json:"dir"`
 	Columns     []WriteColumn     `json:"columns"`
 	Partitions  []string          `json:"partitions,omitempty"`
+	AsTheyCome  bool              `json:"as_they_come,omitempty"`
 	FileBytes   int64             `json:"file_bytes,omitempty"`
 	RowGroup    int64             `json:"row_group,omitempty"`
 	Compression string            `json:"compression,omitempty"`
@@ -345,8 +346,17 @@ func (w *Worker) writeFiles(ctx context.Context, conn *duckdb.Conn, req *taskReq
 	if wr.Compression != "" {
 		opts = append(opts, "COMPRESSION "+wr.Compression)
 	}
-	res, err := conn.QueryContext(ctx, "COPY (SELECT "+strings.Join(names, ", ")+" FROM ("+query+")) TO "+quoteLiteral(to)+
-		" ("+strings.Join(opts, ", ")+")", nil)
+	source := "SELECT " + strings.Join(names, ", ") + " FROM (" + query + ")"
+	if len(wr.Partitions) > 0 && !wr.AsTheyCome {
+		// A partition's rows together: past the files it keeps open, DuckDB closes
+		// one and later opens another for more of its rows. Taking 128 partitions
+		// as they came, a task of a small worker wrote 18 files of each, 40 KB a
+		// file, in a table that took 32 times as long to write as on one machine.
+		// Sorting rows of many kilobytes can take a small worker's memory, in
+		// which case the statement runs again with them as they come (see stage).
+		source += " ORDER BY " + strings.Join(wr.Partitions, ", ")
+	}
+	res, err := conn.QueryContext(ctx, "COPY ("+source+") TO "+quoteLiteral(to)+" ("+strings.Join(opts, ", ")+")", nil)
 	if err != nil {
 		return nil, err
 	}

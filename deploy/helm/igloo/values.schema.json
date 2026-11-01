@@ -1082,10 +1082,11 @@
           }
         },
         "exchanges": {
-          "description": "Where workers exchange rows: object storage, or their own disks.",
+          "description": "Where workers exchange rows: object storage, their own disks, or their disks where they have room.",
           "enum": [
             "object",
-            "local"
+            "local",
+            "auto"
           ]
         },
         "existingSecret": {

@@ -379,11 +379,27 @@ run "sql_not_exposed_by_default" {
 
   assert {
     condition = (
+      alltrue([for p in azurerm_kubernetes_cluster_node_pool.worker : p.auto_scaling_enabled && p.min_count == 0]) &&
+      yamldecode(helm_release.igloo[0].values[0]).workers.enabled == true
+    )
+    error_message = "workers are on by default, and their pools start from no nodes, so that no machine runs until a statement starts one"
+  }
+}
+
+run "workers_can_be_left_out" {
+  command = plan
+
+  variables {
+    workers_enabled = false
+  }
+
+  assert {
+    condition = (
       length(azurerm_kubernetes_cluster_node_pool.worker) == 0 &&
       length(kubernetes_config_map_v1.cluster_autoscaler_priority_expander) == 0 &&
-      !contains(keys(yamldecode(helm_release.igloo[0].values[0])), "workers")
+      yamldecode(helm_release.igloo[0].values[0]).workers == { enabled = false }
     )
-    error_message = "without workers_enabled there must be no worker pools, no priority expander and no workers values, so existing deployments are unchanged"
+    error_message = "with workers_enabled false there must be no worker pools and no priority expander, and the chart must run no workers"
   }
 }
 
@@ -405,7 +421,7 @@ run "workers_on_spot_with_regular_fallback" {
       azurerm_kubernetes_cluster_node_pool.worker["workerspot"].priority == "Spot" &&
       azurerm_kubernetes_cluster_node_pool.worker["workerspot"].eviction_policy == "Delete" &&
       azurerm_kubernetes_cluster_node_pool.worker["workerreg"].priority == "Regular" &&
-      alltrue([for p in azurerm_kubernetes_cluster_node_pool.worker : p.auto_scaling_enabled && p.min_count == 0 && p.max_count == 4 && p.mode == "User"])
+      alltrue([for p in azurerm_kubernetes_cluster_node_pool.worker : p.auto_scaling_enabled && p.min_count == 0 && p.max_count == 16 && p.mode == "User"])
     )
     error_message = "workers must get a Spot pool and a Regular pool to fall back to, both autoscaling from zero to workers_max nodes"
   }
@@ -440,7 +456,7 @@ run "workers_on_spot_with_regular_fallback" {
   assert {
     condition = (
       yamldecode(helm_release.igloo[0].values[0]).workers.enabled == true &&
-      yamldecode(helm_release.igloo[0].values[0]).workers.maxReplicas == 4 &&
+      yamldecode(helm_release.igloo[0].values[0]).workers.maxReplicas == 16 &&
       yamldecode(helm_release.igloo[0].values[0]).workers.pricePerHour == 0.32 &&
       yamldecode(helm_release.igloo[0].values[0]).workers.instanceType == "Standard_D16pds_v6" &&
       yamldecode(helm_release.igloo[0].values[0]).workers.spot == true &&
@@ -917,6 +933,7 @@ run "rejects_large_worker_without_workers" {
   command = plan
 
   variables {
+    workers_enabled      = false
     large_worker_enabled = true
   }
 

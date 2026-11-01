@@ -434,6 +434,84 @@ if k exec psql-client -- pg_isready -h "$FULLNAME-postgresql" -t 5 >/dev/null 2>
 fi
 pass "PostgreSQL is unreachable from other pods"
 
+# --- Workers ---------------------------------------------------------------------
+
+WORKER_PODS="app.kubernetes.io/instance=$RELEASE,app.kubernetes.io/component=worker"
+worker_replicas() { k get deployment "$FULLNAME-workers" -o jsonpath='{.spec.replicas}'; }
+# exchanges WHERE: statements that exchanged rows there, on every igloo pod.
+exchanges() {
+  local pod total=0 n
+  for pod in $(k get pods --selector "$SERVER_PODS" -o jsonpath='{.items[*].status.podIP}'); do
+    n=$(k exec curl-client -- curl -fsS --max-time 10 "http://$pod:8080/metrics" |
+      sed -n "s/^igloo_distributed_exchanging_queries_total{exchanges=\"$1\"} //p")
+    total=$((total + ${n:-0}))
+  done
+  echo "$total"
+}
+# in_mode MODE QUERY: QUERY's rows with distributed execution in MODE.
+in_mode() {
+  k exec psql-client -- env PGPASSWORD="$ADMIN_PASSWORD" \
+    psql "host=$FULLNAME port=5432 user=igloo dbname=igloo sslmode=disable connect_timeout=10" \
+    -X -v ON_ERROR_STOP=1 -At -c "SET distributed_execution = '$1'" -c "$2" | grep -v '^SET$'
+}
+
+log "No worker runs until a statement is worth one"
+expect_eq "worker pods after the statements above" "$(worker_replicas)" "0"
+expect_eq "worker pods that exist" "$(k get pods --selector "$WORKER_PODS" -o name | wc -l | tr -d ' ')" "0"
+
+log "Workers start for a forced statement, and exchange its rows on their disks"
+sql "$FULLNAME" igloo "$ADMIN_PASSWORD" "CREATE TABLE e2e_big AS SELECT i AS id, i % 1000 AS g FROM range(1500000) t(i)" >/dev/null
+sql "$FULLNAME" igloo "$ADMIN_PASSWORD" "INSERT INTO e2e_big SELECT i AS id, i % 1000 AS g FROM range(1500000, 3000000) t(i)" >/dev/null
+join="WITH s AS (SELECT id % 200000 AS k, sum(g) AS q FROM e2e_big GROUP BY 1),
+  u AS (SELECT id AS k FROM e2e_big WHERE g < 100 UNION ALL SELECT id FROM e2e_big WHERE g BETWEEN 100 AND 200)
+  SELECT count(*), sum(q) FROM s JOIN u ON s.k = u.k"
+want="$(in_mode off "$join")"
+before=$(exchanges local)
+expect_eq "a forced join on workers returns the same rows" "$(in_mode on "$join")" "$want"
+[[ "$(worker_replicas)" -ge 1 ]] || fail "the forced statement started no worker"
+after=$(exchanges local)
+[[ "$after" -gt "$before" ]] || fail "its exchanges were not on the workers' disks: $before, then $after local, $(exchanges object) through object storage"
+pass "workers exchanged its rows on their disks, past the NetworkPolicy ($before, then $after)"
+
+log "Nothing but igloo pods and workers reaches a worker's task port"
+for ip in $(k get pods --selector "$WORKER_PODS" -o jsonpath='{.items[*].status.podIP}'); do
+  if k exec curl-client -- curl -ksS --max-time 5 -o /dev/null "https://$ip:7433/" 2>/dev/null; then
+    fail "a pod outside the release reached a worker's task port"
+  fi
+done
+pass "a worker's task port is unreachable from other pods"
+
+log "A worker lost holding exchanged rows: the statement's parts run again on the other"
+slow="WITH s AS (SELECT id % 200000 AS k, sum(length(repeat(md5(id::VARCHAR), 200))) AS q FROM e2e_big GROUP BY 1),
+  u AS (SELECT id AS k FROM e2e_big WHERE g < 100 UNION ALL SELECT id FROM e2e_big WHERE g BETWEEN 100 AND 200)
+  SELECT count(*), sum(q) FROM s JOIN u ON s.k = u.k"
+want="$(in_mode off "$slow")"
+out="$(mktemp)"
+in_mode on "$slow" >"$out" 2>&1 &
+query=$!
+sleep 3
+victim=$(k get pods --selector "$WORKER_PODS" --field-selector=status.phase=Running -o jsonpath='{.items[0].metadata.name}')
+[[ -n "$victim" ]] || fail "no worker runs to lose"
+k delete pod "$victim" --grace-period=0 --force >/dev/null 2>&1
+wait "$query" || true
+got="$(cat "$out")"
+find "$out" -delete
+if [[ "$got" == "$want" ]]; then
+  pass "the statement that lost $victim returns the same rows ($got)"
+elif grep -q "a worker holding exchanged rows on its disk was lost" <<<"$got"; then
+  pass "the statement that lost $victim fails saying so, with no wrong rows"
+else
+  fail "after losing $victim: [$got], want [$want]"
+fi
+
+log "Idle workers stop"
+deadline=$((SECONDS + 240))
+until [[ "$(worker_replicas)" == 0 ]]; do
+  [[ "$SECONDS" -lt "$deadline" ]] || fail "workers still run, $(worker_replicas) of them, 4 minutes after their last task"
+  sleep 5
+done
+pass "no worker pod is asked for once they are idle"
+
 log "helm test"
 run_helm_test
 

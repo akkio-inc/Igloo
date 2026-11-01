@@ -41,7 +41,7 @@ type Workers struct {
 	// Exchanges is where workers write the rows they exchange: object (the
 	// warehouse's object storage), local (their own disks), or auto, the
 	// default (their own disks when every worker of a statement has room
-	// there and runs outside Kubernetes, object storage otherwise). ExchangeMax,
+	// there, object storage otherwise). ExchangeMax,
 	// on a worker, caps the bytes of exchanges on its disk; zero leaves
 	// them to the disk's free space.
 	Exchanges   string
@@ -228,7 +228,7 @@ func loadWorkers(lookup func(string) (string, bool), errs *[]error) Workers {
 		w.Large.Memory = n
 	}
 
-	v := get("IGLOO_WORKER_MAX", "4")
+	v := get("IGLOO_WORKER_MAX", "16")
 	n, err := strconv.Atoi(v)
 	if err != nil || n < 1 {
 		addErr("IGLOO_WORKER_MAX must be a positive integer, got %q", v)

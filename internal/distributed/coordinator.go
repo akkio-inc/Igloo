@@ -619,6 +619,9 @@ func (co *Coordinator) planOn(ctx context.Context, query string, env Env, mode M
 	// enough to be worth their files.
 	x.workersWrite = opts.writes && slices.ContainsFunc(plan.Stages, func(s *Stage) bool { return s.writeSQL != "" }) &&
 		(opts.force || x.fillOut() >= co.minWorkerWrite())
+	if x.workersWrite && mode == ModeAuto && !dry && !co.partitionFilesFit(ctx, env, query, x, f) {
+		x.workersWrite = false
+	}
 	if x.fill && !x.writeFits(f) {
 		// Rows as wide as these are more than a task of theirs holds, in a file
 		// of the table's or of its results; this replica, if it has the room.
@@ -1809,12 +1812,11 @@ const minLocalRoom = 1 << 30
 
 // localFor reports whether workers ws write a statement's exchanges to
 // their own disks: always with LocalExchanges; with AutoExchanges, when
-// every one reports minLocalRoom for them and runs outside Kubernetes,
-// whose pods' volumes the chart sets up for exchanges only when told to
-// (workers.exchanges: local). At ten times the data on 16 workers with
-// NVMe, two reports took 34 and 62 s with exchanges on workers' disks, 96
-// and 205 s through object storage, which also turned requests away under
-// the load.
+// every one reports minLocalRoom for them, which is room in a directory of
+// theirs: on Kubernetes the chart's emptyDir, with a part of it set aside for
+// them. At ten times the data on 16 workers with NVMe, two reports took 34 and
+// 62 s with exchanges on workers' disks, 96 and 205 s through object storage,
+// which also turned requests away under the load.
 func (co *Coordinator) localFor(ws []*worker) bool {
 	if co.opts.LocalExchanges {
 		return true
@@ -1823,7 +1825,7 @@ func (co *Coordinator) localFor(ws []*worker) bool {
 		return false
 	}
 	for _, w := range ws {
-		if w.status.Kubernetes || w.status.LocalRoom < minLocalRoom {
+		if w.status.LocalRoom < minLocalRoom {
 			return false
 		}
 	}

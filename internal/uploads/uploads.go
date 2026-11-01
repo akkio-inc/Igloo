@@ -12,12 +12,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"net/http"
 	"net/url"
 	"strings"
 	"time"
 
-	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
+	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/bloberror"
+	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/blockblob"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/container"
 	icebergio "github.com/apache/iceberg-go/io"
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -89,7 +89,7 @@ func For(fsys icebergio.IO, location string, keys Keys) (Store, error) {
 		if err != nil {
 			return nil, err
 		}
-		return &azureStore{client: client, base: base}, nil
+		return &azureStore{client: client, base: base, dfs: u.Scheme == "abfs" || u.Scheme == "abfss"}, nil
 	}
 	return nil, nil
 }
@@ -152,29 +152,49 @@ func (s *s3Store) Abort(ctx context.Context, u Upload) error {
 
 // azureStore is Azure's uncommitted blobs: those with blocks staged and none
 // committed, which a listing that asks for them shows, of no length. A blob
-// committed before keeps what it has, with blocks staged since it, and a blob on
-// a filesystem written through DFS is a file of no length until it is flushed:
-// both are files that listings show.
+// committed before keeps what it has, with blocks staged since it.
+//
+// dfs says the location's files are written through the DFS endpoint (abfs:// and
+// abfss://), where a write left unfinished is a file of no length with its appended
+// data unflushed, which any listing of files shows, and which goes with the file.
+// So a store that is such an account, and refuses to list uncommitted blobs, has none
+// of this location's to list. Nothing else is taken for that: any other answer
+// fails, and with it the erasure request that asked. Azure's own answer has yet to be
+// seen here (the cloud test script's Azure run says what it is), so that until then
+// the failure is on the side of a request that does not complete.
 type azureStore struct {
 	client *container.Client
 	base   string
+	dfs    bool
 }
 
-// containerRoot is a location's container's root: everything up to the path.
-func containerRoot(location string) (string, error) {
-	scheme, rest, ok := strings.Cut(location, "://")
-	if !ok {
-		return "", fmt.Errorf("%s is not a URL", location)
+// refusedListing reports whether err, from listing uncommitted blobs, is the refusal
+// of a filesystem with a hierarchical namespace: that query refused, by an account
+// that says it is one.
+func (s *azureStore) refusedListing(ctx context.Context, err error) bool {
+	if !s.dfs || !(bloberror.HasCode(err, bloberror.InvalidQueryParameterValue) || bloberror.HasCode(err, bloberror.UnsupportedQueryParameter)) {
+		return false
 	}
-	host, _, ok := strings.Cut(rest, "/")
-	if !ok {
-		return location + "/", nil
-	}
-	return scheme + "://" + host + "/", nil
+	info, ierr := s.client.GetAccountInfo(ctx, nil)
+	return ierr == nil && info.IsHierarchicalNamespaceEnabled != nil && *info.IsHierarchicalNamespaceEnabled
 }
 
-// List implements Store. A store that takes no such listing, as a filesystem may
-// not, has none to list: what a DFS write leaves is a file.
+// isDirectory reports whether a listed blob is a directory of a filesystem, which
+// also lists as a blob of no length.
+func isDirectory(b *container.BlobItem) bool {
+	if b.Properties.ResourceType != nil && strings.EqualFold(*b.Properties.ResourceType, "directory") {
+		return true
+	}
+	for k, v := range b.Metadata {
+		if strings.EqualFold(k, "hdi_isfolder") && v != nil && strings.EqualFold(*v, "true") {
+			return true
+		}
+	}
+	return false
+}
+
+// List implements Store. A blob counts if it has no length and staged blocks: a
+// committed one of no length holds nothing to recover.
 func (s *azureStore) List(ctx context.Context, prefix string) ([]Upload, error) {
 	key, ok := strings.CutPrefix(prefix, s.base)
 	if !ok {
@@ -182,21 +202,29 @@ func (s *azureStore) List(ctx context.Context, prefix string) ([]Upload, error) 
 	}
 	pager := s.client.NewListBlobsFlatPager(&container.ListBlobsFlatOptions{
 		Prefix:  &key,
-		Include: container.ListBlobsInclude{UncommittedBlobs: true},
+		Include: container.ListBlobsInclude{UncommittedBlobs: true, Metadata: true},
 	})
 	var out []Upload
 	for pager.More() {
 		page, err := pager.NextPage(ctx)
 		if err != nil {
-			var re *azcore.ResponseError
-			if errors.As(err, &re) && re.StatusCode >= 400 && re.StatusCode < 500 &&
-				re.StatusCode != http.StatusUnauthorized && re.StatusCode != http.StatusForbidden {
+			if s.refusedListing(ctx, err) {
 				return nil, nil
 			}
 			return nil, err
 		}
 		for _, b := range page.Segment.BlobItems {
-			if b.Name == nil || b.Properties == nil || b.Properties.ContentLength == nil || *b.Properties.ContentLength != 0 {
+			if b.Name == nil || b.Properties == nil || b.Properties.ContentLength == nil || *b.Properties.ContentLength != 0 || isDirectory(b) {
+				continue
+			}
+			blocks, err := s.client.NewBlockBlobClient(*b.Name).GetBlockList(ctx, blockblob.BlockListTypeUncommitted, nil)
+			if bloberror.HasCode(err, bloberror.BlobNotFound) {
+				continue
+			}
+			if err != nil {
+				return nil, fmt.Errorf("the staged blocks of %s: %w", *b.Name, err)
+			}
+			if len(blocks.UncommittedBlocks) == 0 {
 				continue
 			}
 			at := time.Time{}
@@ -218,6 +246,19 @@ func (s *azureStore) Abort(ctx context.Context, u Upload) error {
 	}
 	_, err := blob.Delete(ctx, nil)
 	return err
+}
+
+// containerRoot is a location's container's root: everything up to the path.
+func containerRoot(location string) (string, error) {
+	scheme, rest, ok := strings.Cut(location, "://")
+	if !ok {
+		return "", fmt.Errorf("%s is not a URL", location)
+	}
+	host, _, ok := strings.Cut(rest, "/")
+	if !ok {
+		return location + "/", nil
+	}
+	return scheme + "://" + host + "/", nil
 }
 
 // AbortUnder ends every write under prefix that began before the time, if one is

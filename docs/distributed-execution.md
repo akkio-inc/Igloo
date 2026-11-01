@@ -450,7 +450,10 @@ statement's rows are in the table when that commit is, or not at all.
 - **Partitions.** Identity of booleans, integers, dates, timestamps and
   strings, truncate of integers and strings, and year, month, day and hour are
   written by workers, one file per partition per task until compaction merges
-  them. So a table of many partitions gets many small files at first.
+  them, each task sorting its rows by partition first. So a table of many
+  partitions gets many small files at first. Auto mode looks at a fill's first
+  rows, for up to 3 s, and has this replica write a table whose files would be
+  under 8 MiB on average; `distributed_execution = 'on'` still sends it to workers.
 - **On the coordinator's way instead**, as the log says at debug level: tables
   partitioned by bucket, or identity of decimals, whose partition values
   cannot be read from a file's bounds or written to its manifest; tables with
@@ -1041,7 +1044,7 @@ give the workers more memory.
   and its server-side encryption. No credentials the Iceberg REST catalog
   hands out reach `_igloo_shuffle/`. What a coordinator that stopped
   mid-statement leaves behind, the replicas remove [within hours](#lifecycle-rule).
-  Outside Kubernetes, where workers have room on their disks (the default,
+  Where workers have room on their disks (the default,
   `IGLOO_EXCHANGES=auto`), or with `IGLOO_EXCHANGES=local`, they are instead
   files on the workers' disks, which workers send each other over the task
   port: see [exchanges on workers' disks](#exchanges-on-workers-disks).
@@ -1098,17 +1101,18 @@ disks, and the writers needed 0.9 GB of memory rather than 1.6.
 
 `IGLOO_EXCHANGES=auto`, the default, has workers exchange a statement's
 rows on their disks when every worker it runs on reports at least 1 GiB of
-room for them there and runs outside Kubernetes, and through object storage
-otherwise. `object` always uses object storage, and `local` the workers'
-disks wherever a task's share fits.
+room for them there, and through object storage otherwise. `object` always
+uses object storage, and `local` the workers' disks wherever a task's share fits.
 On 16 workers with NVMe, at ten times the data, two reports took 34 s and
 62 s with exchanges on the workers' disks, where they took 95 s and 205 s
 through S3 (warm medians of three; the same rows, the same peak memory on
 the workers, and no exchange objects in S3 rather than 11,000 and 19,000),
 and a statement through S3 at a hundred times the data had requests turned
-away (503 SlowDown). On Kubernetes the chart sets up the volume for
-exchanges only with `workers.exchanges: local`, so `auto` keeps them in
-object storage there.
+away (503 SlowDown). The Helm chart's default, `workers.exchanges: auto`, sets
+aside 30% of the workers' spill volume for them, an `emptyDir` on the node's
+disk, which goes with the pod as they may, and lets workers reach each other's
+task port; on a volume in memory it keeps them in object storage. Run workers on
+other manifests only with that port open between them, or say `object`.
 
 - **Room.** A task writes to its disk only if twice what it is expected to
   write (what it reads; twice, for the copies its readers fetch), with what
@@ -1139,8 +1143,8 @@ object storage there.
   disks when the statement is done, and tells them it still runs every 30
   minutes; a worker removes files nothing used for six hours, as after the
   server stopped, and all of them when it restarts.
-- **Networks.** Workers must reach each other's task port (7433). With the
-  Helm chart, set `workers.exchanges: local`, which sets `IGLOO_EXCHANGES`,
+- **Networks.** Workers must reach each other's task port (7433). The Helm
+  chart's `workers.exchanges`, `auto` by default, sets `IGLOO_EXCHANGES`,
   lets the workers' NetworkPolicy admit each other on that port (only the
   workers of the same compute pool), and splits the workers' spill volume,
   whose free space Kubernetes does not show its pods: 60% for spill
@@ -1336,19 +1340,18 @@ auto mode what one worker's machine costs an hour
 The OpenTofu modules for [AWS](../deploy/aws/README.md#distributed-execution-workers),
 [Azure](../deploy/azure/README.md#distributed-execution-workers) and
 [Google Cloud](../deploy/gcp/README.md#distributed-execution-workers)
-provision the workers' capacity with `workers_enabled = true` (off by
-default): node pools that scale from zero, or on GKE Autopilot a compute
+provision the workers' capacity by default (`workers_enabled`, as the chart's
+`workers.enabled`), which costs nothing until a statement starts them: node pools that scale from zero, or on GKE Autopilot a compute
 class, on [Spot capacity with an on-demand fallback](#spot-workers), and
 the chart's `workers` values to match.
 
-On Kubernetes, workers exchange rows through object storage unless
-`workers.exchanges` is `local`: their spill volume is an `emptyDir` on
-whatever disk the node keeps kubelet's directory on, which is local NVMe
-only on instance-store node types, and exchanges on it take a third of it
-from spill; and the modules run workers on Spot, whose nodes can go with
-the rows they hold. On worker nodes with local NVMe, set
-`workers.exchanges: local`; see [exchanges on workers'
-disks](#exchanges-on-workers-disks) for what it gains.
+On Kubernetes, workers exchange rows on their spill volume where they have room
+(`workers.exchanges: auto`): an `emptyDir` on whatever disk the node keeps
+kubelet's directory on, which is local NVMe on instance-store node types, and
+exchanges on it take a third of it from spill. The modules run workers on Spot, whose
+nodes can go with the rows they hold: such a statement runs its parts again, once, on
+the others. `object` keeps them in object storage; see [exchanges on workers'
+disks](#exchanges-on-workers-disks) for what either gains.
 
 ### Docker Compose
 
@@ -1465,12 +1468,12 @@ On the Igloo server:
 | `IGLOO_WORKERS` | | Workers' addresses, `host[:port]` comma separated (port 7433 by default). A host may resolve to several workers, as a Kubernetes headless Service does. Empty turns distributed execution off. |
 | `IGLOO_WORKER_SECRET` | (required with workers) | At least 32 characters, the same on the server and the workers |
 | `IGLOO_WORKER_COMPUTE` | | How to start and stop workers: `kubernetes`, `ec2`, `command`, or empty when they always run |
-| `IGLOO_WORKER_MAX` | `4` | The most workers Igloo starts |
+| `IGLOO_WORKER_MAX` | `16` | The most workers Igloo starts, as it weighs how many a statement should run on |
 | `IGLOO_WORKER_IDLE_AFTER` | `auto` | Stop workers after this long without tasks; `auto` for three times what their last start took, from 2 to 10 minutes |
 | `IGLOO_WORKER_WARM` | `1` | While some workers work, how many idle ones past them stay up; the others stop alone, on Kubernetes and EC2 (see [idle workers](#idle-workers)); `off` stops workers only all together |
 | `IGLOO_WORKER_START_TIMEOUT` | `3m` | How long a statement waits for workers to start before it runs on the server instead |
 | `IGLOO_WORKER_THRESHOLD` | `1m` | In `auto` mode, how long a statement must take on the server alone before it may run on workers (see [when](#when)) |
-| `IGLOO_EXCHANGES` | `auto` | Where workers exchange rows: `auto`, their disks where every worker has room and runs outside Kubernetes, object storage otherwise; `object` storage; or `local` disks (see [exchanges on workers' disks](#exchanges-on-workers-disks)) |
+| `IGLOO_EXCHANGES` | `auto` | Where workers exchange rows: `auto`, their disks where every worker has room, object storage otherwise; `object` storage; or `local` disks (see [exchanges on workers' disks](#exchanges-on-workers-disks)) |
 | `IGLOO_WORKER_WRITES` | `on` | Whether workers [write tables' files](#workers-writing-tables) for statements that fill a table from a query; `off`: the coordinator writes them from their results |
 | `IGLOO_WORKER_K8S_DEPLOYMENT`, `IGLOO_WORKER_K8S_NAMESPACE` | | `kubernetes`: the workers' Deployment, and its namespace if not the server's |
 | `IGLOO_WORKER_EC2_INSTANCE_IDS` | | `ec2`: the workers' instances |
@@ -1599,7 +1602,7 @@ Workers suit Spot capacity, 50 to 75% cheaper on AWS: they keep nothing a
 statement needs once their tasks end, a task a lost worker ran runs again on
 another, and with exchanges in object storage (`IGLOO_EXCHANGES=object`)
 nothing they wrote is lost with them; with exchanges on their disks (`auto`,
-the default outside Kubernetes), a statement that loses a worker holding
+the default), a statement that loses a worker holding
 rows it exchanged runs its parts again, once, on the others (see
 [exchanges on workers' disks](#exchanges-on-workers-disks)). Keep Igloo
 itself, the catalog and its

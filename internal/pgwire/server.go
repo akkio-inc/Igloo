@@ -2231,7 +2231,7 @@ func (s *Server) preparedQuery(ctx context.Context, sess *session, user auth.Use
 		peak, sampled := sess.wl.peak, sess.wl.sampled
 		if used != nil && parts.workers == 0 && s.heavy != nil {
 			// Which of this replica's DuckDBs the next like it runs in.
-			s.heavy.observe(shape, used.CPUTime)
+			s.heavy.observe(shape, used.CPUTime, sess.wl.ranInBackground)
 		}
 		switch {
 		case parts.workers > 0:
@@ -2240,7 +2240,12 @@ func (s *Server) preparedQuery(ctx context.Context, sess *session, user auth.Use
 			// What it held here, for the next statement like it.
 			s.workload.Observe(shape, workload.FootprintOf(used.MemoryAllocated, peak, sampled))
 		case err != nil && sampled:
-			// It ended before its end, holding at least that much.
+			// It ended before its end, holding at least that much, or, if it
+			// ran a while, all the memory: it may have held any of what the
+			// statements beside it were charged with.
+			if time.Since(start)-sess.wl.queued >= workload.LongUnfinished {
+				peak = max(peak, s.queryMemory)
+			}
 			s.workload.ObserveUnfinished(shape, peak)
 		}
 		if !sampled {

@@ -130,7 +130,19 @@ func openBackground(ctx context.Context, cfg config.Config, log *slog.Logger) (*
 // over a billion rows read their files again, 12 GB each, and took 60 s, not
 // 8. The background DuckDB then has what the first does not hold, down to a
 // quarter of the limit, and spills: what it gives up is its own to give up.
+//
+// Two DuckDBs hold more than their limits count, each its own metadata and what
+// its allocator keeps: a report over a billion rows and dashboards beside it took
+// the process 11 GB past what they held, against 2 GB for one DuckDB, and left the
+// machine so little that the memory watch stopped the report. So what the limits
+// share is less what the process holds past them, beyond backgroundOver of it.
 const (
+	// backgroundOver is how much past what the two hold the limit leaves room
+	// for, as a divisor of it.
+	backgroundOver = 16
+	// backgroundLeast is the least of the limit they share, as a part of it
+	// out of 4.
+	backgroundLeast = 3
 	// backgroundMinShare is the least of the limit the background DuckDB
 	// keeps, as a divisor.
 	backgroundMinShare = 4
@@ -140,14 +152,18 @@ const (
 	// balanceEvery is how often the limits are weighed.
 	balanceEvery = time.Second
 	// backgroundIdleLimit is the background DuckDB's limit with nothing
-	// running in it, so what it read last gives the first its room back.
+	// running in it while the first reads, so what it read last gives the first
+	// its room back.
 	backgroundIdleLimit = 256 << 20
 )
 
 // ForegroundRead says a statement that reads tables is running in the first
 // DuckDB, whose caches therefore keep their memory for a while.
 func (e *Engine) ForegroundRead() {
-	e.fgRead.Store(time.Now().UnixNano())
+	last := e.fgRead.Swap(time.Now().UnixNano())
+	if time.Since(time.Unix(0, last)) >= foregroundIdle {
+		e.balanceNow()
+	}
 }
 
 // UsingBackground says a statement runs in the background DuckDB until the
@@ -207,8 +223,11 @@ func (e *Engine) balance(ctx context.Context) {
 		e.limit.CompareAndSwap(0, total)
 	}
 	wantMain, wantBg := total, int64(backgroundIdleLimit)
-	if e.bgUsers.Load() > 0 {
-		reading := time.Since(time.Unix(0, e.fgRead.Load())) < foregroundIdle
+	reading := time.Since(time.Unix(0, e.fgRead.Load())) < foregroundIdle
+	// With nothing running in the background DuckDB, what it holds stays for its
+	// next statement until the first reads: a session's reports one after another
+	// read the same files, and one of 24 s took 50 s starting with nothing.
+	if e.bgUsers.Load() > 0 || !reading {
 		query := queryMemory
 		if reading {
 			query = queryAllMemory
@@ -221,10 +240,26 @@ func (e *Engine) balance(ctx context.Context) {
 		if err != nil {
 			return
 		}
-		wantMain, wantBg = balancedLimits(total, mainHeld, bgHeld, reading)
+		mainAll := mainHeld
+		if !reading {
+			if mainAll, err = e.held(ctx, queryAllMemory); err != nil {
+				return
+			}
+		}
+		// Up at once, and down slowly: the limits should not follow what
+		// the allocator hands back and takes again.
+		over := max(processRSS()-mainAll-bgHeld, e.bgOver.Load()-total/64, 0)
+		e.bgOver.Store(over)
+		wantMain, wantBg = balancedLimits(roomFor(total, over), mainHeld, bgHeld, reading)
 	}
 	applyLimit(ctx, e, wantMain)
 	applyLimit(ctx, bg, wantBg)
+}
+
+// roomFor is what the two DuckDBs' limits share of total, when the process holds
+// over past what they hold.
+func roomFor(total, over int64) int64 {
+	return max(total-max(over-total/backgroundOver, 0), total/4*backgroundLeast)
 }
 
 // balancedLimits returns the two DuckDBs' limits, out of total, given what

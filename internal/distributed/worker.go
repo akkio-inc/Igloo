@@ -307,8 +307,8 @@ func (w *Worker) serveStatus(rw http.ResponseWriter, _ *http.Request) {
 		InstanceType: w.opts.InstanceType, Region: w.opts.Region, Spot: w.opts.Spot, Instance: w.opts.Instance, Retiring: w.retiring.Load() || w.draining.Load(),
 		Boot:    w.boot,
 		Running: int(running), IdleSeconds: idle.Seconds(),
-		LocalRoom: w.localRoom(), Kubernetes: os.Getenv("KUBERNETES_SERVICE_HOST") != "",
-		Cache: w.opts.Erasure.Cache, Erased: w.purged.Load(), Alone: w.alone.Load(),
+		LocalRoom: w.localRoom(),
+		Cache:     w.opts.Erasure.Cache, Erased: w.purged.Load(), Alone: w.alone.Load(),
 	})
 }
 

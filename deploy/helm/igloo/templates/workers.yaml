@@ -83,7 +83,7 @@ spec:
             {{- end }}
             {{- if .Values.workers.duckdb.spillVolume.sizeLimit }}
             {{- $spillMiB := float64 (include "igloo.quantityMiB" (list (printf "%sduckdb.spillVolume.sizeLimit" $prefix) .Values.workers.duckdb.spillVolume.sizeLimit)) }}
-            {{- if eq (.Values.workers.exchanges | default "object") "local" }}
+            {{- if ne (include "igloo.workerExchanges" .) "object" }}
             {{- /* Exchanges share the volume: 60% for spill, 30% for them. */}}
             - name: IGLOO_DUCKDB_MAX_TEMP_SIZE
               value: {{ printf "%dMiB" (int64 (floor (mulf $spillMiB 0.6))) | quote }}
@@ -250,8 +250,8 @@ subjects:
 {{- if .Values.networkPolicy.enabled }}
 ---
 # Workers take tasks from their own igloo pods only (those of their compute
-# pool), and serve health checks and metrics; with workers.exchanges local,
-# they also send each other the rows they exchange, over the same port.
+# pool), and serve health checks and metrics; unless exchanges go through object
+# storage, they also send each other the rows they exchange, over the same port.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -272,7 +272,7 @@ spec:
       ports:
         - port: worker
           protocol: TCP
-    {{- if eq (.Values.workers.exchanges | default "object") "local" }}
+    {{- if ne (include "igloo.workerExchanges" .) "object" }}
     - from:
         {{- range $peer := include "igloo.workerPeerComponents" . | fromJsonArray }}
         - podSelector:
