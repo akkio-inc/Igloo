@@ -2098,6 +2098,12 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
 
 ### Fixed
 
+- A statement whose task over one partition ran out of memory on a worker
+  runs again with more memory for each task where more partitions would
+  not fit the tasks that write its exchanges: its tasks take twice a
+  worker's slots, up to all of them, and so twice its memory, and their
+  writers room for twice the partitions. It ran again over about the same
+  partitions, and ran out of memory the same way.
 - A block of the read cache missing or rewritten under a read no longer
   fails the statement. A worker started with an empty disk read ahead as
   if its cache were still empty after it was full, by a measurement of

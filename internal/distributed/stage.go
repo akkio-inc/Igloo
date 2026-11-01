@@ -235,8 +235,11 @@ type execution struct {
 	// parts is how many partitions every exchange has.
 	parts int
 	// smaller is how many times the statement ran again because a task ran
-	// out of memory: each halves the tasks (see Execute).
+	// out of memory: each halves the tasks (see Execute). slots are the
+	// workers' slots each task takes, and the shares of a worker's memory
+	// it has (see retryShape); 0 means 1.
 	smaller int
+	slots   int
 	// roots are the statement's directories in object storage for
 	// exchanges (see spreadRoots).
 	roots     []string
@@ -516,6 +519,9 @@ func (e *execution) stage(ctx context.Context, s *Stage) error {
 	var stopped atomic.Bool
 	for i := range tasks {
 		task := &taskRequest{Query: e.qid, Task: s.ID*10000 + i, Version: e.co.opts.Version, Settings: e.settings, Erased: e.erased}
+		if e.slots > 1 {
+			task.Slots = e.slots
+		}
 		// bytes are what it reads of a table's share, reads all it reads.
 		var bytes int64
 		reads := wholeBytes

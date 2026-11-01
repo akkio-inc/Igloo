@@ -734,7 +734,12 @@ twice the partitions (up to 256), with each task's share of a divided table
 halved, and half the memory for grouping partitions into a task. A task
 that read one partition is no smaller so, so when such a task ran out, the
 partitions grow fourfold instead, up to 1,024, as far as leaves each
-writer files of a million rows of the exchange it read. If those
+writer files of a million rows of the exchange it read. Partitions grow
+only as far as the tasks that write the exchanges have memory for a row
+group of each; where that keeps them from doubling, each task takes twice
+the worker's slots instead, up to all of them, so that fewer run at once
+and each has twice the memory, and its writers room for twice the
+partitions. If those
 run out too, the statement fails with SQLSTATE `53200` (`out_of_memory`), and
 the server logs `a worker ran out of memory running part of a statement`:
 run on another worker or on the coordinator, the part would run out of

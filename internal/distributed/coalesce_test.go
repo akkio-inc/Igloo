@@ -176,10 +176,10 @@ func TestWriterPartitions(t *testing.T) {
 		}
 		return ws
 	}
-	if most := writerPartitions(stagesOf(narrow), workers(16, 24_500<<20, 3), uploadBuffer); most < maxPartitions {
+	if most := writerPartitions(stagesOf(narrow), workers(16, 24_500<<20, 3), uploadBuffer, 1); most < maxPartitions {
 		t.Errorf("narrow rows on 24.5 GiB workers: at most %d partitions", most)
 	}
-	if most := writerPartitions(stagesOf(wide), workers(1, 3e9, 1), 0); most != 28 {
+	if most := writerPartitions(stagesOf(wide), workers(1, 3e9, 1), 0, 1); most != 28 {
 		t.Errorf("400 strings on a 3 GB worker: at most %d partitions, want 28", most)
 	}
 	if n := exchangePartitions(stagesOf(wide), workers(1, 3e9, 1), 1, 0); n != 28 {
@@ -306,12 +306,12 @@ func TestUploadBuffers(t *testing.T) {
 	stages := []*Stage{{ID: 0, Inputs: []Input{{View: "t", Table: &Table{Name: "t", Rows: 4e9,
 		Columns: []Column{{Name: "id", Type: "VARCHAR"}}}, Split: true}}, Out: &Exchange{ID: 0}}}
 	small := []*worker{{status: workerStatus{MemoryBytes: 2e9, Slots: 1, Cores: 4}}}
-	local, remote := writerPartitions(stages, small, 0), writerPartitions(stages, small, uploadBytes("s3://b/w/"))
+	local, remote := writerPartitions(stages, small, 0, 1), writerPartitions(stages, small, uploadBytes("s3://b/w/"), 1)
 	if remote >= local || int64(remote)*uploadBuffer > taskMemory(small)/2 {
 		t.Errorf("a 2 GB worker writes %d partitions to object storage, %d to disk", remote, local)
 	}
 	big := []*worker{{status: workerStatus{MemoryBytes: 26_400_000_000, Slots: 2, Cores: 8}}}
-	if n := writerPartitions(stages, big, uploadBuffer); n < maxPartitions {
+	if n := writerPartitions(stages, big, uploadBuffer, 1); n < maxPartitions {
 		t.Errorf("a 24.6 GiB worker writes at most %d partitions to object storage", n)
 	}
 }
@@ -434,7 +434,7 @@ func TestReportPartitions(t *testing.T) {
 		t.Errorf("ten times the data: %d partitions, want 32", n)
 	}
 	visits.Rows, visits.Bytes = 2_994_000_000, 50e9
-	n, writers := exchangePartitions(stages, ws, len(ws), uploadBuffer), writerPartitions(stages, ws, uploadBuffer)
+	n, writers := exchangePartitions(stages, ws, len(ws), uploadBuffer), writerPartitions(stages, ws, uploadBuffer, 1)
 	if want := int(visits.Rows / (16 << 20)); n != want || n > writers {
 		t.Errorf("a hundred times the data: %d partitions, want %d, within the writers' %d", n, want, writers)
 	}

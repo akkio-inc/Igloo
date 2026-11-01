@@ -76,6 +76,12 @@ type taskRequest struct {
 	// purged through less purges first, and one purged through more
 	// refuses the task (see erasure.go).
 	Erased int64 `json:"erased,omitempty"`
+	// Slots is how many of the worker's slots the task takes (see
+	// taskSlots), and so how many times a task's share of the worker's
+	// memory it has: more than one when a task over one partition ran out
+	// of memory and more partitions would not fit their writers (see
+	// retryShape).
+	Slots int `json:"slots,omitempty"`
 }
 
 // purgeRequest has a worker purge what erasure requests deleted through

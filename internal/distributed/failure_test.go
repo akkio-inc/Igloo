@@ -428,7 +428,7 @@ func TestShuffleFiles(t *testing.T) {
 	dir := filepath.Join(h.dir, "warehouse", config.ShuffleDir, "q", "s0", "0", "a0")
 	cols := []Column{{Name: "i", Type: "BIGINT"}, {Name: "s", Type: "VARCHAR"}, {Name: "__b", Type: "INTEGER"}}
 	res, err := w.shuffle(t.Context(), conn, dir,
-		fmt.Sprintf("SELECT i, 'x' || (i %% 1000) AS s, CAST(hash(i) %% %d AS INTEGER) AS __b FROM range(3000000) t(i)", parts), cols, parts)
+		fmt.Sprintf("SELECT i, 'x' || (i %% 1000) AS s, CAST(hash(i) %% %d AS INTEGER) AS __b FROM range(3000000) t(i)", parts), cols, parts, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -464,12 +464,12 @@ func TestShuffleRowGroupBytes(t *testing.T) {
 	}
 	cols := []Column{{Name: "id", Type: "VARCHAR"}, {Name: "a", Type: "VARCHAR[]"}, {Name: "b", Type: "VARCHAR[]"},
 		{Name: "c", Type: "VARCHAR[]"}, {Name: "d", Type: "VARCHAR[]"}, {Name: "__b", Type: "INTEGER"}}
-	if rows := shuffleRowGroup(w.opts.MemoryBytes, cap(w.slots), parts, cols); rows != minShuffleRowGroup {
+	if rows := shuffleRowGroup(w.opts.MemoryBytes, w.slotCount, parts, cols); rows != minShuffleRowGroup {
 		t.Fatalf("rows a group by types: %d", rows)
 	}
 	query := fmt.Sprintf("SELECT md5(i::VARCHAR) AS id, %s AS a, %s AS b, %s AS c, %s AS d, CAST(hash(i) %% %d AS INTEGER) AS __b FROM range(160000) t(i)",
 		list(1), list(7), list(13), list(17), parts)
-	res, err := w.shuffle(t.Context(), conn, dir, query, cols, parts)
+	res, err := w.shuffle(t.Context(), conn, dir, query, cols, parts, 1)
 	if err != nil {
 		t.Fatal(err)
 	}

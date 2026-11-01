@@ -843,6 +843,55 @@ func retryPartitions(parts int, rows int64, workers int) int {
 	return next
 }
 
+// retryShape returns the partitions a statement's exchanges get, and the
+// workers' slots each of its tasks takes (taskRequest.Slots), when it runs
+// again after a task ran out of memory on a worker, of workers whose
+// fewest slots are most; parts and slots are what it ran with, one is set
+// when the task read one partition, and writers says how many partitions
+// the tasks that write exchanges have memory for at a number of slots a
+// task (see writerPartitions). Smaller tasks get twice the partitions, or
+// for a task over one partition retryPartitions; but no more than their
+// writers have memory for, which at a hundred times the data held a
+// report's partitions where they were after its first run again, so that
+// it ran again over the same partitions and ran out of memory the same
+// way. A task over one partition whose partitions
+// cannot double so takes twice the slots instead, up to all of a worker's,
+// which gives it, and the writers, twice the memory: fewer tasks run at
+// once.
+func retryShape(parts, slots int, one *onePartition, workers, most int, writers func(slots int) int) (int, int) {
+	want := min(2*parts, maxPartitions)
+	if one != nil {
+		want = retryPartitions(parts, one.rows, workers)
+	}
+	fit := func(slots int) int {
+		if n := writers(slots); n > 0 {
+			return min(want, max(n, workers, parts))
+		}
+		return want
+	}
+	next := fit(slots)
+	if one != nil && next < 2*parts && slots < most {
+		slots = min(2*slots, most)
+		next = fit(slots)
+	}
+	return next, slots
+}
+
+// minSlots is the fewest slots of the workers ws (see taskSlots).
+func minSlots(ws []*worker) int {
+	n := 0
+	for _, w := range ws {
+		s := w.status.Slots
+		if s <= 0 {
+			s = taskSlots(w.status.Cores, w.status.MemoryBytes)
+		}
+		if n == 0 || s < n {
+			n = s
+		}
+	}
+	return max(n, 1)
+}
+
 // Keep keeps the workers from stopping as idle until release is called:
 // the server holds them while a statement that ran tasks runs, on the
 // coordinator too, and while one auto mode chose to run there runs, for
@@ -939,9 +988,11 @@ func (co *Coordinator) Execute(ctx context.Context, plan *Plan, settings []Setti
 	}
 	var run *execution
 	planned := plan
-	// smaller counts the runs again in smaller tasks, and lostOnce says the
-	// statement ran again without a worker lost with exchanges on its disk.
-	smaller, lostOnce := 0, false
+	// smaller counts the runs again in smaller tasks, slots are the
+	// workers' slots each task takes (see retryShape), and lostOnce says
+	// the statement ran again without a worker lost with exchanges on its
+	// disk.
+	smaller, slots, lostOnce := 0, 1, false
 	for attempt := 0; ; attempt++ {
 		// Each attempt's tasks and exchanges are its own, so that what a
 		// canceled task of the last one still writes is not read; with
@@ -965,7 +1016,7 @@ func (co *Coordinator) Execute(ctx context.Context, plan *Plan, settings []Setti
 		newRun := func(id string) *execution {
 			r := &execution{
 				co: co, qid: id, dir: ex.dir, ws: ws, files: files, settings: settings, variables: vars, force: planned.force,
-				sp: &spool{limit: limit}, parts: parts, smaller: smaller, roots: spreadRoots(co.opts.Warehouse, id), local: local, erased: erased,
+				sp: &spool{limit: limit}, parts: parts, smaller: smaller, slots: slots, roots: spreadRoots(co.opts.Warehouse, id), local: local, erased: erased,
 				exchanges: map[int]*exchangeRun{}, results: map[int]*jobResult{}, used: map[string]bool{},
 			}
 			// The exchanges are read only by the stages: once they have run,
@@ -1003,17 +1054,15 @@ func (co *Coordinator) Execute(ctx context.Context, plan *Plan, settings []Setti
 			// Smaller tasks: twice the partitions, each task's share of a
 			// divided table halved, and half the memory to group
 			// partitions in (see groups).
-			next := min(2*parts, maxPartitions)
 			var one *onePartition
-			if errors.As(err, &one) {
-				next = retryPartitions(parts, one.rows, len(ws))
-			}
-			if most := writerPartitions(planned.Stages, ws, uploadBytes(co.opts.Warehouse)); most > 0 {
-				next = min(next, max(most, len(ws), parts))
-			}
+			errors.As(err, &one)
+			stages, upload := planned.Stages, uploadBytes(co.opts.Warehouse)
+			next, nextSlots := retryShape(parts, slots, one, len(ws), minSlots(ws), func(slots int) int {
+				return writerPartitions(stages, ws, upload, slots)
+			})
 			co.log.Warn("a task ran out of memory on a worker; running the statement's parts again in smaller tasks",
-				"query", qid, "attempt", attempt+1, "partitions", next, "one_partition", one != nil, "err", err)
-			parts = next
+				"query", qid, "attempt", attempt+1, "partitions", next, "task_slots", nextSlots, "one_partition", one != nil, "err", err)
+			parts, slots = next, nextSlots
 			smaller++
 			dropAttempt()
 			if len(plan.uncertain) == 0 {

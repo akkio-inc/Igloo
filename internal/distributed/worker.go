@@ -27,6 +27,7 @@ import (
 	"time"
 
 	"github.com/duckdb/duckdb-go/v2"
+	"golang.org/x/sync/semaphore"
 
 	"github.com/akkio-inc/igloo/internal/activity"
 	"github.com/akkio-inc/igloo/internal/config"
@@ -120,9 +121,12 @@ type Worker struct {
 	// tasks and is not ready, so that it is stopped alone (see Retiring).
 	retiring atomic.Bool
 
-	// slots bound the tasks that run at once (see taskSlots); running are
-	// those running, which ShedMemory may cancel.
-	slots     chan struct{}
+	// slots bound the tasks that run at once (see taskSlots), of which a
+	// task takes one or more (taskRequest.Slots), and slotCount is how
+	// many there are; running are those running, which ShedMemory may
+	// cancel.
+	slots     *semaphore.Weighted
+	slotCount int
 	runningMu sync.Mutex
 	running   map[*runningTask]bool
 
@@ -197,8 +201,8 @@ func NewWorker(opts WorkerOptions, log *slog.Logger) (*Worker, error) {
 		return nil, fmt.Errorf("create directory for fetched exchanges: %w", err)
 	}
 	w := &Worker{opts: opts, transport: t, log: log.With("component", "worker"), activity: activity.New(),
-		slots: make(chan struct{}, cmp.Or(opts.Tasks, taskSlots(opts.Cores, opts.MemoryBytes))),
 		local: local, fetchRoot: filepath.Clean(fetchRoot), stopSweep: make(chan struct{}),
+		slotCount: cmp.Or(opts.Tasks, taskSlots(opts.Cores, opts.MemoryBytes)),
 		peers: &http.Client{
 			Transport: &http.Transport{TLSClientConfig: t.client.Clone(), MaxIdleConnsPerHost: fetchesPerTask, IdleConnTimeout: time.Minute,
 				// A worker answers at once, if only that it is busy; one that
@@ -209,6 +213,7 @@ func NewWorker(opts WorkerOptions, log *slog.Logger) (*Worker, error) {
 			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 		},
 		boot: newID()}
+	w.slots = semaphore.NewWeighted(int64(w.slotCount))
 	if !opts.Erasure.Through.IsZero() {
 		w.purged.Store(opts.Erasure.Through.UnixNano())
 		w.admitted.Store(opts.Erasure.Through.UnixNano())
@@ -256,7 +261,7 @@ func (w *Worker) serveStatus(rw http.ResponseWriter, _ *http.Request) {
 	running, idle := w.activity.Snapshot()
 	rw.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(rw).Encode(workerStatus{
-		ID: w.opts.ID, Version: w.opts.Version, Cores: w.opts.Cores, MemoryBytes: w.opts.MemoryBytes, Threads: w.opts.Threads, Slots: cap(w.slots),
+		ID: w.opts.ID, Version: w.opts.Version, Cores: w.opts.Cores, MemoryBytes: w.opts.MemoryBytes, Threads: w.opts.Threads, Slots: w.slotCount,
 		InstanceType: w.opts.InstanceType, Region: w.opts.Region, Spot: w.opts.Spot, Instance: w.opts.Instance, Retiring: w.retiring.Load(),
 		Boot:    w.boot,
 		Running: int(running), IdleSeconds: idle.Seconds(),
@@ -319,6 +324,10 @@ func taskSlots(cores int, memory int64) int {
 	}
 	return n
 }
+
+// taskSlots is how many of the worker's slots a task that asks for n
+// takes: at least one, and at most all.
+func (w *Worker) taskSlots(n int) int { return min(max(n, 1), w.slotCount) }
 
 // runningTask is a task while it runs, for ShedMemory and purges.
 type runningTask struct {
@@ -413,15 +422,15 @@ func (w *Worker) serveTask(rw http.ResponseWriter, r *http.Request) {
 		return
 	}
 	log := w.log.With("query", req.Query, "task", req.Task)
-	// Wait for a slot (see taskSlots); the coordinator's task waits with it.
-	select {
-	case w.slots <- struct{}{}:
-	case <-ctx.Done():
+	// Wait for its slots (see taskSlots); the coordinator's task waits
+	// with it.
+	take := int64(w.taskSlots(req.Slots))
+	if err := w.slots.Acquire(ctx, take); err != nil {
 		log.Debug("task canceled while it waited to run")
 		w.opts.Metrics.task("canceled", start)
 		return
 	}
-	defer func() { <-w.slots }()
+	defer w.slots.Release(take)
 	done, err := w.admit(ctx, &runningTask{query: req.Query, task: req.Task, started: time.Now(), cancel: cancel, erased: req.Erased})
 	if err != nil {
 		var te *taskErr
@@ -719,7 +728,7 @@ func (w *Worker) run(ctx context.Context, req *taskRequest) (string, *taskResult
 		return "", res, err
 	}
 	if req.Shuffle != "" {
-		res, err := w.shuffle(ctx, conn, req.Shuffle, query, cols, req.Partitions)
+		res, err := w.shuffle(ctx, conn, req.Shuffle, query, cols, req.Partitions, req.Slots)
 		return "", res, err
 	}
 	// Columns Parquet would change cross as text; see transferType.
@@ -860,16 +869,20 @@ func rowWidth(cols []Column) int64 {
 
 // shuffle writes the rows of query, partitioned by its __b column, under
 // dir in the warehouse's exchanges, and lists the files written.
-func (w *Worker) shuffle(ctx context.Context, conn *duckdb.Conn, dir, query string, cols []Column, parts int) (*taskResult, error) {
+func (w *Worker) shuffle(ctx context.Context, conn *duckdb.Conn, dir, query string, cols []Column, parts, slots int) (*taskResult, error) {
 	if !w.allowed(dir+"/") || !strings.Contains(dir, "/"+config.ShuffleDir+"/") {
 		return nil, fmt.Errorf("shuffle directory %s is outside the warehouse's %s", dir, config.ShuffleDir)
 	}
-	return w.writePartitions(ctx, conn, dir, query, cols, parts)
+	return w.writePartitions(ctx, conn, dir, query, cols, parts, slots)
 }
 
 // writePartitions writes the rows of query, partitioned by its __b column,
-// under dir, and lists the files written.
-func (w *Worker) writePartitions(ctx context.Context, conn *duckdb.Conn, dir, query string, cols []Column, parts int) (*taskResult, error) {
+// under dir, and lists the files written, for a task that took slots of
+// the worker's slots (taskRequest.Slots).
+func (w *Worker) writePartitions(ctx context.Context, conn *duckdb.Conn, dir, query string, cols []Column, parts, slots int) (*taskResult, error) {
+	// The task's share of the worker's memory is that of one of shares
+	// tasks at once.
+	shares := max(w.slotCount/w.taskSlots(slots), 1)
 	if !slices.ContainsFunc(cols, func(c Column) bool { return c.Name == "__b" }) {
 		return nil, errors.New("a shuffle task's rows have no __b column")
 	}
@@ -902,7 +915,7 @@ func (w *Worker) writePartitions(ctx context.Context, conn *duckdb.Conn, dir, qu
 		return nil, err
 	}
 	if _, err := conn.ExecContext(ctx, fmt.Sprintf("SET SESSION partitioned_write_flush_threshold = %d",
-		shuffleFlush(w.opts.MemoryBytes, cap(w.slots), threadsOf(ctx, conn), cols)), nil); err != nil {
+		shuffleFlush(w.opts.MemoryBytes, shares, threadsOf(ctx, conn), cols)), nil); err != nil {
 		return nil, err
 	}
 	if uploadsInParts(dir) {
@@ -910,8 +923,8 @@ func (w *Worker) writePartitions(ctx context.Context, conn *duckdb.Conn, dir, qu
 			return nil, err
 		}
 	}
-	opts := fmt.Sprintf("FORMAT parquet, PARTITION_BY (__b), ROW_GROUP_SIZE %d", shuffleRowGroup(w.opts.MemoryBytes, cap(w.slots), parts, cols))
-	if n := shuffleRowGroupBytes(w.opts.MemoryBytes, cap(w.slots), parts); n > 0 {
+	opts := fmt.Sprintf("FORMAT parquet, PARTITION_BY (__b), ROW_GROUP_SIZE %d", shuffleRowGroup(w.opts.MemoryBytes, shares, parts, cols))
+	if n := shuffleRowGroupBytes(w.opts.MemoryBytes, shares, parts); n > 0 {
 		// DuckDB bounds a row group's bytes only where it need not keep
 		// the rows' order, which an exchange's partitions do not. The
 		// setting is global but for SET SESSION: set plainly, another
