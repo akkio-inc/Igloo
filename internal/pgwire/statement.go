@@ -48,6 +48,10 @@ type statement struct {
 	// readsOnce says running it twice would not read the same rows: it reads
 	// a merge as it is made (see runFinal).
 	readsOnce bool
+	// streams says its rows stream to a writer that may stop for a while, as
+	// a portal with a row limit does: it runs on a connection of its own, and
+	// reads no more of the session than its text (see runLargeSort).
+	streams bool
 	// access is set when grants allowed the statement (see access.go).
 	access *access
 	// bitmaps says it counts distinct IDs in roaring bitmaps, prepared and
@@ -355,7 +359,7 @@ func (st *statement) run(ctx context.Context, args []driver.NamedValue, w wire.D
 		return st.runArrow(ctx, args, w, aw)
 	}
 
-	if !drains(w) {
+	if !drains(w) && !st.streams {
 		return st.readRows(ctx, st.stmt.QueryContext, args, w)
 	}
 	// DuckDB computes the rows as the client reads them, rather than all of
@@ -454,6 +458,13 @@ func (st *statement) readRows(ctx context.Context, query func(context.Context, [
 // client may run other statements on the session before it reads on, nor
 // one of Igloo's own that reads a statement's rows.
 func drains(w wire.DataWriter) bool {
+	d := drainerOf(w)
+	return d != nil && d.Drains()
+}
+
+// drainerOf returns the client's writer w leads to, through Igloo's own
+// wrappers, or nil if it is one of Igloo's own that reads a statement's rows.
+func drainerOf(w wire.DataWriter) wire.Drainer {
 	for {
 		switch x := w.(type) {
 		case *tagWriter:
@@ -461,9 +472,9 @@ func drains(w wire.DataWriter) bool {
 		case afterWriter:
 			w = x.DataWriter
 		case wire.Drainer:
-			return x.Drains()
+			return x
 		default:
-			return false
+			return nil
 		}
 	}
 }

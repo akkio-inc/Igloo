@@ -535,6 +535,13 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
 
 ### Distributed execution
 
+- Reads in order larger than memory sort in runs also with parameters, for a
+  client that reads a few rows at a time through a portal (JDBC's fetch size),
+  by expressions, and with columns the merge cannot compare or pass on, as
+  `HUGEINT`, `UUID`, `INTERVAL`, lists, structs and maps. Arrow Flight results
+  stream, computed as the client takes them, where they were held whole first.
+  See [reads in order larger than
+  memory](docs/operations.md#reads-in-order-larger-than-memory).
 - Tables bucketed by `UUID` columns stay in place too, and those written by
   different engines no longer meet by bucket. DuckDB hashes a `UUID` otherwise
   than Iceberg's spec, so a table's files hold it in a bucket by the hash of the

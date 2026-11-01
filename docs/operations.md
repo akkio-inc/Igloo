@@ -421,12 +421,18 @@ came after 6 seconds. The files and runs take what the spill directory takes
 for such a sort; a read whose estimate passes `IGLOO_SORT_SPILL_BUDGET` sorts
 at once and is stopped as before. `igloo_large_sorts_total` counts these reads.
 
-Only an `ORDER BY` of the result's columns, by name, alias or position, of
-types the merge compares as DuckDB orders them (numbers, text without a
-collation, binary, dates and times, booleans), without `LIMIT` or `GROUP BY`,
-sorts this way. A statement with parameters, or one whose client reads a few rows
-at a time through a portal, sorts at once. So does any read if a step before
-its first row fails, with a warning in the log.
+An `ORDER BY` without `LIMIT` or `GROUP BY` sorts this way, with or without
+parameters. One of the result's columns, by name, alias or position, of types
+the merge compares as DuckDB orders them (numbers, text without a collation,
+binary, dates and times, booleans), is merged by those columns; an order by an
+expression or by other types by a column of its sort key, and columns of types
+the files would not pass on unchanged (`HUGEINT`, `UUID`, `INTERVAL`, lists, structs
+and maps) go through them as text. A client that reads a few rows at a time
+through a portal, as JDBC's fetch size has it do, gets them from a merge on a
+connection of its own, so it may run other statements between its reads. An
+order with a subquery or a collation in it, or of `UNION`, `ENUM`, `BIT` or
+`BIGNUM` columns, sorts at once. So does any read if a step before its first
+row fails, with a warning in the log.
 
 ### When one machine is not enough
 

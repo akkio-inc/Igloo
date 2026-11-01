@@ -209,6 +209,43 @@ func TestQueryReturnsDuckDBArrowTypes(t *testing.T) {
 	}
 }
 
+// TestResultsStreamAsComputed reads a statement's rows that fails three quarters
+// of the way through them: batches reach the client before the error, as they
+// would not if the result were computed whole first.
+func TestResultsStreamAsComputed(t *testing.T) {
+	ts := startServer(t, Options{})
+	cl, ctx := ts.signIn(t, "rita")
+	info, err := cl.Execute(ctx, "SELECT CASE WHEN i < 3000000 THEN i ELSE error('a late failure') END AS i FROM range(4000000) t(i)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rdr, err := cl.DoGet(ctx, info.Endpoint[0].Ticket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rdr.Release()
+	var rows int64
+	for rdr.Next() {
+		rows += rdr.RecordBatch().NumRows()
+	}
+	if rows == 0 {
+		t.Error("no row reached the client before the failure")
+	}
+	if err := rdr.Err(); err == nil || strings.Contains(err.Error(), "Interrupted") && !strings.Contains(err.Error(), "not canceled") ||
+		!strings.Contains(err.Error(), "a late failure") && !strings.Contains(err.Error(), "not canceled") {
+		t.Errorf("after %d rows: %v, want the failure", rows, err)
+	}
+
+	// The session goes on.
+	info, err = cl.Execute(ctx, "SELECT 1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, got, err := fetch(ctx, cl, info); err != nil || len(got) != 1 {
+		t.Errorf("after the failure: %v, %v", got, err)
+	}
+}
+
 func TestLargeResultStreamsInBatches(t *testing.T) {
 	ts := startServer(t, Options{})
 	cl, ctx := ts.signIn(t, "rita")

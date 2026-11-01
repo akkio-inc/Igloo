@@ -94,3 +94,58 @@ func (s *Stmt) QueryArrowContext(ctx context.Context, args []driver.NamedValue) 
 	}
 	return rdr, nil
 }
+
+// QueryArrowStreamContext is QueryArrowContext with DuckDB streaming the
+// result (see QueryStreamContext): it computes the batches as the reader
+// reads them, and the connection must run nothing else until the reader is
+// released. Err is the error that ended them, ErrFalseInterrupt among them.
+func (s *Stmt) QueryArrowStreamContext(ctx context.Context, args []driver.NamedValue) (array.RecordReader, error) {
+	rows, err := s.QueryStreamContext(ctx, args)
+	if err != nil {
+		return nil, err
+	}
+	stream := rows.(*streamRows)
+	rdr, err := recordReaderFromRows(ctx, stream.rows)
+	if err != nil {
+		return nil, errors.Join(err, stream.Close())
+	}
+	return &streamRecords{RecordReader: rdr, stream: stream}, nil
+}
+
+// streamRecords are the record batches of a streaming result.
+type streamRecords struct {
+	array.RecordReader
+	stream   *streamRows
+	err      error
+	released bool
+}
+
+func (r *streamRecords) Next() bool {
+	if r.RecordReader.Next() {
+		return true
+	}
+	if r.RecordReader.Err() == nil {
+		if msg := mapping.ResultError(&r.stream.res); msg != "" {
+			r.err = streamError(r.stream.ctx, msg)
+		}
+	}
+	return false
+}
+
+func (r *streamRecords) Err() error {
+	if r.err != nil {
+		return r.err
+	}
+	return r.RecordReader.Err()
+}
+
+// Release ends the result, after the interrupts end, as streamRows.Close does.
+func (r *streamRecords) Release() {
+	if r.released {
+		return
+	}
+	r.released, r.stream.closed = true, true
+	r.stream.stop()
+	r.RecordReader.Release()
+	r.stream.cleanup()
+}
