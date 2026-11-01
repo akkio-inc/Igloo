@@ -821,7 +821,13 @@ whose replicas share them and stop them once idle; each pool has its own.
   in psql, `Statement.cancel()` in JDBC, context cancellation in Go). The
   request, the statement timeout and the memory watch end a statement while
   it is still prepared too, which for a report whose CTEs become report API
-  calls can take seconds; it then does not run.
+  calls can take seconds; it then does not run. A canceled statement stops
+  when DuckDB next checks for an interruption, which some of its steps do
+  only once they end: a statement still running 30 seconds after its
+  cancel request or its timeout has its client's connection closed, so
+  that the client is not held, and the server logs `a statement canceled
+  or past its timeout has not stopped`, with DuckDB's progress. Its session
+  ends once DuckDB stops it.
 - `IGLOO_MAX_CONNECTIONS` caps sessions per replica; further logins fail with
   SQLSTATE `53300`. Connections that have not signed in yet are limited too:
   as many may be signing in at once (at least 100), half of them from one

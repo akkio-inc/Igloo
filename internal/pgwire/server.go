@@ -240,9 +240,10 @@ type Options struct {
 	// owns any more (see orphanedWork).
 	FreeMemory func(context.Context)
 	// shedStuckAfter and exit, when set, replace shedStuckAfter and
-	// os.Exit (for tests).
+	// os.Exit (for tests); stuckGrace replaces stuckGrace.
 	shedStuckAfter time.Duration
 	exit           func(code int)
+	stuckGrace     time.Duration
 	// ReportRewrite has the statement layer recognize the counting CTEs
 	// of audience reports and answer them through the report API
 	// (IGLOO_REPORT_REWRITE; see reportrecognize.go).
@@ -465,6 +466,9 @@ type Server struct {
 	shedStuckAfter time.Duration
 	exitProcess    func(code int)
 	freeMemory     func(context.Context)
+	// stuck lets the client of a statement that does not stop once
+	// canceled go (see watchStuck).
+	stuck *stuckWatch
 	// orphans is what ShedMemory knows of the work of statements it
 	// canceled once nothing runs (see orphanedWork).
 	orphans orphans
@@ -727,6 +731,7 @@ func New(engine Engine, opts Options, log *slog.Logger) (*Server, error) {
 		s.memoryCritical = memlimit.Critical(opts.MemoryTotal)
 	}
 	s.shedStuckAfter = cmp.Or(opts.shedStuckAfter, shedStuckAfter)
+	s.stuck = &stuckWatch{grace: cmp.Or(opts.stuckGrace, stuckGrace), log: s.log}
 	s.exitProcess = opts.exit
 	s.freeMemory = opts.FreeMemory
 	if s.exitProcess == nil {
@@ -985,6 +990,11 @@ type session struct {
 	shed      bool
 	shedAt    time.Time
 	exiting   bool
+	// stuck, set for a client's session, lets the client go when its
+	// statement does not stop once canceled; watched is the context of the
+	// statement's run it watches (see watchStuck).
+	stuck   *stuckWatch
+	watched context.Context
 	// privs are the user's grants, loaded when first needed.
 	privs privilegeSnapshot
 	// fixed, when set, are the session's grants for good, and its user is
@@ -1301,6 +1311,10 @@ func (sess *session) rearm(outer, ctx context.Context) (context.Context, context
 	}
 	sess.mu.Lock()
 	sess.running, sess.shed = cancel, false
+	if sess.watched != nil {
+		// The stuck watch watches the run again (see watchStuck).
+		sess.watched = again
+	}
 	sess.mu.Unlock()
 	return again, cancel
 }
@@ -1383,7 +1397,9 @@ func (sess *session) runCancelable(ctx context.Context, query string, fn func(co
 		ctx, cancelRun = context.WithTimeout(ctx, timeout)
 		defer cancelRun()
 	}
+	stopWatch := sess.watchStuck(ctx)
 	err = fn(ctx)
+	stopWatch()
 	if err != nil && errors.Is(ctx.Err(), context.DeadlineExceeded) {
 		return errStatementTimeout
 	}

@@ -2098,6 +2098,12 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
 
 ### Fixed
 
+- A statement that does not stop once canceled, or past its statement
+  timeout, no longer holds its client: 30 seconds on, its client's
+  connection is closed and the server logs DuckDB's progress; the session
+  ends once DuckDB stops the statement. A report run on the replica after
+  its workers failed went on after its client's cancel request, the client
+  waiting in it, until Igloo was restarted.
 - A statement whose task over one partition ran out of memory on a worker
   runs again with more memory for each task where more partitions would
   not fit the tasks that write its exchanges: its tasks take twice a
