@@ -207,7 +207,16 @@ type Plan struct {
 	// exchange, and why others are exchanged all the same, for EXPLAIN
 	// DISTRIBUTED (see bucket.go).
 	buckets []string
+	// streamMerged says the session reads a merge of sorted rows as a
+	// stream (see StreamMerged).
+	streamMerged bool
 }
+
+// StreamMerged has Execute leave a merge of the sorted rows a statement
+// reads to be made as the statement reads them, as a view the session
+// registers before it runs the execution's SQL (see Execution.Merged),
+// rather than merge them into a file first.
+func (p *Plan) StreamMerged() { p.streamMerged = true }
 
 // ShortOfMemory reports whether the statement would not fit in the
 // coordinator's memory, so that running it there instead of on workers

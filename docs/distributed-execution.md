@@ -52,9 +52,14 @@ million rows, and a `SELECT ... WHERE` that filters the large table by a
 column equal to a constant, in a list, or equal to a subquery's value (`WHERE
 account_id = 42`), as the statement or as a subquery or common table
 expression whose rows the coordinator reads to run the rest (a window over
-all of them, say). A plain `SELECT ... WHERE` that may keep many of the
-large table's rows is not: every matching row would cross to the
-coordinator and wait on its disk before reaching the client. A `LIMIT`
+all of them, say); and every row of a table, filtered or not, ordered by
+`ORDER BY` without `LIMIT` by an order the coordinator merges by (below):
+workers sort their shares, and the coordinator merges them as the client
+reads them, where one machine sorts them all, past its memory spilling to
+disk and taking more memory besides than its limit. A plain `SELECT ...
+WHERE` that may keep many of the large table's rows is not: every matching
+row would cross to the coordinator and wait on its disk before reaching the
+client. A `LIMIT`
 without `ORDER BY`, any so many rows, has each task keep that many, and
 once the tasks that ended sent as many the others stop; auto mode leaves
 a scan of a table to one machine, which stops at the first rows it reads,
@@ -123,7 +128,9 @@ forecasts rather than the series.
 A result ordered by `ORDER BY` without `LIMIT`, of the groups workers
 complete or the rows they keep, each worker sorts as it completes them, and
 the coordinator merges the workers' sorted rows rather than sorting them
-all, holding a batch of rows a worker in memory whatever the result: by
+all, holding a batch of rows a worker in memory whatever the result, and
+sends the client each batch as it merges it, rather than once it has merged
+them all: by
 columns of numbers, text and `BLOB`s (by their bytes), dates, times,
 timestamps, decimals and booleans, the result's columns or the groups and
 aggregates they show, in the session's default order and `NULLS` order.

@@ -2124,6 +2124,19 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
 
 ### Fixed
 
+- A statement's rows reach its client as DuckDB computes them, rather than
+  once it has computed them all: every result was held whole in memory
+  first, so that every row of a table of hundreds of millions, ordered by
+  `ORDER BY` without `LIMIT`, ran the server out of memory, and the memory
+  watch canceled it, before its client got a row. A portal the client
+  reads a few rows at a time, which may run other statements between its
+  reads, still reads its rows whole first. Such a sort of every row of a
+  table, filtered or not, now runs on workers, which sort their shares,
+  and the coordinator merges them as the client reads them, holding a
+  batch of rows a task, where it merged them into a file before the first
+  row went out; the files it merges it reads a megabyte at a time. On one
+  machine, DuckDB's sort of more rows than fit in memory takes up to 40%
+  more memory than its limit as it starts to return them.
 - Planning a statement no longer fetches AWS credentials, nor fails for
   want of them. iceberg-go builds an S3 file system for each table it
   loads, each with a provider of the credential chain of its own, so the

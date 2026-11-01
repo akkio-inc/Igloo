@@ -27,6 +27,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/duckdb/duckdb-go/v2"
 	"golang.org/x/sync/errgroup"
 
@@ -805,11 +806,31 @@ type Execution struct {
 	// exchanges describes what the statement's exchanges held, for tests'
 	// failures and debug logs.
 	exchanges string
+	// merged are the merges SQL reads as views (see Merged).
+	merged []*MergedView
 }
+
+// MergedView is sorted rows merged as they are read (see mergeOrdered),
+// which the execution's SQL reads through MergedFunction: the session runs
+// SQL, prepared and run, under a context that holds them (WithMerged).
+type MergedView struct {
+	Reader array.RecordReader
+}
+
+// Merged returns the merges SQL reads, which the context SQL runs under
+// must hold (see WithMerged).
+func (e *Execution) Merged() []*MergedView { return e.merged }
 
 // Close removes the partial results. Call it once SQL has run.
 func (e *Execution) Close() {
-	if e != nil && e.dir != "" {
+	if e == nil {
+		return
+	}
+	for _, m := range e.merged {
+		m.Reader.Release()
+	}
+	e.merged = nil
+	if e.dir != "" {
 		_ = os.RemoveAll(e.dir)
 	}
 }
@@ -990,6 +1011,8 @@ func (co *Coordinator) Execute(ctx context.Context, plan *Plan, settings []Setti
 	}
 	var run *execution
 	planned := plan
+	// Plans made again with relations' sizes are read as this one is.
+	stream := plan.streamMerged
 	// smaller counts the runs again in smaller tasks, slots are the
 	// workers' slots each task takes (see retryShape), and lostOnce says
 	// the statement ran again without a worker lost with exchanges on its
@@ -1107,10 +1130,13 @@ func (co *Coordinator) Execute(ctx context.Context, plan *Plan, settings []Setti
 	}
 
 	final := clone(plan.final).(node)
-	co.mergeOrdered(ctx, final, plan.Stages, run, settings, ex.dir, qid)
+	co.mergeOrdered(ctx, final, plan.Stages, run, settings, ex.dir, qid, stream)
 	for _, s := range plan.Stages {
 		if s.Out != nil {
 			continue
+		}
+		if m := run.results[s.ID].merged; m != nil {
+			ex.merged = append(ex.merged, m)
 		}
 		ref, err := co.partials(run.results[s.ID])
 		if err != nil {
@@ -1740,12 +1766,17 @@ func (co *Coordinator) partials(r *jobResult) (node, error) {
 		// Otherwise a type DuckDB prints but cannot read, such as a row's
 		// STRUCT(BIGINT, BIGINT), which Parquet keeps as it is.
 	}
-	files := make([]string, len(r.files))
-	for i, f := range r.files {
-		files[i] = quoteLiteral(f)
+	var from string
+	if r.merged != nil {
+		from = MergedFunction + "()"
+	} else {
+		files := make([]string, len(r.files))
+		for i, f := range r.files {
+			files[i] = quoteLiteral(f)
+		}
+		from = "read_parquet([" + strings.Join(files, ", ") + "])"
 	}
-	n, err := co.parser.parse("SELECT * FROM (SELECT " + strings.Join(cols, ", ") + " FROM read_parquet([" +
-		strings.Join(files, ", ") + "])) AS __igloo_p")
+	n, err := co.parser.parse("SELECT * FROM (SELECT " + strings.Join(cols, ", ") + " FROM " + from + ") AS __igloo_p")
 	if err != nil {
 		return nil, err
 	}

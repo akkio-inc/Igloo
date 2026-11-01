@@ -2,6 +2,7 @@ package pgwire
 
 import (
 	"context"
+	"database/sql"
 	"database/sql/driver"
 	"errors"
 	"fmt"
@@ -252,6 +253,11 @@ func (s *Server) runDistributed(ctx context.Context, sess *session, user auth.Us
 	// The workers stay up while the statement runs, here too.
 	release := s.dist.Keep()
 	start := time.Now()
+	if s.streamMerged {
+		// A merge of the workers' sorted rows reaches the client as it is
+		// made (see runFinal).
+		plan.StreamMerged()
+	}
 	ex, err := s.dist.Execute(ctx, plan, settings)
 	if err != nil {
 		// Released now if the statement is done; otherwise once it has run
@@ -324,7 +330,7 @@ func (s *Server) runDistributed(ctx context.Context, sess *session, user auth.Us
 	defer release()
 	defer ex.Close()
 	parts = distParts{workers: ex.Workers, large: ex.Large, placement: plan.Placement(), stages: ex.Stages, exchanges: ex.Exchanges, key: plan.Key}
-	if err := st.runFinal(ctx, sess.conn, ex.SQL, args, w); err != nil {
+	if err := st.runFinal(ctx, sess.conn, ex.SQL, ex.Merged(), args, w); err != nil {
 		if w.Written() > 0 || ctx.Err() != nil || distributed.DataError(err) || bitmapsDidNotFit(err) {
 			// Combining the workers' bitmaps did not fit either: the
 			// session runs the statement again with the hash.
@@ -592,7 +598,10 @@ func policyReason(st *statement) string {
 
 // runFinal runs the part of a distributed statement that combines its
 // parts' results, in st's place: it must have st's columns and parameters.
-func (st *statement) runFinal(ctx context.Context, conn *duckdb.Conn, query string, args []driver.NamedValue, w wire.DataWriter) error {
+// It reads merged, the workers' sorted rows merged as it reads them (see
+// distributed.MergedFunction).
+func (st *statement) runFinal(ctx context.Context, conn *duckdb.Conn, query string, merged []*distributed.MergedView, args []driver.NamedValue, w wire.DataWriter) error {
+	ctx = distributed.WithMerged(ctx, merged)
 	fin, err := prepare(ctx, conn, query, st.clientOIDs)
 	if err != nil {
 		return err
@@ -604,6 +613,23 @@ func (st *statement) runFinal(ctx context.Context, conn *duckdb.Conn, query stri
 	}
 	fin.stmtType, fin.query = st.stmtType, st.query
 	return fin.run(ctx, args, w)
+}
+
+// registerMerged registers distributed.MergedFunction on the engine's
+// database, and reports whether it did. Without it, statements read the
+// merge of workers' sorted rows from a file once it is made.
+func (s *Server) registerMerged() bool {
+	r, ok := s.engine.(interface {
+		RegisterFunctions(ctx context.Context, register func(*sql.Conn) error) error
+	})
+	if !ok {
+		return false
+	}
+	if err := r.RegisterFunctions(context.Background(), distributed.RegisterMerged); err != nil {
+		s.log.Warn("could not register the function that reads merges of workers' sorted rows; statements read them once merged", "err", err)
+		return false
+	}
+	return true
 }
 
 // distributedHarmless are settings a session may change that do not change

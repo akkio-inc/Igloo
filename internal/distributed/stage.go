@@ -284,6 +284,9 @@ type jobResult struct {
 	files   []string
 	columns []Column
 	workers map[string]bool
+	// merged, if set, is the files merged as they are read (see
+	// mergeOrdered).
+	merged *MergedView
 }
 
 // run runs every stage, each once the exchanges it reads are complete.

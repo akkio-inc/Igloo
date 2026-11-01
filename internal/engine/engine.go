@@ -198,6 +198,18 @@ func (e *Engine) sqlConn(ctx context.Context) (*sql.Conn, func(), error) {
 	return conn, func() { _, _ = conn.Close(), db.Close() }, nil
 }
 
+// RegisterFunctions runs register on a connection of the engine's
+// database, to register functions every session's statements may call,
+// as DuckDB registers them for the database.
+func (e *Engine) RegisterFunctions(ctx context.Context, register func(*sql.Conn) error) error {
+	conn, release, err := e.sqlConn(ctx)
+	if err != nil {
+		return err
+	}
+	defer release()
+	return register(conn)
+}
+
 // keepOpen hides the engine's connector's Close from database/sql, which
 // closes the connector a pool was opened on along with the pool.
 type keepOpen struct{ driver.Connector }

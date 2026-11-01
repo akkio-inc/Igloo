@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/apache/arrow-go/v18/arrow"
@@ -33,13 +34,21 @@ import (
 // a collation, dates, times, timestamps, decimals and booleans; and where
 // the session keeps the order rows are read in (preserve_insertion_order).
 // Otherwise the coordinator sorts, as before.
+//
+// A plan whose session reads the merge as it is made (Plan.StreamMerged)
+// gets it as a stream of batches, which the statement reads through a
+// table function (see MergedFunction): rows reach the client as the
+// coordinator merges them, rather than once it has merged every one into a
+// file, which for hundreds of millions of rows took minutes before the
+// first.
 
 // mergeOrdered merges the files of the stage whose rows are the result of
 // final, the statement the coordinator runs, when its tasks sorted them by
 // final's ORDER BY (Stage.merge) and final only projects and filters them:
-// the stage's result becomes the one merged file, and final loses its
-// ORDER BY. Where they cannot be merged, final sorts them as before.
-func (co *Coordinator) mergeOrdered(ctx context.Context, final node, stages []*Stage, run *execution, settings []setting, dir, qid string) {
+// the stage's result becomes the one merged file, or the stream that
+// merges them as the statement reads it, and final loses its ORDER BY.
+// Where they cannot be merged, final sorts them as before.
+func (co *Coordinator) mergeOrdered(ctx context.Context, final node, stages []*Stage, run *execution, settings []setting, dir, qid string, stream bool) {
 	from := child(final, "from_table")
 	if str(final["type"]) != "SELECT_NODE" || str(from["type"]) != "BASE_TABLE" || len(list(final, "group_expressions")) > 0 ||
 		child(final, "qualify") != nil || hasClass(final["select_list"], "WINDOW") || len(list(child(final, "cte_map"), "map")) > 0 {
@@ -62,6 +71,27 @@ func (co *Coordinator) mergeOrdered(ctx context.Context, final node, stages []*S
 	keys, ok := resolveMerge(s.merge, res.columns, settings)
 	if !ok {
 		return
+	}
+	if stream {
+		// Read as the session's statement reads it, which its cancel
+		// stops; the files are removed with the execution's directory.
+		r, err := newMergeReader(context.WithoutCancel(ctx), res.files, keys)
+		if err == nil {
+			if _, _, err = mergedColumns(r.Schema()); err != nil {
+				r.Release()
+			}
+		}
+		if err == nil {
+			res.merged = &MergedView{Reader: r}
+			final["modifiers"] = []any{}
+			co.log.Debug("merging a stage's sorted rows as the statement reads them", "query", qid, "stage", s.String(), "files", len(res.files))
+			return
+		}
+		if !errors.Is(err, errNotMergeable) || IsUnsupported(err) {
+			co.log.Debug("could not merge a stage's sorted rows; the coordinator sorts them", "query", qid, "stage", s.String(), "err", err)
+			return
+		}
+		// Columns the function does not return: merged into a file.
 	}
 	start := time.Now()
 	out := filepath.Join(dir, fmt.Sprintf("%d-merged.parquet", s.ID))
@@ -221,16 +251,16 @@ func (c *mergeCursor) load(keys []resolvedKey) (bool, error) {
 }
 
 // advance moves the cursor to its next row. Past its batch's last row, it
-// returns that batch, for the caller to write what it needs of it and
-// release, and reads the next; ok is false at the end of the file.
-func (c *mergeCursor) advance(keys []resolvedKey) (left arrow.RecordBatch, ok bool, err error) {
+// releases that batch and reads the next; ok is false at the end of the
+// file.
+func (c *mergeCursor) advance(keys []resolvedKey) (ok bool, err error) {
 	c.row++
 	if c.row < int(c.rec.NumRows()) {
-		return nil, true, nil
+		return true, nil
 	}
-	left, c.rec = c.rec, nil
-	ok, err = c.load(keys)
-	return left, ok, err
+	c.rec.Release()
+	c.rec = nil
+	return c.load(keys)
 }
 
 func (c *mergeCursor) close() {
@@ -389,65 +419,302 @@ func mergeableArrow(dt arrow.DataType) bool {
 	return false
 }
 
-// mergeRowGroup is the most rows of a row group of a merged file.
-const mergeRowGroup = 122_880
+// mergeBatch is how many rows a batch of merged rows holds, mergeRowGroup
+// the most rows of a row group of a merged file, and mergeReadBuffer what
+// the merge reads of each file at a time: it reads every task's file of a
+// stage at once, hundreds of them, and a row group's column chunks read
+// whole held megabytes each.
+const (
+	mergeBatch      = 8192
+	mergeRowGroup   = 122_880
+	mergeReadBuffer = 1 << 20
+)
+
+// mergeReader is an array.RecordReader of the rows of files, each sorted by
+// keys, merged in order by them, in batches of mergeBatch rows. It reads
+// each file a batch at a time, so that it holds a batch a file and the
+// batch it makes, whatever the files hold; the first batch comes once each
+// file's first is read. Its columns are copied value by value into the
+// batch it makes where their types allow (see appender), and otherwise
+// sliced from the files' batches and concatenated.
+type mergeReader struct {
+	ctx     context.Context
+	refs    atomic.Int64
+	schema  *arrow.Schema
+	keys    []resolvedKey
+	cursors []*mergeCursor
+	h       *mergeHeap
+	// b and appends copy rows value by value; without them, runs are the
+	// batch's runs of consecutive rows of the files' batches, each holding
+	// its batch.
+	b       *array.RecordBuilder
+	appends []func(arrow.Array, int)
+	runs    []mergeRun
+	rec     arrow.RecordBatch
+	err     error
+}
+
+// mergeRun is consecutive rows, from start to end, of a file's batch.
+type mergeRun struct {
+	rec        arrow.RecordBatch
+	start, end int
+}
+
+// newMergeReader opens files, each sorted by keys, to merge them. It fails
+// with errNotMergeable where the columns cannot be compared, before it
+// reads a row. ctx ends the merge.
+func newMergeReader(ctx context.Context, files []string, keys []resolvedKey) (_ *mergeReader, err error) {
+	mem := memory.DefaultAllocator
+	r := &mergeReader{ctx: ctx, keys: keys}
+	r.refs.Store(1)
+	defer func() {
+		if err != nil {
+			r.Release()
+		}
+	}()
+	props := parquet.NewReaderProperties(mem)
+	props.BufferedStreamEnabled, props.BufferSize = true, mergeReadBuffer
+	for _, path := range files {
+		pf, err := file.OpenParquetFile(path, false, file.WithReadProps(props))
+		if err != nil {
+			return nil, err
+		}
+		c := &mergeCursor{pf: pf}
+		r.cursors = append(r.cursors, c)
+		fr, err := pqarrow.NewFileReader(pf, pqarrow.ArrowReadProperties{BatchSize: mergeBatch}, mem)
+		if err != nil {
+			return nil, err
+		}
+		s, err := fr.Schema()
+		if err != nil {
+			return nil, err
+		}
+		if r.schema == nil {
+			r.schema = s
+		} else if !r.schema.Equal(s) {
+			return nil, fmt.Errorf("%w: files of different columns", errNotMergeable)
+		}
+		if c.rr, err = fr.GetRecordReader(ctx, nil, nil); err != nil {
+			return nil, err
+		}
+	}
+	if r.schema == nil {
+		return nil, fmt.Errorf("%w: no files", errNotMergeable)
+	}
+	for _, k := range keys {
+		if k.col >= len(r.schema.Fields()) || !mergeableArrow(r.schema.Field(k.col).Type) {
+			return nil, fmt.Errorf("%w: column %d", errNotMergeable, k.col)
+		}
+	}
+	r.h = &mergeHeap{keys: keys}
+	for _, c := range r.cursors {
+		ok, err := c.load(keys)
+		if err != nil {
+			return nil, err
+		}
+		if ok {
+			r.h.cs = append(r.h.cs, c)
+		}
+	}
+	heap.Init(r.h)
+	b := array.NewRecordBuilder(mem, r.schema)
+	for i := range r.schema.Fields() {
+		f, ok := appender(b.Field(i))
+		if !ok {
+			b.Release()
+			r.appends = nil
+			return r, nil
+		}
+		r.appends = append(r.appends, f)
+	}
+	r.b = b
+	return r, nil
+}
+
+func (r *mergeReader) Retain()                        { r.refs.Add(1) }
+func (r *mergeReader) Schema() *arrow.Schema          { return r.schema }
+func (r *mergeReader) RecordBatch() arrow.RecordBatch { return r.rec }
+func (r *mergeReader) Record() arrow.RecordBatch      { return r.rec }
+func (r *mergeReader) Err() error                     { return r.err }
+
+// Release closes the files once the last reference is released.
+func (r *mergeReader) Release() {
+	if r.refs.Add(-1) != 0 {
+		return
+	}
+	if r.rec != nil {
+		r.rec.Release()
+		r.rec = nil
+	}
+	if r.b != nil {
+		r.b.Release()
+	}
+	r.dropRuns()
+	for _, c := range r.cursors {
+		c.close()
+	}
+	r.cursors = nil
+}
+
+// Next makes the next batch of merged rows.
+func (r *mergeReader) Next() bool {
+	if r.rec != nil {
+		r.rec.Release()
+		r.rec = nil
+	}
+	if r.err != nil || r.h == nil || r.h.Len() == 0 {
+		return false
+	}
+	if r.err = r.ctx.Err(); r.err != nil {
+		return false
+	}
+	if r.b != nil {
+		r.b.Reserve(mergeBatch)
+	}
+	n := 0
+	for n < mergeBatch && r.h.Len() > 0 {
+		c := r.h.cs[0]
+		if r.b != nil {
+			for i, f := range r.appends {
+				f(c.rec.Column(i), c.row)
+			}
+		} else if last := len(r.runs) - 1; last >= 0 && r.runs[last].rec == c.rec && r.runs[last].end == c.row {
+			r.runs[last].end++
+		} else {
+			c.rec.Retain()
+			r.runs = append(r.runs, mergeRun{rec: c.rec, start: c.row, end: c.row + 1})
+		}
+		n++
+		ok, err := c.advance(r.keys)
+		if err != nil {
+			r.err = err
+			return false
+		}
+		if ok {
+			heap.Fix(r.h, 0)
+		} else {
+			heap.Pop(r.h)
+		}
+		if r.h.err != nil {
+			r.err = r.h.err
+			return false
+		}
+	}
+	if r.b != nil {
+		r.rec = r.b.NewRecordBatch()
+		return true
+	}
+	r.rec, r.err = r.concatRuns(n)
+	r.dropRuns()
+	return r.err == nil
+}
+
+// concatRuns makes a batch of the n rows of the runs.
+func (r *mergeReader) concatRuns(n int) (arrow.RecordBatch, error) {
+	cols := make([]arrow.Array, len(r.schema.Fields()))
+	defer func() {
+		for _, c := range cols {
+			if c != nil {
+				c.Release()
+			}
+		}
+	}()
+	parts := make([]arrow.Array, len(r.runs))
+	for i := range cols {
+		for j, run := range r.runs {
+			parts[j] = array.NewSlice(run.rec.Column(i), int64(run.start), int64(run.end))
+		}
+		col, err := array.Concatenate(parts, memory.DefaultAllocator)
+		for _, p := range parts {
+			p.Release()
+		}
+		if err != nil {
+			return nil, err
+		}
+		cols[i] = col
+	}
+	return array.NewRecordBatch(r.schema, cols, int64(n)), nil
+}
+
+func (r *mergeReader) dropRuns() {
+	for _, run := range r.runs {
+		run.rec.Release()
+	}
+	r.runs = r.runs[:0]
+}
+
+// appender returns what copies a value of an array of b's type into b, for
+// the types it copies value by value.
+func appender(b array.Builder) (func(arrow.Array, int), bool) {
+	switch b := b.(type) {
+	case *array.Int8Builder:
+		return appendOf(b, b.Append, (*array.Int8).Value), true
+	case *array.Int16Builder:
+		return appendOf(b, b.Append, (*array.Int16).Value), true
+	case *array.Int32Builder:
+		return appendOf(b, b.Append, (*array.Int32).Value), true
+	case *array.Int64Builder:
+		return appendOf(b, b.Append, (*array.Int64).Value), true
+	case *array.Uint8Builder:
+		return appendOf(b, b.Append, (*array.Uint8).Value), true
+	case *array.Uint16Builder:
+		return appendOf(b, b.Append, (*array.Uint16).Value), true
+	case *array.Uint32Builder:
+		return appendOf(b, b.Append, (*array.Uint32).Value), true
+	case *array.Uint64Builder:
+		return appendOf(b, b.Append, (*array.Uint64).Value), true
+	case *array.Float32Builder:
+		return appendOf(b, b.Append, (*array.Float32).Value), true
+	case *array.Float64Builder:
+		return appendOf(b, b.Append, (*array.Float64).Value), true
+	case *array.StringBuilder:
+		return appendOf(b, b.Append, (*array.String).Value), true
+	case *array.LargeStringBuilder:
+		return appendOf(b, b.Append, (*array.LargeString).Value), true
+	case *array.BinaryBuilder:
+		if b.Type().ID() == arrow.LARGE_BINARY {
+			return appendOf(b, b.Append, (*array.LargeBinary).Value), true
+		}
+		return appendOf(b, b.Append, (*array.Binary).Value), true
+	case *array.Date32Builder:
+		return appendOf(b, b.Append, (*array.Date32).Value), true
+	case *array.Date64Builder:
+		return appendOf(b, b.Append, (*array.Date64).Value), true
+	case *array.TimestampBuilder:
+		return appendOf(b, b.Append, (*array.Timestamp).Value), true
+	case *array.Time32Builder:
+		return appendOf(b, b.Append, (*array.Time32).Value), true
+	case *array.Time64Builder:
+		return appendOf(b, b.Append, (*array.Time64).Value), true
+	case *array.Decimal128Builder:
+		return appendOf(b, b.Append, (*array.Decimal128).Value), true
+	case *array.BooleanBuilder:
+		return appendOf(b, b.Append, (*array.Boolean).Value), true
+	}
+	return nil, false
+}
+
+// appendOf is what copies values of arrays of type A, read by value, with
+// add, into b, NULLs as NULLs.
+func appendOf[A arrow.Array, T any](b array.Builder, add func(T), value func(A, int) T) func(arrow.Array, int) {
+	return func(a arrow.Array, i int) {
+		if a.IsNull(i) {
+			b.AppendNull()
+			return
+		}
+		add(value(a.(A), i))
+	}
+}
 
 // mergeSorted merges files, each sorted by keys, into one Parquet file at
 // out, sorted by them. It fails with errNotMergeable where the columns
 // cannot be compared, before writing a row.
 func mergeSorted(ctx context.Context, files []string, keys []resolvedKey, out string) (err error) {
-	mem := memory.DefaultAllocator
-	var cursors []*mergeCursor
-	defer func() {
-		for _, c := range cursors {
-			c.close()
-		}
-	}()
-	var schema *arrow.Schema
-	for _, path := range files {
-		pf, err := file.OpenParquetFile(path, false)
-		if err != nil {
-			return err
-		}
-		c := &mergeCursor{pf: pf}
-		cursors = append(cursors, c)
-		fr, err := pqarrow.NewFileReader(pf, pqarrow.ArrowReadProperties{BatchSize: 8192}, mem)
-		if err != nil {
-			return err
-		}
-		s, err := fr.Schema()
-		if err != nil {
-			return err
-		}
-		if schema == nil {
-			schema = s
-		} else if !schema.Equal(s) {
-			return fmt.Errorf("%w: files of different columns", errNotMergeable)
-		}
-		if c.rr, err = fr.GetRecordReader(ctx, nil, nil); err != nil {
-			return err
-		}
+	r, err := newMergeReader(ctx, files, keys)
+	if err != nil {
+		return err
 	}
-	if schema == nil {
-		return fmt.Errorf("%w: no files", errNotMergeable)
-	}
-	for _, k := range keys {
-		if k.col >= len(schema.Fields()) || !mergeableArrow(schema.Field(k.col).Type) {
-			return fmt.Errorf("%w: column %d", errNotMergeable, k.col)
-		}
-	}
-	h := &mergeHeap{keys: keys}
-	for _, c := range cursors {
-		ok, err := c.load(keys)
-		if err != nil {
-			return err
-		}
-		if ok {
-			h.cs = append(h.cs, c)
-		}
-	}
-	heap.Init(h)
-
+	defer r.Release()
 	f, err := os.Create(out)
 	if err != nil {
 		return err
@@ -460,54 +727,16 @@ func mergeSorted(ctx context.Context, files []string, keys []resolvedKey, out st
 	props := parquet.NewWriterProperties(parquet.WithCompression(compress.Codecs.Snappy), parquet.WithMaxRowGroupLength(mergeRowGroup),
 		parquet.WithStoreDecimalAsInteger(true))
 	// The writer closes what it writes to if it can: f is closed above.
-	w, err := pqarrow.NewFileWriter(schema, struct{ io.Writer }{f}, props, pqarrow.DefaultWriterProps())
+	w, err := pqarrow.NewFileWriter(r.Schema(), struct{ io.Writer }{f}, props, pqarrow.DefaultWriterProps())
 	if err != nil {
 		return err
 	}
-	// Consecutive rows of one batch are written together, as a slice of it.
-	var run arrow.RecordBatch
-	start, end := 0, 0
-	flush := func() error {
-		if run == nil || end <= start {
-			return nil
-		}
-		s := run.NewSlice(int64(start), int64(end))
-		defer s.Release()
-		return w.WriteBuffered(s)
-	}
-	rows := 0
-	for h.Len() > 0 {
-		c := h.cs[0]
-		if c.rec != run || c.row != end {
-			if err := flush(); err != nil {
-				return err
-			}
-			run, start = c.rec, c.row
-		}
-		end = c.row + 1
-		left, ok, err := c.advance(keys)
-		if left != nil {
-			// The run's batch is done: write it before letting it go.
-			err = errors.Join(err, flush())
-			left.Release()
-			run = nil
-		}
-		if err != nil {
+	for r.Next() {
+		if err := w.WriteBuffered(r.RecordBatch()); err != nil {
 			return err
 		}
-		if ok {
-			heap.Fix(h, 0)
-		} else {
-			heap.Pop(h)
-		}
-		if h.err != nil {
-			return h.err
-		}
-		if rows++; rows%65536 == 0 && ctx.Err() != nil {
-			return ctx.Err()
-		}
 	}
-	if err := flush(); err != nil {
+	if err := r.Err(); err != nil {
 		return err
 	}
 	return w.Close()

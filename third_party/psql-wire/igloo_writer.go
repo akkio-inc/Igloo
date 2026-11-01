@@ -78,3 +78,18 @@ func (writer *dataWriter) CopyDone() error {
 func (writer *dataWriter) CopyAbort() error {
 	return writer.client.EndBatch()
 }
+
+// Drainer is a DataWriter that says whether the statement runs to its end
+// in one go.
+type Drainer interface {
+	Drains() bool
+}
+
+// Drains reports whether the client reads every row of the statement in
+// this Execute, without a row limit, so that the statement runs to its end
+// before the session handles another message. A portal with a row limit
+// suspends the statement after that many rows, and the client may run
+// other statements before it reads more.
+func (writer *dataWriter) Drains() bool {
+	return writer.batchable
+}

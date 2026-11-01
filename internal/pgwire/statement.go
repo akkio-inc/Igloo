@@ -342,7 +342,16 @@ func (st *statement) run(ctx context.Context, args []driver.NamedValue, w wire.D
 		return st.runArrow(ctx, args, w, aw)
 	}
 
-	rows, err := st.stmt.QueryContext(ctx, args)
+	query := st.stmt.QueryContext
+	if drains(w) {
+		// DuckDB computes the rows as the client reads them, rather than
+		// all of them first: a sort of hundreds of millions of rows held
+		// every one in memory, past the server's, before its client got
+		// the first. Nothing else runs on the session's connection until
+		// the client has them all.
+		query = st.stmt.QueryStreamContext
+	}
+	rows, err := query(ctx, args)
 	if err != nil {
 		return err
 	}
@@ -366,6 +375,26 @@ func (st *statement) run(ctx context.Context, args []driver.NamedValue, w wire.D
 		return err
 	}
 	return w.Complete(commandTag(st.stmtType, st.query, int64(w.Written())))
+}
+
+// drains reports whether w, through Igloo's own wrappers, is a client's
+// that reads every row of the statement before the session runs anything
+// else (see wire.Drainer): not a portal's with a row limit, after which the
+// client may run other statements on the session before it reads on, nor
+// one of Igloo's own that reads a statement's rows.
+func drains(w wire.DataWriter) bool {
+	for {
+		switch x := w.(type) {
+		case *tagWriter:
+			w = x.DataWriter
+		case afterWriter:
+			w = x.DataWriter
+		case wire.Drainer:
+			return x.Drains()
+		default:
+			return false
+		}
+	}
 }
 
 // rowBatch is how many rows go to the client at a time. psql-wire sends a

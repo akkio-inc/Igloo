@@ -1973,7 +1973,14 @@ func (pl *planner) rowsJob(c *candidate) (*jobBuild, error) {
 		// which auto mode's estimates, of the whole scan, do not count.
 		return nil, unsupported("LIMIT without ORDER BY, which one machine answers fastest")
 	}
-	if distinct == nil && limit == nil && !qualifies && !filtersRelation && !selective && !feeds {
+	// And so do those sorted by ORDER BY without LIMIT: workers sort their
+	// shares, and the coordinator merges them as the client reads them
+	// (see merge.go), in memory for a batch of rows a task, where one
+	// machine sorts them all, past its memory spilling to disk and taking
+	// more memory besides than its limit allows.
+	sorts := c.top && order != nil && limit == nil && distinct == nil
+	hop := distinct == nil && limit == nil && !qualifies && !filtersRelation && !selective && !feeds
+	if hop && !sorts {
 		// Every matching row would cross to the coordinator and wait on its
 		// disk before the first reached the client: a hop, not a saving.
 		return nil, unsupported("rows of %s without DISTINCT, aggregates or ORDER BY ... LIMIT", c.largest())
@@ -2139,7 +2146,31 @@ func (pl *planner) rowsJob(c *candidate) (*jobBuild, error) {
 			}
 		}
 	}
+	if hop && !pl.mergeable(b.merge, columns[:n], c.columns) {
+		// Sorted only on the coordinator, after every row crossed to it.
+		return nil, unsupported("rows of %s ordered by what the coordinator cannot merge", c.largest())
+	}
 	return b, nil
+}
+
+// mergeable reports whether the coordinator will merge rows sorted by keys,
+// the result's columns of cols named names, in this session (see
+// resolveMerge), rather than sort them.
+func (pl *planner) mergeable(keys []mergeKey, names []string, cols []Column) bool {
+	var settings []setting
+	for _, name := range []string{"preserve_insertion_order", "default_collation", "default_order", "default_null_order"} {
+		v, err := pl.env.Setting(pl.ctx, name)
+		if err != nil {
+			return false
+		}
+		settings = append(settings, setting{Name: name, Value: v})
+	}
+	named := make([]Column, len(cols))
+	for i, c := range cols {
+		named[i] = Column{Name: names[i], Type: c.Type}
+	}
+	_, ok := resolveMerge(keys, named, settings)
+	return ok
 }
 
 // mergeOrder returns, for an aggregation whose result is its whole groups

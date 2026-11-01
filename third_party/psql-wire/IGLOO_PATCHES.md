@@ -48,6 +48,11 @@ otherwise unchanged except for these patches:
   connection the listener accepted for a client, so that Igloo's listener,
   which gives each connection a deadline to sign in, can lift it once the
   client has.
+- `igloo_writer.go`: `Drainer`, whose `Drains` says whether the client
+  reads every row of a statement in one Execute, so that Igloo can have
+  DuckDB stream the statement's result: a portal with a row limit suspends
+  the statement, and the client may run others on the session before it
+  reads on, which would end a result DuckDB streams.
 
 Drop this copy and the `replace` directive once a psql-wire release includes
 equivalent fixes.
