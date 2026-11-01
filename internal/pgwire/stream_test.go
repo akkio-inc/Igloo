@@ -311,6 +311,38 @@ func TestStreamFailureClassified(t *testing.T) {
 	}
 }
 
+// TestParameterInResult checks a statement whose result's columns DuckDB cannot
+// tell before it has an untyped parameter's value: it fails with a code that
+// says so, where it took the session's statement down with a panic, and the
+// session goes on. Cast, it runs.
+func TestParameterInResult(t *testing.T) {
+	ts := startServer(t)
+	conn := ts.admin(t, pgx.QueryExecModeExec)
+	ctx := context.Background()
+	rows, err := conn.Query(ctx, "SELECT i, i + $1 AS m FROM range(10) t(i) ORDER BY i", int64(5))
+	if err == nil {
+		for rows.Next() {
+		}
+		rows.Close()
+		err = rows.Err()
+	}
+	if code := pgCode(err); code != "42P18" {
+		t.Fatalf("%v, want SQLSTATE 42P18", err)
+	}
+	rows, err = conn.Query(ctx, "SELECT i, i + $1::BIGINT AS m FROM range(10) t(i) ORDER BY i", int64(5))
+	if err != nil {
+		t.Fatal(err)
+	}
+	n := 0
+	for rows.Next() {
+		n++
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil || n != 10 {
+		t.Fatalf("cast: %d rows, %v", n, err)
+	}
+}
+
 // TestStreamedResultCanceled ends a statement whose rows stream on a
 // cancel request while the client reads them, and on the statement
 // timeout, and the session runs the next statement.

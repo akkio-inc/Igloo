@@ -431,6 +431,13 @@ func (st *statement) readRows(ctx context.Context, query func(context.Context, [
 		return err
 	}
 	defer rows.Close() //nolint:errcheck
+	if got := len(rows.Columns()); got > len(st.columns) {
+		// An untyped parameter in the result's expressions: DuckDB could not
+		// tell the result's columns before it had the parameter's value, and
+		// the client was told others.
+		return pgerror.WithCode(fmt.Errorf("the statement's result depends on the type of a parameter (%d columns, %d described): "+
+			"cast the parameter, as in $1::BIGINT", got, len(st.columns)), codes.IndeterminateDatatype)
+	}
 
 	b := newRowBatcher(w, st.columns)
 	dest := make([]driver.Value, len(st.columns))
