@@ -435,6 +435,11 @@ func TestPeaks(t *testing.T) {
 	if got, _ := c.Footprint("s"); got != 8*gb {
 		t.Errorf("a run that held less before its end lowered the footprint to %d", got)
 	}
+	// What a completed run held proves the shape fits; a run cut short
+	// that held more proves nothing (see Completed).
+	if got, ok := c.Completed("s"); !ok || got != 8*gb {
+		t.Errorf("completed, then cut short holding less: %d (%v)", got, ok)
+	}
 	c.ObserveUnfinished("s", 10*gb)
 	c.ObserveUnfinished("new", 3*gb)
 	if got, _ := c.Footprint("s"); got != 10*gb {
@@ -443,9 +448,17 @@ func TestPeaks(t *testing.T) {
 	if got, ok := c.Footprint("new"); !ok || got != 3*gb {
 		t.Errorf("an unfinished run of a new shape: %d (%v)", got, ok)
 	}
+	for _, shape := range []string{"s", "new", "never"} {
+		if got, ok := c.Completed(shape); ok {
+			t.Errorf("%s, latest cut short or never run: completed at %d", shape, got)
+		}
+	}
 	c.Observe("s", 0)
 	if got, ok := c.Footprint("s"); !ok || got != 0 {
 		t.Errorf("a run that held nothing: %d (%v)", got, ok)
+	}
+	if got, ok := c.Completed("s"); !ok || got != 0 {
+		t.Errorf("a completed run that held nothing: %d (%v)", got, ok)
 	}
 
 	// SampleMemory reads until its context ends.

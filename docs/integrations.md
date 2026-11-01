@@ -74,8 +74,19 @@ What works, as `scripts/clients/dbt` exercises it on every pull request:
 - `dbt seed`, `run`, `test`, `build`, `snapshot`, `show`, `docs generate`
   and `source freshness`.
 - Materializations `view`, `table` and `incremental` with the `append`,
-  `merge` and `delete+insert` strategies, `--full-refresh`, and snapshots
-  (the test uses the `timestamp` strategy).
+  `merge`, `delete+insert` and `microbatch` strategies, `--full-refresh`,
+  and snapshots (the test uses the `timestamp` strategy).
+- **Incremental runs write only what changed.** `merge`, `delete+insert`
+  and `microbatch` delete the rows they replace with Iceberg delete files
+  and add the new rows in new files; `append` adds files. No data file is
+  rewritten: after the test's second day, the snapshots each run committed
+  hold only the rows it changed or added. Maintenance compacts the small
+  files later, leaving a table alone while a run's transaction uses it, so
+  that it does not fail the run's `COMMIT` (see
+  [operations](operations.md#table-maintenance)). dbt-postgres's
+  `microbatch` needs a `unique_key` (it merges each batch), and an
+  `event_time` on the models it reads, so each batch reads only its days;
+  run a range of days with `--event-time-start` and `--event-time-end`.
 - Generic and singular tests, `persist_docs` for tables, views and their
   columns (stored as Iceberg comments, shown by `docs generate` and BI
   tools), schemas per model (`+schema`).

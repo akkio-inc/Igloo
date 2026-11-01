@@ -205,6 +205,21 @@ How limits are enforced:
 ([metrics](operations.md#monitoring)) show how often limits hold statements
 back.
 
+### Heavy statements beside short ones
+
+With workers configured ([distributed
+execution](distributed-execution.md)), nothing needs setting for a heavy
+statement not to take the replica's cores from short ones: auto mode runs a
+heavy statement on workers when other statements run on the replica beside
+it, as it weighs the replica's time at as many times as long as the
+statements sharing it, up to four; and the guard moves a heavy statement
+that runs on the replica to workers once it has run its estimate while
+others run beside it, rather than three times it (see [beside other
+statements](distributed-execution.md#when)). `IGLOO_WORKER_THRESHOLD`
+sets how long a statement must take for workers to be worth it. Without
+workers, the replica's limit below and roles' limits hold heavy statements
+back.
+
 ### The replica's limit
 
 `IGLOO_MAX_CONCURRENT_STATEMENTS` limits the queries and changes of data
@@ -268,7 +283,9 @@ build took 558 to 590 seconds; after a restart, with what the history kept,
 to 4,096 of them, and statements that ran on [workers](distributed-execution.md)
 are not learned from, since most of what they allocated was the workers'.
 A shape that ran to its end on the replica also tells auto mode that the
-replica is not short of memory for it (see [when](distributed-execution.md#when)).
+replica is not short of memory for it (see [when](distributed-execution.md#when));
+one whose latest run was cut short, as by the guard or a timeout, holding
+more than it held to its end before, does not.
 
 ## Compute pools
 
@@ -324,7 +341,11 @@ gateway, which starts and stops only that pool. Clients connect to the
 pool's Service (`igloo-pool-acme:5432` above); the release's own Service is
 the `default` pool. A pool takes every value it does not set from the
 release's values; `extraEnv` adds to the release's. With `workers.enabled`,
-each pool also gets its own worker Deployment, `<release>-pool-<name>-workers`.
+each pool also gets its own worker Deployment, `<release>-pool-<name>-workers`,
+and with `workers.large.enabled` its own [large
+worker](distributed-execution.md#a-large-worker),
+`<release>-pool-<name>-workers-large`; a pool sets `workers.large.enabled:
+false` to run without one.
 Pools have no HorizontalPodAutoscaler or PodDisruptionBudget of their own. See
 [the chart's README](../deploy/helm/igloo/README.md#compute-pools).
 

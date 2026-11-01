@@ -53,6 +53,11 @@ type governance struct {
 	mu      sync.Mutex
 	snap    atomic.Pointer[policy.Snapshot]
 	checked atomic.Int64
+	// confirmed is when the store last answered: the snapshot was current
+	// then. maxStale is how long statements may run on it after that
+	// (see current).
+	confirmed atomic.Int64
+	maxStale  time.Duration
 	// gen changes whenever the snapshot does.
 	gen atomic.Uint64
 
@@ -93,6 +98,7 @@ func newGovernance(ctx context.Context, store policy.Store, refresh time.Duratio
 	}
 	g.snap.Store(snap)
 	g.checked.Store(time.Now().UnixNano())
+	g.confirmed.Store(g.checked.Load())
 	return g, nil
 }
 
@@ -117,13 +123,15 @@ func (g *governance) snapshot(ctx context.Context) *policy.Snapshot {
 	if fresh() {
 		return snap
 	}
-	defer g.checked.Store(time.Now().UnixNano())
+	now := time.Now().UnixNano()
+	defer g.checked.Store(now)
 	v, err := g.store.Version(ctx)
 	if err != nil {
 		g.log.Warn("could not check for policy changes", "err", err)
 		return snap
 	}
 	if v == snap.Version {
+		g.confirmed.Store(now)
 		return snap
 	}
 	next, err := g.store.Load(ctx)
@@ -133,7 +141,19 @@ func (g *governance) snapshot(ctx context.Context) *policy.Snapshot {
 	}
 	g.snap.Store(next)
 	g.gen.Add(1)
+	g.confirmed.Store(now)
 	return next
+}
+
+// current is snapshot for a statement about to be checked. It fails once
+// the store has not answered for maxStale, as policies attached elsewhere
+// meanwhile would not apply (see Server.refreshAccess).
+func (g *governance) current(ctx context.Context) (*policy.Snapshot, error) {
+	snap := g.snapshot(ctx)
+	if age := time.Since(time.Unix(0, g.confirmed.Load())); g.maxStale > 0 && age >= g.maxStale {
+		return nil, staleAccess("the policies", age)
+	}
+	return snap, nil
 }
 
 // reload loads the policies now, after a change this replica made.
@@ -149,6 +169,25 @@ func (g *governance) reload(ctx context.Context) error {
 	g.snap.Store(next)
 	g.gen.Add(1)
 	g.checked.Store(time.Now().UnixNano())
+	g.confirmed.Store(g.checked.Load())
+	return nil
+}
+
+// reloadOwn is reload after a change this replica made only to the
+// policies of tables in Igloo's own schemas, which no user's statement
+// reads: the generation, which prepared statements' checks and kept
+// results are tied to, stays.
+func (g *governance) reloadOwn(ctx context.Context) error {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	next, err := g.store.Load(ctx)
+	if err != nil {
+		g.checked.Store(0)
+		return err
+	}
+	g.snap.Store(next)
+	g.checked.Store(time.Now().UnixNano())
+	g.confirmed.Store(g.checked.Load())
 	return nil
 }
 
@@ -226,11 +265,18 @@ func (s *Server) Erasing(ctx context.Context, schema, table string) (bool, error
 // it to others than user (see policy.Confinement). The Iceberg REST
 // catalog refuses such a table to everyone but admins.
 func (s *Server) ProtectedFor(ctx context.Context, user auth.User, schema, table string) (bool, error) {
+	if err := s.membersCurrent(ctx); err != nil {
+		return true, err
+	}
 	if len(s.memberDomains(ctx, schema, table)) > 0 {
 		// Its files hold the columns of ids, which are Igloo's own.
 		return true, nil
 	}
-	r := s.gov.snapshot(ctx).Rules(schema, table)
+	snap, err := s.gov.current(ctx)
+	if err != nil {
+		return true, err
+	}
+	r := snap.Rules(schema, table)
 	if r == nil {
 		return false, nil
 	}
@@ -400,18 +446,27 @@ func droppedSchema(query string) (string, bool) {
 // columns, set on them or through their tags, and the clean rooms that
 // keep it, as "clean room name", and the ID domains its columns are
 // members of, as "ID domain name", whose ids are in its files. Delta
-// Sharing refuses to share or serve such a table (package sharing).
-func (s *Server) ProtectedBy(ctx context.Context, schema, table string) []string {
+// Sharing refuses to share or serve such a table (package sharing). It
+// fails, as ProtectedFor does, once the policies could not be read for
+// too long (see governance.current).
+func (s *Server) ProtectedBy(ctx context.Context, schema, table string) ([]string, error) {
 	// Columns that hold ID domains' ids are in the table's files, which
 	// Delta Sharing serves whole.
+	if err := s.membersCurrent(ctx); err != nil {
+		return nil, err
+	}
 	var names []string
 	for _, d := range s.memberDomains(ctx, schema, table) {
 		names = append(names, "ID domain "+d)
 	}
-	r := s.gov.snapshot(ctx).Rules(schema, table)
+	snap, err := s.gov.current(ctx)
+	if err != nil {
+		return nil, err
+	}
+	r := snap.Rules(schema, table)
 	if r == nil {
 		slices.Sort(names)
-		return names
+		return names, nil
 	}
 	for _, room := range r.Rooms() {
 		names = append(names, "clean room "+room)
@@ -430,7 +485,7 @@ func (s *Server) ProtectedBy(ctx context.Context, schema, table string) []string
 		}
 	}
 	slices.Sort(names)
-	return slices.Compact(names)
+	return slices.Compact(names), nil
 }
 
 // externalFiles reports whether reading prefix, the start of a path
@@ -935,8 +990,11 @@ func policyRules(t duckdb.StmtType, query string) error {
 // policyRewrite returns query, a statement of type t, as it must run for
 // user under the policies in force, and how they applied. ran says it ran
 // statements on the session's connection, after which statements prepared
-// earlier must be prepared again (see reprepare).
-func (s *Server) policyRewrite(ctx context.Context, sess *session, user auth.User, t duckdb.StmtType, query string, oids []uint32) (string, *guard, bool, error) {
+// earlier must be prepared again (see reprepare). pins are the bitmap
+// indexes Igloo wrote query to read, whose tables' references it wrote are
+// its own (see refEdit).
+func (s *Server) policyRewrite(ctx context.Context, sess *session, user auth.User, t duckdb.StmtType, query string, oids []uint32,
+	pins []indexPin) (string, *guard, bool, error) {
 	// Applying policies resolves names and runs DESCRIBE and sensitivity
 	// checks, all of which walk the catalog's in-memory set. Most callers
 	// already hold the catalog (preparing or rechecking a statement); a
@@ -1009,6 +1067,7 @@ func (s *Server) policyRewrite(ctx context.Context, sess *session, user auth.Use
 	if err != nil {
 		return "", nil, ran, err
 	}
+	rw.indexTables = indexNames(pins)
 	edits, err := rw.statementEdits(t, query)
 	if err != nil {
 		return "", nil, ran, err
@@ -1929,7 +1988,7 @@ func (s *Server) recheckPolicies(ctx context.Context, sess *session, st *stateme
 	if original == "" {
 		original = st.query
 	}
-	text, ng, ran, err := s.policyRewrite(ctx, sess, user, st.stmtType, original, st.clientOIDs)
+	text, ng, ran, err := s.policyRewrite(ctx, sess, user, st.stmtType, original, st.clientOIDs, st.indexPins)
 	if err == nil {
 		var ranWrites bool
 		ranWrites, err = s.keptWrites(ctx, sess, user, st.stmtType, original)
@@ -1966,9 +2025,17 @@ func (s *Server) recheckPolicies(ctx context.Context, sess *session, st *stateme
 // grants to check again, or its policies could apply otherwise now, as
 // policies, the catalog or the session's settings changed, or as they
 // read the user's privileges. Like recheck, it first reads the user again,
-// failing for a user dropped or disabled meanwhile, and the policies, as
-// changed elsewhere; neither holds the catalog lock.
+// failing for a user dropped or disabled meanwhile, and the grants and
+// policies, as changed elsewhere, failing for any not read for too long
+// (see refreshAccess); neither holds the catalog lock.
 func (s *Server) needsRecheck(ctx context.Context, sess *session, st *statement) (bool, error) {
+	user, err := s.refreshUser(ctx, sess)
+	if err == nil {
+		err = s.refreshAccess(ctx, sess, user)
+	}
+	if err != nil {
+		return false, err
+	}
 	if st.access != nil {
 		return true, nil
 	}
@@ -1976,10 +2043,6 @@ func (s *Server) needsRecheck(ctx context.Context, sess *session, st *statement)
 	if g == nil {
 		return false, nil
 	}
-	if _, err := s.refreshUser(ctx, sess); err != nil {
-		return false, err
-	}
-	s.gov.snapshot(ctx)
 	return g.touched || g.policyGen != s.gov.gen.Load() || g.catalogGen != s.catalogGeneration() || g.settingGen != sess.settingGen, nil
 }
 

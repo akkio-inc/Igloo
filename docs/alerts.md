@@ -130,7 +130,8 @@ SHOW ALERTS
   recorded as `skipped`. When the owner is dropped, their alerts, like their
   tasks, pipes and materialized views, are suspended and marked as a
   dropped user's: `SHOW ALERTS` gives their owner as `ana (dropped)`. A user
-  created later with the same name does not get them; admins may drop them,
+  created later with the same name does not get them, nor runs of them
+  that came due before the drop, which are skipped; admins may drop them,
   or `CREATE OR REPLACE` them as their own.
 - **Creating an alert needs the writer role** and `USAGE` on its
   integration. A user owns at most 50 alerts. Only its owner and admins may

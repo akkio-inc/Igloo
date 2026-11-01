@@ -40,9 +40,10 @@ func QualifiedClass(class string) string {
 }
 
 // MaxTrainRows bounds the rows Igloo's classes train on. Above it, or
-// above MaxValues values, they train on a sample of about that many rows
-// (package pgwire samples them by a hash of each row, so the same rows
-// give the same sample).
+// above MaxValues values, they train on a sample of a little fewer rows
+// (package pgwire samples them by a hash of each row, its place among the
+// rows equal to it, and the seed, so the same rows and seed give the same
+// sample).
 const MaxTrainRows = 10_000_000
 
 // TrainRowLimit is the most rows of cols columns a model trains on.
@@ -62,6 +63,10 @@ type IglooArgs struct {
 	Total, Rows int
 	Interrupt   func() error
 }
+
+// Seed is CONFIG_OBJECT's seed (0 if not given), which seeds the sample of
+// a large input as well as training.
+func (a IglooArgs) Seed() (uint64, error) { return newConfig(a.Config).seed() }
 
 // TrainIgloo trains a model of one of Igloo's classes on t, and returns
 // it with a summary of its metrics for the model's row.

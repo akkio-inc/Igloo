@@ -22,13 +22,23 @@ Clients connect to it instead of to Igloo, and so can browsers using the
 
 - When a client connects and Igloo is stopped, the gateway starts the
   compute and holds the connection until Igloo accepts it. The client sees a
-  slow login, nothing else.
+  slow login, nothing else. The gateway waits for the client's first bytes
+  before it starts Igloo or connects to it: a connection that sends nothing
+  within `IGLOO_GATEWAY_FIRST_BYTE_TIMEOUT` (30 seconds) is closed, and
+  starts nothing. At most `IGLOO_GATEWAY_MAX_WAITING` (200) connections may
+  wait at once, for their first bytes or for Igloo to start; further ones
+  are closed at once, with a warning in the gateway's log at most once a
+  minute. A client that has sent something waits for a start as long as
+  `IGLOO_GATEWAY_RESUME_TIMEOUT`.
 - Once connected, the gateway copies bytes in both directions. TLS and
   passwords stay end to end between the client and Igloo; the gateway never
   sees them.
 - When no client has sent or received anything for `IGLOO_GATEWAY_SUSPEND_AFTER`
   (10 minutes by default) and Igloo reports no running statements or table
-  maintenance, the gateway stops the compute.
+  maintenance, the gateway stops the compute. Not knowing is not idle: while
+  Igloo's activity endpoint does not answer, the gateway keeps Igloo
+  running and logs a warning, unless Igloo's SQL port refuses connections,
+  which says it is down.
 - When [scheduled work](#scheduled-work) (tasks, pipes, materialized views,
   alerts) is due, the gateway starts the compute for it, with nobody
   connected.
@@ -199,7 +209,9 @@ setup above is the one where scale to zero saves the machine's cost.
 
 The gateway reaches Igloo through a second Service, and asks every Igloo
 pod for running work through a headless Service on port 8080, so a
-statement running on any replica keeps them all up. If Igloo also has a
+statement running on any replica keeps them all up. So does a pod that
+does not answer, which may be busy: the gateway logs a warning each time
+it holds off for one. If Igloo also has a
 HorizontalPodAutoscaler (`autoscaling.enabled`), it pauses at zero replicas
 and takes over again after a start.
 
@@ -215,7 +227,10 @@ service account may then patch that Deployment's scale too.
 Pods scaled to zero lose whatever their containers held, including the
 [read cache](operations.md#read-cache) unless `/var/lib/igloo/cache` is on a
 PersistentVolumeClaim, so the first queries after a start read every table
-file from object storage again.
+file from object storage again. The chart keeps the cache on a claim with
+`cacheVolume.type: persistentVolumeClaim` and `cacheVolume.existingClaim`,
+for one igloo pod (`replicaCount: 1`, or `scaleToZero.replicas: 1`, and
+`strategy.type: Recreate`).
 
 Without the chart, set up the same pieces yourself, following its
 `gateway.yaml` and `service.yaml` templates: `IGLOO_GATEWAY_BACKEND` pointing
@@ -235,7 +250,9 @@ again does not undo the gateway's scaling.
 | `IGLOO_GATEWAY_COMPUTE` | (required) | `ec2`, `kubernetes` or `command` |
 | `IGLOO_GATEWAY_SUSPEND_AFTER` | `10m` | Stop Igloo after this long without client traffic or running work |
 | `IGLOO_GATEWAY_RESUME_TIMEOUT` | `5m` | How long a connecting client waits for Igloo to start before the gateway gives up and closes the connection |
-| `IGLOO_GATEWAY_ACTIVITY_URL` | `http://BACKEND_HOST:8080/activity` | Igloo's activity endpoint. Set it empty to judge idleness by traffic alone, which can stop Igloo during a long statement that sends nothing. |
+| `IGLOO_GATEWAY_FIRST_BYTE_TIMEOUT` | `30s` | How long a client has, from connecting, to send its first bytes. The gateway neither starts Igloo nor connects to it until then, and closes a connection that sends nothing for this long. It does not bound the wait for a start, which `IGLOO_GATEWAY_RESUME_TIMEOUT` does. |
+| `IGLOO_GATEWAY_MAX_WAITING` | `200` | How many client connections, SQL, console, Flight SQL and Iceberg REST together, may wait at once for their first bytes or for Igloo to start. Further ones are closed as soon as they connect. Raise it if more clients than this connect together while Igloo starts. |
+| `IGLOO_GATEWAY_ACTIVITY_URL` | `http://BACKEND_HOST:8080/activity` | Igloo's activity endpoint. While it cannot be read, Igloo is not stopped unless it refuses connections; a wrong address keeps Igloo running, with a warning in the gateway's log. Set it empty to judge idleness by traffic alone, which can stop Igloo during a long statement that sends nothing. |
 | `IGLOO_GATEWAY_LISTEN_ADDR` | `:5432` | Where clients connect |
 | `IGLOO_GATEWAY_CONSOLE_BACKEND` | | Igloo's web console address, `host:port` (port 8443). Set it to forward the console too. |
 | `IGLOO_GATEWAY_CONSOLE_LISTEN_ADDR` | `:8443` | Where browsers connect for the console, when it is forwarded |
@@ -249,6 +266,7 @@ again does not undo the gateway's scaling.
 | `IGLOO_GATEWAY_K8S_NAMESPACE` | the gateway's own | `kubernetes`: its namespace |
 | `IGLOO_GATEWAY_K8S_REPLICAS` | `1` | `kubernetes`: replicas to start |
 | `IGLOO_GATEWAY_K8S_WORKER_DEPLOYMENT` | | `kubernetes`: a Deployment of [distributed-execution workers](distributed-execution.md) to stop along with Igloo. Igloo starts them itself when a statement needs them. |
+| `IGLOO_GATEWAY_K8S_LARGE_WORKER_DEPLOYMENT` | | `kubernetes`: the Deployment of the pool's [large worker](distributed-execution.md#a-large-worker) to stop along with Igloo, as the workers' |
 | `IGLOO_GATEWAY_START_COMMAND`, `IGLOO_GATEWAY_STOP_COMMAND` | | `command`: shell commands that start and stop the compute |
 | `IGLOO_LOG_FORMAT`, `IGLOO_LOG_LEVEL` | `text`, `info` | As for the server |
 
@@ -271,7 +289,7 @@ out when none is scheduled).
 | `igloo_gateway_next_due_timestamp_seconds` | | When Igloo last said its scheduled work is next due, which the gateway starts it for; 0 if none is, or the gateway does not know |
 
 Alert on `igloo_gateway_resumes_total{result="failure"}`: clients cannot
-connect while starts fail.
+connect, and scheduled work does not run, while starts fail.
 
 ## Scheduled work
 
@@ -286,7 +304,10 @@ scheduled run is due, and the gateway:
   took, so the work starts about on time. Igloo runs it within seconds of
   starting, and the gateway stops it again after
   `IGLOO_GATEWAY_SUSPEND_AFTER` without traffic or work, as after any
-  start.
+  start. If the start fails, the gateway keeps the due time and tries
+  again, waiting twice as long after each failure (from 10 seconds, or a
+  quarter of `IGLOO_GATEWAY_SUSPEND_AFTER` if that is less, up to five
+  minutes), until a start succeeds.
 
 So a nightly task costs one start and about `IGLOO_GATEWAY_SUSPEND_AFTER`
 of compute a night, plus its run. Work that is due often keeps Igloo
@@ -297,7 +318,9 @@ arrive, such as `SCHEDULE '1 hour'` for daily drops.
 The gateway keeps the due time in memory, and learns it each time it
 stops Igloo. A gateway that starts while Igloo is stopped cannot know it,
 so it starts Igloo once to find out; after a gateway restart, expect one
-start of up to `IGLOO_GATEWAY_SUSPEND_AFTER`. With
+start of up to `IGLOO_GATEWAY_SUSPEND_AFTER`. If that start fails, the
+gateway tries again as for scheduled work, waiting twice as long after each
+failure, until Igloo runs, for that start or a client's. With
 `IGLOO_GATEWAY_ACTIVITY_URL` set empty the gateway reads no activity, and
 scheduled work runs only while clients keep Igloo up.
 

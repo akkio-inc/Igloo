@@ -49,8 +49,15 @@ type aggregation struct {
 	// mode says how the groups are completed (see the agg* constants).
 	mode string
 	// final says the coordinator reads whole groups, as __f columns,
-	// rather than partial aggregates.
+	// rather than partial aggregates: one row a group, which its combine
+	// step projects rather than groups again (see combine).
 	final bool
+	// regroup says the partial results of a stage that computes the
+	// aggregates over DISTINCT values (aggInPlace, aggByValue), a row a
+	// group and partition, go to an exchange keyed by the groups too, and
+	// a last stage completes the groups (groupStage), so that the
+	// coordinator reads one row a group.
+	regroup bool
 	// staged are the select items a second stage that completes the
 	// groups (aggByGroup) computes too, as __s columns: those that call
 	// a group function (see GroupFunctions).
@@ -146,6 +153,7 @@ func (pl *planner) aggregateJob(c *candidate) (*jobBuild, error) {
 	if err := a.collect(); err != nil {
 		return nil, err
 	}
+	a.ownTopK()
 	if err := a.choose(); err != nil {
 		return nil, err
 	}
@@ -163,6 +171,15 @@ func (pl *planner) aggregateJob(c *candidate) (*jobBuild, error) {
 	switch a.mode {
 	case aggByValue:
 		b.second, err = a.valueStage()
+		if err == nil && a.regroup {
+			// The value stage's rows, a group's partial results a partition,
+			// completed by group.
+			b.third, err = a.groupStage()
+		}
+	case aggInPlace:
+		if a.regroup {
+			b.second, err = a.groupStage()
+		}
 	case aggByGroup:
 		b.second, err = a.groupStage()
 	}
@@ -171,6 +188,20 @@ func (pl *planner) aggregateJob(c *candidate) (*jobBuild, error) {
 	}
 	if b.combine, err = a.combine(); err != nil {
 		return nil, err
+	}
+	if c.top {
+		if keys, order := a.mergeOrder(); keys != nil {
+			// The stage that sends the coordinator whole groups sorts them
+			// task by task, and the coordinator merges them (see merge.go).
+			last := &b.fragment
+			if b.third != nil {
+				last = &b.third.fragment
+			} else if b.second != nil {
+				last = &b.second.fragment
+			}
+			(*last)["modifiers"] = []any{order}
+			b.merge = keys
+		}
 	}
 	return b, nil
 }
@@ -479,6 +510,29 @@ var combinable = map[string]string{
 	"count": "sum", "count_star": "sum", "count_if": "sum", "countif": "sum",
 	// Roaring bitmaps: a union of unions.
 	"rb_agg": "rb_or_agg", "rb_or_agg": "rb_or_agg",
+	// HLL sketches (the datasketches extension, as APPROX_COUNT_DISTINCT
+	// and HLL_ACCUMULATE count): a union of sketches of the same size, k,
+	// the first argument (see sketchCall).
+	"datasketch_hll": "datasketch_hll_union", "datasketch_hll_union": "datasketch_hll_union",
+}
+
+// sketches are the aggregates of combinable whose first argument is the
+// sketch's size, which their combination takes first too.
+var sketches = map[string]bool{"datasketch_hll": true, "datasketch_hll_union": true}
+
+// sketchCall is the call that combines partial sketches, col, of call's
+// size: datasketch_hll_union(k, col). Unions of sketches of one size
+// estimate as a sketch of all their values does, within its error.
+func (pl *planner) sketchCall(call node, col string) (node, error) {
+	ref, err := pl.p.expr(quoteIdent(col))
+	if err != nil {
+		return nil, err
+	}
+	c := clone(call).(node)
+	c["function_name"] = combinable[strings.ToLower(str(call["function_name"]))]
+	c["children"] = []any{clone(list(call, "children")[0]), ref}
+	c["alias"], c["filter"] = "", nil
+	return c, nil
 }
 
 // collect finds the aggregate calls of the parts the coordinator evaluates
@@ -488,6 +542,10 @@ func (a *aggregation) collect() error {
 	var err error
 	visit := func(v any) {
 		walk(v, func(n node) bool {
+			if str(n["class"]) == "SUBQUERY" {
+				// Its own aggregates, computed with it (see rewrite).
+				return false
+			}
 			if err != nil || !a.pl.isAggregate(n) {
 				return err == nil
 			}
@@ -580,6 +638,9 @@ func (a *aggregation) add(call node) error {
 			ac.distinct = len(a.distincts)
 			a.distincts, a.distinctKeys = append(a.distincts, arg), append(a.distinctKeys, k)
 		}
+	case sketches[name] && (len(args) != 2 || str(args[0].(node)["class"]) != "CONSTANT" || call["distinct"] == true ||
+		len(list(child(call, "order_bys"), "orders")) > 0):
+		ac.whole = unsupported("%s() of a size that is not a constant", name)
 	default:
 		ac.whole = partialArgs(name, len(args))
 	}
@@ -655,6 +716,12 @@ func (a *aggregation) choose() error {
 			return ac.whole
 		}
 	}
+	// Workers complete the groups, so that the coordinator reads a row a
+	// group, when there may be too many for it to combine every worker's
+	// (or every partition's) partial results, or a select item calls a
+	// group function.
+	complete := single && len(a.groups) > 0 && collation == "" &&
+		(a.pl.opts.aggregation == aggByGroup || a.pl.opts.aggregation == "" && (a.manyGroups() || a.groupWork()))
 	switch {
 	case a.c.relation:
 		// The coordinator's combine step runs on workers, over whole groups.
@@ -670,17 +737,17 @@ func (a *aggregation) choose() error {
 		a.mode = aggGather
 	case len(a.distincts) == 0:
 		a.mode = aggGather
-		if single && len(a.groups) > 0 && (a.pl.opts.aggregation == aggByGroup || a.pl.opts.aggregation == "" && (a.manyGroups() || a.groupWork())) {
+		if complete {
 			a.mode = aggByGroup
 		}
 	case !single:
 		a.mode = aggGather
 	case additive && a.inPlace():
-		a.mode = aggInPlace
+		a.mode, a.regroup = aggInPlace, complete
 	case a.pl.opts.aggregation == aggGather:
 		a.mode = aggGather
 	case additive && anchor >= 0 && a.pl.opts.aggregation != aggByGroup:
-		a.mode = aggByValue
+		a.mode, a.regroup = aggByValue, complete
 	case len(a.groups) > 0:
 		a.mode = aggByGroup
 	default:
@@ -926,6 +993,11 @@ func (c *candidate) fixesKey(fixed []itemColumn) bool {
 		}
 	}
 	for _, k := range c.keyed {
+		if k.nullable {
+			// Its key is NULL for the rows its join matched to none of
+			// it, in every partition.
+			continue
+		}
 		all := true
 		for _, key := range k.keys {
 			if !slices.Contains(fixed, itemColumn{k.item, key}) {
@@ -982,35 +1054,127 @@ func determined(e node, sc *scope) []itemColumn {
 	return nil
 }
 
-// manyGroups guesses whether the groups are too many to send every
-// worker's to the coordinator: the top of an aggregation by a column of a
-// table the workers divide, such as spend per device, top ten. Then each
-// partition's top groups are all the coordinator needs.
+// maxGatheredGroups is the most groups whose partial results, every
+// task's, the coordinator combines itself (see manyGroups).
+const maxGatheredGroups = 10_000
+
+// manyGroups guesses whether the groups may be too many to send every
+// worker's partial results to the coordinator, which would combine as many
+// rows as there are groups times tasks, or partitions, and hold every
+// group: at a hundred times the data, a report's groups ranked on the
+// coordinator filled its disk. Partitions that complete their groups send
+// it only the groups HAVING, a ranking or ORDER BY ... LIMIT keeps, a row
+// each. The groups are few when every group expression takes few values
+// (see groupValues), more than maxGatheredGroups together; a column of an
+// input the workers divide or partition counts as many, unless ANALYZE
+// counted its distinct values. Groups of the tables every worker reads in
+// full are few.
 func (a *aggregation) manyGroups() bool {
-	if _, ok := a.topN(); !ok {
-		return false
-	}
 	small := map[*fromItem]bool{}
+	tables := map[*fromItem]*Table{}
 	for _, u := range a.c.uses {
-		if u.scope == a.c.scope && u != a.c.split && !slices.ContainsFunc(a.c.keyed, func(k *keyed) bool { return k.use == u }) {
+		if u.scope != a.c.scope {
+			continue
+		}
+		tables[u.item] = u.table
+		if u != a.c.split && !slices.ContainsFunc(a.c.keyed, func(k *keyed) bool { return k.use == u }) {
 			small[u.item] = true
 		}
 	}
+	groups := 1.0
 	for _, g := range a.groups {
-		large := false
-		walk(g, func(n node) bool {
-			if str(n["class"]) == "COLUMN_REF" {
-				if it := resolveColumn(n, a.c.scope); it == nil || !small[it] {
-					large = true
-				}
-			}
-			return !large
-		})
-		if large {
+		n, ok := groupValues(g, a.c.scope, small, tables)
+		if !ok {
 			return true
 		}
+		groups *= n
 	}
-	return false
+	return groups > maxGatheredGroups
+}
+
+// fewValuesFunctions are the functions whose values are few, whatever
+// their arguments': the fields and truncations of dates and times, by
+// which reports group a quarter's rows into days or months.
+var fewValuesFunctions = map[string]bool{
+	"date_trunc": true, "datetrunc": true, "date_part": true, "datepart": true, "extract": true,
+	"year": true, "quarter": true, "month": true, "week": true, "weekofyear": true, "yearweek": true,
+	"day": true, "dayofmonth": true, "dayofweek": true, "dayofyear": true, "isodow": true, "isoyear": true,
+	"weekday": true, "hour": true, "monthname": true, "dayname": true, "last_day": true,
+}
+
+// datePartValues is how many values a date's field or truncation is taken
+// to take: the days of three years.
+const datePartValues = 1000
+
+// groupValues estimates how many values e, a group expression of FROM
+// clause sc, takes, or reports that it cannot tell: one for a constant or
+// a column of one of small, the tables every worker reads in full; a
+// column's distinct count, as ANALYZE keeps it in its table (tables); two
+// or three for a comparison or another test; datePartValues for a date or
+// time's field or truncation; the sum of a CASE's results; and for any
+// other expression the product of the values of the columns it reads.
+func groupValues(e node, sc *scope, small map[*fromItem]bool, tables map[*fromItem]*Table) (float64, bool) {
+	switch str(e["class"]) {
+	case "CONSTANT":
+		return 1, true
+	case "COLUMN_REF":
+		it := resolveColumn(e, sc)
+		if it == nil {
+			return 0, false
+		}
+		if small[it] {
+			return 1, true
+		}
+		if t := tables[it]; t != nil {
+			if n, ok := t.Distinct[strings.ToLower(lastName(e))]; ok {
+				return float64(n), true
+			}
+		}
+		return 0, false
+	case "COMPARISON", "CONJUNCTION", "BETWEEN":
+		return 3, true
+	case "OPERATOR":
+		switch str(e["type"]) {
+		case "OPERATOR_IS_NULL", "OPERATOR_IS_NOT_NULL", "OPERATOR_NOT", "COMPARE_IN", "COMPARE_NOT_IN":
+			return 3, true
+		}
+	case "CAST":
+		return groupValues(child(e, "child"), sc, small, tables)
+	case "CASE":
+		total := 0.0
+		branches := []node{child(e, "else_expr")}
+		for _, c := range list(e, "case_checks") {
+			branches = append(branches, child(c.(node), "then_expr"))
+		}
+		for _, b := range branches {
+			if b == nil {
+				total++
+				continue
+			}
+			n, ok := groupValues(b, sc, small, tables)
+			if !ok {
+				return 0, false
+			}
+			total += n
+		}
+		return total, true
+	case "FUNCTION":
+		if fewValuesFunctions[strings.ToLower(str(e["function_name"]))] {
+			return datePartValues, true
+		}
+	}
+	// Otherwise at most every combination of the columns it reads.
+	values, ok, any := 1.0, true, false
+	walk(e, func(n node) bool {
+		if str(n["class"]) == "COLUMN_REF" {
+			any = true
+			v, known := groupValues(n, sc, small, tables)
+			ok = ok && known
+			values *= v
+		}
+		return ok
+	})
+	return values, ok && any
 }
 
 // types works out the result type of each aggregate call, which its
@@ -1091,11 +1255,14 @@ func (a *aggregation) fragment() (node, error) {
 		f["group_expressions"] = groups
 		f["group_sets"] = []any{set}
 		// Whole groups: the rows a statement ranks and keeps the first of
-		// (see markTopK).
+		// (see markTopK), and under ORDER BY ... LIMIT each task's first.
 		if keep := child(a.c.sel, topKMark); keep != nil {
 			if q, err := a.substituteAliases(clone(keep).(node)); err == nil {
 				f["qualify"] = q
 			}
+		}
+		if mods, ok := a.wholeFirstRows(); ok {
+			f["modifiers"] = mods
 		}
 		return f, nil
 	}
@@ -1179,7 +1346,12 @@ func (a *aggregation) valueStage() (*secondStage, error) {
 				// Counts stay BIGINT, as one machine has them.
 				text = "CAST(" + text + " AS BIGINT)"
 			}
-			if e, err = a.pl.p.expr(text); err != nil {
+			if sketches[name] {
+				e, err = a.pl.sketchCall(p, "__a"+strconv.Itoa(i))
+			} else {
+				e, err = a.pl.p.expr(text)
+			}
+			if err != nil {
 				return nil, err
 			}
 		}
@@ -1429,6 +1601,52 @@ func (a *aggregation) firstRows() ([]any, bool) {
 	return mods, true
 }
 
+// wholeFirstRows returns the ORDER BY and LIMIT that keep the first groups
+// of a stage that computes whole groups (aggComplete), in terms of the
+// candidate's own FROM clause, which the stage's fragment groups as the
+// candidate does.
+func (a *aggregation) wholeFirstRows() ([]any, bool) {
+	total, ok := a.topN()
+	if !ok || child(a.c.sel, topKMark) != nil {
+		return nil, false
+	}
+	var mods []any
+	for _, m := range list(a.c.sel, "modifiers") {
+		mod := clone(m).(node)
+		switch str(mod["type"]) {
+		case "ORDER_MODIFIER":
+			for _, o := range list(mod, "orders") {
+				ord := o.(node)
+				e := child(ord, "expression")
+				if k, ok := intConstant(e); ok && k >= 1 && int(k) <= len(a.items) {
+					e = bare(a.items[k-1])
+				} else if str(e["class"]) == "COLUMN_REF" && len(columnNames(e)) == 1 {
+					if i, isAlias := a.aliases[strings.ToLower(columnNames(e)[0])]; isAlias {
+						if has, _ := a.c.scope.hasColumn(strings.ToLower(columnNames(e)[0])); !has {
+							e = bare(a.items[i])
+						}
+					}
+				} else if str(e["class"]) == "STAR" {
+					return nil, false
+				}
+				r, err := a.substituteAliases(clone(e).(node))
+				if err != nil || hasClass(r, "SUBQUERY") || hasClass(r, "WINDOW") || hasClass(r, "PARAMETER") {
+					return nil, false
+				}
+				ord["expression"] = r
+			}
+		case "LIMIT_MODIFIER":
+			l, err := a.pl.p.expr(strconv.FormatInt(total, 10))
+			if err != nil {
+				return nil, false
+			}
+			mod["limit"], mod["offset"] = l, nil
+		}
+		mods = append(mods, mod)
+	}
+	return mods, true
+}
+
 // substituteAliasesInArgs substitutes aliases in a partial aggregate's
 // arguments and FILTER, which DuckDB also resolves against the select
 // list when no column has the name.
@@ -1477,7 +1695,7 @@ func (a *aggregation) combine() (node, error) {
 		var err error
 		if a.staged[i] {
 			// Computed by the second stage (see groupStage).
-			e, err = a.pl.p.expr("any_value(" + quoteIdent("__s"+strconv.Itoa(i)) + ")")
+			e, err = a.pl.p.expr(quoteIdent("__s" + strconv.Itoa(i)))
 		} else {
 			e, err = a.rewrite(bare(item), "select")
 		}
@@ -1492,7 +1710,7 @@ func (a *aggregation) combine() (node, error) {
 		items = append(items, cast)
 	}
 	out["select_list"] = items
-	if len(a.groups) > 0 {
+	if len(a.groups) > 0 && !a.final {
 		var groups []any
 		for i := range a.groups {
 			ref, err := a.pl.p.expr(quoteIdent("__g" + strconv.Itoa(i)))
@@ -1509,6 +1727,11 @@ func (a *aggregation) combine() (node, error) {
 			e, err := a.rewrite(clone(h).(node), part)
 			if err != nil {
 				return nil, err
+			}
+			if part == "having" && a.final {
+				// Whole groups, a row each: the combine step only projects
+				// them, and keeps those HAVING keeps.
+				part = "where_clause"
 			}
 			out[part] = e
 		}
@@ -1533,6 +1756,22 @@ func (a *aggregation) combine() (node, error) {
 		mods = append(mods, mod)
 	}
 	out["modifiers"] = mods
+	if a.final {
+		// Projected, not grouped: GROUPING() of the one grouping set,
+		// which groups by every group column, is 0.
+		zero, err := a.pl.p.expr("CAST(0 AS BIGINT)")
+		if err != nil {
+			return nil, err
+		}
+		out = rewrite(out, func(n node) (node, bool) {
+			if str(n["class"]) != "OPERATOR" || str(n["type"]) != "GROUPING_FUNCTION" {
+				return nil, false
+			}
+			z := clone(zero).(node)
+			z["alias"] = n["alias"]
+			return z, true
+		}).(node)
+	}
 	return out, nil
 }
 
@@ -1602,9 +1841,17 @@ func (a *aggregation) rewrite(e node, part string) (node, error) {
 			err = unsupported("column %s is neither grouped nor aggregated", strings.Join(parts, "."))
 			return nil, false
 		case "SUBQUERY", "LAMBDA", "PARAMETER":
-			if str(n["class"]) == "PARAMETER" {
+			switch str(n["class"]) {
+			case "PARAMETER":
 				// Parameters are bound when the combine step runs.
 				return n, true
+			case "SUBQUERY":
+				// A scalar subquery that stands on its own (see analyze),
+				// which the coordinator computes, its tables read at the
+				// workers' snapshots (see pinReads).
+				if !a.c.relation {
+					return n, true
+				}
 			}
 			err = unsupported("%s outside WHERE", strings.ToLower(str(n["class"])))
 			return nil, false
@@ -1630,12 +1877,18 @@ func (a *aggregation) combined(ac *aggCall) (node, error) {
 	case a.final && ac.final < 0:
 		return nil, fmt.Errorf("aggregate %s was left on the workers", ac.name)
 	case a.final:
-		// One row per group: any of its values is the value.
-		text = "any_value(" + quoteIdent("__f"+strconv.Itoa(ac.final)) + ")"
+		// One row per group, which the combine step projects.
+		text = quoteIdent("__f" + strconv.Itoa(ac.final))
 	case ac.kind == combineCount:
 		text = "coalesce(sum(" + col(0) + "), 0)"
 	case ac.kind == combineAvg:
 		text = "CAST(sum(" + col(0) + ") AS DOUBLE) / CAST(sum(" + col(1) + ") AS DOUBLE)"
+	case ac.kind == combineSame && sketches[ac.name]:
+		e, err := a.pl.sketchCall(ac.call, "__a"+strconv.Itoa(ac.partials[0]))
+		if err != nil {
+			return nil, err
+		}
+		return a.pl.cast(e, ac.typ)
 	case ac.kind == combineSame:
 		text = combinable[ac.name] + "(" + col(0) + ")"
 	case ac.kind == combineBitmap:
@@ -1680,10 +1933,11 @@ func (pl *planner) cast(e node, typ string) (node, error) {
 // workers filter and project their rows, and, for ORDER BY with LIMIT,
 // keep only their first rows; the coordinator concatenates, sorts and
 // limits. It is only worth it when that cuts the rows down: with a WHERE
-// clause, DISTINCT, or ORDER BY with LIMIT.
+// clause, DISTINCT, or LIMIT, with ORDER BY or not (any rows, which its
+// stage stops sending once it has enough: see Stage.enough).
 func (pl *planner) rowsJob(c *candidate) (*jobBuild, error) {
 	sel := c.sel
-	if hasClass(sel["select_list"], "WINDOW") || child(sel, "qualify") != nil {
+	if (hasClass(sel["select_list"], "WINDOW") || child(sel, "qualify") != nil || hasClass(sel["modifiers"], "WINDOW")) && c.window == nil {
 		return nil, unsupported("window functions over rows")
 	}
 	var order, limit, distinct node
@@ -1697,12 +1951,39 @@ func (pl *planner) rowsJob(c *candidate) (*jobBuild, error) {
 			distinct = mod
 		}
 	}
-	if limit != nil && order == nil {
+	// Rows that workers compute anyway, a relation's, cross to the
+	// coordinator fewer for its filters; so do those of windows workers
+	// compute, for its QUALIFY, rather than every row for the coordinator to
+	// compute them over.
+	filtersRelation := child(sel, "where_clause") != nil && slices.ContainsFunc(c.keyed, func(k *keyed) bool { return k.rel != nil })
+	qualifies := c.window != nil && child(sel, "qualify") != nil
+	// So do those of a scan that keeps few of the divided table's rows, by
+	// a column equal to a constant, in a list or equal to a subquery's
+	// value, as auto mode's estimates take it (filtersSelectively): workers
+	// read the table, and the coordinator what they keep.
+	selective := c.split != nil && child(sel, "where_clause") != nil && filtersSelectively(node{"where_clause": child(sel, "where_clause")}, c.split.table)
+	// And so do those of a subquery whose rows the coordinator reads to run
+	// the rest, as a window over all of them, where they are fewer than
+	// the table's, by its filters or its columns: workers read the table in
+	// shares, rather than the coordinator alone, and send what they keep.
+	feeds := !c.top && c.split != nil && (child(sel, "where_clause") != nil ||
+		2*columnsRead(sel, c.split.table).bytes(c.split.table) <= c.split.table.Bytes)
+	if limit != nil && order == nil && !pl.opts.force && !selective && !filtersRelation && !qualifies && c.window == nil && len(c.keyed) == 0 {
+		// Any rows of a scan: one machine stops at the first it reads,
+		// which auto mode's estimates, of the whole scan, do not count.
 		return nil, unsupported("LIMIT without ORDER BY, which one machine answers fastest")
 	}
-	if distinct == nil && limit == nil {
+	// And so do those sorted by ORDER BY without LIMIT: workers sort their
+	// shares, and the coordinator merges them as the client reads them
+	// (see merge.go), in memory for a batch of rows a task, where one
+	// machine sorts them all, past its memory spilling to disk and taking
+	// more memory besides than its limit allows.
+	sorts := c.top && order != nil && limit == nil && distinct == nil
+	hop := distinct == nil && limit == nil && !qualifies && !filtersRelation && !selective && !feeds
+	if hop && !sorts && !pl.opts.writes {
 		// Every matching row would cross to the coordinator and wait on its
 		// disk before the first reached the client: a hop, not a saving.
+		// Workers that write a table's files send it none.
 		return nil, unsupported("rows of %s without DISTINCT, aggregates or ORDER BY ... LIMIT", c.largest())
 	}
 	if limit != nil {
@@ -1845,7 +2126,111 @@ func (pl *planner) rowsJob(c *candidate) (*jobBuild, error) {
 		outMods = append(outMods, clone(limit))
 	}
 	out["modifiers"] = outMods
-	return &jobBuild{fragment: f, combine: out, columns: columns}, nil
+	b := &jobBuild{fragment: f, combine: out, columns: columns}
+	if limit != nil && order == nil && distinct == nil {
+		// Any rows: its tasks stop once those that ended sent enough.
+		if total, ok := limitRows(limit); ok && total > 0 {
+			b.enough = total
+		}
+	}
+	if c.top && order != nil && limit == nil && distinct == nil {
+		// Each task sorts its rows by the ORDER BY it keeps, which the
+		// coordinator merges them by.
+		for _, ord := range orders {
+			e := child(ord, "expression")
+			names := columns[:n]
+			if str(e["class"]) != "STAR" {
+				names = columnNames(e)
+			}
+			for _, name := range names {
+				b.merge = append(b.merge, mergeKey{column: name, order: str(ord["type"]), nulls: str(ord["null_order"])})
+			}
+		}
+	}
+	if hop && sorts && !pl.mergeable(b.merge, columns[:n], c.columns) {
+		// Sorted only on the coordinator, after every row crossed to it.
+		return nil, unsupported("rows of %s ordered by what the coordinator cannot merge", c.largest())
+	}
+	return b, nil
+}
+
+// mergeable reports whether the coordinator will merge rows sorted by keys,
+// the result's columns of cols named names, in this session (see
+// resolveMerge), rather than sort them.
+func (pl *planner) mergeable(keys []mergeKey, names []string, cols []Column) bool {
+	var settings []setting
+	for _, name := range []string{"preserve_insertion_order", "default_collation", "default_order", "default_null_order"} {
+		v, err := pl.env.Setting(pl.ctx, name)
+		if err != nil {
+			return false
+		}
+		settings = append(settings, setting{Name: name, Value: v})
+	}
+	named := make([]Column, len(cols))
+	for i, c := range cols {
+		named[i] = Column{Name: names[i], Type: c.Type}
+	}
+	_, ok := resolveMerge(keys, named, settings)
+	return ok
+}
+
+// mergeOrder returns, for an aggregation whose result is its whole groups
+// (final) ordered by ORDER BY without LIMIT, the columns of the stage that
+// completes them its tasks sort their rows by, and the ORDER BY that sorts
+// them so; nil when an ORDER BY item is not a group expression, an
+// aggregate or a select item computing one of them, or the result is
+// otherwise.
+func (a *aggregation) mergeOrder() ([]mergeKey, node) {
+	sel := a.c.sel
+	if !a.final || child(sel, "qualify") != nil {
+		return nil, nil
+	}
+	var order node
+	for _, m := range list(sel, "modifiers") {
+		switch mod := m.(node); str(mod["type"]) {
+		case "ORDER_MODIFIER":
+			order = clone(mod).(node)
+		default:
+			return nil, nil
+		}
+	}
+	if order == nil {
+		return nil, nil
+	}
+	var keys []mergeKey
+	for _, o := range list(order, "orders") {
+		ord := o.(node)
+		e := child(ord, "expression")
+		staged := -1
+		if k, ok := intConstant(e); ok && k >= 1 && int(k) <= len(a.items) {
+			e, staged = bare(a.items[k-1]), int(k-1)
+		} else if str(e["class"]) == "COLUMN_REF" && len(columnNames(e)) == 1 {
+			if i, isAlias := a.aliases[strings.ToLower(columnNames(e)[0])]; isAlias {
+				if has, _ := a.c.scope.hasColumn(strings.ToLower(columnNames(e)[0])); !has {
+					e, staged = bare(a.items[i]), i
+				}
+			}
+		}
+		col := ""
+		k := a.key(e)
+		if g := slices.Index(a.groupKeys, k); g >= 0 {
+			col = "__g" + strconv.Itoa(g)
+		} else if ac, ok := a.aggKeys[k]; ok && a.pl.isAggregate(e) && ac.final >= 0 {
+			col = "__f" + strconv.Itoa(ac.final)
+		} else if staged >= 0 && a.staged[staged] {
+			col = "__s" + strconv.Itoa(staged)
+		}
+		if col == "" {
+			return nil, nil
+		}
+		ref, err := a.pl.p.expr(quoteIdent(col))
+		if err != nil {
+			return nil, nil
+		}
+		ord["expression"] = ref
+		keys = append(keys, mergeKey{column: col, order: str(ord["type"]), nulls: str(ord["null_order"])})
+	}
+	return keys, order
 }
 
 // columnIndex returns the index of the one result column called name, or

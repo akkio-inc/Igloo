@@ -126,7 +126,7 @@ func (cs *catalogServer) rewritten(t *testing.T, name, query string) string {
 		t.Fatalf("%s: %v", query, err)
 	}
 	defer st.close() //nolint:errcheck
-	text, _, _, err := cs.srv.policyRewrite(ctx, sess, user, st.stmtType, query, nil)
+	text, _, _, err := cs.srv.policyRewrite(ctx, sess, user, st.stmtType, query, nil, nil)
 	if err != nil {
 		t.Fatalf("%s: %v", query, err)
 	}

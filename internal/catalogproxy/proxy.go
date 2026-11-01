@@ -148,6 +148,8 @@ type Proxy struct {
 	sharedHold
 	// data goes up whenever a table may have changed (see DataVersion).
 	data dataVersion
+	// pending are the notes of staged creates (see pending.go).
+	pending pendingCreates
 	// counts are the distinct counts table loads had (see distinctcounts.go).
 	counts distinctCounts
 
@@ -156,6 +158,10 @@ type Proxy struct {
 	// namespaces.go), keyed by their names joined by \x1f; mu guards it.
 	prefix atomic.Pointer[string]
 	hide   map[string]bool
+	// gone are the tables DuckDB is to forget, by namespace and name,
+	// lower-cased, with the names the catalog renamed them to (see
+	// gone.go); mu guards it.
+	gone map[[2]string]string
 }
 
 // New starts a proxy to the catalog on a random loopback port.
@@ -202,6 +208,7 @@ func New(opts Options) (*Proxy, error) {
 		cancel:  cancel,
 		changes: map[[sha256.Size]byte]*change{},
 		hide:    map[string]bool{},
+		gone:    map[[2]string]string{},
 		lists:   newListings(opts.ListTTL),
 		names:   newNames(opts.ListTTL),
 	}
@@ -284,7 +291,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	p.notePrefix(rest)
-	if p.refuseShared(w, r, rest) {
+	if p.refuseShared(w, r, rest) || p.forgotten(w, r, rest) {
 		return
 	}
 	switch r.Method {
@@ -341,22 +348,35 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	body = withDefaults(rest, body)
 	// A change makes the listings kept stale: forgotten before it, so no
 	// listing begun before it is kept, and after it, so none answered
-	// while it was under way is.
-	p.lists.forget()
-	p.data.bump()
+	// while it was under way is. So does it the versions of the tables it
+	// changes.
+	tables, known, none := changedTables(r.Method, rest, body)
+	changed := func() {
+		if !none {
+			p.lists.forget()
+			p.data.bumpTables(tables, known)
+		}
+	}
+	changed()
+	pkey, pnote := p.notePending(r, rest, body)
 	c := p.begin(r, rest, body)
+	settled := func() {
+		if c.res != nil {
+			p.settlePending(r, rest, body, c.res.status, pkey, pnote)
+		}
+	}
 	select {
 	case <-c.done:
-		p.lists.forget()
-		p.data.bump()
+		changed()
+		settled()
 		c.res.write(w)
 	case <-r.Context().Done():
 		// DuckDB gave up waiting; it sends the change again, which joins
 		// this one.
 		go func() {
 			<-c.done
-			p.lists.forget()
-			p.data.bump()
+			changed()
+			settled()
 		}()
 	}
 }

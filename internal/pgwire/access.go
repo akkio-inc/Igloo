@@ -69,6 +69,49 @@ func (s *Server) catalogGeneration() uint64 {
 	return g
 }
 
+// resultGeneration is catalogGeneration for the results the result cache
+// keeps of statements it has prepared: it leaves out the DDL that makes,
+// replaces, renames or drops tables, or makes schemas (see tablesOnly). A
+// prepared statement's result is tied to the versions of the tables
+// preparing it loaded, which such DDL raises (see TablesVersion), and a
+// statement that binds to another table after it loads another table. A
+// rollup's CREATE OR REPLACE TABLE, or dbt's CREATE SCHEMA IF NOT EXISTS,
+// emptied the cache of every dashboard. Views, macros, functions and
+// connections still change it, as their definitions change what a
+// statement means without a table's version showing it. The results it
+// answers before preparing a statement, by its text, stay tied to
+// catalogGeneration (see statementKey).
+func (s *Server) resultGeneration() uint64 {
+	g := s.defsGen.Load()
+	if s.ddl != nil {
+		g += s.ddl.Generation()
+	}
+	if s.remotes != nil {
+		g += s.remotes.Generation()
+	}
+	return g
+}
+
+// tablesOnly reports whether st, DDL that ran, only made, replaced,
+// renamed, altered or dropped tables, or made a schema, all through
+// DuckDB, which the catalog proxy saw: the changes TablesVersion follows
+// (see resultGeneration).
+func tablesOnly(st *statement) bool {
+	sc := &scanner{s: st.query}
+	switch st.stmtType {
+	case duckdb.STATEMENT_TYPE_CREATE:
+		if _, ok := parseCreateTable(st.query); ok {
+			return true
+		}
+		return sc.keywords("CREATE", "SCHEMA")
+	case duckdb.STATEMENT_TYPE_DROP:
+		return sc.keywords("DROP", "TABLE")
+	case duckdb.STATEMENT_TYPE_ALTER:
+		return sc.keywords("ALTER", "TABLE")
+	}
+	return false
+}
+
 // changesCatalog reports whether a statement of type t may change what
 // statements bind to.
 func changesCatalog(t duckdb.StmtType) bool {
@@ -196,7 +239,8 @@ func (s *Server) catalogName() string {
 
 // privileges returns the session's grants, reloading them once they are as
 // old as the role refresh interval. If the store fails, the last ones
-// loaded stay in force, as the role does.
+// loaded stay in force, as the role does, for up to maxStale (see
+// refreshAccess).
 func (s *Server) privileges(ctx context.Context, sess *session, user auth.User) (*auth.Privileges, error) {
 	sess.mu.Lock()
 	snap, fixed := sess.privs, sess.fixed
@@ -211,6 +255,9 @@ func (s *Server) privileges(ctx context.Context, sess *session, user auth.User) 
 	if err != nil {
 		if snap.privs != nil {
 			s.log.Warn("could not refresh grants", "user", user.Name, "err", err)
+			if age := time.Since(snap.loaded); age >= s.maxStale {
+				return nil, staleAccess("the session's grants", age)
+			}
 			return snap.privs, nil
 		}
 		return nil, err
@@ -424,6 +471,8 @@ type createTable struct {
 	replace, temporary, ifNotExists bool
 	name                            []string
 	query                           string
+	// partitionedBy is the PARTITIONED BY (...) clause before AS, if any.
+	partitionedBy string
 }
 
 func parseCreateTable(query string) (createTable, bool) {
@@ -447,6 +496,7 @@ func parseCreateTable(query string) (createTable, bool) {
 		return c, false
 	}
 	c.name = name
+	c.partitionedBy = sc.partitionedBy()
 	if i := topLevelKeyword(sc.rest(), "AS"); i >= 0 {
 		q := strings.TrimSpace(sc.rest()[i+2:])
 		q = strings.TrimSpace(strings.TrimSuffix(q, ";"))

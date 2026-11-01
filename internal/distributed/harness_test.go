@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"database/sql/driver"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -52,8 +53,10 @@ type harness struct {
 	views map[string]string
 	// hook, if set, sees every record the coordinator and workers log.
 	hook atomic.Pointer[func(slog.Record)]
-	// rb, if set, is the rb extension the session and workers load.
-	rb string
+	// rb, if set, is the rb extension the session and workers load, and
+	// extensions are DuckDB's that they load from IGLOO_TEST_EXTENSION_DIR.
+	rb         string
+	extensions []string
 	// wrap, if set, wraps the listener of each worker startWorker starts.
 	wrap func(i int, ln net.Listener) net.Listener
 	// groupFunctions are the functions the session's GroupFunctions names.
@@ -62,6 +65,9 @@ type harness struct {
 	// connected, if set, sees each connection worker i opens for a task.
 	erasure   func(i int) WorkerErasure
 	connected func(i int)
+	// noPlans keeps the session from planning statements for auto mode's
+	// working sets (see harnessEnv.Explain).
+	noPlans bool
 }
 
 // hookHandler passes records to the harness's hook, and on to its handler.
@@ -165,6 +171,18 @@ func (e harnessEnv) Describe(ctx context.Context, query string) ([]Column, error
 
 func (e harnessEnv) UserFunction(context.Context, string) (bool, error) { return false, nil }
 
+// Explain plans query on the session, as the server's sessions do; with
+// noPlans, it plans nothing, as for tests whose tables' sizes are set by
+// hand, which DuckDB's plan of the harness's small tables would not see.
+func (e harnessEnv) Explain(ctx context.Context, query string) (string, error) {
+	if e.h.noPlans {
+		return "", errors.New("the harness plans nothing")
+	}
+	var plan string
+	err := e.h.session.QueryRowContext(ctx, "EXPLAIN (FORMAT JSON) "+query).Scan(new(string), &plan)
+	return plan, err
+}
+
 func (e harnessEnv) GroupFunction(name string) bool { return e.h.groupFunctions[name] }
 
 // ViewDefinition returns the views addView made. Names in them mean the
@@ -251,7 +269,14 @@ func newHarness(t *testing.T, sf float64, files, n int) *harness {
 // extension at rb, if not empty, as Igloo loads it.
 func newHarnessRB(t *testing.T, sf float64, files, n int, rb string) *harness {
 	t.Helper()
-	h := &harness{t: t, dir: t.TempDir(), tables: map[string]*Table{}, files: map[string][]File{}, rb: rb}
+	return newHarnessWith(t, sf, files, n, rb)
+}
+
+// newHarnessWith is newHarnessRB whose session and workers also load
+// extensions, DuckDB's, from IGLOO_TEST_EXTENSION_DIR, as Igloo loads them.
+func newHarnessWith(t *testing.T, sf float64, files, n int, rb string, extensions ...string) *harness {
+	t.Helper()
+	h := &harness{t: t, dir: t.TempDir(), tables: map[string]*Table{}, files: map[string][]File{}, rb: rb, extensions: extensions}
 	var base slog.Handler = slog.NewTextHandler(io.Discard, nil)
 	if testing.Verbose() {
 		base = slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug})
@@ -270,6 +295,9 @@ func newHarnessRB(t *testing.T, sf float64, files, n int, rb string) *harness {
 	if rb != "" {
 		h.exec("LOAD " + quoteLiteral(rb))
 	}
+	for _, stmt := range h.extensionLoads() {
+		h.exec(stmt)
+	}
 	h.exec("INSTALL tpch")
 	h.exec("LOAD tpch")
 	h.exec(fmt.Sprintf("CALL dbgen(sf = %g)", sf))
@@ -278,6 +306,19 @@ func newHarnessRB(t *testing.T, sf float64, files, n int, rb string) *harness {
 	}
 	h.startWorkers(n)
 	return h
+}
+
+// extensionLoads load the harness's extensions from
+// IGLOO_TEST_EXTENSION_DIR.
+func (h *harness) extensionLoads() []string {
+	if len(h.extensions) == 0 {
+		return nil
+	}
+	out := []string{"SET extension_directory = " + quoteLiteral(os.Getenv("IGLOO_TEST_EXTENSION_DIR"))}
+	for _, e := range h.extensions {
+		out = append(out, "LOAD "+e)
+	}
+	return out
 }
 
 func (h *harness) exec(query string) {
@@ -425,6 +466,7 @@ func (h *harness) startWorker(i int) {
 	if h.rb != "" {
 		load = []string{"LOAD " + quoteLiteral(h.rb), "SET allow_unsigned_extensions = false"}
 	}
+	load = append(h.extensionLoads(), load...)
 	for _, stmt := range append(load,
 		"SET threads = 2",
 		"SET allowed_directories = ["+quoteLiteral(filepath.Join(h.dir, "warehouse")+"/")+", "+quoteLiteral(tmp+"/")+"]",

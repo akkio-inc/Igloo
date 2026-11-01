@@ -270,10 +270,11 @@ func TestAhead(t *testing.T) {
 	for name, mode := range map[string]tracking{"access times": byAccessTime, "opens": byOpens} {
 		t.Run(name, func(t *testing.T) {
 			dir := t.TempDir()
-			p, err := New(Options{Dir: dir, BlockSize: block, Concurrency: 4, Room: func() int64 { return 0 },
+			// A sliver of room: minAhead's worth ahead.
+			p, err := New(Options{Dir: dir, BlockSize: block, Concurrency: 4, Room: func() int64 { return 1 },
 				Open: func(ctx context.Context, _ string) (Object, error) {
 					f, err := os.Open(local)
-					return &localObject{File: f}, err
+					return &localObject{File: f, etag: `"v1"`}, err
 				}})
 			if err != nil {
 				t.Fatal(err)
@@ -308,7 +309,7 @@ func TestAhead(t *testing.T) {
 // TestBounded reads ahead, where the prefetcher cannot tell which blocks
 // DuckDB read, at most boundedAhead for a statement however much DuckDB
 // reads, and nothing past its share of the cache's free room, so reading
-// ahead evicts nothing.
+// ahead evicts nothing: with no room, not even a file's footer.
 func TestBounded(t *testing.T) {
 	local := testFile(t, 400000, 10000)
 	st, _ := os.Stat(local)
@@ -320,12 +321,12 @@ func TestBounded(t *testing.T) {
 	for _, c := range []struct {
 		room int64
 		want int
-	}{{1 << 40, footer + 4}, {0, footer}} {
+	}{{1 << 40, footer + 4}, {0, 0}} {
 		dir := t.TempDir()
 		p, err := New(Options{Dir: dir, BlockSize: block, Concurrency: 4, Room: func() int64 { return c.room },
 			Open: func(ctx context.Context, _ string) (Object, error) {
 				f, err := os.Open(local)
-				return &localObject{File: f}, err
+				return &localObject{File: f, etag: `"v1"`}, err
 			}})
 		if err != nil {
 			t.Fatal(err)
@@ -337,6 +338,9 @@ func TestBounded(t *testing.T) {
 			return len(entries)
 		}
 		waitFor(t, "the first blocks", func() bool { return count() >= c.want })
+		if c.want == 0 {
+			time.Sleep(300 * time.Millisecond)
+		}
 		// DuckDB reads them all, which changes nothing.
 		for range 3 {
 			entries, _ := os.ReadDir(dir)
@@ -346,7 +350,7 @@ func TestBounded(t *testing.T) {
 			time.Sleep(150 * time.Millisecond)
 		}
 		if n := count(); n != c.want {
-			t.Errorf("room %d: %d blocks read ahead, want %d (the footer's %d and at most 4 more, within the room)", c.room, n, c.want, footer)
+			t.Errorf("room %d: %d blocks read ahead, want %d (with room, the footer's %d and at most 4 more)", c.room, n, c.want, footer)
 		}
 		stop()
 		p.Close()
@@ -363,7 +367,7 @@ func TestSharing(t *testing.T) {
 	var order []string
 	p, err := New(Options{Dir: dir, BlockSize: 64 << 10, Concurrency: 1, Open: func(ctx context.Context, path string) (Object, error) {
 		f, err := os.Open(local)
-		return &recordingObject{localObject: localObject{File: f}, path: path, mu: &mu, order: &order}, err
+		return &recordingObject{localObject: localObject{File: f, etag: `"v1"`}, path: path, mu: &mu, order: &order}, err
 	}})
 	if err != nil {
 		t.Fatal(err)
@@ -496,6 +500,19 @@ func TestCacheHTTPFSReadsBlocks(t *testing.T) {
 			l, _ := strconv.ParseInt(length, 10, 64)
 			if read, ok := watch.readSince(BlockName(path, o, l)); ok && !read {
 				t.Errorf("no open of block %s seen as DuckDB read the column", b)
+			}
+		}
+	}
+	// Where reads move access times, those tell the blocks DuckDB read
+	// too, though cache_httpfs sets a block's access and modification
+	// times both to the time it reads it.
+	if atime, _ := probe(dir); atime {
+		for _, b := range blockFiles(t, dir, path, etag) {
+			off, length, _ := strings.Cut(b, "+")
+			o, _ := strconv.ParseInt(off, 10, 64)
+			l, _ := strconv.ParseInt(length, 10, 64)
+			if read, ok := readSince(filepath.Join(dir, BlockName(path, o, l))); ok && !read {
+				t.Errorf("block %s does not show as read by its access time after DuckDB read the column", b)
 			}
 		}
 	}

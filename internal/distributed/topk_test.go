@@ -58,6 +58,20 @@ func TestTopK(t *testing.T) {
 			SELECT src, kind, v, n, r FROM ranked WHERE upper(kind) = 'AIR' OR r <= 2 ORDER BY src, kind, r, v`, true},
 		{"read twice", agg + `, ranked AS (SELECT f, m, v, n, ROW_NUMBER() OVER (PARTITION BY f, m ORDER BY n DESC, v) AS r FROM agg)
 			SELECT f, m, v, n, r FROM ranked WHERE r <= 1 UNION ALL SELECT f, m, v, n, 0 FROM agg WHERE n > 25 ORDER BY 1, 2, 3, 5`, false},
+		// A union's branches as SELECT * of the aggregations they read.
+		{"union of stars", `WITH a1 AS (SELECT l_shipmode AS kind, l_partkey % 40 AS v, count(DISTINCT l_orderkey) AS n FROM lineitem GROUP BY 1, 2),
+			a2 AS (SELECT l_returnflag AS kind, l_suppkey % 40 AS v, count(DISTINCT l_orderkey) AS n FROM lineitem GROUP BY 1, 2),
+			allr AS (SELECT * FROM a1 UNION ALL SELECT * FROM a2),
+			ranked AS (SELECT kind, v, n, ROW_NUMBER() OVER (PARTITION BY kind ORDER BY n DESC NULLS LAST, v) AS r FROM allr)
+			SELECT kind, v, n, r FROM ranked WHERE r <= 2 ORDER BY kind, r`, true},
+		// The aggregation's own QUALIFY, by an alias and inline; beside
+		// another window, every group.
+		{"own qualify", `SELECT l_returnflag AS f, l_partkey % 50 AS v, count(DISTINCT l_orderkey) AS n, row_number() OVER (PARTITION BY f ORDER BY n DESC, v) AS r
+			FROM lineitem GROUP BY 1, 2 QUALIFY r <= 3 ORDER BY f, r`, true},
+		{"own qualify inline", `SELECT l_shipmode AS m, l_partkey % 50 AS v, count(*) AS c FROM lineitem GROUP BY 1, 2
+			QUALIFY rank() OVER (PARTITION BY m ORDER BY count(*) DESC) <= 2 ORDER BY m, c DESC, v`, true},
+		{"own qualify beside a window", `SELECT l_shipmode AS m, l_partkey % 50 AS v, count(*) AS c, sum(count(*)) OVER (PARTITION BY l_shipmode) AS t
+			FROM lineitem GROUP BY 1, 2 QUALIFY rank() OVER (PARTITION BY m ORDER BY count(*) DESC) <= 2 ORDER BY m, c DESC, v`, false},
 	}
 	for _, mode := range []string{aggByGroup, ""} {
 		h.co.aggregation = mode

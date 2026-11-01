@@ -19,6 +19,7 @@ locals {
   release_name = "igloo"
   igloo_ksa    = "igloo"
   catalog_ksa  = "igloo-catalog"
+  worker_ksa   = "igloo-worker"
   service_name = "igloo" # Service the chart creates for the SQL port (release fullname).
 
   secret_names = {
@@ -26,6 +27,7 @@ locals {
     database       = "igloo-database"
     encryption_key = "igloo-catalog-encryption"
     gcs_hmac       = "igloo-gcs-hmac"
+    worker_hmac    = "igloo-gcs-hmac-worker"
     tls            = "igloo-tls"
   }
 

@@ -27,13 +27,7 @@ func (e *Engine) setupPrefetch(cfg config.Config, dir string, log *slog.Logger) 
 	p, err := prefetch.New(prefetch.Options{
 		Dir: dir, Concurrency: cfg.Prefetch.Concurrency, Log: log,
 		Open: (&objectOpener{storage: cfg.Storage}).open,
-		Room: func() int64 {
-			limit, size := c.limit.Load(), c.size.Load()
-			if !c.on || size >= limit {
-				return 0
-			}
-			return int64(limit - size)
-		},
+		Room: c.room,
 	})
 	if err != nil {
 		log.Warn("prefetch off", "err", err)

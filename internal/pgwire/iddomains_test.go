@@ -22,8 +22,8 @@ func TestParseDomainCommand(t *testing.T) {
 		"CREATE ID DOMAIN People (VARCHAR)": {kind: dcCreate, name: "people", typ: "varchar"},
 		"create id domain if not exists people (uuid) tag pii = 'person_id', src = 'crm' comment = 'who';": {kind: dcCreate, name: "people", typ: "uuid",
 			ifNotExists: true, tags: map[string]string{"pii": "person_id", "src": "crm"}, comment: "who"},
-		"DROP ID DOMAIN IF EXISTS people":                               {kind: dcDrop, name: "people", ifExists: true},
-		"SHOW ID DOMAINS":                                               {kind: dcShow},
+		"DROP ID DOMAIN IF EXISTS people": {kind: dcDrop, name: "people", ifExists: true},
+		"SHOW ID DOMAINS":                 {kind: dcShow},
 		"ALTER TABLE s.t ALTER COLUMN person_id SET ID DOMAIN people":   {kind: dcSet, table: []string{"s", "t"}, column: "person_id", name: "people"},
 		"alter table if exists t modify \"Id\" unset id domain":         {kind: dcUnset, table: []string{"t"}, column: "Id", ifExists: true},
 		"ALTER TABLE lake.s.t ALTER person_id SET ID DOMAIN people   ;": {kind: dcSet, table: []string{"lake", "s", "t"}, column: "person_id", name: "people"},
@@ -245,8 +245,8 @@ func TestIDDomains(t *testing.T) {
 	}
 	// Its files hold the ids, so Delta Sharing refuses it, and Igloo's
 	// Iceberg REST endpoint keeps it to admins.
-	if got := r.srv.ProtectedBy(ctx, "public", "people"); strings.Join(got, ",") != "ID domain people" {
-		t.Errorf("ProtectedBy: %q", got)
+	if got, err := r.srv.ProtectedBy(ctx, "public", "people"); err != nil || strings.Join(got, ",") != "ID domain people" {
+		t.Errorf("ProtectedBy: %q, %v", got, err)
 	}
 	if p, err := r.srv.ProtectedFor(ctx, auth.User{Name: "rita", Role: auth.RoleReader}, "public", "people"); err != nil || !p {
 		t.Errorf("ProtectedFor: %v, %v", p, err)

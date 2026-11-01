@@ -119,6 +119,31 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   `igloo_comments()`, and `information_schema.tables` and `.columns`.
 - SQL cursors (`DECLARE`, `FETCH`, `CLOSE`) and array parameters, so
   psycopg's server-side cursors and Ibis's PostgreSQL backend work.
+- `RESET ALL` and `DISCARD ALL`, which PgBouncer (its default
+  `server_reset_query`) and drivers' connection pools send to clean a
+  session for its next client, in either dialect. `RESET ALL` puts every
+  setting a session can change back to what it had at login: DuckDB's
+  session settings, the search path (the catalog's default schema),
+  `statement_timeout`, `statement_queued_timeout`, `query_tag`,
+  `sql_dialect`, `distributed_execution`, the `igloo_` switches, the AI
+  settings, `application_name` and SQL variables, with the user's and
+  roles' settings applying again. `DISCARD ALL` also closes cursors and
+  drops prepared statements and temporary objects, keeping those every
+  session starts with, and runs only outside a transaction block, as in
+  PostgreSQL. `DISCARD TEMP` drops temporary objects alone. `DISCARD PLANS`
+  and `DISCARD SEQUENCES` succeed and change nothing: DuckDB keeps no plans
+  but prepared statements, and no sequence values per session. DuckDB
+  refuses `RESET ALL` and does not parse `DISCARD`, so all of these failed
+  before. What an admin set for the whole server, with `SET GLOBAL` or an
+  unscoped `SET` that DuckDB applies globally, stays, as `ALTER SYSTEM`
+  settings do in PostgreSQL.
+- `pg_advisory_unlock_all()` and `UNLISTEN`, so asyncpg's connection pool
+  can clean a session it takes back with its reset query (`SELECT
+  pg_advisory_unlock_all(); CLOSE ALL; UNLISTEN *; RESET ALL;`), in either
+  dialect. Igloo has no advisory locks and no `LISTEN`, so both succeed and
+  change nothing. DuckDB has no `pg_advisory_unlock_all()` and does not
+  parse `UNLISTEN`, so the query failed before. `LISTEN` is refused as not
+  supported (`0A000`) instead of failing as a syntax error.
 - Semi-structured columns. Lists, maps and structs are Iceberg's own
   `list`, `map` and `struct`, which Spark, Trino and PyIceberg read. A `JSON`
   or `VARIANT` column, which Iceberg tables of format version 1 and 2 cannot
@@ -360,6 +385,26 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
 - Materialized views (`CREATE [OR REPLACE] MATERIALIZED VIEW ... [SCHEDULE]
   AS query`, `REFRESH MATERIALIZED VIEW`) keep a query's result as an
   Iceberg table, refreshed in one transaction on demand or on a schedule.
+- Incremental refresh: a materialized view's refresh reads only what
+  changed in its tables since the last refresh, as their Iceberg snapshots
+  tell (data files added and removed, rows deleted), for filters,
+  projections and inner joins of appended rows, and `GROUP BY` with
+  `count`, `sum`, `avg`, `min`, `max` and `count(DISTINCT)` (kept in
+  roaring bitmaps), rows deleted or updated included for counts, sums and
+  averages. After a day's load into a 6.2-million-row fact table, a
+  refresh read 1.3 MB of files where a full one read 41 MB, in 15 ms of
+  CPU against 382 ms. Results equal a full refresh's exactly: every table
+  is read at the snapshot the refresh records. Anything else refreshes in
+  full, and `SHOW MATERIALIZED VIEWS` and the run's `detail` in
+  `igloo.task_history` say why (see [incremental
+  refresh](docs/loading.md#incremental-refresh)).
+- Snowflake's dynamic tables: `CREATE [OR REPLACE] DYNAMIC TABLE ...
+  TARGET_LAG = '...' | DOWNSTREAM WAREHOUSE = ... [REFRESH_MODE = AUTO |
+  FULL | INCREMENTAL] [INITIALIZE = ...] AS query`, `ALTER DYNAMIC TABLE
+  ... SUSPEND | RESUME | REFRESH | SET TARGET_LAG`, `DROP` and `SHOW
+  DYNAMIC TABLES`, which Igloo refused, refreshed within their lag the
+  same way, in both dialects; `WAREHOUSE` is accepted and ignored with a
+  notice (see [dynamic tables](docs/loading.md#dynamic-tables)).
 - Tasks, pipes and refreshes run as their owner, with the owner's role and
   grants at the time they run; scheduling needs the writer role. When a
   user is dropped, their tasks, pipes, materialized views and alerts are
@@ -490,6 +535,262 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
 
 ### Distributed execution
 
+- DuckDB's freed buffers go back to the system: Igloo fixes glibc's `mmap`
+  threshold at 128 KiB, where it had risen to as much as 32 MiB with the
+  largest allocation freed. After a sort that returned its rows a process kept
+  0.5 GiB where it had kept 3.4 GiB, with the same CPU seconds over TPC-H,
+  alone and with sessions at once. See
+  [sizing](docs/operations.md#sizing).
+- Bucketed tables stay in place beside what is not bucketed. A join of a table
+  bucketed by the join column to another table, or to a relation workers
+  compute, shuffles the other side into the table's buckets, by the key's
+  Iceberg bucket, and leaves the bucketed table's rows where they are, where
+  both were exchanged. A subquery read once that keeps the key as it is, by
+  filtering and projecting a bucketed table, joining bucketed tables on the
+  key, or grouping one with the key among its groups, is read by bucket where
+  it stands. A key computed from the column, or counts that do not divide,
+  are exchanged as before. `EXPLAIN DISTRIBUTED` says what is written to
+  buckets. See [bucketed tables](docs/distributed-execution.md#bucketed-tables).
+- A `SELECT ... ORDER BY` larger than memory on one machine sorts in runs and
+  merges them as the client reads them: its rows go to files in the spill
+  directory, each file is sorted within memory, and the merge streams them.
+  DuckDB's own sort of such a read goes up to 40% past its memory limit as it
+  returns rows, which is the memory watch's to cancel. On 72 million rows
+  under a limit of 9.7 GiB the process peaked at 3.5 GiB, where it had peaked
+  at 10.6 to 13.9 GiB, in the same time, with the first row after 6 seconds.
+  See [reads in order larger than
+  memory](docs/operations.md#reads-in-order-larger-than-memory).
+- Workers complete an aggregation's groups whenever they may be many (a
+  `GROUP BY` of a large table's column, unless `ANALYZE`'s distinct counts
+  put the groups at 10,000 or fewer), partitioned by group, counts of
+  distinct values (in roaring bitmaps too) by value and then by group, and
+  keep what `HAVING`, `ORDER BY ... LIMIT` and rankings of the groups keep
+  (`QUALIFY row_number() OVER (...) <= k`, also through `SELECT *`
+  unions): the coordinator receives the result's rows and only projects,
+  filters and orders them, where it combined every task's partial results
+  of every group. A report shaped like the one that did not finish at a
+  hundred times the data on 16 workers (its groups ranked on the
+  coordinator, 55.6 GB of memory and 91 GB of spill) has the coordinator
+  receive 6 KB at test scale and 19 KB at four times that. A result ordered
+  by `ORDER BY` without `LIMIT` is sorted by each task and merged by the
+  coordinator, a batch of rows a task in memory, rather than sorted there.
+  Window functions that partition their rows by the same columns run on
+  workers, partitioned so, under `QUALIFY` or a later filter (see [what
+  runs distributed](docs/distributed-execution.md#what-runs-distributed)
+  and [window functions](docs/distributed-execution.md#window-functions)).
+- Tables partitioned by `bucket(n, column)` (`CREATE TABLE ... PARTITIONED
+  BY`, `ALTER TABLE ... SET PARTITIONED BY`, or Snowflake's `CLUSTER BY
+  (BUCKET(n, column))`) are read by bucket, without an exchange, where a
+  part joins them on their bucket columns, one count dividing the others,
+  groups by the column, counts its distinct values or partitions windows by
+  it; `EXPLAIN DISTRIBUTED` says so, and why bucketed tables are exchanged
+  all the same (see [bucketed
+  tables](docs/distributed-execution.md#bucketed-tables)). Maintenance
+  compacts each bucket's files into files of that bucket.
+- More statements run on workers: `TABLESAMPLE` of a percentage of the
+  large table (Snowflake's `SAMPLE ROW` and `SAMPLE BLOCK`), sampled where
+  each task reads it, the same rows again with a seed; HyperLogLog
+  sketches (`APPROX_COUNT_DISTINCT`, `HLL_ACCUMULATE`, `HLL_COMBINE`),
+  sketched by each task and merged in the final stage; a plain `SELECT ...
+  WHERE` that filters the large table by a column equal to a constant or a
+  list, also as a subquery the coordinator reads; and scalar subqueries
+  in an aggregation's select list, `HAVING` and `ORDER BY`, which the
+  coordinator computes over the combined groups. Masking and row access
+  policies keep a statement on one machine only when they apply to a
+  table it reads, not when it, or a view it reads, spells a protected
+  table's name, as a column named like an ID domain did.
+- Reports' last steps run on workers too, rather than on the coordinator
+  over what workers sent: an `ORDER BY` without `LIMIT` that what reads it
+  sorts again or aggregates is left out; inputs too large for every
+  worker that are joined on `upper`, `lower` or `trim` of a text column
+  are partitioned by it; a `UNION` of distinct rows is a relation workers
+  compute; the large side of a `LEFT`, `RIGHT` or `FULL` join is read by
+  partition with the other side partitioned alike; a `LIMIT` without
+  `ORDER BY` takes any rows, its tasks stopped once those that ended sent
+  enough; and a subquery whose every row the coordinator reads is divided
+  where its filters or columns keep less than its table (see [what runs
+  distributed](docs/distributed-execution.md#what-runs-distributed)).
+- Auto mode picks how many workers a statement runs on: of 1, 2, 4 and so
+  on up to `IGLOO_WORKER_MAX`, and the workers running, the cheapest of
+  those whose time is within a fifth of the fastest, so never one that
+  another beats on both time and cost. A way's cost counts the workers'
+  seconds at their price (`IGLOO_WORKER_PRICE_PER_HOUR`), with the start
+  and idle tail of workers it starts, and the replica's for as long as it
+  runs (`IGLOO_PRICE_PER_HOUR`); where idle workers do not stop alone,
+  every running worker's. Times a statement took on a number of workers
+  stand for the estimates, and a number estimated near the fastest it ran
+  on is tried once a day: at ten times the data, a report that took 112 s
+  on 8 workers and 127 s on 16 runs on 8, where an earlier rule took 4, 200
+  s, for an estimate within a fifth of 16's; another that took 44 s on 16
+  and 75 s on 8 runs on 16. The workers' estimates count a statement's
+  levels of stages (5 s each) rather than its stages, and read at 0.4 of
+  one machine's rate, within a factor of 1.35 of 15 runs on 1 to 16
+  workers where they were within 2.05. Of more running, it takes those with
+  the fewest tasks. `EXPLAIN DISTRIBUTED` shows the choice (`fleet`) and
+  the ways weighed (`options`), and `query_history.placement` where a
+  statement ran and why (see [when](docs/distributed-execution.md#when)).
+- A report whose aggregates and windows were estimated just past the
+  replica's room now counts as spilling on its first run, and runs on
+  workers: estimated at 41 GB, 1.1 times the room, so fitting, at 47 s, it
+  held 51 GB, spilled 35 GB, and the guard moved it after 88 s. Estimates
+  within half again the room count as fitting only in the share joins'
+  hash tables hold, whose estimates run high. And a completed run of a
+  statement's shape that held 90% or more of the replica's limit no longer
+  proves it fits: it may have spilled any amount.
+- Auto mode no longer tries a statement of five minutes or more on a
+  number of workers estimated past a fifth of its best way's time, to
+  measure it, and a first run takes the best way: an ordered result of 361 million rows that
+  took 470 s on 16 workers was tried on one, and took 621 s, slower than
+  one machine. The estimates of fewer workers count their shares of a sort
+  spilling past their memory, as one worker's of that 41.6 GB sort did.
+- Auto mode's estimates count the client's taking a result's rows, either
+  way, where one machine's estimate of 361 million ordered rows was 30 s
+  against 516 s; a sort or window that holds half of the replica's room or
+  more runs on workers, where configured, unless they take a quarter
+  longer than one machine, as DuckDB's sort exceeds its limit by about 40%
+  and that one finished within 2 GB of the memory watch; and the reason
+  for running on the replica names the rule that decided, where "one
+  machine is faster: one machine should take 30 s and workers 22 s" did not.
+- A statement that fills a table from a query, `CREATE [OR REPLACE] TABLE
+  ... AS` (dbt's table models too), `INSERT INTO ... SELECT` and a
+  materialized view's or dynamic table's full refresh, runs its query on
+  workers where auto mode would run it there as a read, by the same
+  estimates, history, grants and policies, the replica writing the table
+  from their results: a `count(DISTINCT)` of a billion IDs into a table,
+  which the memory watch canceled on the replica, sends it a thousand rows.
+  Auto mode counts the replica's writing of the rows on both sides, and
+  their fetch from the workers, so a copy stays on the replica unless
+  workers are clearly faster. The guard, a run out of memory, the failure
+  history and the fallbacks work as for reads, a fill whose workers run
+  out of memory goes on in passes, and a fill from a table with masking
+  or row access policies stays on the replica.
+- Workers write tables: where the tasks of such a fill hold its rows, as a
+  copy's do, each writes its own as Parquet with the table's field IDs and
+  partitions, under a directory of the statement's under the table's
+  location, and the replica commits them all in one Iceberg commit, without
+  fetching a row, so auto mode runs a copy where workers write it faster.
+  Credentials limited to a task's directory, with no right to delete, for an
+  hour (STS on S3, `IGLOO_S3_STS_ROLE_ARN`), or on Google Cloud and Azure an
+  identity that can only create files in directories of that name; the Helm
+  chart's `workers.serviceAccount` and the OpenTofu modules now give workers
+  an identity of their own, without write access to tables, and the chart
+  turns worker writes on only then (`workers.writes`,
+  `IGLOO_WORKER_WRITES`). Before it commits, the replica checks that each file
+  is under the attempt's directory, and reads its footer: rows, size and
+  schema must be what the worker said. Only the winning attempt's files count,
+  a failed or canceled statement removes what it wrote, and looks again a minute
+  later for what its tasks finished meanwhile, the table's next write removes
+  what a stopped process left, and erasure requests treat what is
+  left as the table's orphan files. A worker refused the write leaves it to
+  the replica. Tables partitioned by bucket stay with the replica.
+- DuckDB's memory limit, where `IGLOO_DUCKDB_MEMORY_LIMIT` does not set it,
+  is what Igloo's memory leaves after the eighth it keeps free before it
+  lowers DuckDB's limit, its reserve and an eighth of the limit itself,
+  about 73% of it, where it was DuckDB's own 80% of the machine (and the
+  Helm chart's 80% of the container's limit): finishing a `count(DISTINCT)`
+  it had spilled, DuckDB holds about 0.1 GiB a thread beyond its limit,
+  and a `count(DISTINCT)` of a billion IDs into a table on a replica of
+  61.6 GiB took 5 GiB more within a second, and was canceled with 2.6 GiB
+  left. With 4.1 GiB less for DuckDB, it would have left 6.7.
+- Auto mode no longer takes a run cut short on the replica, as one the
+  guard stopped, for proof that a statement's shape fits there: such a
+  run, learned at all of a replica's 53 GB from the query history, made a
+  report whose plan's working set was about three times that count as
+  fitting, and it was tried on the replica once a day, estimated at 47 s,
+  spilling 54 GB until the guard moved it after 145 s. Nor is a statement
+  tried on the replica where its working set is four or more times its
+  room, however much slower it ran on workers than the replica's estimate.
+- The large worker no longer runs a statement whose working set would
+  spill there before it ran there, while the small workers can run it: at
+  a hundred times the data, a report whose working set was 5.3 times the
+  large worker's room, estimated at 217 s there spilling 2.5 times as
+  long, ran past 1,800 s there, where 16 workers ran it in 729 s. The
+  choice's reason and `EXPLAIN DISTRIBUTED` name the large worker passed
+  over.
+- A heavy statement no longer takes the replica's cores from short ones
+  where workers are configured, with nothing to set: auto mode weighs the
+  replica's time at as many times as long as the statements running on it
+  beside the one it plans, up to four, so a heavy statement started among
+  dashboards' runs on workers; and the guard moves a heavy statement that
+  runs on the replica to workers once it has run its estimate while others
+  run beside it, weighing it again every second, where it had waited
+  three times its estimate times the statements running when it started,
+  and so never fired under load. At ten times the data, beside 16 users'
+  dashboards and two ELT streams, a report that had run in 25 s on the
+  replica ran 577 s there, the dashboards' median rising from 4 ms to 23 s.
+- A relation of uncertain size, as an audience filtered to one version of
+  a lookup, whose tables' statistics bound it under what every worker may
+  read (a `GROUP BY` or `DISTINCT` of columns by their distinct counts,
+  from `ANALYZE` or Iceberg's theta sketches; a filter by `=` by the
+  column's) is measured with the workers to itself the first time, as one
+  measured small lately is, rather than beside the tables' partitioning to
+  meet it: at a hundred times the data, a report took 305 s with that
+  partitioning and 50 s without.
+- A statement that fails on a number of workers, or on the large worker, is
+  taken to need one and a half times as long as it ran there before it
+  failed, for a day, so auto mode weighs other ways against it; the query
+  history records where it failed, which replicas read when they start
+  (a worker's running out of memory no longer reads back as the replica's).
+  A statement whose large worker fails runs on the other workers where its
+  working set by DuckDB's plan is four or more times the coordinator's
+  room, rather than on the coordinator, and one whose workers fail fails
+  there rather than run on the coordinator, whatever a run of its shape
+  allocated there at a tenth of the data: at a hundred times the data, a
+  report of 250 GB ran on the coordinator after its large worker failed,
+  spilled 167 GB and was killed after 9 minutes.
+- A compute pool may have a large worker (`IGLOO_LARGE_WORKER`, the chart's
+  `workers.large`), on which auto mode runs a statement alone when it fits
+  there and is estimated within a fifth of the fastest way and cheapest,
+  planned again for its memory; erasure requests purge its read cache as
+  the other workers' (see [a large
+  worker](docs/distributed-execution.md#a-large-worker)).
+- Auto mode estimates a statement's working set from DuckDB's own plan of
+  it (`EXPLAIN`): joins' build sides, groupings' groups no more than the
+  distinct counts of their keys allow (ANALYZE's, or Iceberg's theta
+  sketches), distinct aggregates, sorts and windows, at their columns'
+  widths, with inner joins' rows from their keys' distinct counts, and
+  corrected by statements' peaks on the replica. Over TPC-H at three times
+  its scale it is 2.9 times off at the geometric mean, where six times what
+  the stages read was 37 times off (see
+  [when](docs/distributed-execution.md#when)). Where DuckDB's plan ran far
+  off at ten times the data, Igloo corrects it: a `UNION`'s branches hold
+  no more than the largest; an inner join to keys DuckDB knows nothing of
+  keeps the larger side's rows its other side's filters keep, not a fifth;
+  a join to a scalar subquery's one row keeps as a filter by a constant; a
+  cross product with a small source, as `FLATTEN` becomes, makes every
+  pair; and `OVER ()` windows buffer their rows once. Three reports
+  estimated at 793, 25 and 439 GB that held 33, about 106 and 9.5 GB are
+  estimated at 46, 215 and 14 GB. The plan also gives one machine's
+  reading, the columns its scans project (9.6 GB where the stages named 77
+  GB of a view's table), and its hash tables' time, at 10 million rows a
+  core-second past the processor's caches. A working set estimated within
+  half again the replica's room counts as fitting, as the estimates ran up
+  to half again high where nothing spilled: the first report, which held
+  33 GB and took 98 s on the replica, is estimated at 46 GB and 127 s
+  there, without spilling, where it was estimated at 2,939 s and sent to
+  workers; the second, at 215 GB, still runs on workers.
+- Where no worker price is set, auto mode prices workers and the large
+  worker by their instance types' list prices from a built-in table of AWS,
+  Azure and Google Cloud machines, on Spot and by region
+  (`IGLOO_WORKER_INSTANCE_TYPE`, `IGLOO_WORKER_SPOT`, `IGLOO_CLOUD_REGION`;
+  set by the chart and the OpenTofu modules; see
+  [prices](docs/distributed-execution.md#prices)).
+- While some workers work, idle ones past `IGLOO_WORKER_WARM` (one) stop
+  alone: retired, not ready, then the Deployment scaled down past them or
+  their EC2 instances stopped, only where their caches go with them or
+  were purged for erasure requests (see [idle
+  workers](docs/distributed-execution.md#idle-workers)).
+- Auto mode's estimates of one machine spill by a curve fitted to the scale
+  runs, the working set over the memory for it to the power of 0.55, within
+  a factor of two for ten of eleven reports, where spilling was held to twice
+  as long; past twelve times the memory a machine is taken to run out of
+  it. `EXPLAIN DISTRIBUTED`'s `spill` rows show each machine's working set,
+  room and spill.
+- The OpenTofu modules can provision workers (`workers_enabled`), on Spot
+  capacity by default with an on-demand fallback: the cluster autoscaler's
+  priority expander on AWS and Azure, a compute class on GKE Autopilot. A
+  harness test interrupts a worker's Spot Instance mid-statement: its tasks
+  run elsewhere and the statement finishes with the same rows.
 - Workers stop after an idle tail sized to their start
   (`IGLOO_WORKER_IDLE_AFTER=auto`, the default): three times what their
   last start took, from 2 to 10 minutes, where every burst of work kept
@@ -714,11 +1015,13 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   at a hundred times the data; in a lab, such rows held 1.2 GB a task over
   202 partitions where they had held 2.1 GB.
 - A statement auto mode runs on the replica, though workers could run it,
-  is stopped there once it has run three times its estimate, and at least
-  90 seconds, without sending a row, and runs on workers instead, which
-  are started if stopped (`igloo_auto_guard_reruns_total`); auto mode runs
-  it on workers from then on. A report estimated at 51 s on the replica
-  that took 1,798 s there, and 362 s on workers, would take about 515 s.
+  is stopped there once it has run three times its estimate and as long as
+  the workers are estimated to take it, start included, and at least 15
+  seconds, without sending a row, and runs on workers instead, which are
+  started if stopped (`igloo_auto_guard_reruns_total`); auto mode runs it
+  on workers from then on. That bounds the loss at about twice the faster
+  side: a report estimated at 13 s on the replica and 30 s on workers moves
+  after 39 s rather than 90.
   Workers are not stopped as idle while such a statement runs on the
   replica. Writes and statements that have sent rows are never stopped.
 - Auto mode's history counts runs on workers with runs on about as many
@@ -887,24 +1190,41 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   Opens cut short by a task's end no longer count in
   `igloo_prefetch_errors_total`, and the startup line gives the
   prefetcher's concurrency rather than 0 when it is unset.
-- `IGLOO_EXCHANGES=auto` has workers exchange a statement's rows on their
-  disks when every worker it runs on reports at least 1 GiB of room there
-  and runs outside Kubernetes, and through object storage otherwise;
-  recommended on machines with local NVMe, where two reports at ten times
-  the data on 16 workers took 34 s and 62 s rather than 95 s and 205 s
-  through S3. Workers report their room and whether they run in
-  Kubernetes; `igloo_distributed_exchanging_queries_total` counts
-  statements by where they exchanged rows. The single-machine Compose
-  stack passes `IGLOO_EXCHANGES` through. The default stays `object`.
-- A scan of a table semi-joined, or inner-joined to a relation (a common
-  table expression, a subquery, an exchange), such as an audience, reads
-  ahead at most 256 MiB, as a filtered one does: DuckDB skips its row
-  groups by the join's keys as it builds the join, so what it reads is not
-  known before it runs.
-- Workers read ahead of a filtered scan of a task's table at most 256 MiB,
-  as the replica does of its own: tasks did not say their part filters the
-  table, so workers read ahead every row group of the columns it reads,
-  however many of them DuckDB then skipped by their statistics.
+- `IGLOO_EXCHANGES=auto`, the default, has workers exchange a statement's
+  rows on their disks when every worker it runs on reports at least 1 GiB
+  of room there and runs outside Kubernetes, and through object storage
+  otherwise: two reports at ten times the data on 16 workers with NVMe
+  took 34 s and 62 s rather than 95 s and 205 s through S3. `object`
+  keeps every exchange in object storage, as before. Workers report their
+  room and whether they run in Kubernetes;
+  `igloo_distributed_exchanging_queries_total` counts statements by where
+  they exchanged rows. The single-machine Compose stack passes
+  `IGLOO_EXCHANGES` through. On Kubernetes the chart still sets `object`
+  unless `workers.exchanges` is `local`.
+- A filtered scan reads ahead what DuckDB will read of it, on replicas
+  and workers (tasks tell workers which columns filter their part): a scan
+  filtered by a `WHERE` clause, or by a semi join or an inner join to a
+  relation such as an audience (whose keys DuckDB skips row groups by),
+  reads ahead in full the files whose footers show that no filter on those
+  columns could skip a row group (each row group holds values from across
+  the file's range of every filtered column, the file's range is not
+  narrow within the scan's, no Bloom filter), and only the footers of
+  others, rather than at most 256 MiB of every filtered scan. Against an
+  object store with S3's latency, reading ahead 256 MiB of a scan of the
+  last tenth of a date-ordered 4 GB table fetched 58% more than DuckDB
+  alone (145% more on three workers) for no gain; it now fetches 1% more.
+  A join of the table to an audience of random devices took 8.8 s cold
+  without prefetch, 8.4 s with 256 MiB read ahead, and takes 2.6 s; on
+  three workers, 6.5 s, 5.2 s and 2.6 s.
+- Prefetch tells the blocks DuckDB read where file systems keep access
+  times: cache_httpfs sets a block's access and modification times both to
+  the time it reads it, so the access time never passed the modification
+  time, and every block read ahead counted as unread: workers whose cache
+  was in a container's file system reported 99.9% of what they read ahead
+  as overfetch, and a statement was never credited the blocks DuckDB read,
+  so it read ahead a quarter of the cache's room at most. The prefetcher
+  now writes a block's access time an hour behind and counts it read once
+  the access time catches up.
 - `count(DISTINCT x) FILTER (WHERE ...)`, and `sum`, `avg`, `min` and
   `max` over `DISTINCT` values with a `FILTER`, run distributed: the
   planner writes them as `count(DISTINCT CASE WHEN ... THEN x END)`, which
@@ -959,6 +1279,11 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   pull request with a sample agency project (`scripts/clients/dbt`). The
   profile's `dbname` is the catalog's name. See
   [docs/integrations.md](docs/integrations.md).
+- dbt's `microbatch` incremental strategy, tested with the others: a run
+  builds the days it is given, each merged into the model. Incremental
+  runs of every strategy delete the rows they replace with delete files
+  and add new files, rewriting no data file: the test checks that the
+  snapshots each run commits write no more rows than it changed or added.
 - Tested clients: SQLAlchemy 2 with psycopg 3, pandas and polars (through
   SQLAlchemy, connectorx and ADBC), and the JDBC metadata calls and SQL of
   Tableau and Looker, in `scripts/e2e.sh`; Metabase, Apache Superset and
@@ -1207,6 +1532,15 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   model that cannot be trained again keeps the request blocked, with an
   alert, until it can, is dropped, or an admin closes the request, which
   records it as left.
+- Erasure requests replace the materialized views and dynamic tables made
+  from their tables, tagged or not (a new `views` step, after `rewrite`):
+  each is made again from its query as its owner, which deletes the old
+  table's files and snapshots, and the state its incremental refreshes
+  keep (partial aggregates, and bitmaps that can hold a person's id) is
+  dropped, so its next refresh is full. Verification counts views whose
+  table or state has a snapshot from before the step; a view that cannot
+  be replaced keeps the request blocked, with an alert, until it can, is
+  dropped, or an admin closes the request, which records it as left.
 - Erasure requests purge distributed execution's workers: their read
   caches, with what the prefetcher read ahead, footers, models and
   exchange files on their disks. Coordinators record every worker that
@@ -1414,6 +1748,45 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
 
 ### Performance and cost
 
+- The result cache sends a dashboard's repeated queries again more often:
+  it compares statements without their comments and spacing, which BI
+  tools vary per run; shares a result between users when no policy
+  changes the statement; and keeps a result until one of the tables its
+  statement reads changes, not any table. In a test of three users
+  opening a five-chart dashboard three times while a pipe loaded a raw
+  table, 36 of 45 chart queries were answered from the cache, against none
+  before. Erasure requests empty every replica's result cache.
+- Prefetch is on by default (`IGLOO_PREFETCH`): replicas and workers read
+  ahead, into the read cache, the blocks statements are about to read, with
+  256 requests in flight rather than DuckDB's few per thread. Against an
+  object store with S3's latency, cold, a scan of three columns of a 4 GB
+  table took 2.4 s rather than 11.3 s on 16 cores and 2.4 s rather than
+  6.6 s on three workers, fetching 1 to 3% more than DuckDB alone; filtered
+  scans that a filter can prune fetch about 1% more and run as fast as
+  without. The Compose stack passes `IGLOO_PREFETCH` through;
+  `IGLOO_PREFETCH=false` turns it off. On Kubernetes the chart's igloo
+  pods and workers read ahead into their cache volumes.
+- The Helm chart's igloo pods have a read cache, which they had not: a
+  volume at `/var/lib/igloo/cache` (`cacheVolume`), an `emptyDir` by
+  default, or a volume of each pod's own from a storage class
+  (`ephemeral`), or a claim that keeps the cache across restarts and
+  scaling to zero for one igloo pod (`persistentVolumeClaim`), with a
+  writable `/tmp` for the cache's extension; `cacheVolume.sizeLimit` sets
+  the volume's size and `IGLOO_CACHE_SIZE` to 90% of it. Statements after a
+  start, and prefetch, now read the files they read before from local disk
+  rather than object storage. The volume is a 50Gi emptyDir unless
+  `cacheVolume.sizeLimit` says otherwise, and the read cache, wherever it
+  runs, now takes at most half of its disk's free space whatever
+  `IGLOO_CACHE_SIZE` says, so it cannot fill a small node disk, unless it
+  has a volume of its own (`IGLOO_CACHE_DEDICATED`, which the chart sets
+  for an ephemeral volume or a claim), which it fills to
+  `IGLOO_CACHE_SIZE`. The chart
+  and the docs say the volume's file system must keep extended attributes (see [read
+  cache](docs/operations.md#read-cache)). Erasure requests have every
+  running replica empty it with the prefetcher held, as workers do, and,
+  with `IGLOO_CACHE_EPHEMERAL` (which the chart sets but for a claim), count
+  a replica whose volume went with its pod as holding nothing rather than
+  as pending.
 - A replica reads what the past week's statements allocated from the
   query history when it starts, those that ran under its memory limit, so
   a dashboard's first build after a restart reserves memory as later ones
@@ -1800,7 +2173,10 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   Cloud (GKE, GCS, Cloud SQL) and Azure (AKS, ADLS Gen2, PostgreSQL Flexible
   Server), each able to pull Igloo from a mirror or private registry.
 - A price-performance benchmark (`bench/`) that runs the same TPC-H queries
-  on Igloo, Snowflake and Databricks and prices them by each one's billing.
+  on Igloo, Snowflake and Databricks and prices them by each one's billing,
+  and a mixed-load one (`bench/mixed.py`) that runs dashboards and ELT on
+  Igloo at once and reports each class's throughput, latency percentiles,
+  queueing, errors and cost.
 - A website (`site/`): a landing page and the documentation, built from the
   repository's markdown with search, light and dark themes, and a link check
   in CI (`make site`).
@@ -1836,6 +2212,371 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
 
 ### Fixed
 
+- The coordinator merges workers' sorted rows on several cores and copies
+  them into DuckDB a column at a time: rows of a table sorted on workers
+  took longer to reach the client than one machine's own sort of them.
+  Each worker's file is decoded in a goroutine of its own, groups of
+  up to eight files are merged at once and the groups' rows merged in turn
+  (by a tournament of losers, with comparisons typed per column), ahead
+  of DuckDB reading them; numbers, dates, times, timestamps and decimals
+  are copied into DuckDB's vectors in bulk, text of up to twelve bytes
+  written into them, and longer text assigned in one call a chunk. On 4
+  million synthetic rows from 32 files, merged rows read through DuckDB
+  take about as long as DuckDB's sort of the same rows, three times faster
+  than before.
+- A worker told to stop, by a Spot Instance's interruption notice or by
+  SIGTERM, keeps serving the exchange files on its disk until the
+  statements that read them end, or its deadline passes (ten seconds
+  before the time AWS gave; 110 seconds after a SIGTERM), while it takes
+  no more tasks and finishes those it runs. It stopped serving them at
+  once, so that the statements reading them ran again the parts that
+  wrote them, as for a worker lost, and draining saved nothing. Its status
+  says it is retiring meanwhile, so that coordinators send it nothing. The
+  Helm chart gives workers 125 seconds to stop
+  (`workers.terminationGracePeriodSeconds`).
+- A statement's rows reach its client as DuckDB computes them, rather than
+  once it has computed them all: every result was held whole in memory
+  first, so that every row of a table of hundreds of millions, ordered by
+  `ORDER BY` without `LIMIT`, ran the server out of memory, and the memory
+  watch canceled it, before its client got a row. A portal the client
+  reads a few rows at a time, which may run other statements between its
+  reads, still reads its rows whole first. Such a sort of every row of a
+  table, filtered or not, now runs on workers, which sort their shares,
+  and the coordinator merges them as the client reads them, holding a
+  batch of rows a task, where it merged them into a file before the first
+  row went out; the files it merges it reads a megabyte at a time. On one
+  machine, DuckDB's sort of more rows than fit in memory takes up to 40%
+  more memory than its limit as it starts to return them.
+- Planning a statement no longer fetches AWS credentials, nor fails for
+  want of them. iceberg-go builds an S3 file system for each table it
+  loads, each with a provider of the credential chain of its own, so the
+  first request of every statement's scan planning, on the replica and
+  when workers ran it, fetched credentials from the EC2 instance metadata
+  service under the statement's deadline; under load the service answered
+  late, and statements ran on the replica instead. Igloo now holds one set
+  for the process, fetched once for every caller waiting and refreshed in
+  the background ahead of expiry, and hands out those held at once while
+  they are valid.
+- A statement that does not stop once canceled, or past its statement
+  timeout, no longer holds its client: 30 seconds on, its client's
+  connection is closed and the server logs DuckDB's progress; the session
+  ends once DuckDB stops the statement. A report run on the replica after
+  its workers failed went on after its client's cancel request, the client
+  waiting in it, until Igloo was restarted.
+- A statement whose task over one partition ran out of memory on a worker
+  runs again with more memory for each task where more partitions would
+  not fit the tasks that write its exchanges: its tasks take twice a
+  worker's slots, up to all of them, and so twice its memory, and their
+  writers room for twice the partitions. It ran again over about the same
+  partitions, and ran out of memory the same way.
+- A block of the read cache missing or rewritten under a read no longer
+  fails the statement. A worker started with an empty disk read ahead as
+  if its cache were still empty after it was full, by a measurement of
+  the cache minutes old, while the cache's extension evicted
+  a block on each miss, and statements reading the same blocks ahead wrote
+  them through one temporary file each, the second truncating what the
+  first had renamed into place. The extension, which deletes a block it
+  takes for stale or evicts by checking that the file exists and then
+  removing it, then failed a task with "Could not remove file", and a short
+  block failed reads, or took the prefetcher down. Read-ahead now writes
+  each block through a file of its own, keeps to the disk's free space
+  beyond the extension's floor as it is now, reads nothing ahead with no
+  room, writes no block of an object without an ETag, and reads a footer
+  block that is not whole again from object storage; and a task or a
+  statement whose read raced another over a block runs again, up to three
+  times.
+- Planning a statement for workers no longer recurses without end on a
+  common table expression filtered by `IN` a subquery that joins two
+  subqueries, one with a scalar subquery in its filter: the subquery was
+  made a relation of the columns read, whose producing took it for more
+  than a projection of the subquery, as the scalar subquery deep in its
+  `FROM` counted against it, and made the subquery a relation again, and
+  again, in auto mode too, until the statement timed out. A part whose
+  relations nest more than 64 deep or would compute a relation from itself
+  now runs on one machine, and `EXPLAIN DISTRIBUTED` ends on the session's
+  `statement_timeout` and on a cancel request.
+- A long report in auto mode is no longer sent to one machine because its
+  planning took more than 10 seconds: a report of many stages, whose
+  parts each took a while to describe in the session, ran on one machine
+  for many times as long as on workers. Auto mode now stops planning only
+  once it stalls, having planned no stage and described no new part for
+  a tenth of the statement's expected time on one machine (between half a
+  second and a minute), or after that whole time, so that a cheap
+  statement whose planning stalls still waits half a second for it; and it
+  no longer skips planning statements of a shape that ran past its limit
+  lately. `distributed_execution = on` and `EXPLAIN DISTRIBUTED` plan for
+  as long as planning takes, within the statement's timeout. Planning is
+  quicker too: it describes each part of a statement in the session once,
+  for both its plans and its plan again with measured sizes, looks each
+  table up once per plan, and keeps the SQL it printed of each part, which
+  took most of the time of planning a long chain of common table
+  expressions. It logs `planned a statement` with its time, stages, and
+  descriptions and other lookups in the session, and their times, when it
+  takes a second or more.
+- Workers write to exchanges only the columns of a table or view that the
+  statement reads when a view joined to it has a star of its own, as
+  every stored view has where it reads its tables through
+  `SELECT COLUMNS(...)`: the view's star counted as the statement's, so a
+  table read by partition was written whole when it was joined to a view,
+  and a report's branches, factored into one `SELECT` over a wide view
+  joined to a common table expression of the same view, wrote every one
+  of the view's columns to an exchange and ran the workers out of memory.
+- Such a report's stage that joins the view to the common table
+  expression aggregates the rows it makes, once per branch, as it makes
+  them. The planner made the whole factored `SELECT` a relation instead,
+  when the two large tables it partitions lay in different subqueries of
+  its `FROM` (the view's and the expression's copy of it), and wrote each
+  of its rows to an exchange once per branch before another stage
+  aggregated them.
+- No one may put Igloo's own schemas (`igloo_domains`, `igloo_bitmaps`,
+  `igloo_refresh`) on the search path or make one the current schema, in
+  any case or quoting: through such a path any reader read bitmap
+  indexes' rows, their groups' counts and members, including groups a row
+  access policy on the indexed table hides. Only the reads of an index's
+  table that Igloo writes to answer counts skip its policy; any other
+  gets it and no rows, and writes, drops and policy changes are refused
+  by the table a name resolves to, not only by the names in the text.
+- Users' writes win over maintenance: compaction leaves the files of a table
+  alone while a write that reads or writes it runs, or a transaction block
+  that has read or written it is open (every table, once the block has
+  listed the catalog, as dbt does before each `MERGE`; a block idle for 15
+  minutes no longer counts), and checks again with sessions held off the
+  table just before it commits. A compaction that committed between a MERGE's read and its
+  commit made dbt's microbatch batches, each a `BEGIN` ... `COMMIT`, fail
+  with `CatalogCommitConflicts`, and had writes outside blocks run again.
+- `CREATE TABLE ... PARTITIONED BY (...) AS`, as Snowflake's `CLUSTER BY
+  (BUCKET(n, column))` makes it, runs in steps like any `CREATE TABLE ...
+  AS`, holding the catalog lock only to create and rename the table: as one
+  statement, a 35-minute copy into a bucketed table kept every other
+  session from preparing a statement or signing in.
+- No long query holds the catalog lock past its bind, so none keeps other
+  sessions from preparing statements, listing the catalog or signing in:
+  `CREATE [OR REPLACE] TEMP TABLE ... AS` (which dbt runs for every
+  incremental model) and `CREATE TABLE ... AS` in a transaction block run
+  in steps too, `EXECUTE` of a query prepared in SQL holds no more than the
+  query would, and a materialized view's or dynamic table's refresh holds
+  the lock only to plan and to change the catalog. Each held it for its
+  whole run.
+- A `CREATE TABLE ... AS` that an earlier, stopped one left something under
+  its name no longer fails after its whole fill: a copy of 833 million rows
+  failed at its rename after 236 s with "Tabular with the same name already
+  exists", over a staged create an Igloo killed mid-statement had left in
+  Lakekeeper, unseen and undroppable. Igloo notes the tables it is making in
+  their schema's properties, and clears what a stopped process of its own
+  left (half-filled staging tables, uncommitted staged creates) at the next
+  `CREATE TABLE ... AS` or `DROP TABLE IF EXISTS` of the name; a create
+  checks before it fills anything that nothing else holds the name, and an
+  admin's `DROP TABLE` of the name releases a hold whoever left it.
+- ELT that makes, replaces, renames or drops tables, makes schemas or
+  refreshes materialized views no longer empties the result cache of
+  dashboards over other tables: `CREATE OR REPLACE TABLE`, `CREATE SCHEMA
+  IF NOT EXISTS` and a refresh each made every kept result unused, as the
+  mixed-load benchmark's rollup and refresh jobs did for every dashboard.
+  Results stay tied to the versions of the tables they read, and a
+  statement prepared before DDL binds again without the cache.
+- A materialized view's or dynamic table's refresh chooses between reading
+  what changed and reading its tables whole by what each read costs: the
+  bytes of its files, and, for each row a position delete file deletes,
+  about what DuckDB takes to apply the deletion as it scans, which made
+  scans of a billion-row table on S3 six times slower after an update of
+  2% of its rows. It chose by the share of each table's rows in changed
+  files, so any update spread over every file refreshed in full, its
+  deletions applied. Reading what changed now takes the rows new delete
+  files delete by their positions, joined to the files as the last refresh
+  read them, rather than reading those files twice and comparing every row
+  (`EXCEPT ALL`). A table with a column named `filename` or
+  `file_row_number`, which would hide DuckDB's columns of each row's file
+  and position, refreshes in full.
+- A full refresh of a materialized view or dynamic table writes the view's
+  rows as new files and commits them in place of all of its table's files,
+  in one Iceberg commit, rather than deleting every row and inserting the
+  new ones: DuckDB wrote a position delete for each row deleted, so a full
+  refresh of 50 million rows took 23 s where `CREATE TABLE ... AS` of the
+  same rows took 0.58 s, and a count of the view took 5.9 s afterwards,
+  until compaction. It now takes 0.71 s. Readers see the old rows or the
+  new ones, on every replica and through the result cache, which the
+  commit invalidates once. A refresh that fails or is canceled deletes its
+  files; files a stopped one left go at the view's next refresh or an
+  erasure request's replacement of the view, and an erasure request does
+  not complete while any from before it may remain. Partitioned views and
+  views with columns of nested, fixed-length or nanosecond types are
+  written as before.
+- A `CREATE TABLE ... AS` of an aggregate that the memory watch stops while
+  it fills its table runs the fill again, its groups a share at a time, as
+  it does when DuckDB runs out of memory: the benchmark's copy of a
+  `count(DISTINCT)` of a billion ids failed with SQLSTATE `53200`.
+- A statement whose run lists a schema's tables as DuckDB binds it, as one
+  over a table dropped since it was prepared does, binds again holding the
+  catalog lock exclusively when other statements' binds hold it shared: it
+  failed with `HTTP 423 Locked`, the catalog proxy's refusal to let a
+  listing walk the tables alongside other binds, which preparing such a
+  statement already retried. The proxy logs the refusal at debug level.
+- A write into a table partitioned into more than 100 partitions, such as
+  `bucket(256, column)`, writes a file a partition: DuckDB kept 100 files
+  open and closed and reopened the others, writing thousands of files of a
+  few thousand rows, each a request to object storage (16 times as many
+  files as buckets for 16 million rows), at a fifth of a core. Maintenance
+  sizes the row groups of inserts into bucketed tables for a row group in
+  every partition's file.
+- Connections signing in from a loopback or private address, such as the
+  scale-to-zero gateway's, a pooler's or a Kubernetes Service's, which all
+  the clients behind it share, count only toward the limit of all
+  connections signing in, not toward half of it for one address: a burst
+  of more than 50 logins through the gateway after it woke Igloo was
+  refused with `53300`.
+- ID domains' members are held to `IGLOO_ACCESS_MAX_STALENESS` as the
+  users, grants and policies are: a replica that cannot read them for
+  that long refuses statements, and Delta Sharing's and the Iceberg REST
+  catalog's checks of a table, until it can, rather than protect tables
+  as members by what it read last.
+- Delta Sharing refuses shared tables with `503` once a replica could not
+  read the policies for `IGLOO_ACCESS_MAX_STALENESS`, rather than serve
+  them under the policies it read last.
+- The scale-to-zero gateway waits up to `IGLOO_GATEWAY_FIRST_BYTE_TIMEOUT`
+  (30 seconds) for a client's first bytes before it starts or reaches
+  Igloo, and lets at most `IGLOO_GATEWAY_MAX_WAITING` (200) connections
+  wait at once; the Helm chart sets them as `scaleToZero.firstByteTimeout`
+  and `scaleToZero.maxWaiting`. Connections that sent nothing started Igloo
+  and stayed open for good. A failed start the gateway makes as it starts,
+  to learn the schedule, is tried again as one for scheduled work is.
+- A task, pipe, materialized view or alert does not start again on another
+  replica until its last run has stopped: each run holds a lease in the
+  metadata database (`igloo_tasks.leases`), renewed every 5 seconds, which
+  another run may take only 30 seconds after its last renewal, and a run
+  that cannot renew it stops before then. Losing the advisory lock alone
+  let a second run start before the first had noticed.
+- Maintenance, and the purge of a table a clone replaced, stop deleting a
+  table's files once they lose the lock of its location, and leave the
+  rest to a later pass.
+- Replicas apply one user's roles one at a time, at SCIM group changes and
+  at sign-in, so the roles that stay follow the latest groups.
+- After a `CREATE OR REPLACE TABLE` whose rename the catalog made though
+  DuckDB heard it fail, DuckDB no longer lists the new table under its
+  temporary name too.
+- Models and model grants that users and roles dropped before `DROP` did
+  this itself left behind are disowned and removed as each replica starts,
+  those a user or role later created with the same name would have got
+  included. A grant given again to such a name before upgrading must be
+  given again.
+- The migration report compares decimals of more than 28 digits row by
+  row, which raised an error when their scales differed.
+- `make bench-test` runs the benchmark's unit tests, and CI runs it.
+- A SQL connection must sign in within `IGLOO_LOGIN_TIMEOUT` (30 seconds)
+  or is closed, and at most `IGLOO_MAX_CONNECTIONS` (at least 100) may be
+  signing in at once, half of them from one public address; others are
+  refused with `53300`. A connection read through a 16 MiB buffer from its
+  first byte, and logins left hanging held their user's login slots for
+  good, so ten stalled handshakes blocked a user's password logins, and
+  idle sockets that never signed in could fill a replica's memory. The buffer
+  now starts at 8 KiB and grows to the 16 MiB message limit (see
+  [configuration](docs/configuration.md#server)).
+- A replica that cannot read the metadata database goes on with the users,
+  tokens, grants and policies it read last for up to
+  `IGLOO_ACCESS_MAX_STALENESS` (2 minutes), then refuses statements with
+  `58000` until it can read them again, rather than apply them for as long
+  as it ran: a user disabled, or a token, grant or policy changed, on a
+  healthy replica did not reach one cut off from the database.
+- Without TLS, the console, SCIM, Delta Sharing, the clean room API and
+  Flight SQL take requests addressed to `localhost` only from a loopback or
+  private address, as the Iceberg REST catalog does; a request from
+  anywhere could name `localhost` in its Host.
+- With SCIM on, removing a user from a group the identity provider pushes
+  takes the group's roles away at once. The groups of the user's last
+  sign-in token were added to SCIM's, so a group the token had listed kept
+  its roles until the next console sign-in.
+- A SCIM group change whose roles cannot be applied answers 500, and the
+  users it touches are recorded with it (`igloo_auth.scim_changes`), so the
+  provider's retry, or a sweep each minute, applies them. It answered 204,
+  and a retry, finding the removed user already out of the group, left
+  their roles.
+- Access tokens of the identity provider sign SQL clients in as the linked
+  user only by issuer and subject, or by the claim
+  `IGLOO_OIDC_ACCESS_TOKEN_ID_CLAIM` names (`uid` for Okta, `oid` for Entra
+  ID) as recorded at the user's last console sign-in, never by email: a new
+  account given a reused address signed in as the old one. Users whose
+  provider's access tokens have a subject of their own need that setting,
+  and one console sign-in, to use them again (see [single
+  sign-on](docs/sso.md)).
+- Dropping a user disowns their models, shown as owned by `name (dropped)`,
+  which only admins can then grant, replace or drop, and dropping a user or
+  role removes the models' grants to it, as for tasks and alerts. A user
+  or role created later with the same name, by SSO sign-in too, got them.
+- A task's or alert's run that came due before its owner was dropped is
+  skipped when its owner changed, rather than run as a new user of the same
+  name.
+- AI functions keep their cached answers per integration, by its ID,
+  address and API settings, rather than per provider host, so an
+  integration a user may not use cannot answer them through another one's
+  cache. Providers' error messages in row errors, `error_details` and
+  notices are scrubbed of the integration's keys and headers, as other
+  errors were.
+- `CREATE OR REPLACE TABLE` asks the catalog what happened when dropping the
+  old table or renaming the new one into its place fails, and drops the new
+  table only when the catalog refused the drop. When the catalog cannot
+  say, the error names the new table and the `ALTER TABLE ... RENAME TO`
+  that puts it in place. A drop or rename the catalog applied without
+  confirming it lost both tables.
+- A clone the catalog registered, though the answer to registering it was
+  lost, is kept and reported as made, rather than undone with its metadata
+  file and share records deleted while the catalog still served it.
+- A run of a task, pipe, materialized view or alert stops within seconds
+  of losing its lock in the metadata database, and is recorded as failed,
+  rather than run on alongside the next; a clone that lost its lock undoes
+  itself rather than let its source's files be purged.
+- Dropping or replacing a model while another model with the same blob is
+  being created no longer deletes that blob: writing and deleting a blob
+  are serialized by its hash, across replicas.
+- `COPY INTO` and pipes record their files as `unknown` in
+  `igloo.load_history` when the load's commit fails other than by a
+  conflict, as when the catalog applied it and stopped answering (`40003`),
+  rather than forget them and load them again on the next run.
+- A distributed statement runs on one machine when a column's type, nested
+  fields included, changed between planning and running it, rather than
+  read the new snapshot's files with the old types: a `FLOAT` promoted to
+  `DOUBLE` lost precision.
+- Tables of Iceberg format version 3 whose fields have initial defaults are
+  read on one machine, which applies them, rather than by workers, which
+  read `NULL`.
+- Training on a sample keeps or drops each copy of a repeated row on its
+  own, by `seed`, aims below the row and value limits, and says so when the
+  sample is empty. Identical rows were all kept or all dropped, so a class
+  could vanish from the sample.
+- The scale-to-zero gateway stops Igloo only when every replica says it is
+  idle, or when its SQL port refuses connections, and warns when it cannot
+  tell. An activity endpoint it could not read counted as idle, and stopped
+  running queries.
+- A start for scheduled work that fails is tried again, after a wait that
+  doubles up to 5 minutes, rather than forgotten until a client connects.
+- Download CSV runs a worksheet's query with the settings the statements
+  before it in the run made (`SET`, `USE`, `ALTER SESSION`), and refuses
+  one that ran after temporary objects were made, inside a transaction
+  block, or after a setting computed by an expression, rather than download
+  another schema's table.
+- The console saves each worksheet on its own, and its tabs see each
+  other's changes, rather than one tab overwriting another's work with an
+  older copy.
+- The loading guide's hourly rollup task is a `MERGE` that can run again;
+  the `INSERT` it showed did not parse, and counted the latest hour again
+  on every run.
+- The migration report compares integers and decimals exactly, and tells
+  `NULL` from `\N` and one column's values from the next's; it matched
+  results that differed in these. Only doubles are compared to 10
+  significant digits.
+- The benchmark turns Igloo's result cache off, as it does Snowflake's and
+  Databricks', checks that it is off, and records it in its results.
+- The benchmark report bills a burst for the longer of its work plus the
+  idle tail and the platform's minimum, as `pricing.toml` describes, rather
+  than the longer of its work and the minimum plus the idle tail. Four
+  Snowflake burst and monthly figures fall, X-Small Gen2 at scale 10 from
+  $99 to $74 a month; the warm-run comparisons do not change. Its Failed
+  column shows queries that failed in only some of a row's merged runs.
+- `RESET search_path` and `RESET schema`, and `SET search_path TO DEFAULT`
+  and `SET schema TO DEFAULT`, put a session back on the schema and search
+  path it started with, the catalog's default schema and its views' schema.
+  DuckDB's own default is its own database with an empty path, so an
+  admin's unqualified `CREATE SCHEMA` after such a `RESET` landed in
+  `memory`, and a non-admin's `RESET` was refused for making `memory` the
+  current database.
 - `ALTER TABLE ... SET TAG`, `SET ID DOMAIN`, `ADD BITMAP INDEX`,
   `SET SORTED BY`, `ANALYZE`, `SYSTEM$CLUSTERING_DEPTH`, and the other
   commands that look up a table by name, `CREATE` and `DROP` of ID domains

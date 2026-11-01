@@ -335,7 +335,7 @@ func (s *Server) prepareWithoutIDs(ctx context.Context, sess *session, user auth
 	if kind, _, _, ok := writeTarget(query); !ok || kind != "INSERT" {
 		return nil
 	}
-	protected, _, _, err := s.policyRewrite(ctx, sess, user, duckdb.STATEMENT_TYPE_INSERT, query, oids)
+	protected, _, _, err := s.policyRewrite(ctx, sess, user, duckdb.STATEMENT_TYPE_INSERT, query, oids, nil)
 	if err != nil || protected == query {
 		return nil
 	}

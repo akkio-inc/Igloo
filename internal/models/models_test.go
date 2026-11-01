@@ -3,8 +3,10 @@ package models
 import (
 	"context"
 	"errors"
+	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/akkio-inc/igloo/internal/testdb"
 )
@@ -101,6 +103,188 @@ func TestStore(t *testing.T) {
 		if _, err := s.Delete(ctx, "demo", "conversion"); !errors.Is(err, ErrNotFound) {
 			t.Errorf("delete again: %v", err)
 		}
+	})
+}
+
+// TestStoreDroppedGrantees: a dropped user's models are given to a name no
+// user can have, and the grants to a dropped user or role go, leaving those
+// to others of the same name.
+func TestStoreDroppedGrantees(t *testing.T) {
+	stores(t, func(t *testing.T, s Store) {
+		ctx := context.Background()
+		for _, m := range []Model{{Schema: "demo", Name: "anas", Owner: "ana"}, {Schema: "demo", Name: "bobs", Owner: "bob"}} {
+			m.Class, m.TrainingSQL, m.Blob = ClassClassification, "CREATE ...", strings.Repeat("a", 64)
+			if _, err := s.Put(ctx, m, false); err != nil {
+				t.Fatal(err)
+			}
+		}
+		for _, g := range []Grant{
+			{Grantee: "ana", GranteeType: "user", Privilege: PrivilegeUsage},
+			{Grantee: "ana", GranteeType: "role", Privilege: PrivilegeUsage},
+			{Grantee: "analysts", GranteeType: "role", Privilege: PrivilegePredict},
+			{Grantee: "analysts", GranteeType: "user", Privilege: PrivilegePredict},
+		} {
+			g.Schema, g.Name = "demo", "bobs"
+			if err := s.AddGrant(ctx, g); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := s.DisownModels(ctx, "ana", "ana (dropped)"); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.ForgetGrantee(ctx, "user", "ana"); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.ForgetGrantee(ctx, "role", "analysts"); err != nil {
+			t.Fatal(err)
+		}
+		if m, _ := s.Get(ctx, "demo", "anas"); m.Owner != "ana (dropped)" {
+			t.Errorf("a dropped user's model is %q's", m.Owner)
+		}
+		if m, _ := s.Get(ctx, "demo", "bobs"); m.Owner != "bob" {
+			t.Errorf("another's model is %q's", m.Owner)
+		}
+		gs, err := s.Grants(ctx)
+		var left []string
+		for _, g := range gs {
+			left = append(left, g.GranteeType+" "+g.Grantee)
+		}
+		if err != nil || strings.Join(left, ", ") != "role ana, user analysts" {
+			t.Errorf("grants left: %q, %v", left, err)
+		}
+	})
+}
+
+// TestStoreBlobLock: a blob's lock is held by one caller at a time, on
+// every replica, and leaves other blobs' free.
+func TestStoreBlobLock(t *testing.T) {
+	stores(t, func(t *testing.T, s Store) {
+		ctx := context.Background()
+		// Another replica.
+		other := s
+		if _, ok := s.(*PostgresStore); ok {
+			o, err := OpenPostgres(ctx, testdb.URL())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer o.Close()
+			other = o
+		}
+		a, b := strings.Repeat("a", 64), strings.Repeat("b", 64)
+		unlock, err := s.LockBlob(ctx, a)
+		if err != nil {
+			t.Fatal(err)
+		}
+		short, cancel := context.WithTimeout(ctx, 200*time.Millisecond)
+		defer cancel()
+		if u, err := other.LockBlob(short, a); err == nil {
+			u()
+			t.Fatal("a blob's lock taken twice")
+		}
+		unlockB, err := other.LockBlob(ctx, b)
+		if err != nil {
+			t.Fatal(err)
+		}
+		unlockB()
+		taken := make(chan func())
+		go func() {
+			if u, err := other.LockBlob(ctx, a); err == nil {
+				taken <- u
+			}
+			close(taken)
+		}()
+		select {
+		case <-taken:
+			t.Fatal("a blob's lock taken while held")
+		case <-time.After(100 * time.Millisecond):
+		}
+		unlock()
+		select {
+		case u, ok := <-taken:
+			if !ok {
+				t.Fatal("the lock was not taken once let go")
+			}
+			u()
+		case <-time.After(10 * time.Second):
+			t.Fatal("the lock was not taken once let go")
+		}
+	})
+}
+
+// TestStoreForgetDropped: the models and grants that users and roles
+// dropped before DROP disowned and removed them left behind are disowned
+// and removed: those of a user or role that is not there, or that was
+// created after them, while those made since ForgetDropped began asking
+// who there is stay. A second run changes nothing.
+func TestStoreForgetDropped(t *testing.T) {
+	stores(t, func(t *testing.T, s Store) {
+		ctx := context.Background()
+		for _, m := range []Model{{Name: "anas", Owner: "ana"}, {Name: "bobs", Owner: "bob"}, {Name: "dons", Owner: "don"},
+			{Name: "cys", Owner: "cy (dropped)"}} {
+			m.Schema, m.Class, m.TrainingSQL, m.Blob = "demo", ClassClassification, "CREATE ...", strings.Repeat("a", 64)
+			if _, err := s.Put(ctx, m, false); err != nil {
+				t.Fatal(err)
+			}
+		}
+		grant := func(name, granteeType, grantee string) {
+			t.Helper()
+			g := Grant{Schema: "demo", Name: name, Grantee: grantee, GranteeType: granteeType, Privilege: PrivilegeUsage}
+			if err := s.AddGrant(ctx, g); err != nil {
+				t.Fatal(err)
+			}
+		}
+		for _, g := range [][2]string{{"user", "ana"}, {"user", "bob"}, {"role", "bob"}, {"user", "don"}, {"role", "analysts"},
+			{"role", "auditors"}} {
+			grant("bobs", g[0], g[1])
+		}
+		created, err := s.Get(ctx, "demo", "dons")
+		if err != nil {
+			t.Fatal(err)
+		}
+		// bob and the role analysts were there first; don and the role
+		// auditors are newer than their names' models and grants; ana is
+		// gone. eve signed up meanwhile, and created a model and was
+		// granted another.
+		before, after := created.CreatedAt.Add(-time.Hour), created.CreatedAt.Add(time.Hour)
+		who := func(ctx context.Context) (Principals, error) {
+			if _, err := s.Put(ctx, Model{Schema: "demo", Name: "eves", Owner: "eve", Class: ClassClassification, TrainingSQL: "CREATE ...",
+				Blob: strings.Repeat("a", 64)}, false); err != nil {
+				return Principals{}, err
+			}
+			grant("bobs", "user", "eve")
+			return Principals{Users: map[string]time.Time{"bob": before, "don": after}, Roles: map[string]time.Time{"analysts": before, "auditors": after}}, nil
+		}
+		if disowned, forgotten, err := s.ForgetDropped(ctx, who); err != nil || disowned != 2 || forgotten != 4 {
+			t.Errorf("disowned %d models and removed %d grants: %v", disowned, forgotten, err)
+		}
+		owners := map[string]string{"anas": "ana (dropped)", "bobs": "bob", "cys": "cy (dropped)", "dons": "don (dropped)", "eves": "eve"}
+		check := func() {
+			t.Helper()
+			for name, want := range owners {
+				if m, err := s.Get(ctx, "demo", name); err != nil || m.Owner != want {
+					t.Errorf("%s is %q's: %v", name, m.Owner, err)
+				}
+			}
+			gs, err := s.Grants(ctx)
+			var left []string
+			for _, g := range gs {
+				left = append(left, g.GranteeType+" "+g.Grantee)
+			}
+			slices.Sort(left)
+			if err != nil || strings.Join(left, ", ") != "role analysts, user bob, user eve" {
+				t.Errorf("grants left: %q, %v", left, err)
+			}
+		}
+		check()
+		// Again, with eve there.
+		again := func(context.Context) (Principals, error) {
+			return Principals{Users: map[string]time.Time{"bob": before, "don": after, "eve": before},
+				Roles: map[string]time.Time{"analysts": before, "auditors": after}}, nil
+		}
+		if disowned, forgotten, err := s.ForgetDropped(ctx, again); err != nil || disowned != 0 || forgotten != 0 {
+			t.Errorf("a second run disowned %d models and removed %d grants: %v", disowned, forgotten, err)
+		}
+		check()
 	})
 }
 

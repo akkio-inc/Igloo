@@ -23,7 +23,8 @@ warm, and what that costs under each platform's billing:
   disk (run.py --disk, or the default in pricing.toml) is priced as gp3.
 
 Several results for the same platform, size and scale (repeated bursts)
-are merged: per-query medians, and the median resume time.
+are merged: per-query medians, and the median resume time. A query that
+failed in some of them is listed with how many.
 
 Prices come from bench/pricing.toml; see the notes there.
 """
@@ -98,13 +99,14 @@ def hourly_rate(pricing: dict, result: dict) -> float:
 
 def burst_seconds(pricing: dict, platform: str, busy: float, resume: float = 0) -> float:
     """Billed seconds for one burst of work that starts from a stopped
-    warehouse or machine and is followed by idleness."""
+    warehouse or machine and is followed by idleness: from start to stop,
+    the idle tail included, at least the minimum."""
     if platform == "snowflake":
         p = pricing["snowflake"]
-        return max(busy, p["minimum_seconds"]) + p["auto_suspend_seconds"]
+        return max(busy + p["auto_suspend_seconds"], p["minimum_seconds"])
     if platform == "databricks":
         p = pricing["databricks"]
-        return max(busy, p["minimum_seconds"]) + p["auto_stop_seconds"]
+        return max(busy + p["auto_stop_seconds"], p["minimum_seconds"])
     # Igloo with scale to zero: EC2 bills from start to stop.
     p = pricing["igloo"]
     return max(resume + busy + p["suspend_after_seconds"], p["minimum_seconds"])
@@ -112,7 +114,8 @@ def burst_seconds(pricing: dict, platform: str, busy: float, resume: float = 0) 
 
 def merge(results: list[dict]) -> list[dict]:
     """Combines results for the same platform, size, scale and mode: the
-    median cold time per query, every warm time, the median resume."""
+    median cold time per query, every warm time, the median resume, and
+    in how many of the results each query failed."""
     groups: dict[tuple, list[dict]] = {}
     for r in results:
         key = (r["platform"], r["size"], r["scale"], r["suite"], bool(r.get("scale_to_zero")), r.get("storage"),
@@ -132,6 +135,10 @@ def merge(results: list[dict]) -> list[dict]:
                 "error": None if ok else qs[0]["error"],
                 "cold": statistics.median(q["cold"] for q in ok) if ok else None,
                 "warm": [w for q in ok for w in q["warm"]],
+                # Times come from the results where it succeeded; a result
+                # without it counts as failed.
+                "attempts": len(rs),
+                "failed_attempts": len(rs) - len(ok),
             })
         result = {**rs[0], "queries": queries, "bursts": len(rs)}
         if result.get("scale_to_zero"):
@@ -146,6 +153,8 @@ def summarize(result: dict) -> dict:
         "cold": sum(q["cold"] for q in ok),
         "warm": sum(statistics.median(q["warm"]) for q in ok if q["warm"]),
         "failed": [q["query"] for q in result["queries"] if q["error"]],
+        # Queries that failed in some of the merged results: (failed, of).
+        "incomplete": {q["query"]: (q["failed_attempts"], q["attempts"]) for q in ok if q["failed_attempts"]},
         "per_query": {q["query"]: (statistics.median(q["warm"]) if q["warm"] else None) for q in ok},
     }
 
@@ -209,8 +218,12 @@ def main() -> None:
     out.write("|---|---|---|---|---|---|---|---|---|---|---|\n")
     for r in sorted(rows, key=lambda r: (r["scale"], r["monthly"])):
         resume = "-" if r["resume"] is None else f"{r['resume']:.1f}s"
+        failed = sorted(r["failed"] + [f"{q} (failed {n} of {of})" for q, (n, of) in r["incomplete"].items()])
         out.write(f"| {r['platform']} | {r['size']} | {r['scale']:g} | {money(r['rate'])} | {resume} | {r['cold']:.1f}s | {r['warm']:.1f}s"
-                  f" | {money(r['warm_cost'])} | {money(r['burst_cost'])} | {money(r['monthly'])} | {', '.join(r['failed']) or '-'} |\n")
+                  f" | {money(r['warm_cost'])} | {money(r['burst_cost'])} | {money(r['monthly'])} | {', '.join(failed) or '-'} |\n")
+    if any(r["incomplete"] for r in rows):
+        out.write("\nFailed n of m: the query failed in n of the m runs merged into the row, so those runs did not"
+                  " complete; its times are from the others.\n")
     if any(r["resume"] is not None for r in rows):
         prices = pricing["igloo"]
         out.write(f"\nScale to zero: resume is the median time from a client connecting to a stopped machine until Igloo"

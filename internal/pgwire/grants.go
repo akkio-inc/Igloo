@@ -925,7 +925,7 @@ func (s *Server) applyEffect(ctx context.Context, sess *session, e *grantEffect)
 			s.log.Warn("could not update grants after a change to the catalog", "object", o.String(), "err", err)
 		}
 		if !o.IsSchema() {
-			s.tableGone(ctx, o, e.renameTo)
+			s.tableGone(ctx, sess, o, e.renameTo)
 		}
 		s.sessions.expireAll()
 	}

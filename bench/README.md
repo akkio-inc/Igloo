@@ -14,6 +14,10 @@ python bench/run.py --platform databricks --size S --scale 10
 python bench/report.py bench/results/*.json > bench/results/report.md
 ```
 
+`python -m unittest discover -s bench` tests the scripts without a
+platform to run against; `make bench-test` runs those tests in a Python
+container, as CI does.
+
 ## Method
 
 **Data.** TPC-H at scale factor 10 (about 10 GB) and 100. TPC-H's generator
@@ -52,7 +56,8 @@ rows for every query.
 **Queries.** The 22 TPC-H queries in `queries/tpch`, from DuckDB's TPC-H
 extension, translated with sqlglot for Snowflake and Databricks. Each query
 runs once cold and then three times warm, one at a time. Result caches are
-off on every platform, so warm runs measure the engine.
+off on every platform, so warm runs measure the engine; `run.py` checks
+that Igloo's is and records it in the results (`result_cache`).
 
 **Sizes.** Each platform runs at the sizes a team would actually pick, and
 the report compares them at matched cost as well as matched speed: at scale
@@ -158,12 +163,12 @@ price.
 **Snowflake Gen2** runs the suite 1.25x to 1.45x faster than Gen1 at scale
 100 and about 1.5x faster at scale 10, for 1.35x the credits per hour. A
 warm run therefore costs about the same on either (from 13% less to 8%
-more), while a burst costs 2% to 35% more on Gen2, because the 60-second
-minimum and the idle tail are billed at the higher rate. Igloo's lead over
-Snowflake shrinks by Gen2's speed-up. The scale 10 Gen1 X-Small result is
-the earlier run on another warehouse (COMPUTE_WH, also Gen1); every other
-Snowflake run used one warehouse, BENCH_WH, switched between
-generations.
+more), while a burst costs from 13% less (X-Small at scale 10, whose cold
+run Gen2 cuts from 79 s to 30 s) to 23% more on Gen2, because the idle
+tail is billed at the higher rate. Igloo's lead over Snowflake shrinks by
+Gen2's speed-up. The scale 10 Gen1 X-Small result is the earlier run on
+another warehouse (COMPUTE_WH, also Gen1); every other Snowflake run used
+one warehouse, BENCH_WH, switched between generations.
 
 **The first run after a resume** is where Igloo's lead goes. It waits about
 17 s for the machine to start, then reads table data from the disk cache
@@ -177,10 +182,10 @@ here) is short, so their first runs (Snowflake Gen1 208 s at X-Small to
 c7g.4xlarge's (153 s with the start) from Snowflake Small and Databricks
 Small up, and match or beat c7g.16xlarge's (75 s) from Snowflake Gen2
 Medium, Gen1 X-Large and Databricks Medium up. Igloo still costs less per
-burst at every pairing (2.6x to 166x), because the others bill a minimum
-and an idle tail: at 24 bursts a day, c7g.4xlarge with scale to zero comes
-to $66 a month, Snowflake X-Small to $163 (Gen1) or $176 (Gen2) and
-Databricks 2X-Small to $263.
+burst at every pairing (2.6x to 166x), because the others bill an idle
+tail: at 24 bursts a day, c7g.4xlarge with scale to zero comes to $66 a
+month, Snowflake X-Small to $163 (Gen1) or $176 (Gen2) and Databricks
+2X-Small to $263.
 
 **Caveats.**
 
@@ -188,7 +193,7 @@ Databricks 2X-Small to $263.
   6,000 IOPS and 500 MB/s ($38 a month), which the cached first runs depend
   on. Earlier reports charged a 20 GB disk ($1.61); the real disk raises
   every Igloo scale-to-zero month by $36, e.g. c7g.4xlarge from $14 to $51
-  at scale 10 (Snowflake X-Small: $85 on Gen1, $99 on Gen2; Databricks
+  at scale 10 (Snowflake X-Small: $85 on Gen1, $74 on Gen2; Databricks
   2X-Small: $194) and from $30 to $66 at scale 100. Per-run costs do not
   change.
 - Per query, Snowflake matches or beats Igloo on the date-range scans q06
@@ -208,9 +213,10 @@ Databricks 2X-Small to $263.
 
 `distributed.py` measures [distributed execution](../docs/distributed-execution.md)
 against one machine: it runs each query of a suite with
-`SET distributed_execution = 'off'` and `'on'`, interleaved, and reports the
-fastest of `--runs` runs of each, the speedup, how many workers ran it (from
-`igloo.query_history`) and the cost of one run at the prices given:
+`SET distributed_execution = 'off'` and `'on'`, interleaved, with the
+result cache off, and reports the fastest of `--runs` runs of each, the
+speedup, how many workers ran it (from `igloo.query_history`) and the cost
+of one run at the prices given:
 
 ```sh
 python bench/distributed.py --suite tpch --runs 3 \
@@ -253,12 +259,60 @@ Report per query: one machine's time, the distributed time per worker
 count, the speedup, and the cost per query; and per worker count, the total
 over the queries that ran distributed. Results go in `bench/results/`.
 
+## Mixed load
+
+`mixed.py` runs dashboards and ELT on Igloo at the same time, as a
+warehouse sees them, and reports per class of work the throughput, the
+latency percentiles (p50, p95, p99), the time statements waited for
+[workload limits](../docs/workload-management.md) (`queued_ms` from the
+query history), errors, how many statements ran on workers, and what the
+window cost:
+
+- **Dashboards:** `--dashboard-users` BI users, each opening one of three
+  dashboards (delivery, reach, and tiles over the tables the ELT jobs
+  build) after another, with an exponential think time (`--think`). A
+  dashboard's tiles run at once, `--tile-concurrency` at a time, and
+  filter by an advertiser from a small pool (`--param-pool`) and one of
+  three date ranges, so dashboards repeat; the result cache stays as the
+  server has it unless `--result-cache off`.
+- **ELT:** `ingest` (`INSERT` of a new batch of impressions), `rollup`
+  (`CREATE OR REPLACE TABLE ... AS`), `increment` (`INSERT ... SELECT` of
+  new batches past a watermark), `merge` (`MERGE` of recent campaign
+  totals) and `refresh` (`REFRESH MATERIALIZED VIEW`), each due every
+  `--elt-every` seconds, run by `--elt-streams` sessions; a job still
+  running when it is due again is skipped, as Igloo's schedules do, and
+  the report counts the skips.
+
+```sh
+python bench/mixed.py setup --rows 2000000                    # synthetic schema "mixed"
+python bench/mixed.py run --duration 120 --warmup 20 --dashboard-users 8 --elt-streams 2 \
+    --metrics-url http://127.0.0.1:8432/metrics --coordinator m7g.4xlarge \
+    --out bench/results/mixed-local.json
+```
+
+Statements run with `IGLOO_DSN`'s user, and their text starts with
+`/* mixed RUN CLASS NAME */`, the same each time a tile repeats, so the
+history can be read per run. Cost is the coordinator's price for the
+window plus each worker's for the seconds it ran: with `--metrics-url`
+the client samples `igloo_distributed_workers` every second, idle tails
+included (a scrape that fails keeps the last count); without it, workers
+are billed for the seconds their statements ran there, which leaves out
+idle time but counts a worker once per concurrent statement, so it can come
+out far above what the workers cost. Prices come from `pricing.toml`
+(`--coordinator`, `--worker` name instance types) or are given per hour;
+`--spot-factor` scales the worker price. On a fleet, raise `--rows` at
+setup (10 billion takes the generator about as long as `load-media.sql`
+does), `--dashboard-users`, `--elt-streams` and `--batch-rows`, and run
+the client next to the coordinator. The data is synthetic, computed from
+row numbers as in `load-media.sql`.
+
 ## What it does not measure yet
 
-- **Concurrency.** Queries run one at a time. Many users at once favor
-  platforms that add clusters automatically (Snowflake multi-cluster,
-  Databricks serverless scaling); Igloo scales out with replicas.
-- **Loading and transformation.** Only queries are timed.
+- **Concurrency against other platforms.** `mixed.py` runs many users and
+  jobs at once on Igloo only; the other platforms' runs are one query at a
+  time. Many users at once favor platforms that add clusters automatically
+  (Snowflake multi-cluster, Databricks serverless scaling); Igloo scales
+  out with replicas and workers.
 - **A real workload.** TPC-H is a stand-in. `python -m migrate report`
   ([migrating](../docs/migrating.md)) now replays a production query mix
   from Snowflake's or Databricks' history on Igloo and compares results,

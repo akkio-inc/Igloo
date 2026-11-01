@@ -66,6 +66,12 @@ type readCache struct {
 	dir string
 	// maxSize is IGLOO_CACHE_SIZE, or 0 to size the cache automatically.
 	maxSize uint64
+	// ephemeral is IGLOO_CACHE_EPHEMERAL: the cache's volume goes with the
+	// pod (see CacheIdentity).
+	ephemeral bool
+	// dedicated is IGLOO_CACHE_DEDICATED: the cache has its volume to
+	// itself (see cacheLimits).
+	dedicated bool
 	// reserve is the free space the extension currently leaves on the disk,
 	// and on whether it caches at all. Once the cache is set up, only
 	// measureCache touches them.
@@ -74,6 +80,10 @@ type readCache struct {
 	// size and limit are the cache's size and what it may grow to, as of
 	// the last measurement, for metrics.
 	size, limit atomic.Uint64
+	// floor and caching are reserve and on, for the prefetcher, which reads
+	// them while measureCache changes them (see room).
+	floor   atomic.Uint64
+	caching atomic.Bool
 
 	stop, done chan struct{}
 }
@@ -99,13 +109,15 @@ func (e *Engine) setupCache(exec func(string) error, cfg config.Config, log *slo
 		log.Warn("read cache off: cannot measure its disk", "dir", dir, "err", err)
 		return nil
 	}
-	c := &readCache{dir: dir, maxSize: uint64(cfg.Cache.MaxSize)}
+	c := &readCache{dir: dir, maxSize: uint64(cfg.Cache.MaxSize), ephemeral: cfg.Cache.Ephemeral, dedicated: cfg.Cache.Dedicated}
 	// Measuring what is already cached means listing every file, so it
 	// happens in the background once Igloo is up (see measure). Until then
 	// the cache counts as empty.
-	limit, reserve := cacheLimits(total, avail, 0, c.maxSize)
+	limit, reserve := cacheLimits(total, avail, 0, c.maxSize, c.dedicated)
 	c.reserve, c.on = reserve, limit > 0
 	c.limit.Store(limit)
+	c.floor.Store(reserve)
+	c.caching.Store(c.on)
 
 	if err := exec("LOAD cache_httpfs"); err != nil {
 		log.Warn("read cache off: cannot load the cache_httpfs extension", "err", err)
@@ -175,15 +187,20 @@ func cacheOffStatements() []string {
 
 // cacheLimits returns how large the cache may grow and the free space the
 // extension must leave on its disk for that, given the disk's size and free
-// space and the bytes already cached. Without maxSize the cache gets half of
-// the space nothing else uses, up to maxAutoCacheSize. Either way the disk
-// keeps at least 5% free, as the extension does by default; when it cannot,
-// the limit is 0.
-func cacheLimits(total, avail, used, maxSize uint64) (limit, reserve uint64) {
+// space and the bytes already cached. On a disk it shares (not dedicated),
+// the cache gets at most half of the space nothing else uses, whatever
+// maxSize says, so that a small disk is never filled, as a node's disk
+// under an emptyDir must not be. Either way it gets at most maxSize, or
+// maxAutoCacheSize without it, and the disk keeps at least 5% free, as the
+// extension does by default; when it cannot, the limit is 0.
+func cacheLimits(total, avail, used, maxSize uint64, dedicated bool) (limit, reserve uint64) {
 	usable := avail + used
+	if maxSize == 0 {
+		maxSize = maxAutoCacheSize
+	}
 	limit = maxSize
-	if limit == 0 {
-		limit = min(usable/2, maxAutoCacheSize)
+	if !dedicated {
+		limit = min(usable/2, maxSize)
 	}
 	reserve = max(total/20, 1)
 	if usable > limit {
@@ -247,7 +264,7 @@ func (e *Engine) measureCache(log *slog.Logger) error {
 	if err != nil {
 		return err
 	}
-	limit, reserve := cacheLimits(total, avail, used, c.maxSize)
+	limit, reserve := cacheLimits(total, avail, used, c.maxSize, c.dedicated)
 	c.size.Store(used)
 	c.limit.Store(limit)
 	log.Debug("measured the read cache", "bytes", used, "max_bytes", limit, "disk_free", avail)
@@ -278,7 +295,31 @@ func (e *Engine) measureCache(log *slog.Logger) error {
 		log.Warn("read cache paused and emptied: its disk is almost full", "dir", c.dir, "disk_free", avail)
 	}
 	c.on = on
+	c.floor.Store(reserve)
+	c.caching.Store(on)
 	return nil
+}
+
+// room is how many more bytes the cache may take before cache_httpfs
+// evicts a block on each miss, for the prefetcher: what the last
+// measurement left it, and at most what the disk has free now beyond the
+// free space the extension keeps. The measurement is minutes old, and in
+// between the disk fills, with the cache's blocks and with what else is on
+// it, as the spill files and exchanges of a worker sharing it: a worker
+// started with an empty disk read ahead as if the cache were still empty
+// for a minute after it was full, while cache_httpfs evicted the blocks
+// read ahead as they landed and failed a read of one (see package
+// prefetch's errUnversioned).
+func (c *readCache) room() int64 {
+	limit, size := c.limit.Load(), c.size.Load()
+	if !c.caching.Load() || size >= limit {
+		return 0
+	}
+	room := int64(limit - size)
+	if _, avail, err := diskSpace(c.dir); err == nil {
+		room = min(room, int64(avail)-int64(c.floor.Load()))
+	}
+	return max(room, 0)
 }
 
 // adjustments are the statements that move the extension from its current

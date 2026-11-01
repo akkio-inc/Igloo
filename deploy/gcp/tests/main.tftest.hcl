@@ -417,6 +417,186 @@ run "spot" {
   }
 }
 
+run "no_workers_by_default" {
+  command = plan
+
+  assert {
+    condition = (
+      length(helm_release.compute_classes) == 0 &&
+      !contains(keys(yamldecode(helm_release.igloo[0].values[0])), "workers")
+    )
+    error_message = "Without workers_enabled there must be no compute classes and no workers values, so existing deployments are unchanged."
+  }
+}
+
+run "workers_on_spot_with_on_demand_fallback" {
+  command = plan
+
+  variables {
+    workers_enabled        = true
+    workers_price_per_hour = 0.25
+  }
+
+  assert {
+    condition = yamldecode(helm_release.compute_classes[0].values[0]).classes == [{
+      name = "igloo-workers"
+      spec = {
+        priorities = [
+          { machineFamily = "n4", spot = true },
+          { machineFamily = "n4", spot = false },
+        ]
+        whenUnsatisfiable = "DoNotScaleUp"
+      }
+    }]
+    error_message = "The workers' compute class must try Spot first and fall back to on-demand."
+  }
+
+  assert {
+    condition     = endswith(helm_release.compute_classes[0].chart, "/compute-classes")
+    error_message = "Compute classes must come from the module's own chart, which Helm can plan before the cluster exists."
+  }
+
+  assert {
+    condition = (
+      yamldecode(helm_release.igloo[0].values[0]).workers.enabled == true &&
+      yamldecode(helm_release.igloo[0].values[0]).workers.maxReplicas == 4 &&
+      yamldecode(helm_release.igloo[0].values[0]).workers.pricePerHour == 0.25 &&
+      yamldecode(helm_release.igloo[0].values[0]).workers.instanceType == "n4-standard-16" &&
+      yamldecode(helm_release.igloo[0].values[0]).workers.spot == true &&
+      yamldecode(helm_release.igloo[0].values[0]).workers.region == "us-central1" &&
+      yamldecode(helm_release.igloo[0].values[0]).workers.large.enabled == false &&
+      yamldecode(helm_release.igloo[0].values[0]).workers.nodeSelector == { "cloud.google.com/compute-class" = "igloo-workers" }
+    )
+    error_message = "The chart must turn workers on, on the workers' compute class, with no large worker."
+  }
+
+  assert {
+    condition = (
+      yamldecode(helm_release.igloo[0].values[0]).workers.resources.requests.cpu == "14" &&
+      yamldecode(helm_release.igloo[0].values[0]).workers.resources.limits.memory == "54Gi" &&
+      yamldecode(helm_release.igloo[0].values[0]).workers.resources.requests["ephemeral-storage"] == "109Gi" &&
+      yamldecode(helm_release.igloo[0].values[0]).workers.resources.limits["ephemeral-storage"] == "109Gi" &&
+      yamldecode(helm_release.igloo[0].values[0]).workers.duckdb.spillVolume.sizeLimit == "80Gi" &&
+      yamldecode(helm_release.igloo[0].values[0]).workers.cacheVolume.sizeLimit == "28Gi"
+    )
+    error_message = "Worker pods must request ephemeral storage for spill, read cache and /tmp, which Autopilot caps their volumes at."
+  }
+
+  assert {
+    condition = yamldecode(helm_release.igloo[0].values[0]).workers.tolerations == [
+      { key = "cloud.google.com/compute-class", operator = "Equal", value = "igloo-workers", effect = "NoSchedule" },
+      { key = "cloud.google.com/gke-spot", operator = "Equal", value = "true", effect = "NoSchedule" },
+    ]
+    error_message = "Worker pods must tolerate their compute class's nodes, Spot ones included."
+  }
+
+  assert {
+    condition     = !contains(keys(yamldecode(helm_release.igloo[0].values[0]).nodeSelector), "cloud.google.com/compute-class")
+    error_message = "Igloo pods must keep their own scheduling."
+  }
+}
+
+run "workers_have_an_identity_of_their_own" {
+  command = plan
+
+  variables {
+    workers_enabled = true
+  }
+
+  override_resource {
+    target = google_service_account.worker[0]
+    values = { email = "igloo-worker@test.iam.gserviceaccount.com", member = "serviceAccount:igloo-worker@test.iam.gserviceaccount.com", name = "projects/test/serviceAccounts/igloo-worker@test.iam.gserviceaccount.com" }
+  }
+
+  assert {
+    condition     = yamldecode(helm_release.igloo[0].values[0]).workers.serviceAccount.name == "igloo-worker" && yamldecode(helm_release.igloo[0].values[0]).workers.serviceAccount.annotations["iam.gke.io/gcp-service-account"] == "igloo-worker@test.iam.gserviceaccount.com" && yamldecode(helm_release.igloo[0].values[0]).workers.storage.gcs.existingSecret == "igloo-gcs-hmac-worker"
+    error_message = "Workers must have a service account and an HMAC key of their own."
+  }
+
+  assert {
+    condition     = google_storage_bucket_iam_member.worker_write[0].role == "roles/storage.objectCreator" && strcontains(google_storage_bucket_iam_member.worker_write[0].condition[0].expression, "igloo-write-[0-9a-f]+/") && strcontains(google_storage_bucket_iam_member.worker_write[0].condition[0].expression, "_igloo_shuffle/")
+    error_message = "Workers may only create objects, in exchanges and statements' directories."
+  }
+
+  assert {
+    condition     = length(google_storage_bucket_iam_member.worker_read) == 2 && !contains([for g in google_storage_bucket_iam_member.worker_read : g.role], "roles/storage.objectAdmin")
+    error_message = "Workers read the rest of the bucket, and may not change it."
+  }
+}
+
+run "workers_on_demand_only" {
+  command = plan
+
+  variables {
+    workers_enabled        = true
+    workers_spot           = false
+    workers_machine_family = "c4a"
+  }
+
+  assert {
+    condition = (
+      yamldecode(helm_release.compute_classes[0].values[0]).classes[0].spec.priorities == [{ machineFamily = "c4a", spot = false }] &&
+      length(yamldecode(helm_release.igloo[0].values[0]).workers.tolerations) == 1
+    )
+    error_message = "workers_spot = false must leave only the on-demand rule, of workers_machine_family."
+  }
+}
+
+run "large_worker" {
+  command = plan
+
+  variables {
+    workers_enabled             = true
+    large_worker_enabled        = true
+    large_worker_price_per_hour = 3.9
+  }
+
+  assert {
+    condition = (
+      length(yamldecode(helm_release.compute_classes[0].values[0]).classes) == 2 &&
+      one([for c in yamldecode(helm_release.compute_classes[0].values[0]).classes : c if c.name == "igloo-large-worker"]) == {
+        name = "igloo-large-worker"
+        spec = {
+          priorities        = [{ machineType = "n4-highmem-64", spot = false }]
+          whenUnsatisfiable = "DoNotScaleUp"
+        }
+      }
+    )
+    error_message = "The large worker must get a compute class of its own: an on-demand n4-highmem-64."
+  }
+
+  assert {
+    condition = (
+      yamldecode(helm_release.igloo[0].values[0]).workers.large.enabled == true &&
+      yamldecode(helm_release.igloo[0].values[0]).workers.large.pricePerHour == 3.9 &&
+      yamldecode(helm_release.igloo[0].values[0]).workers.large.instanceType == "n4-highmem-64" &&
+      yamldecode(helm_release.igloo[0].values[0]).workers.large.resources.requests.cpu == "57" &&
+      yamldecode(helm_release.igloo[0].values[0]).workers.large.resources.limits.memory == "435Gi" &&
+      yamldecode(helm_release.igloo[0].values[0]).workers.large.nodeSelector == { "cloud.google.com/compute-class" = "igloo-large-worker" } &&
+      length(yamldecode(helm_release.igloo[0].values[0]).workers.large.tolerations) == 1
+    )
+    error_message = "The chart's workers.large must fill the large worker's machine and select its class."
+  }
+}
+
+run "large_worker_on_spot" {
+  command = plan
+
+  variables {
+    workers_enabled      = true
+    large_worker_enabled = true
+    large_worker_spot    = true
+  }
+
+  assert {
+    condition = one([for c in yamldecode(helm_release.compute_classes[0].values[0]).classes : c if c.name == "igloo-large-worker"]).spec.priorities == [
+      { machineType = "n4-highmem-64", spot = true },
+      { machineType = "n4-highmem-64", spot = false },
+    ]
+    error_message = "large_worker_spot must try Spot first and keep on-demand to fall back to."
+  }
+}
+
 run "spill_on_local_ssd" {
   command = plan
 

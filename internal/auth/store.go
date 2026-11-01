@@ -250,6 +250,13 @@ var migrations = []string{
 		PRIMARY KEY (group_id, user_name)
 	)`,
 	`CREATE INDEX IF NOT EXISTS scim_members_user ON igloo_auth.scim_members (user_name)`,
+	// Users whose groups SCIM changed, until their roles follow them
+	// (SCIMChanges): marked with each change, so roles a failure left
+	// behind are applied later.
+	`CREATE TABLE IF NOT EXISTS igloo_auth.scim_changes (
+		user_name text PRIMARY KEY REFERENCES igloo_auth.users (name) ON DELETE CASCADE,
+		mark      bigint NOT NULL
+	)`,
 	connectionGrantsTable,
 	// ERASE on the account, which lets a custom role erase people's data
 	// (see package erasure). Changed once, so later starts take no lock on
@@ -261,6 +268,18 @@ var migrations = []string{
 			ALTER TABLE igloo_auth.grants DROP CONSTRAINT grants_privilege_check,
 				ADD CONSTRAINT grants_privilege_check
 				CHECK (privilege IN ('SELECT', 'INSERT', 'UPDATE', 'DELETE', 'CREATE', 'ERASE'));
+		END IF;
+	END $$`,
+	// The account ID that the provider's access tokens are matched by
+	// besides the subject (Identity.AccountID). Added once, so later starts
+	// take no lock on the table. Identities older replicas still running
+	// link have none, and match access tokens by subject alone until their
+	// next sign-in.
+	`DO $$
+	BEGIN
+		IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+				WHERE table_schema = 'igloo_auth' AND table_name = 'identities' AND column_name = 'account_id') THEN
+			ALTER TABLE igloo_auth.identities ADD COLUMN IF NOT EXISTS account_id text NOT NULL DEFAULT '';
 		END IF;
 	END $$`,
 }
@@ -303,7 +322,7 @@ func (s *PostgresStore) migrate(ctx context.Context) error {
 }
 
 func (s *PostgresStore) Get(ctx context.Context, name string) (User, error) {
-	u, err := scanUser(s.pool.QueryRow(ctx, `SELECT `+userColumns+` FROM igloo_auth.users WHERE name = $1`, name))
+	u, err := scanUser(s.db(ctx).QueryRow(ctx, `SELECT `+userColumns+` FROM igloo_auth.users WHERE name = $1`, name))
 	if errors.Is(err, pgx.ErrNoRows) {
 		return User{}, ErrNotFound
 	}
@@ -403,7 +422,7 @@ func (s *PostgresStore) Delete(ctx context.Context, name string) error {
 // concurrent demotions from both passing the check. The names lock comes
 // first, as in every transaction that takes both.
 func (s *PostgresStore) changeAdmins(ctx context.Context, name string, change func(pgx.Tx) (pgconn.CommandTag, error)) error {
-	return pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+	return pgx.BeginFunc(ctx, s.db(ctx), func(tx pgx.Tx) error {
 		if err := lockNames(ctx, tx); err != nil {
 			return err
 		}

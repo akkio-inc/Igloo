@@ -74,7 +74,13 @@ def main() -> None:
 
     import psycopg
 
+    from run import igloo_result_cache
+
     conn = psycopg.connect(os.environ["IGLOO_DSN"], autocommit=True)
+    # As in run.py: a run answered from the result cache times neither mode.
+    with conn.cursor() as cur:
+        cur.execute("SET igloo_result_cache = off")
+    result_cache = igloo_result_cache(conn)
     names = set(args.queries.split(",")) if args.queries else None
     results = []
     for path in sorted((QUERIES / args.suite).glob("*.sql")):
@@ -117,6 +123,7 @@ def main() -> None:
         "runs": args.runs,
         "coordinator_price": args.coordinator_price,
         "worker_price": args.worker_price,
+        "result_cache": result_cache,
         "results": results,
     }
     if ran:

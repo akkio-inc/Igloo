@@ -16,6 +16,7 @@ import (
 	pgerror "github.com/jeroenrinzema/psql-wire/errors"
 
 	"github.com/akkio-inc/igloo/internal/auth"
+	"github.com/akkio-inc/igloo/internal/catalog"
 	"github.com/akkio-inc/igloo/internal/policy"
 )
 
@@ -101,27 +102,109 @@ func (s *Server) replaceTable(ctx context.Context, sess *session, r tableReplace
 }
 
 // swapIn drops the table r replaces and renames the new one into place.
+//
+// DuckDB can report a drop or rename failed that the catalog made all the
+// same (see doneAnyway), and the catalog proxy answers that a change's
+// outcome is unknown when the catalog does not confirm it. So after a step
+// fails, the catalog itself is asked what happened before anything more is
+// dropped: once the old table may be gone, the new one may be the only copy
+// of either. When the catalog cannot tell, swapIn stops, keeps both names'
+// tables, and says where the new one is.
 func (s *Server) swapIn(ctx context.Context, sess *session, r tableReplace) error {
 	_, drop, rename := r.statements()
 	exec := func(ctx context.Context, q string) error {
 		_, err := sess.conn.ExecContext(ctx, q, nil)
 		return err
 	}
+	target, terr := s.newTableTarget(ctx, sess, r.target)
+	staging := r.staging[len(r.staging)-1]
+	// exists asks the catalog, not DuckDB's copy of it, whether the table
+	// name is in the target's schema; sure is false when it cannot tell.
+	exists := func(name string) (there, sure bool) {
+		if s.ddl == nil || terr != nil {
+			return false, false
+		}
+		there, err := s.ddl.TableExists(ctx, target.Schema, name)
+		return there, err == nil
+	}
+	// dropped reports whether the target is gone after a drop that failed
+	// with err; when it is not, the drop was refused if refused is set,
+	// and may yet happen otherwise.
+	dropped := func(err error) (gone, refused bool) {
+		there, sure := exists(target.Table)
+		return sure && !there, sure && there && !outcomeUnknown(err)
+	}
+	// unsure is the error when the catalog does not say whether step
+	// happened: nothing more is dropped.
+	unsure := func(step string, err error, where string) error {
+		return fmt.Errorf("%s failed, and the catalog does not say whether it happened: %w; nothing more was dropped, "+
+			"and the new table is complete as %s", step, err, where)
+	}
+
 	if err := exec(ctx, drop); err != nil {
-		_ = exec(ctx, "DROP TABLE IF EXISTS "+quoteName(r.staging))
-		return err
+		switch gone, refused := dropped(err); {
+		case refused:
+			// The old table is as it was, so the new one goes, as after
+			// any failure before the swap.
+			_ = exec(ctx, "DROP TABLE IF EXISTS "+quoteName(r.staging))
+			return err
+		case !gone:
+			return unsure("dropping the old table "+quoteName(r.target), err, fmt.Sprintf(
+				"%s: once %s is gone, ALTER TABLE %s RENAME TO %s puts it in place",
+				quoteName(r.staging), quoteName(r.target), quoteName(r.staging), quoteIdent(r.target[len(r.target)-1])))
+		}
+		// Dropped all the same.
 	}
 	var err error
 	for attempt := 0; attempt < 3; attempt++ {
 		if err = exec(ctx, rename); err == nil {
 			return nil
 		}
-		// Another session may have replaced the table in between; the last
-		// replace wins.
-		_ = exec(ctx, drop)
+		staged, sure := exists(staging)
+		placed, sureToo := exists(target.Table)
+		switch {
+		case !sure || !sureToo || staged && outcomeUnknown(err):
+			// The rename may yet happen.
+			return unsure("after dropping the old table, renaming the new one", err,
+				quoteName(r.staging)+" or, if the rename went through, as "+quoteName(r.target))
+		case !staged && placed:
+			// Renamed all the same.
+			s.forgetStaging(ctx, sess, r, target)
+			return nil
+		case !staged:
+			return fmt.Errorf("renaming the new table %s to %s failed: %w; neither is in the catalog any more, so another session dropped the new table",
+				quoteName(r.staging), quoteName(r.target), err)
+		case placed:
+			// Another session made a table of the name in between: the
+			// last replace wins.
+			if derr := exec(ctx, drop); derr != nil {
+				if gone, _ := dropped(derr); !gone {
+					return renameFailed(r, derr)
+				}
+			}
+		}
 		time.Sleep(time.Duration(attempt+1) * 100 * time.Millisecond)
 	}
-	return fmt.Errorf("the new table is complete as %s, but renaming it to %s failed: %w",
+	return renameFailed(r, err)
+}
+
+// forgetStaging has DuckDB forget the new table's temporary name after a
+// rename into place that DuckDB heard fail but the catalog made: DuckDB
+// would list the table under it, to every session of the replica, until
+// it stops. Its drop of the name drops nothing in the catalog (see
+// Engine.ForgetTable). The caller holds the catalog lock exclusively.
+func (s *Server) forgetStaging(ctx context.Context, sess *session, r tableReplace, target auth.Object) {
+	defer s.engine.ForgetTable(target.Schema, r.staging[len(r.staging)-1], target.Table)()
+	if _, err := sess.conn.ExecContext(ctx, "DROP TABLE "+quoteName(r.staging), nil); err != nil {
+		s.log.Warn("DuckDB still lists the new table of a CREATE OR REPLACE TABLE under its temporary name, which the catalog renamed",
+			"table", target.String(), "name", quoteName(r.staging), "err", err)
+	}
+}
+
+// renameFailed is swapIn's error when the new table stays under its
+// temporary name.
+func renameFailed(r tableReplace, err error) error {
+	return fmt.Errorf("the old table was dropped and the new table is complete as %s, but renaming it to %s failed: %w",
 		quoteName(r.staging), quoteName(r.target), err)
 }
 
@@ -141,13 +224,16 @@ type stagedCreate struct {
 	replace bool
 	// target is the table, to check that it does not exist yet.
 	target auth.Object
-	// query is the query after AS.
-	query string
+	// query is the query after AS, and partitionedBy the PARTITIONED BY
+	// clause before it, if any (bucketed tables'), which the new table is
+	// given before it is filled.
+	query, partitionedBy string
 }
 
 // stagedCreateOf returns how to carry out query in steps, or nil when it is
-// not CREATE [OR REPLACE] TABLE [IF NOT EXISTS] name AS query of an Iceberg
-// table (with no column list, not TEMP and not WITH NO DATA) on its own.
+// not CREATE [OR REPLACE] TABLE [IF NOT EXISTS] name [PARTITIONED BY (...)]
+// AS query of an Iceberg table (with no column list, not TEMP and not WITH
+// NO DATA) on its own.
 func (s *Server) stagedCreateOf(ctx context.Context, sess *session, query string) *stagedCreate {
 	if !createsTableAs(query) {
 		return nil
@@ -168,16 +254,71 @@ func (s *Server) stagedCreateOf(ctx context.Context, sess *session, query string
 	staging := append(append([]string{}, c.name[:len(c.name)-1]...),
 		c.name[len(c.name)-1]+policy.StagingMark+hex.EncodeToString(b[:]))
 	return &stagedCreate{
-		tableReplace: tableReplace{target: c.name, staging: staging, rest: " AS " + c.query},
-		replace:      c.replace, target: target, query: c.query,
+		tableReplace: tableReplace{target: c.name, staging: staging, rest: strings.TrimRight(" "+c.partitionedBy, " ") + " AS " + c.query},
+		replace:      c.replace, target: target, query: c.query, partitionedBy: c.partitionedBy,
 	}
 }
 
-// runStagedCreate carries out c, holding the catalog lock exclusively only
-// while it changes the catalog. done is false when c is CREATE TABLE of a
-// table or view that exists: the statement then runs as written, under the
-// lock, for DuckDB's own error or, with IF NOT EXISTS, its notice.
-func (s *Server) runStagedCreate(ctx context.Context, sess *session, c *stagedCreate) (rows int64, done bool, err error) {
+// stagedFill runs a staged create's INSERTs into its new table on the
+// session's connection, under ctx.
+type stagedFill struct {
+	s    *Server
+	sess *session
+	ctx  context.Context
+	// ends ends the contexts again armed.
+	ends []context.CancelFunc
+}
+
+func (f *stagedFill) fill(q string) (n int64, err error) {
+	return f.fillAt(f.ctx, q)
+}
+
+// fillAt is fill under ctx.
+func (f *stagedFill) fillAt(ctx context.Context, q string) (n int64, err error) {
+	err = f.s.runBound(f.sess, nil, func() error {
+		res, err := f.sess.conn.QueryContext(ctx, q, nil)
+		if err == nil {
+			n, err = countOf(res)
+		}
+		return err
+	})
+	return n, err
+}
+
+// again says whether an INSERT that failed with err may run again on less
+// at a time: DuckDB ran out of memory, its estimate short, or the memory
+// watch stopped the statement (ShedMemory), the replica running out of
+// memory, as it stopped a copy's count(DISTINCT) of a billion ids. After
+// the memory watch's stop, the fill goes on under what is left of the
+// statement's time (see rearm).
+func (f *stagedFill) again(err error) bool {
+	if f.ctx.Err() == nil {
+		return isOutOfMemory(err)
+	}
+	if f.sess.outer == nil || !f.sess.ranOutOfMemory(f.ctx, err) {
+		return false
+	}
+	ctx, end := f.sess.rearm(f.sess.outer, f.ctx)
+	f.ctx, f.ends = ctx, append(f.ends, end)
+	return true
+}
+
+// rearmed says whether the fill went on after the memory watch stopped it.
+func (f *stagedFill) rearmed() bool { return len(f.ends) > 0 }
+
+func (f *stagedFill) close() {
+	for _, end := range f.ends {
+		end()
+	}
+}
+
+// runStagedCreate carries out c, of st, holding the catalog lock
+// exclusively only while it changes the catalog. done is false when c is
+// CREATE TABLE of a table or view that exists: the statement then runs as
+// written, under the lock, for DuckDB's own error or, with IF NOT EXISTS,
+// its notice. Its query runs on workers where auto mode would run it there
+// as a read (see fillOn).
+func (s *Server) runStagedCreate(ctx context.Context, sess *session, st *statement, c *stagedCreate) (rows int64, done bool, err error) {
 	exec := func(ctx context.Context, q string) error {
 		_, err := sess.conn.ExecContext(ctx, q, nil)
 		return err
@@ -195,8 +336,24 @@ func (s *Server) runStagedCreate(ctx context.Context, sess *session, c *stagedCr
 			return 0, false, nil
 		}
 	}
+	// What stopped creates left under the name goes, and nothing else may
+	// hold it, before the fill rather than at the rename after it (see
+	// clearLeftovers).
+	if err := s.clearLeftovers(ctx, sess, c.target.Schema, c.target.Table, true); err != nil {
+		release()
+		return 0, true, err
+	}
+	// Noted while it is made, so a stop leaves what it made to clear.
+	forget := s.notePending(ctx, c.target.Schema, catalog.NewPending(catalog.PendingFill, c.staging[len(c.staging)-1], c.target.Table))
+	defer forget()
 	// On a line of its own, after a query that may end in a comment.
 	err = exec(ctx, "CREATE TABLE "+quoteName(c.staging)+" AS "+c.query+"\nWITH NO DATA")
+	if err == nil && c.partitionedBy != "" {
+		// Its partition spec, by which the fill writes its files.
+		if err = exec(ctx, "ALTER TABLE "+quoteName(c.staging)+" SET "+c.partitionedBy); err != nil {
+			_ = exec(context.WithoutCancel(ctx), "DROP TABLE IF EXISTS "+quoteName(c.staging))
+		}
+	}
 	if err == nil && c.replace {
 		// The new table keeps the columns with policies or tags, which the
 		// statement was checked for too.
@@ -224,42 +381,68 @@ func (s *Server) runStagedCreate(ctx context.Context, sess *session, c *stagedCr
 		return 0, true, err
 	}
 
-	fill := func(q string) (int64, error) {
-		res, err := sess.conn.QueryContext(ctx, q, nil)
-		if err != nil {
-			return 0, err
-		}
-		return countOf(res)
+	f := &stagedFill{s: s, sess: sess, ctx: ctx}
+	defer f.close()
+	if s.beforeFill != nil {
+		s.beforeFill(ctx)
 	}
 	plain := "INSERT INTO " + quoteName(c.staging) + "\n" + c.query
 	if text, ok := s.joinedInsert(parsedInsert{target: quoteName(c.staging), columns: visible,
 		source: strings.TrimRight(c.query, "; \t\r\n")}, idMembersOf(ids)); ok {
-		rows, err = fill(text)
+		s.noWorkerWrite(c.target.String(), "it fills an ID domain's ids, joined here")
+		rows, err = f.fill(text)
 		if err != nil && joinFailed(err) {
 			s.log.Debug("a new member table is filled without its ids", "table", c.target.String(), "err", err)
-			rows, err = fill(plain)
+			rows, err = f.fill(plain)
 		}
 	} else if sw := s.sortedWriteOf(ctx, sess, "INSERT INTO "+quoteName(c.staging), c.query); sw != nil {
 		// Too many rows in order to sort at once: a range at a time.
+		s.noWorkerWrite(c.target.String(), "its rows are written in order, a range at a time")
 		var done bool
 		if rows, done, err = s.runSortedWrite(ctx, sess, sw); !done && err == nil {
-			rows, err = fill(plain)
+			rows, err = f.fill(plain)
 		}
 	} else if ap := s.aggPassesOf(ctx, sess, c.query, 0); ap != nil {
 		// An aggregate whose states would not fit in memory: its groups a
 		// share at a time (see aggpasses.go).
-		rows, err = s.fillInPasses(ctx, fill, c.staging, ap)
-	} else if rows, err = fill(plain); isOutOfMemory(err) && ctx.Err() == nil {
-		// DuckDB's estimate was short: in passes, if the query allows,
-		// into the table the failed fill left empty.
-		if ap := s.aggPassesOf(ctx, sess, c.query, 16); ap != nil {
-			rows, err = s.fillInPasses(ctx, fill, c.staging, ap)
+		s.noWorkerWrite(c.target.String(), "its groups are written in passes")
+		rows, err = s.fillInPasses(f, c.staging, ap)
+	} else {
+		// Its query on workers where auto mode runs it there as a read,
+		// the new table filled from their results.
+		into := "INSERT INTO " + quoteName(c.staging) + "\n"
+		here := func(ctx context.Context) (int64, error) { return f.fillAt(ctx, plain) }
+		from := func(ctx context.Context, source string) (int64, error) { return f.fillAt(ctx, into+source) }
+		var (
+			parts distParts
+			again bool
+		)
+		src := s.fillSource(f.ctx, sess, st, c.query)
+		if src != nil {
+			src.writer = s.tableWriter(f.ctx, sess, c.target.Schema, c.staging[len(c.staging)-1], src, nil)
 		}
+		rows, parts, again, err = s.fillOn(f, src, here, from)
+		st.filled = &parts
+		if err != nil && (again || errors.Is(err, errWorkerMemory) && f.ctx.Err() == nil) {
+			// DuckDB's estimate was short, the memory watch stopped the
+			// fill, or a worker ran out of memory: in passes here, if the
+			// query allows, into the table the failed fill left empty.
+			if ap := s.aggPassesOf(f.ctx, sess, c.query, 16); ap != nil {
+				rows, err = s.fillInPasses(f, c.staging, ap)
+				st.filled = nil
+			} else if f.rearmed() {
+				err = errMemoryShed
+			}
+		}
+	}
+	if err != nil && errors.Is(f.ctx.Err(), context.DeadlineExceeded) && f.rearmed() {
+		err = errStatementTimeout
 	}
 	if err != nil {
 		dropStaging()
 		return 0, true, err
 	}
+	ctx = f.ctx
 	if ids != nil && s.idSyncMinRows > 0 && rows < s.idSyncMinRows && s.idDomainsOn {
 		// A small table: mapped shortly after, under its own name once it
 		// has it.
@@ -278,7 +461,19 @@ func (s *Server) runStagedCreate(ctx context.Context, sess *session, c *stagedCr
 	}
 	_, _, rename := c.statements()
 	if err := exec(ctx, rename); err != nil {
-		// A table of that name was created in the meantime.
+		// A table of that name was created in the meantime, or a create
+		// that never was holds the name since the check: if it is a stopped
+		// create of Igloo's own, it goes, and the rename is tried again.
+		if s.ddl != nil {
+			if there, terr := s.ddl.TableExists(ctx, c.target.Schema, c.target.Table); terr == nil && !there {
+				if s.clearLeftovers(ctx, sess, c.target.Schema, c.target.Table, false) == nil && exec(ctx, rename) == nil {
+					return rows, true, nil
+				}
+				if held, _ := s.ddl.HeldUnseen(ctx, c.target.Schema, c.target.Table); held {
+					err = errHeldUnseen(c.target.Schema, c.target.Table)
+				}
+			}
+		}
 		_ = exec(ctx, "DROP TABLE IF EXISTS "+quoteName(c.staging))
 		return 0, true, err
 	}
@@ -306,8 +501,24 @@ func (s *Server) relationExists(ctx context.Context, sess *session, o auth.Objec
 // steps (see stagedCreate), and writes of too many rows in order to sort at
 // once a range of the order at a time (see sortedwrite.go).
 func (s *Server) runStatement(ctx context.Context, sess *session, st *statement, args []driver.NamedValue, w wire.DataWriter) error {
+	// Maintenance leaves the tables it writes be until it commits (see
+	// txTables).
+	defer sess.useTables(st)()
+	if st.tempFill != nil {
+		rows, err := s.runTempCreate(ctx, sess, st.tempFill)
+		if err != nil {
+			return err
+		}
+		reportRows(w, rows)
+		return w.Complete("CREATE TABLE")
+	}
+	if deallocates.MatchString(st.query) {
+		// Forgotten whether it runs or not: an EXECUTE of the name holds the
+		// lock, as one of a statement prepared some other way does.
+		sess.notePrepared(st.query)
+	}
 	if st.staged != nil && !sess.inTx {
-		rows, done, err := s.runStagedCreate(ctx, sess, st.staged)
+		rows, done, err := s.runStagedCreate(ctx, sess, st, st.staged)
 		if done {
 			if err != nil {
 				return err
@@ -323,24 +534,45 @@ func (s *Server) runStatement(ctx context.Context, sess *session, st *statement,
 	if done, err := s.runSortedInsert(ctx, sess, st, args, w); done {
 		return err
 	}
+	// A read of more rows in order than memory holds sorts them in runs
+	// (see largesort.go).
+	if done, err := s.runLargeSort(ctx, sess, st, args, w); done {
+		return err
+	}
 	written := int64(-1)
-	err := runWithCommitRetry(ctx, sess, st, func() error {
-		if err := st.freshForRun(ctx, sess.conn); err != nil {
-			return err
-		}
-		return sess.profiled(ctx, st, func() error {
-			// An INSERT into a member table writes the ids it can.
-			done, n, err := s.runWithIDs(ctx, sess, st, args, w)
-			if done {
-				written = n
-				return err
-			}
-			return st.run(ctx, args, w)
+	run := func(ctx context.Context) error {
+		return s.runBound(sess, w, func() error {
+			return runWithCommitRetry(ctx, sess, st, func() error {
+				if err := st.freshForRun(ctx, sess.conn); err != nil {
+					return err
+				}
+				return sess.profiled(ctx, st, func() error {
+					// An INSERT into a member table writes the ids it can.
+					done, n, err := s.runWithIDs(ctx, sess, st, args, w)
+					if done {
+						written = n
+						return err
+					}
+					return st.run(ctx, args, w)
+				})
+			})
 		})
-	})
+	}
+	// An INSERT INTO ... SELECT runs its query on workers where auto mode
+	// runs it there as a read (see fillOn).
+	if done, err := s.runInsertFill(ctx, sess, st, len(args), w, run); done {
+		return err
+	}
+	err := run(ctx)
 	if err == nil && st.ids != nil {
 		// And then those of the values that had none.
 		s.fillIDs(ctx, sess, st.ids, written)
+	}
+	if err == nil && st.stmtType == duckdb.STATEMENT_TYPE_PREPARE {
+		sess.notePrepared(st.query)
+	}
+	if err == nil && st.stmtType == duckdb.STATEMENT_TYPE_DROP {
+		s.afterDropTable(ctx, sess, st)
 	}
 	if err != nil && st.changesIceberg && s.doneAnyway(ctx, st, err) {
 		return w.Complete(commandTag(st.stmtType, st.query, 0))
@@ -428,4 +660,11 @@ func (s *Server) replaceable(sess *session, st *statement) (tableReplace, bool) 
 // REPLACE TABLE on an Iceberg table.
 func isIcebergNoReplace(err error) bool {
 	return err != nil && strings.Contains(err.Error(), icebergNoReplace)
+}
+
+// outcomeUnknown reports whether err says the catalog did not confirm
+// whether a change was applied (see package catalogproxy), which it may
+// still apply.
+func outcomeUnknown(err error) bool {
+	return strings.Contains(strings.ToLower(err.Error()), "commitstateunknownexception")
 }

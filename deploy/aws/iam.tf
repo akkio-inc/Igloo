@@ -163,3 +163,171 @@ resource "aws_iam_role_policy" "igloo_assume_engines" {
     ]
   })
 }
+
+################################################################################
+# Workers (with workers_enabled)
+#
+# Workers read the warehouse and write the rows they exchange between a
+# statement's stages, nothing else. They write a table's files with the
+# credentials a statement's tasks carry: the igloo pods assume the engines role
+# with a session policy for each task's directory, with no right to delete,
+# for an hour, and check every file before they commit it
+# (docs/distributed-execution.md#security). Nothing here lets a worker write
+# to a table's location by itself; a worker cannot assume the engines role.
+################################################################################
+
+resource "aws_iam_role" "worker" {
+  count = var.workers_enabled ? 1 : 0
+
+  name        = "${var.name_prefix}-worker"
+  description = "Igloo workers: read table data, write the rows they exchange"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect    = "Allow"
+        Principal = { Federated = module.eks.oidc_provider_arn }
+        Action    = "sts:AssumeRoleWithWebIdentity"
+        Condition = {
+          StringEquals = {
+            "${module.eks.oidc_provider}:sub" = "system:serviceaccount:${var.namespace}:${local.worker_service_account}"
+            "${module.eks.oidc_provider}:aud" = "sts.amazonaws.com"
+          }
+        }
+      },
+    ]
+  })
+}
+
+resource "aws_iam_role_policy" "worker_warehouse" {
+  count = var.workers_enabled ? 1 : 0
+
+  name = "warehouse-read-exchanges-write"
+  role = aws_iam_role.worker[0].id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = concat(
+      [
+        {
+          Sid      = "ListWarehousePrefix"
+          Effect   = "Allow"
+          Action   = "s3:ListBucket"
+          Resource = aws_s3_bucket.warehouse.arn
+          Condition = {
+            StringLike = {
+              "s3:prefix" = [local.warehouse_prefix, "${local.warehouse_prefix}/*"]
+            }
+          }
+        },
+        {
+          Sid      = "BucketLocation"
+          Effect   = "Allow"
+          Action   = "s3:GetBucketLocation"
+          Resource = aws_s3_bucket.warehouse.arn
+        },
+        {
+          Sid      = "ReadWarehouseObjects"
+          Effect   = "Allow"
+          Action   = "s3:GetObject"
+          Resource = "${aws_s3_bucket.warehouse.arn}/${local.warehouse_prefix}/*"
+        },
+        {
+          Sid    = "WriteExchanges"
+          Effect = "Allow"
+          # PutObject also covers multipart uploads. Igloo deletes exchanges.
+          Action = [
+            "s3:PutObject",
+            "s3:AbortMultipartUpload",
+            "s3:ListMultipartUploadParts",
+          ]
+          Resource = "${aws_s3_bucket.warehouse.arn}/${local.warehouse_prefix}/_igloo_shuffle/*"
+        },
+      ],
+      var.bucket_kms_key_arn == "" ? [] : [
+        {
+          Sid      = "UseBucketKey"
+          Effect   = "Allow"
+          Action   = ["kms:Decrypt", "kms:Encrypt", "kms:GenerateDataKey"]
+          Resource = var.bucket_kms_key_arn
+        },
+      ],
+    )
+  })
+}
+
+################################################################################
+# Cluster autoscaler (with workers_enabled, see workers.tf)
+#
+# Assumable only by kube-system/cluster-autoscaler. It may read autoscaling
+# groups, launch templates, instance types and managed node groups (labels
+# and taints, to scale a group from zero), and change the size of the worker
+# node groups' autoscaling groups only, not the default node group's.
+################################################################################
+
+data "aws_caller_identity" "current" {}
+
+resource "aws_iam_role" "cluster_autoscaler" {
+  count = var.workers_enabled ? 1 : 0
+
+  name        = "${var.name_prefix}-cluster-autoscaler"
+  description = "Kubernetes cluster autoscaler: scales the worker node groups"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect    = "Allow"
+        Principal = { Federated = module.eks.oidc_provider_arn }
+        Action    = "sts:AssumeRoleWithWebIdentity"
+        Condition = {
+          StringEquals = {
+            "${module.eks.oidc_provider}:sub" = "system:serviceaccount:kube-system:${local.cluster_autoscaler_service_account}"
+            "${module.eks.oidc_provider}:aud" = "sts.amazonaws.com"
+          }
+        }
+      },
+    ]
+  })
+}
+
+resource "aws_iam_role_policy" "cluster_autoscaler" {
+  count = var.workers_enabled ? 1 : 0
+
+  name = "scale-worker-node-groups"
+  role = aws_iam_role.cluster_autoscaler[0].id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid    = "Describe"
+        Effect = "Allow"
+        Action = [
+          "autoscaling:DescribeAutoScalingGroups",
+          "autoscaling:DescribeAutoScalingInstances",
+          "autoscaling:DescribeLaunchConfigurations",
+          "autoscaling:DescribeScalingActivities",
+          "autoscaling:DescribeTags",
+          "ec2:DescribeImages",
+          "ec2:DescribeInstanceTypes",
+          "ec2:DescribeLaunchTemplateVersions",
+          "ec2:GetInstanceTypesFromInstanceRequirements",
+          "eks:DescribeNodegroup",
+        ]
+        Resource = "*"
+      },
+      {
+        Sid    = "ScaleWorkerNodeGroups"
+        Effect = "Allow"
+        Action = [
+          "autoscaling:SetDesiredCapacity",
+          "autoscaling:TerminateInstanceInAutoScalingGroup",
+        ]
+        Resource = [
+          for g in local.worker_autoscaling_groups :
+          "arn:${data.aws_partition.current.partition}:autoscaling:${var.region}:${data.aws_caller_identity.current.account_id}:autoScalingGroup:*:autoScalingGroupName/${g.name}"
+        ]
+      },
+    ]
+  })
+}

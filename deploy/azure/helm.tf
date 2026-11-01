@@ -19,7 +19,9 @@ locals {
     "service.beta.kubernetes.io/azure-load-balancer-resource-group" = azurerm_resource_group.this.name
   } : {}
 
-  helm_values = {
+  helm_values = merge(local.helm_base_values, local.workers_helm_values)
+
+  helm_base_values = {
     image = merge({ tag = var.image_tag }, var.image_repository == "" ? {} : { repository = var.image_repository })
 
     replicaCount = var.replica_count

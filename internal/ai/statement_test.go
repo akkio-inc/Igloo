@@ -149,6 +149,77 @@ func TestCacheAcrossStatements(t *testing.T) {
 	}
 }
 
+// TestCacheIsPerIntegration: integrations at one host, granted apart,
+// never answer each other's calls from the cache, nor does an integration
+// made again under an old one's name, or one whose API version changed;
+// CREATE OR REPLACE with the same settings keeps the answers.
+func TestCacheIsPerIntegration(t *testing.T) {
+	t.Parallel()
+	f := newFake(t, echo)
+	rt := testRuntime(t, f)
+	store := rt.opts.Store
+	main, err := store.Integration(ctx, "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	calls := int64(0)
+	ask := func(name, what string, wantCall bool) {
+		t.Helper()
+		s := begin(t, rt, func(o *StatementOptions) { o.Integration = name })
+		if out, err := s.Complete(completeRows("m", "same prompt"), false); err != nil || out[0] != "echo: same prompt" {
+			t.Fatalf("%s: %v %v", what, out, err)
+		}
+		if wantCall {
+			calls++
+		}
+		if n := f.calls.Load(); n != calls {
+			t.Errorf("%s: %d requests, want %d", what, n, calls)
+		}
+	}
+	ask("main", "the first call", true)
+	ask("main", "the same call again", false)
+
+	for _, other := range []Integration{
+		{Name: "tenant_b", BaseURL: main.BaseURL},
+		{Name: "gateway_b", BaseURL: f.srv.URL + "/tenant-b/v1"},
+	} {
+		in := main.Clone()
+		in.Name, in.BaseURL = other.Name, other.BaseURL
+		if err := store.CreateIntegration(ctx, in, false); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.GrantUsage(ctx, Grant{Integration: in.Name, Grantee: "analysts", GranteeType: "role"}); err != nil {
+			t.Fatal(err)
+		}
+		ask(in.Name, "another integration at "+in.BaseURL, true)
+	}
+
+	replaced := main.Clone()
+	replaced.APIKey = "sk-rotated-not-a-real-key"
+	if err := store.CreateIntegration(ctx, replaced, true); err != nil {
+		t.Fatal(err)
+	}
+	ask("main", "main replaced with a new key", false)
+	replaced.APIVersion = "2026-01-01"
+	if err := store.UpdateIntegration(ctx, replaced); err != nil {
+		t.Fatal(err)
+	}
+	ask("main", "main with another API version", true)
+
+	if err := store.DropIntegration(ctx, "tenant_b"); err != nil {
+		t.Fatal(err)
+	}
+	again := main.Clone()
+	again.Name, again.CreatedAt = "tenant_b", time.Time{}
+	if err := store.CreateIntegration(ctx, again, false); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.GrantUsage(ctx, Grant{Integration: "tenant_b", Grantee: "analysts", GranteeType: "role"}); err != nil {
+		t.Fatal(err)
+	}
+	ask("tenant_b", "an integration made again under a dropped one's name", true)
+}
+
 // TestPurgeStopsStatementsUnderway: an erasure purges the entries derived
 // from its tables, and a statement that began before it keeps nothing more:
 // it may have read the rows the purge was for. A statement that begins
@@ -336,6 +407,36 @@ func TestRowErrorsAndDetails(t *testing.T) {
 	_, err = s2.Complete(completeRows("m", "x"), false)
 	if err == nil || IsRowError(err) || strings.Contains(err.Error(), "sk-test-not-a-real-key") || !strings.Contains(err.Error(), "***") {
 		t.Errorf("a bad key: %v", err)
+	}
+}
+
+// TestRowErrorsAreScrubbed: a provider refusing a row's input may echo the
+// request's credentials; they never reach the row's error, the statement's
+// first error or the failed statement.
+func TestRowErrorsAreScrubbed(t *testing.T) {
+	t.Parallel()
+	f := newFake(t, func(r fakeRequest) (int, any) {
+		return 400, map[string]any{"error": map[string]any{"type": "invalid_request_error",
+			"message": "rejected " + r.Header.Get("Authorization") + " with gateway key " + r.Header.Get("X-Gateway-Key")}}
+	})
+	rt := testRuntime(t, f, func(in *Integration) { in.Headers = map[string]string{"X-Gateway-Key": "gw-secret-123456"} })
+	leaks := func(s string) bool {
+		return strings.Contains(s, "sk-test-not-a-real-key") || strings.Contains(s, "gw-secret-123456")
+	}
+	s := begin(t, rt)
+	out, err := s.Complete([]row{{"m", "x", `{"on_error": "details"}`}}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d, _ := out[0].(string); !strings.Contains(d, "rejected") || !strings.Contains(d, "***") || leaks(d) {
+		t.Errorf("details %v", out)
+	}
+	if sp := s.End(); sp.FirstError == "" || leaks(sp.FirstError) {
+		t.Errorf("first error %q", sp.FirstError)
+	}
+	_, err = begin(t, rt).Complete([]row{{"m", "y", `{"on_error": "fail"}`}}, false)
+	if err == nil || leaks(err.Error()) {
+		t.Errorf("on_error fail: %v", err)
 	}
 }
 

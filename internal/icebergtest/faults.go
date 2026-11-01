@@ -36,7 +36,8 @@ const (
 )
 
 // Faults forwards requests to an Iceberg REST catalog and does the faults
-// it is armed with to the commits that pass, one fault per commit.
+// it is armed with to the commits that pass, one fault per commit, and to
+// the table drops and renames, which are armed apart.
 type Faults struct {
 	// URL is the base URL to use in place of the catalog's.
 	URL string
@@ -46,7 +47,10 @@ type Faults struct {
 
 	mu    sync.Mutex
 	armed []Fault
-	down  bool
+	// drops and renames are the faults for the next table drops and
+	// renames.
+	drops, renames []Fault
+	down           bool
 	// before, if set, runs before the next commit is forwarded.
 	before  func()
 	commits []string
@@ -56,6 +60,13 @@ type Faults struct {
 // commitPath matches the paths commits are posted to: a table's, or the
 // warehouse's transactions/commit.
 var commitPath = regexp.MustCompile(`/v1/[^/]+/(namespaces/[^/]+/tables/[^/]+|transactions/commit)$`)
+
+// tablePath and renamePath match the paths of a table, which a drop
+// deletes, and of renames.
+var (
+	tablePath  = regexp.MustCompile(`/v1/[^/]+/namespaces/[^/]+/tables/[^/]+$`)
+	renamePath = regexp.MustCompile(`/v1/[^/]+/tables/rename$`)
+)
 
 // NewFaults forwards to the catalog at upstream, a base URL such as
 // http://lakekeeper:8181/catalog. Close stops it.
@@ -78,6 +89,20 @@ func (f *Faults) Arm(faults ...Fault) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.armed = append(f.armed, faults...)
+}
+
+// ArmDrops and ArmRenames set the faults for the next table drops and
+// renames, in order, as Arm does for commits.
+func (f *Faults) ArmDrops(faults ...Fault) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.drops = append(f.drops, faults...)
+}
+
+func (f *Faults) ArmRenames(faults ...Fault) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.renames = append(f.renames, faults...)
 }
 
 // Up ends DownAfterApply's outage.
@@ -117,7 +142,15 @@ func (f *Faults) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		unavailable(w)
 		return
 	}
-	if r.Method != http.MethodPost || !commitPath.MatchString(r.URL.Path) {
+	var armed *[]Fault
+	switch {
+	case r.Method == http.MethodPost && renamePath.MatchString(r.URL.Path):
+		armed = &f.renames
+	case r.Method == http.MethodPost && commitPath.MatchString(r.URL.Path):
+		armed = &f.armed
+	case r.Method == http.MethodDelete && tablePath.MatchString(r.URL.Path):
+		armed = &f.drops
+	default:
 		f.proxy.ServeHTTP(w, r)
 		return
 	}
@@ -128,14 +161,16 @@ func (f *Faults) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	r.Body = io.NopCloser(bytes.NewReader(body))
 
 	f.mu.Lock()
-	before := f.before
-	f.before = nil
-	fault := Pass
-	if len(f.armed) > 0 {
-		fault, f.armed = f.armed[0], f.armed[1:]
+	var before func()
+	if armed == &f.armed {
+		before, f.before = f.before, nil
+		f.commits = append(f.commits, string(body))
+		f.keys = append(f.keys, r.Header.Get("Idempotency-Key"))
 	}
-	f.commits = append(f.commits, string(body))
-	f.keys = append(f.keys, r.Header.Get("Idempotency-Key"))
+	fault := Pass
+	if len(*armed) > 0 {
+		fault, *armed = (*armed)[0], (*armed)[1:]
+	}
 	f.mu.Unlock()
 	if before != nil {
 		before()

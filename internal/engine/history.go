@@ -274,6 +274,7 @@ func (t historyTypes) queryColumns() []duckdb.ColumnInfo {
 		{Name: "ai_output_tokens", T: t.bigint},
 		{Name: "ai_cost_usd", T: t.double},
 		{Name: "ai_models", T: t.list},
+		{Name: "placement", T: t.varchar},
 	}
 }
 
@@ -297,7 +298,8 @@ func queryValues(q audit.Query) []any {
 		nullList(q.TablesRead), nullList(q.TablesWritten), nullString(q.ClientAddress), nullString(q.ApplicationName),
 		nullList(q.Policies), nullString(q.QueryTag), nullString(q.Pool), millis(q.Queued), cpu, read, memory,
 		nullList(q.LocationsRead), nullString(q.Job), int32(q.Workers),
-		int32(q.Stages), int32(q.Exchanges), nullString(q.PlanKey), aiCalls, aiHits, aiIn, aiOut, aiCost, aiModels}
+		int32(q.Stages), int32(q.Exchanges), nullString(q.PlanKey), aiCalls, aiHits, aiIn, aiOut, aiCost, aiModels,
+		nullString(q.Placement)}
 }
 
 func millis(d time.Duration) float64 { return float64(d.Microseconds()) / 1000 }

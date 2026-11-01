@@ -20,6 +20,7 @@ its tools in containers.
 | `make test` | Run the Go tests in a `golang` container, with a throwaway PostgreSQL for the user-store tests |
 | `make lint` | Check gofmt and run `go vet` |
 | `make migrate-test` | Run the [migration report's](migrate/README.md) unit tests in a Python container |
+| `make bench-test` | Run the [benchmark's](bench/README.md) unit tests in a Python container |
 | `make build` | Build the `igloo:dev` image |
 | `make up` | Start the single-machine stack: Igloo, the Lakekeeper catalog, PostgreSQL and local object storage |
 | `make psql` | Open a SQL shell on the running stack |
@@ -60,7 +61,7 @@ change touches locally (above, and `make e2e` for what crosses the stack).
 It checks:
 
 - gofmt, `go vet` and `go test`
-- `make migrate-test`
+- `make migrate-test` and `make bench-test`
 - the container image, built natively for linux/amd64 and linux/arm64
 - `make e2e`
 - `helm lint` and `helm template` for `deploy/helm/igloo`

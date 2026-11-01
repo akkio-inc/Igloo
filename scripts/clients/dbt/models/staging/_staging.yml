@@ -3,6 +3,9 @@ version: 2
 models:
   - name: stg_ad_platform_daily
     description: One row per platform, campaign and day.
+    config:
+      # Microbatch models read it a day at a time.
+      event_time: event_date
     columns:
       - name: campaign_id
         description: Campaign the delivery belongs to.

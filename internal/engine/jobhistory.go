@@ -73,6 +73,7 @@ func (e *Engine) registerJobHistory(ctx context.Context) error {
 					{Name: "scheduled_time", T: t.timestamp}, {Name: "start_time", T: t.timestamp},
 					{Name: "end_time", T: t.timestamp}, {Name: "duration_ms", T: t.double},
 					{Name: "outcome", T: t.varchar}, {Name: "error", T: t.varchar}, {Name: "row_count", T: t.bigint},
+					{Name: "detail", T: t.varchar},
 				},
 				viewer: viewer(ctx),
 				fetch: func(_ History, v audit.Viewer, p audit.Page) ([]tasks.Run, error) {
@@ -162,7 +163,7 @@ func runValues(r tasks.Run) []any {
 		scheduled = r.Scheduled
 	}
 	return []any{r.ID, r.Kind, r.Name, r.User, r.Trigger, scheduled, r.Start, end, duration, r.Outcome,
-		nullString(r.Error), rows}
+		nullString(r.Error), rows, nullString(r.Detail)}
 }
 
 func loadValues(l tasks.Load) []any {

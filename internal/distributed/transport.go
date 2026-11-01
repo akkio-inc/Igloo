@@ -31,6 +31,16 @@ type transport struct {
 	server, client *tls.Config
 }
 
+// WorkerTLS returns the TLS settings of both ends for secret, for what stands
+// between them, as in tests.
+func WorkerTLS(secret string) (server, client *tls.Config, err error) {
+	t, err := newTransport(secret)
+	if err != nil {
+		return nil, nil, err
+	}
+	return t.server, t.client, nil
+}
+
 func newTransport(secret string) (*transport, error) {
 	if len(secret) < MinSecretLength {
 		return nil, fmt.Errorf("the worker secret must be at least %d characters", MinSecretLength)

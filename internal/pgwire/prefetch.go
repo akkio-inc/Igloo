@@ -169,6 +169,9 @@ func prefetchScans(scans []distributed.Scan) []prefetch.Scan {
 		for i, id := range sc.FieldIDs {
 			ps.FieldIDs[i] = int32(id)
 		}
+		for _, id := range sc.Filters {
+			ps.Filters = append(ps.Filters, int32(id))
+		}
 		for i, f := range sc.Files {
 			ps.Files[i] = prefetch.File{Path: f.Path, Size: f.Size}
 		}

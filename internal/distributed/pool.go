@@ -2,6 +2,7 @@ package distributed
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -25,6 +26,23 @@ type Compute interface {
 	Scale(ctx context.Context, n int) error
 }
 
+// Shrinker is a Compute that can stop some of the workers while the
+// others run (see pool.shrink).
+type Shrinker interface {
+	// Shrink stops retired, workers that take no more tasks, of running,
+	// as many as answered, and reports whether it did. It may stop none, as
+	// when the workers changed meanwhile, more being started for another
+	// coordinator.
+	Shrink(ctx context.Context, retired []RetiredWorker, running int) (bool, error)
+}
+
+// RetiredWorker is a worker retired to be stopped: its address, its ID
+// (its host name, a Kubernetes pod's name) and its cloud instance, where
+// it says.
+type RetiredWorker struct {
+	Addr, ID, Instance string
+}
+
 // PoolOptions say where workers are and how to start them.
 type PoolOptions struct {
 	// Addresses are the workers' host:port. A host may resolve to several
@@ -42,6 +60,10 @@ type PoolOptions struct {
 	IdleAuto  bool
 	// StartTimeout bounds how long a statement waits for workers to start.
 	StartTimeout time.Duration
+	// Warm is how many workers past those busy stay up while some are, when
+	// Compute can stop workers alone (Shrinker); below zero, none are
+	// stopped but all together.
+	Warm int
 }
 
 // pool tracks the workers.
@@ -70,6 +92,11 @@ type pool struct {
 	// memory is the smallest memory limit workers reported at the last
 	// check any answered, kept while none run.
 	memory int64
+	// retired are the workers this pool retired, by address, and when (see
+	// shrink); erased, if set, is the latest deletion of erasure requests
+	// the coordinator knows of.
+	retired map[string]time.Time
+	erased  func() int64
 }
 
 // worker is a worker that answered the last check.
@@ -157,13 +184,13 @@ func (p *pool) ready(ctx context.Context) []*worker {
 	return p.usable(p.refresh(ctx))
 }
 
-// usable leaves out workers that failed recently.
+// usable leaves out workers that failed recently, and those retired.
 func (p *pool) usable(ws []*worker) []*worker {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	var out []*worker
 	for _, w := range ws {
-		if until, ok := p.down[w.addr]; ok && time.Now().Before(until) {
+		if until, ok := p.down[w.addr]; ok && time.Now().Before(until) || w.status.Retiring {
 			continue
 		}
 		out = append(out, w)
@@ -311,6 +338,13 @@ func (p *pool) purge(ctx context.Context, addr string, through int64) (workerSta
 // canStart reports whether workers can be started on demand.
 func (p *pool) canStart() bool { return p.opts.Compute != nil && p.opts.MaxWorkers > 0 }
 
+// stopsAlone reports whether idle workers stop alone while others work
+// (see shrink): Compute can stop them so, and IGLOO_WORKER_WARM is not off.
+func (p *pool) stopsAlone() bool {
+	_, ok := p.opts.Compute.(Shrinker)
+	return ok && p.opts.Warm >= 0
+}
+
 // startEstimate is how long starting workers is expected to take.
 func (p *pool) startEstimate() time.Duration {
 	p.mu.Lock()
@@ -323,6 +357,11 @@ func (p *pool) startEstimate() time.Duration {
 // and then for at most StartTimeout.
 func (p *pool) ensure(ctx context.Context, want int, wait bool) ([]*worker, error) {
 	ws := p.ready(ctx)
+	if len(ws) < want && p.unretire(ctx, want-len(ws)) > 0 {
+		// Retired workers not stopped yet serve again, sooner than new ones
+		// start.
+		ws = p.usable(p.refresh(ctx))
+	}
 	if len(ws) >= want || !p.canStart() {
 		return ws, nil
 	}
@@ -425,7 +464,10 @@ func (p *pool) run(ctx context.Context) {
 			return
 		case <-tick.C:
 		}
-		p.stopIdle(ctx, p.refresh(ctx))
+		ws := p.refresh(ctx)
+		if !p.stopIdle(ctx, ws) {
+			p.shrink(ctx, ws)
+		}
 	}
 }
 
@@ -457,9 +499,9 @@ func (p *pool) idleAfter() time.Duration {
 // to be used, though none may answer yet: counting from its last task
 // alone, a coordinator that had run none, or none for IdleAfter, stopped
 // the workers it had started for a statement while they booted.
-func (p *pool) stopIdle(ctx context.Context, ws []*worker) {
+func (p *pool) stopIdle(ctx context.Context, ws []*worker) (stopped bool) {
 	if !p.canStart() {
-		return
+		return false
 	}
 	after := p.idleAfter()
 	p.mu.Lock()
@@ -471,24 +513,177 @@ func (p *pool) stopIdle(ctx context.Context, ws []*worker) {
 	scaled := p.scaled
 	p.mu.Unlock()
 	if !idle {
-		return
+		return false
 	}
 	busy := slices.ContainsFunc(ws, func(w *worker) bool {
 		return w.status.Running > 0 || time.Duration(w.status.IdleSeconds*float64(time.Second)) < after
 	})
 	if busy || (len(ws) == 0 && scaled == 0) {
-		return
+		return false
 	}
 	err := p.opts.Compute.Scale(ctx, 0)
 	p.metrics.compute("stop", err)
 	if err != nil {
 		p.log.Warn("could not stop idle workers", "err", err)
-		return
+		return false
 	}
 	p.log.Info("stopped idle workers", "idle", after)
 	p.mu.Lock()
-	p.scaled, p.workers, p.refreshed = 0, nil, time.Time{}
+	p.scaled, p.workers, p.refreshed, p.retired = 0, nil, time.Time{}, nil
 	p.mu.Unlock()
+	return true
+}
+
+// retireSettle is how long a worker retired is left before Compute stops
+// it: long enough for Kubernetes to find it not ready (its readiness probe
+// fails three times 2 s apart), so that scaling the Deployment down
+// removes it and no other.
+var retireSettle = 15 * time.Second
+
+// retireGiveUp is how long a worker retired that Compute has not stopped,
+// as while the workers kept changing, is left before it takes tasks again.
+var retireGiveUp = 3 * time.Minute
+
+// shrink stops workers alone while others work, keeping those busy (a task
+// running, or one within idleAfter) and Warm more: of the workers ws that
+// answered, it retires the idle ones past those, which then take no more
+// tasks and are not ready, and once they have been retired retireSettle,
+// has Compute stop them (Shrinker). Kubernetes, scaling the Deployment
+// down from as many pods as answered, removes the pods that are not ready
+// first; EC2 stops their instances. It retires only a worker whose read
+// cache goes with it, or that was purged of what erasure requests deleted
+// as far as the coordinator knows: one whose cache outlives it and that
+// has not purged blocks requests until it comes back, which it would not
+// for a while (see package erasure). Every worker says how long it has been
+// idle, for any coordinator, so a worker another coordinator uses is busy.
+func (p *pool) shrink(ctx context.Context, ws []*worker) {
+	shrinker, ok := p.opts.Compute.(Shrinker)
+	if !ok || p.opts.Warm < 0 || len(ws) == 0 {
+		return
+	}
+	after := p.idleAfter()
+	now := time.Now()
+	var erased int64
+	if p.erased != nil {
+		erased = p.erased()
+	}
+	p.mu.Lock()
+	if p.retired == nil {
+		p.retired = map[string]time.Time{}
+	}
+	var settled []RetiredWorker
+	var idle []*worker
+	var stale []string
+	busy := 0
+	for _, w := range ws {
+		st := w.status
+		switch at, mine := p.retired[w.addr]; {
+		case st.Retiring && mine && now.Sub(at) >= retireGiveUp:
+			stale = append(stale, w.addr)
+		case st.Retiring && mine && now.Sub(at) >= retireSettle:
+			settled = append(settled, RetiredWorker{Addr: w.addr, ID: st.ID, Instance: st.Instance})
+		case st.Retiring:
+		case st.Running > 0 || time.Duration(st.IdleSeconds*float64(time.Second)) < after:
+			busy++
+		case st.Cache != "" && (!strings.Contains(st.Cache, "/kept/") || st.Erased >= erased):
+			idle = append(idle, w)
+		default:
+			// A cache that outlives it, not purged: kept up, as if busy.
+			busy++
+		}
+	}
+	p.mu.Unlock()
+	for _, addr := range stale {
+		if _, err := p.retire(ctx, addr, false); err == nil {
+			p.log.Info("took back a retired worker that was not stopped", "worker", addr)
+			p.mu.Lock()
+			delete(p.retired, addr)
+			p.mu.Unlock()
+		}
+	}
+	if busy == 0 {
+		// All idle: stopIdle stops them together, once this coordinator
+		// has not used them for idleAfter either.
+		return
+	}
+	if len(settled) > 0 {
+		switch stopped, err := shrinker.Shrink(ctx, settled, len(ws)); {
+		case err != nil:
+			p.log.Warn("could not stop idle workers", "workers", len(settled), "err", err)
+			p.metrics.compute("stop", err)
+		case stopped:
+			p.log.Info("stopped idle workers while others work", "workers", len(settled), "running", len(ws))
+			p.metrics.compute("stop", nil)
+			p.mu.Lock()
+			for _, r := range settled {
+				delete(p.retired, r.Addr)
+			}
+			p.mu.Unlock()
+		}
+	}
+	// The warm ones are the least idle; the others retire.
+	slices.SortFunc(idle, func(a, b *worker) int { return cmp.Compare(a.status.IdleSeconds, b.status.IdleSeconds) })
+	for _, w := range idle[min(p.opts.Warm, len(idle)):] {
+		if _, err := p.retire(ctx, w.addr, true); err != nil {
+			p.log.Warn("could not retire an idle worker", "worker", w.addr, "err", err)
+			continue
+		}
+		p.mu.Lock()
+		p.retired[w.addr] = now
+		p.mu.Unlock()
+	}
+}
+
+// unretire takes back up to n workers this pool retired that still answer,
+// and returns how many it took back.
+func (p *pool) unretire(ctx context.Context, n int) int {
+	p.mu.Lock()
+	var addrs []string
+	for addr := range p.retired {
+		addrs = append(addrs, addr)
+	}
+	p.mu.Unlock()
+	slices.Sort(addrs)
+	back := 0
+	for _, addr := range addrs {
+		if back == n {
+			break
+		}
+		if st, err := p.retire(ctx, addr, false); err == nil && !st.Retiring {
+			back++
+			p.mu.Lock()
+			delete(p.retired, addr)
+			p.mu.Unlock()
+		}
+	}
+	return back
+}
+
+// retire retires the worker at addr, or takes it back, and returns its
+// status after.
+func (p *pool) retire(ctx context.Context, addr string, retire bool) (workerStatus, error) {
+	ctx, cancel := context.WithTimeout(ctx, statusTimeout)
+	defer cancel()
+	var st workerStatus
+	body, err := json.Marshal(retireRequest{Retire: retire})
+	if err != nil {
+		return st, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://"+addr+retirePath, bytes.NewReader(body))
+	if err != nil {
+		return st, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := p.client.Do(req)
+	if err != nil {
+		return st, err
+	}
+	defer resp.Body.Close() //nolint:errcheck
+	if resp.StatusCode != http.StatusOK {
+		return st, fmt.Errorf("worker answered %s", resp.Status)
+	}
+	err = json.NewDecoder(resp.Body).Decode(&st)
+	return st, err
 }
 
 // ParseAddresses splits a comma-separated list of worker addresses,

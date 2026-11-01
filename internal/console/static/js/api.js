@@ -120,9 +120,11 @@ export function objects(result) {
 }
 
 // download runs a query again and saves its whole result as CSV, streaming
-// it to a file where the browser can, or else collecting it first.
-// onProgress receives the bytes received so far.
-export async function download(sql, { signal, onProgress = () => {} } = {}) {
+// it to a file where the browser can, or else collecting it first. before
+// are the statements that ran before it in its run, whose settings the
+// server makes again first (see internal/console/query.go). onProgress
+// receives the bytes received so far.
+export async function download(sql, { before = [], signal, onProgress = () => {} } = {}) {
   const name = `igloo-${new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)}.csv`;
   let file = null;
   if (window.showSaveFilePicker) {
@@ -137,7 +139,7 @@ export async function download(sql, { signal, onProgress = () => {} } = {}) {
       file = null;
     }
   }
-  const res = await post('/api/download', { sql }, { signal, raw: true });
+  const res = await post('/api/download', before.length ? { sql, before } : { sql }, { signal, raw: true });
   const reader = res.body.getReader();
   const chunks = [];
   let bytes = 0;

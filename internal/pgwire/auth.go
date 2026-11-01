@@ -186,6 +186,11 @@ func (s *Server) loginAccepted(ctx context.Context, writer *buffer.Writer, user 
 		}
 		return ctx, err
 	}
+	// Holding a session, the connection is no longer signing in (see
+	// startup.go).
+	if c, ok := wire.AcceptedConn(ctx).(*startupConn); ok {
+		c.signedIn()
+	}
 
 	addr := wire.RemoteAddress(ctx)
 	sess := &session{
@@ -193,6 +198,7 @@ func (s *Server) loginAccepted(ctx context.Context, writer *buffer.Writer, user 
 		checked:  time.Now(),
 		timeout:  s.timeout,
 		activity: s.activity,
+		stuck:    s.stuck,
 		open:     make(map[*wire.PreparedStatement]*statement),
 		appName:  wire.ClientParameters(ctx)[wire.ParamApplicationName],
 

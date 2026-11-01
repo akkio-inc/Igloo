@@ -61,9 +61,15 @@ func TestGroupFunctions(t *testing.T) {
 	}
 	// A group function the coordinator's HAVING reads too: the lists cross.
 	h.check(`SELECT l_returnflag, list_sort(list(l_linenumber))[1] AS first FROM lineitem GROUP BY 1 HAVING len(list(l_linenumber)) > 10 ORDER BY 1`)
-	// Without one, the coordinator completes few groups.
+	// Without one, the coordinator completes few groups: those of a table
+	// every worker reads in full. A column of the divided table may have
+	// many values, whose groups workers complete all the same.
 	h.groupFunctions = nil
-	if n := h.exchanged(q, "aggregate"); n != 0 {
+	few := `SELECT n_name, count(*) AS n FROM lineitem JOIN supplier ON l_suppkey = s_suppkey JOIN nation ON s_nationkey = n_nationkey GROUP BY 1 ORDER BY 1`
+	if n := h.exchanged(few, "aggregate"); n != 0 {
 		t.Errorf("without group functions, %d stages wrote partial results to an exchange", n)
+	}
+	if n := h.exchanged(q, "aggregate"); n != 1 {
+		t.Errorf("groups of the divided table: %d stages wrote partial results to an exchange", n)
 	}
 }

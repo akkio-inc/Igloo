@@ -274,8 +274,9 @@ def rerun_check(shape, attempt: Attempt, rerun, uses_by_key: dict) -> dict:
         out["verdict"] = "not compared"
         out["notes"].append(rerun.skipped or f"the source failed: {sqltext.redact_message(rerun.error)}")
         return out
-    digest = compare.Digest(attempt.rows, attempt.checksum, attempt.columns or []) if attempt.checksum else None
-    out["verdict"] = compare.verdict(digest, rerun.rows, rerun.checksum) if digest else (
+    digest = compare.Digest(attempt.rows, attempt.checksum, attempt.columns or [],
+                            loose=attempt.loose) if attempt.checksum else None
+    out["verdict"] = compare.verdict(digest, rerun.rows, rerun.checksum, rerun.loose) if digest else (
         "rows match" if attempt.rows == rerun.rows else "rows differ")
     if out["verdict"] == "values differ" and attempt.values is not None and rerun.values is not None:
         t = compare.tolerant(rerun.values, attempt.values)

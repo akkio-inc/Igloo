@@ -522,6 +522,196 @@ func TestSkippedRuns(t *testing.T) {
 	}
 }
 
+// TestRunStopsWhenItsLockIsLost checks a run whose connection holding the
+// job's lock drops, as when the metadata database fails over or ends an
+// idle session: Postgres releases the lock, so another replica could start
+// the job. The run went on, and two ran at once; now it is canceled, and
+// recorded as failed with why.
+func TestRunStopsWhenItsLockIsLost(t *testing.T) {
+	url := testdb.URL()
+	if url == "" {
+		t.Skip("IGLOO_TEST_DATABASE_URL not set")
+	}
+	ctx := context.Background()
+	store, err := OpenPostgres(ctx, url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if _, err := store.pool.Exec(ctx, "TRUNCATE igloo_tasks.jobs, igloo_tasks.runs, igloo_tasks.loads"); err != nil {
+		t.Fatal(err)
+	}
+	s := NewScheduler(store, Options{})
+	s.heldEvery = 50 * time.Millisecond
+	j := Job{Kind: KindTask, Name: "long", Owner: "ana", Statement: "SELECT 1", State: StateSuspended}
+	if err := store.CreateJob(ctx, j, false); err != nil {
+		t.Fatal(err)
+	}
+	started, stopped := make(chan struct{}), make(chan error, 1)
+	r := runnerFunc(func(ctx context.Context, _ Job) (int64, error) {
+		close(started)
+		select {
+		case <-ctx.Done():
+			stopped <- ctx.Err()
+			return -1, ctx.Err()
+		case <-time.After(10 * time.Second):
+			stopped <- nil
+			return 1, nil
+		}
+	})
+	done := make(chan error, 1)
+	go func() {
+		_, err := s.RunNow(ctx, r, j)
+		done <- err
+	}()
+	<-started
+	if _, err := store.pool.Exec(ctx, `SELECT pg_terminate_backend(pid) FROM pg_locks
+		WHERE locktype = 'advisory' AND objid::bigint = $1::bigint & 4294967295`, lockID(JobKey(KindTask, "long"))); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-stopped:
+		if err == nil {
+			t.Fatal("the run was not canceled")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the run went on after its lock was lost")
+	}
+	if err := <-done; err == nil || !strings.Contains(err.Error(), "lost its lock") {
+		t.Errorf("run: %v", err)
+	}
+	runs, _ := store.Runs(ctx, audit.Viewer{All: true}, audit.Page{})
+	if len(runs) != 1 || runs[0].Outcome != OutcomeFailed || !strings.Contains(runs[0].Error, "lost its lock") {
+		t.Errorf("recorded: %+v", runs)
+	}
+}
+
+// replicas opens two stores on the test database, as two replicas do,
+// with its tables empty.
+func replicas(t *testing.T) (a, b *PostgresStore) {
+	t.Helper()
+	url := testdb.URL()
+	if url == "" {
+		t.Skip("IGLOO_TEST_DATABASE_URL not set")
+	}
+	open := func() *PostgresStore {
+		s, err := OpenPostgres(context.Background(), url)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(s.Close)
+		return s
+	}
+	a, b = open(), open()
+	if _, err := a.pool.Exec(context.Background(), "TRUNCATE igloo_tasks.jobs, igloo_tasks.runs, igloo_tasks.loads, igloo_tasks.leases"); err != nil {
+		t.Fatal(err)
+	}
+	return a, b
+}
+
+// slowToStop runs a job until it is canceled, and then takes stop to
+// stop, as a statement can.
+type slowToStop struct {
+	stop    time.Duration
+	started chan struct{}
+	running atomic.Bool
+}
+
+func (r *slowToStop) RunJob(ctx context.Context, _ Job) (int64, error) {
+	r.running.Store(true)
+	defer r.running.Store(false)
+	close(r.started)
+	select {
+	case <-ctx.Done():
+		time.Sleep(r.stop)
+		return -1, ctx.Err()
+	case <-time.After(20 * time.Second):
+		return 1, nil
+	}
+}
+
+// secondRun runs j with s until a run of it starts, and fails t if one
+// starts while first is still running.
+func secondRun(t *testing.T, s *Scheduler, j Job, first *slowToStop) {
+	t.Helper()
+	ran := false
+	r := runnerFunc(func(context.Context, Job) (int64, error) {
+		if first.running.Load() {
+			t.Error("a second run started while the first was still running")
+		}
+		ran = true
+		return 1, nil
+	})
+	for deadline := time.Now().Add(15 * time.Second); !ran; time.Sleep(50 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatal("no second run started")
+		}
+		if _, err := s.RunNow(context.Background(), r, j); err != nil && !errors.Is(err, ErrRunning) {
+			t.Fatal(err)
+		}
+	}
+}
+
+// TestNoSecondRunWhileTheFirstStops ends the session that holds a job's
+// lock while a run of the job is under way, as a failover does. Postgres
+// releases the lock at once, while the run goes on until it notices, and
+// takes a while to stop then: another replica started the job as soon as
+// the lock was free, and two runs overlapped. Now the run's lease keeps
+// the job from starting again until the run has stopped.
+func TestNoSecondRunWhileTheFirstStops(t *testing.T) {
+	a, b := replicas(t)
+	ctx := context.Background()
+	j := Job{Kind: KindTask, Name: "long", Owner: "ana", Statement: "SELECT 1", State: StateSuspended}
+	if err := a.CreateJob(ctx, j, false); err != nil {
+		t.Fatal(err)
+	}
+	s := NewScheduler(a, Options{})
+	s.heldEvery = 50 * time.Millisecond
+	first := &slowToStop{stop: time.Second, started: make(chan struct{})}
+	done := make(chan error, 1)
+	go func() {
+		_, err := s.RunNow(ctx, first, j)
+		done <- err
+	}()
+	<-first.started
+	if _, err := a.pool.Exec(ctx, `SELECT pg_terminate_backend(pid) FROM pg_locks
+		WHERE locktype = 'advisory' AND objid::bigint = $1::bigint & 4294967295`, lockID(JobKey(KindTask, "long"))); err != nil {
+		t.Fatal(err)
+	}
+	secondRun(t, NewScheduler(b, Options{}), j, first)
+	if err := <-done; err == nil || !strings.Contains(err.Error(), "lost its lock") {
+		t.Errorf("the first run: %v", err)
+	}
+}
+
+// TestRunStopsBeforeItsLeaseExpires cuts a replica running a job off from
+// the metadata database but for its lock's connection: it cannot renew the
+// job's lease, which another replica may take once it expires. The run is
+// canceled before then, and has stopped by the time another starts.
+func TestRunStopsBeforeItsLeaseExpires(t *testing.T) {
+	a, b := replicas(t)
+	a.leaseTTL, a.renewEvery, a.leaseMargin = 2*time.Second, 100*time.Millisecond, time.Second
+	ctx := context.Background()
+	j := Job{Kind: KindTask, Name: "cut-off", Owner: "ana", Statement: "SELECT 1", State: StateSuspended}
+	if err := a.CreateJob(ctx, j, false); err != nil {
+		t.Fatal(err)
+	}
+	s := NewScheduler(a, Options{})
+	s.heldEvery = 50 * time.Millisecond
+	first := &slowToStop{stop: 200 * time.Millisecond, started: make(chan struct{})}
+	done := make(chan error, 1)
+	go func() {
+		_, err := s.RunNow(ctx, first, j)
+		done <- err
+	}()
+	<-first.started
+	a.pool.Close()
+	secondRun(t, NewScheduler(b, Options{}), j, first)
+	if err := <-done; err == nil || !strings.Contains(err.Error(), "renewed in time") {
+		t.Errorf("the first run: %v", err)
+	}
+}
+
 func TestNextDue(t *testing.T) {
 	store := NewMemoryStore()
 	ctx := context.Background()

@@ -658,8 +658,17 @@ func (t *translator) alterTable(nodes []*node, idx []int) ([]*node, string, erro
 			// The clustering key is the table's sort order, which table
 			// maintenance clusters its files by.
 			if k+2 < len(words) && words[k+1] == "BY" {
-				if cols, ok := clusterColumns(nodes[idx[k+2]]); ok && k+3 == len(words) {
-					return []*node{raw(strings.TrimRight(render(nodes[:idx[k]]), " \t\r\n") + " SET SORTED BY (" + cols + ")")}, "", nil
+				if cols, buckets, ok := clusterItems(nodes[idx[k+2]]); ok && k+3 == len(words) {
+					prefix := strings.TrimRight(render(nodes[:idx[k]]), " \t\r\n")
+					if buckets == "" {
+						return []*node{raw(prefix + " SET SORTED BY (" + cols + ")")}, "", nil
+					}
+					// BUCKET(n, column) items are the table's partition spec,
+					// which its files are written by from then on.
+					if cols != "" {
+						t.after = append(t.after, prefix+" SET SORTED BY ("+cols+")")
+					}
+					return []*node{raw(prefix + " SET PARTITIONED BY (" + buckets + ")")}, "", nil
 				}
 			}
 			t.notice("ALTER TABLE ... CLUSTER BY is ignored: Igloo clusters tables by columns, not expressions")
@@ -719,18 +728,41 @@ func (t *translator) alterTable(nodes []*node, idx []int) ([]*node, string, erro
 // clusterColumns returns the columns of a CLUSTER BY list, g, as DuckDB
 // writes them, or false when an item is an expression rather than a column.
 func clusterColumns(g *node) (string, bool) {
+	cols, buckets, ok := clusterItems(g)
+	return cols, ok && buckets == "" && cols != ""
+}
+
+// clusterItems returns the items of a CLUSTER BY list, g, as DuckDB writes
+// them: its columns, the table's clustering key, and its BUCKET(n, column)
+// items, Igloo's, the bucket transforms of the table's Iceberg partition
+// spec (bucket(n, column)), by which distributed execution reads joins and
+// groups on the column bucket by bucket; false when an item is another
+// expression.
+func clusterItems(g *node) (cols, buckets string, ok bool) {
 	if !g.isGroup('(') {
-		return "", false
+		return "", "", false
 	}
-	var cols []string
+	var cs, bs []string
 	for _, item := range splitArgs(g.kids) {
 		ii := sig(item)
-		if len(ii) != 1 || item[ii[0]].kind != kWord && item[ii[0]].kind != kQuoted {
-			return "", false
+		switch {
+		case len(ii) == 1 && (item[ii[0]].kind == kWord || item[ii[0]].kind == kQuoted):
+			cs = append(cs, item[ii[0]].String())
+		case len(ii) == 2 && item[ii[0]].word() == "BUCKET" && item[ii[1]].isGroup('('):
+			args := splitArgs(item[ii[1]].kids)
+			if len(args) != 2 {
+				return "", "", false
+			}
+			n, col := sig(args[0]), sig(args[1])
+			if len(n) != 1 || args[0][n[0]].kind != kNumber || len(col) != 1 || args[1][col[0]].kind != kWord && args[1][col[0]].kind != kQuoted {
+				return "", "", false
+			}
+			bs = append(bs, "bucket("+args[0][n[0]].String()+", "+args[1][col[0]].String()+")")
+		default:
+			return "", "", false
 		}
-		cols = append(cols, item[ii[0]].String())
 	}
-	return strings.Join(cols, ", "), len(cols) > 0
+	return strings.Join(cs, ", "), strings.Join(bs, ", "), len(cs)+len(bs) > 0
 }
 
 // qualifiedName renders the name that starts at nodes[idx[j]], parts and
@@ -819,8 +851,22 @@ func (t *translator) createStatement(nodes []*node, idx []int) ([]*node, string,
 		return t.createTable(nodes, idx, k, drop)
 	case "VIEW":
 		return t.createView(nodes, idx, k, drop)
+	case "DYNAMIC":
+		if word(k+1) == "TABLE" {
+			// Igloo's own statement (see package pgwire's jobs.go): its
+			// options as written, its query translated.
+			j := k + 2
+			if word(j) == "IF" {
+				j += 3
+			}
+			if _, next := qualifiedName(nodes, idx, j); next < len(idx) && nodes[idx[next]].isGroup('(') {
+				return nil, "", unsupported("CREATE DYNAMIC TABLE with a column list", "name the columns in its query")
+			}
+			return t.expressions(dropNodes(nodes, drop))
+		}
+		return nil, "", unsupported("CREATE DYNAMIC", createHints["DYNAMIC"])
 	case "DATABASE", "WAREHOUSE", "STAGE", "FILE", "STREAM", "PROCEDURE", "PIPE_", "EXTERNAL_FUNCTION",
-		"SEQUENCE", "DYNAMIC", "EVENT", "NETWORK", "STORAGE", "API", "SECURITY", "ICEBERG", "HYBRID":
+		"SEQUENCE", "EVENT", "NETWORK", "STORAGE", "API", "SECURITY", "ICEBERG", "HYBRID":
 		if kind == "FILE" {
 			kind = "FILE FORMAT"
 		}
@@ -837,7 +883,7 @@ var createHints = map[string]string{
 	"STAGE":     "load files with COPY INTO from a location in IGLOO_ALLOWED_LOCATIONS",
 	"SEQUENCE":  "Iceberg tables have no sequences; generate keys with uuid() or row_number()",
 	"STREAM":    "query a table's changes with time travel (AT (TIMESTAMP => ...))",
-	"DYNAMIC":   "use CREATE MATERIALIZED VIEW, refreshed on a schedule by a task",
+	"DYNAMIC":   "Igloo has dynamic tables: CREATE DYNAMIC TABLE name TARGET_LAG = ... AS query",
 }
 
 // dropNodes returns nodes without those at the indexes in drop, and the
@@ -986,21 +1032,31 @@ func (t *translator) tableClauses(nodes []*node, idx []int, j int, drop map[int]
 			return nil
 		case w == "CLUSTER" && j+2 < len(idx) && nodes[idx[j+1]].word() == "BY":
 			// The clustering key is the table's sort order, set once it is
-			// created (see Result.After).
-			cols, ok := clusterColumns(nodes[idx[j+2]])
+			// created (see Result.After); its BUCKET(n, column) items are
+			// the table's partition spec, which it is created with.
+			cols, buckets, ok := clusterItems(nodes[idx[j+2]])
+			drop[idx[j]], drop[idx[j+1]], drop[idx[j+2]] = true, true, true
 			switch {
 			case !ok:
 				t.notice("CLUSTER BY is ignored: Igloo clusters tables by columns, not expressions")
 			case t.temporary:
 				t.notice("CLUSTER BY is ignored for a temporary table")
-			case t.tableIfNotExists:
-				t.notice("CLUSTER BY is ignored with IF NOT EXISTS; set it with ALTER TABLE ... CLUSTER BY")
 			case t.table == "":
 				t.notice("CLUSTER BY is ignored")
 			default:
-				t.after = append(t.after, "ALTER TABLE "+t.table+" SET SORTED BY ("+cols+")")
+				if buckets != "" {
+					nodes[idx[j]], drop[idx[j]] = raw("PARTITIONED BY ("+buckets+")"), false
+				}
+				switch {
+				case cols == "":
+				case t.tableIfNotExists && buckets == "":
+					t.notice("CLUSTER BY is ignored with IF NOT EXISTS; set it with ALTER TABLE ... CLUSTER BY")
+				case t.tableIfNotExists:
+					t.notice("CLUSTER BY's columns are ignored with IF NOT EXISTS; set them with ALTER TABLE ... CLUSTER BY")
+				default:
+					t.after = append(t.after, "ALTER TABLE "+t.table+" SET SORTED BY ("+cols+")")
+				}
 			}
-			drop[idx[j]], drop[idx[j+1]], drop[idx[j+2]] = true, true, true
 			j += 3
 		case w == "COPY" && j+1 < len(idx) && nodes[idx[j+1]].word() == "GRANTS":
 			// Igloo's grants follow a table's name, so a replaced table

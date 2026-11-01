@@ -41,6 +41,24 @@ were removed; the code is otherwise unchanged except for these patches:
   `createScalarFunc` with the connection's context store passed in rather
   than taken from a `*sql.Conn`.
 
+- `igloo_stream.go` (new) and `mapping/igloo_stream.go` (new):
+  `Stmt.QueryStreamContext`, a query whose result DuckDB streams, computing
+  rows as `Next` reads them (`duckdb_pending_prepared_streaming`), with
+  interrupts on the context's cancellation until the rows close and
+  DuckDB's error at their end. Upstream materializes every result before it
+  returns the first row, as Igloo's clients' results were: a sort of
+  hundreds of millions of rows without `LIMIT` held every row in memory,
+  past the server's, before the client saw one.
+- `igloo_chunk.go` (new): `DataChunk.ChunkColumn`, for a table function's
+  `FillChunk` to write a column at a time: the vector's memory, for values
+  of a fixed size copied in bulk, NULLs set in the validity mask, strings of
+  up to twelve bytes written into the vector, and longer ones gathered and
+  assigned in one cgo call per chunk (`Strings`), through a C loop over
+  `duckdb_vector_assign_string_element_len`, declared there with its
+  vector as an opaque pointer. `SetChunkValue` checks the column and
+  converts each value; Igloo's table function of a merge of sorted rows
+  spent most of its time there.
+
 Drop this copy and the `replace` directive once a duckdb-go release can
 describe and run a prepared statement as Arrow and DuckDB-Iceberg's set of
 tables is safe to bind against, list and change at once.

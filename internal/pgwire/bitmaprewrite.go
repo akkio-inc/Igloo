@@ -50,8 +50,11 @@ import (
 // reference to those tables reads the same snapshot (AT (VERSION => ...)),
 // and before each run Igloo checks that the tables are still at them,
 // writing the statement again, or back, if not (refreshIndexes). No user's
-// statement may name igloo_bitmaps (indexReferences), so references to it
-// are Igloo's own, which the policy rewrite leaves to it.
+// statement may name igloo_bitmaps (indexReferences), nor put it on the
+// search path (iglooOnPath), so the references to the indexes' tables
+// that the statement's pins name, in full, are Igloo's own, which the
+// policy rewrite leaves to it (ownIndexRead); any other reference that
+// resolves to one gets the index's policy, which denies every row.
 
 // indexPin is a table a statement reads as of a snapshot, through index
 // x's bitmaps.
@@ -88,6 +91,31 @@ func indexReferences(text string) error {
 		}
 	}
 	return nil
+}
+
+// ownIndexRead says whether ref, which resolves to o, reads a bitmap
+// index's table as Igloo writes such a read (see indexTable): named in
+// full, catalog, igloo_bitmaps and index, of an index the statement was
+// written to read (rw.indexTables).
+func (rw *rewriter) ownIndexRead(ref *refNode, o object) bool {
+	return strings.EqualFold(o.db, rw.r.catalog) && strings.EqualFold(o.schema, iddomain.IndexSchema) &&
+		indexReference(ref.parts, rw.r.catalog, rw.indexTables)
+}
+
+// indexReference says whether parts name in full, in catalog, the table of
+// one of indexes, by lower-case name.
+func indexReference(parts []string, catalog string, indexes map[string]bool) bool {
+	return len(parts) == 3 && strings.EqualFold(parts[0], catalog) && strings.EqualFold(parts[1], iddomain.IndexSchema) &&
+		indexes[strings.ToLower(parts[2])]
+}
+
+// indexNames are the lower-case names of the indexes of pins.
+func indexNames(pins []indexPin) map[string]bool {
+	out := map[string]bool{}
+	for _, p := range pins {
+		out[strings.ToLower(p.index)] = true
+	}
+	return out
 }
 
 // namesIn returns the names in SQL text: its code's words and its quoted

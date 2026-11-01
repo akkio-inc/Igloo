@@ -57,6 +57,10 @@ type Config struct {
 	// MetadataDatabaseURL is the Postgres database that stores users. Empty
 	// means the administrator is the only account.
 	MetadataDatabaseURL string
+	// AccessMaxStaleness is how long a replica that cannot read the
+	// metadata database keeps checking statements against the users,
+	// grants and policies it read last, before it refuses them.
+	AccessMaxStaleness time.Duration
 	// IDDomains turns on ID domains' work (IGLOO_ID_DOMAINS, off by
 	// default): columns joining domains, filling the columns that hold
 	// their ids, and statements counting through them.
@@ -115,6 +119,9 @@ type Config struct {
 	// MaxConnections caps concurrent client sessions; each holds DuckDB
 	// resources.
 	MaxConnections int
+	// LoginTimeout is how long a SQL client may take to sign in, from
+	// connecting, before Igloo closes its connection.
+	LoginTimeout time.Duration
 	// ShutdownDelay is how long Igloo keeps accepting connections, while
 	// reporting not ready, after it is asked to stop. It gives load
 	// balancers time to stop sending new connections.
@@ -180,11 +187,19 @@ type Cache struct {
 	// MaxSize caps the cache in bytes. Zero sizes it from the free space on
 	// Dir's disk.
 	MaxSize int64
+	// Ephemeral is IGLOO_CACHE_EPHEMERAL: Dir's volume goes with the pod
+	// or machine, as a Kubernetes emptyDir or ephemeral volume does, so
+	// erasure requests do not count a replica that is gone as keeping it.
+	Ephemeral bool
+	// Dedicated is IGLOO_CACHE_DEDICATED: Dir's volume holds the cache
+	// alone, so it may fill to MaxSize rather than half the free space
+	// other files leave.
+	Dedicated bool
 }
 
 // Prefetch configures reading ahead into the read cache.
 type Prefetch struct {
-	// Enabled is IGLOO_PREFETCH, off by default.
+	// Enabled is IGLOO_PREFETCH, on by default.
 	Enabled bool
 	// Concurrency is IGLOO_PREFETCH_CONCURRENCY: requests in flight for the
 	// whole process; zero means the prefetcher's default.
@@ -477,6 +492,22 @@ func Load(lookup func(string) (string, bool)) (Config, error) {
 		}
 		cfg.MaxConnections = n
 	}
+	cfg.LoginTimeout = 30 * time.Second
+	cfg.AccessMaxStaleness = 2 * time.Minute
+	if v := get("IGLOO_ACCESS_MAX_STALENESS", ""); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil || d <= 0 {
+			addErr("IGLOO_ACCESS_MAX_STALENESS must be a duration such as 2m or 10m, got %q", v)
+		}
+		cfg.AccessMaxStaleness = d
+	}
+	if v := get("IGLOO_LOGIN_TIMEOUT", ""); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil || d <= 0 {
+			addErr("IGLOO_LOGIN_TIMEOUT must be a duration such as 30s or 1m, got %q", v)
+		}
+		cfg.LoginTimeout = d
+	}
 
 	if v := get("IGLOO_DUCKDB_THREADS", ""); v != "" {
 		n, err := strconv.Atoi(v)
@@ -511,6 +542,12 @@ func Load(lookup func(string) (string, bool)) (Config, error) {
 	}
 	if d := cfg.Cache.Dir; d != "" && !strings.HasPrefix(d, "/") {
 		addErr("IGLOO_CACHE_DIR must be an absolute path, got %q", d)
+	}
+	if cfg.Cache.Ephemeral, err = strconv.ParseBool(get("IGLOO_CACHE_EPHEMERAL", "false")); err != nil {
+		addErr("IGLOO_CACHE_EPHEMERAL must be true or false: %w", err)
+	}
+	if cfg.Cache.Dedicated, err = strconv.ParseBool(get("IGLOO_CACHE_DEDICATED", "false")); err != nil {
+		addErr("IGLOO_CACHE_DEDICATED must be true or false: %w", err)
 	}
 
 	enabled, err := strconv.ParseBool(get("IGLOO_MAINTENANCE", "true"))
@@ -561,7 +598,7 @@ func Load(lookup func(string) (string, bool)) (Config, error) {
 		*dst = v
 	}
 
-	prefetch, err := strconv.ParseBool(get("IGLOO_PREFETCH", "false"))
+	prefetch, err := strconv.ParseBool(get("IGLOO_PREFETCH", "true"))
 	if err != nil {
 		addErr("IGLOO_PREFETCH must be true or false: %w", err)
 	}

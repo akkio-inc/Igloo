@@ -44,14 +44,20 @@ reference for every setting mentioned here.
   `IGLOO_METADATA_DATABASE_URL`. After 10 failed logins for a user, or 50
   from an address, in 15 minutes, each replica refuses further ones for a
   while. Disabled users (`NOLOGIN`) cannot sign in by any means, and their
-  sessions end.
+  sessions end. Changes to users, their tokens, roles and grants, and to
+  policies and ID domains' members, reach open sessions on other replicas
+  within 30 seconds; a replica that cannot read the metadata database goes
+  on with what it read last for at most `IGLOO_ACCESS_MAX_STALENESS` (2
+  minutes by default), then refuses statements until it can read it again.
 - **Access tokens** ([details](docs/sso.md#access-tokens)) stand in for
   passwords in SQL clients. They are 256-bit random secrets with an
   `igloo_` prefix, shown once and stored only as a SHA-256 hash and SCRAM
   keys; SQL logins with them use SCRAM, so the token does not cross the
   network, and hashes are compared in constant time. Every token expires
   (90 days by default, at most `IGLOO_TOKEN_MAX_LIFETIME`); its use is
-  recorded; revoking it ends its sessions within 30 seconds. A session that
+  recorded; revoking it ends its sessions within 30 seconds (or, on a
+  replica that cannot read the metadata database, stops their statements
+  after `IGLOO_ACCESS_MAX_STALENESS`). A session that
   signed in with a token, or a task, cannot create tokens for its user or
   set its password; an admin's token can still do anything an admin can. Tokens do
   not sign in to the web console. Service accounts have no password and
@@ -148,7 +154,9 @@ reference for every setting mentioned here.
   source behind those policies. Policies are not a boundary for admins,
   who manage them and can read the warehouse's files, nor for other
   engines reading the Iceberg tables directly. Policy changes reach other
-  replicas within 30 seconds.
+  replicas within 30 seconds, and one that cannot read them refuses
+  statements, and Delta Sharing requests, after
+  `IGLOO_ACCESS_MAX_STALENESS`.
 - **Connections to other databases.** Only admins create, change and drop
   [connections](docs/federation.md) to PostgreSQL, MySQL and Snowflake
   databases. A
@@ -453,30 +461,35 @@ reference for every setting mentioned here.
   with the same failed-login delay, limits and logging as SQL logins, or
   with single sign-on. The browser sends the password inside HTTPS; without
   TLS the console accepts sign-ins, single sign-on included, only from a
-  browser at `localhost`. Every statement runs as the signed-in user through
-  the same authorization as SQL clients, and admin pages are refused to
-  non-admins on the server. Sessions are encrypted, signed, `HttpOnly`,
-  `SameSite=Strict` cookies (`Secure` under TLS) that expire after 12 hours
-  or an hour idle and end when the user is dropped or disabled or their
-  password changes. Changes need a CSRF token; pages have a strict
-  Content-Security-Policy and cannot be framed. Set `IGLOO_CONSOLE_ADDR=` to
-  turn the console off.
+  browser at `localhost`: a request addressed to `localhost` from this
+  machine or a private network, which guards against plaintext across a
+  network by mistake but is not an access control, so the single-machine
+  setup binds the port to loopback. Every statement runs as the signed-in
+  user through the same authorization as SQL clients, and admin pages are
+  refused to non-admins on the server. Sessions are encrypted, signed,
+  `HttpOnly`, `SameSite=Strict` cookies (`Secure` under TLS) that expire
+  after 12 hours or an hour idle and end when the user is dropped or
+  disabled or their password changes. Changes need a CSRF token; pages have
+  a strict Content-Security-Policy and cannot be framed. Set
+  `IGLOO_CONSOLE_ADDR=` to turn the console off.
 - **Arrow Flight SQL.** Port 31337 serves [Arrow Flight SQL](docs/flight-sql.md)
   (gRPC). Clients sign in with a handshake carrying their Igloo password in
   HTTP basic authentication, checked against the same SCRAM verifier with
   the same failed-login delay, logging and login history as SQL logins.
   Basic authentication sends the password itself, so with TLS configured the
   port serves TLS only, and without TLS it serves only clients that connect
-  to it as `localhost` (on the same machine, or through an SSH tunnel or
-  `kubectl port-forward`); others are refused before their password is
-  checked. The handshake returns a random bearer token that is valid only on
-  the connection it was issued on and ends with it. Every statement and
-  metadata call runs as the user through the same authorization, sandbox,
-  statement timeout and query history as SQL clients. Set
-  `IGLOO_FLIGHT_ADDR=` to turn it off.
+  to it as `localhost` (on the same machine, or through Docker's published
+  ports, an SSH tunnel or `kubectl port-forward`), from this machine or a
+  private network, as the console requires; others are refused before
+  their password is checked. The handshake returns a random bearer token
+  that is valid only on the connection it was issued on and ends with it.
+  Every statement and metadata call runs as the user through the same
+  authorization, sandbox, statement timeout and query history as SQL
+  clients. Set `IGLOO_FLIGHT_ADDR=` to turn it off.
 - **Delta Sharing.** Port 8444 serves [Delta Sharing](docs/sharing.md) to
   outside recipients: over HTTPS, or without TLS only to requests addressed
-  to `localhost`. Only admins create shares, recipients and providers.
+  to `localhost` from this machine or a private network, as the console
+  requires. Only admins create shares, recipients and providers.
   Recipients authenticate with 256-bit bearer tokens that Igloo stores as
   SHA-256 hashes and checks in constant time; tokens expire, can be rotated,
   and are delivered through one-time activation links that only a button
@@ -500,10 +513,11 @@ reference for every setting mentioned here.
   shared: recipients read files with their own tools, which cannot apply
   Igloo's policies. `ALTER SHARE ... ADD TABLE` refuses them, and a shared
   table that gains a policy is refused to recipients from then on (on other
-  replicas within 30 seconds), downloads of files listed before included,
-  with each refusal and the policies behind it in the query history; until
-  Igloo has loaded the policies, the endpoint serves no table. Policies do
-  not attach to external tables, and while tables have policies users
+  replicas within 30 seconds; one that cannot read the policies serves no
+  table after `IGLOO_ACCESS_MAX_STALENESS`, until it can again), downloads
+  of files listed before included, with each refusal and the policies
+  behind it in the query history; until Igloo has loaded the policies, the
+  endpoint serves no table. Policies do not attach to external tables, and while tables have policies users
   other than admins cannot read external tables' files through the proxy,
   nor the copies of shared files in the warehouse. Recipients' tokens
   (`dst_`) and Igloo's access tokens (`igloo_`) are distinct: neither

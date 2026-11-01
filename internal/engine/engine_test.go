@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/akkio-inc/igloo/internal/config"
+	"github.com/akkio-inc/igloo/internal/memlimit"
 )
 
 func TestOpenWithoutCatalog(t *testing.T) {
@@ -283,6 +284,39 @@ func TestConfigureThreads(t *testing.T) {
 	want := fmt.Sprintf("SET threads = %d", 3*cores/2)
 	if len(stmts) < 2 || !strings.HasPrefix(stmts[0], "SET memory_limit") || stmts[len(stmts)-1] != want {
 		t.Errorf("statements %q, want the memory limit first and %q last", stmts, want)
+	}
+}
+
+// TestConfigureMemory checks DuckDB's memory limit where none is
+// configured: memlimit.DuckDBLimit of the process's memory, not DuckDB's
+// 80% of the machine; DuckDB's own where the memory is not known; and the
+// configured one where there is one.
+func TestConfigureMemory(t *testing.T) {
+	defer func(f func() int64) { processMemory = f }(processMemory)
+	limit := func(cfg config.Config) string {
+		t.Helper()
+		var set string
+		exec := func(s string) error {
+			if v, ok := strings.CutPrefix(s, "SET memory_limit = "); ok {
+				set = v
+			}
+			return nil
+		}
+		if err := configure(cfg, serverThreadsPerCore, exec, func(string) (string, error) { return "", errors.New("none") }); err != nil {
+			t.Fatal(err)
+		}
+		return set
+	}
+	processMemory = func() int64 { return 66_169_339_904 }
+	if got, want := limit(config.Config{}), fmt.Sprintf("'%dMiB'", memlimit.DuckDBLimit(66_169_339_904)>>20); got != want || want != "'46276MiB'" {
+		t.Errorf("61.6 GiB: memory_limit %s, want %s", got, want)
+	}
+	if got := limit(config.Config{DuckDB: config.DuckDB{MemoryLimit: "6GB"}}); got != "'6GB'" {
+		t.Errorf("configured: memory_limit %s", got)
+	}
+	processMemory = func() int64 { return 0 }
+	if got := limit(config.Config{}); got != "" {
+		t.Errorf("memory not known: memory_limit %s", got)
 	}
 }
 

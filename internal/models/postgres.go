@@ -4,7 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"strings"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -56,9 +58,14 @@ var migrations = []string{
 }
 
 // PostgresStore keeps models in the "igloo_ml" schema of the metadata
-// database.
+// database, and locks blobs with session-level advisory locks, which
+// Postgres releases if the replica holding them dies.
 type PostgresStore struct {
 	pool *pgxpool.Pool
+	// locks holds a connection for each blob lock held. It is a pool of
+	// its own, so callers holding locks always find a connection in pool
+	// for the models.
+	locks *pgxpool.Pool
 }
 
 // OpenPostgres connects to url and creates the tables if needed.
@@ -70,6 +77,14 @@ func OpenPostgres(ctx context.Context, url string) (*PostgresStore, error) {
 	cfg.MaxConns = 4
 	pool, err := pgxpool.NewWithConfig(ctx, cfg)
 	if err != nil {
+		return nil, err
+	}
+	lockCfg := cfg.Copy()
+	lockCfg.MaxConns = 16
+	lockCfg.MaxConnIdleTime = time.Minute
+	locks, err := pgxpool.NewWithConfig(ctx, lockCfg)
+	if err != nil {
+		pool.Close()
 		return nil, err
 	}
 	err = pgx.BeginFunc(ctx, pool, func(tx pgx.Tx) error {
@@ -85,9 +100,10 @@ func OpenPostgres(ctx context.Context, url string) (*PostgresStore, error) {
 	})
 	if err != nil {
 		pool.Close()
+		locks.Close()
 		return nil, fmt.Errorf("create model tables: %w", err)
 	}
-	return &PostgresStore{pool: pool}, nil
+	return &PostgresStore{pool: pool, locks: locks}, nil
 }
 
 const modelColumns = `schema_name, name, class, owner, comment, training_sql, config::text, metrics::text, blob_sha256, blob_size, created_at,
@@ -197,6 +213,39 @@ func (s *PostgresStore) BlobUsed(ctx context.Context, sha string) (bool, error) 
 	return used, err
 }
 
+// blobLockKey is the advisory lock key of blob sha.
+func blobLockKey(sha string) int64 {
+	h := fnv.New64a()
+	_, _ = h.Write([]byte("igloo/model-blob/" + sha))
+	return int64(h.Sum64())
+}
+
+func (s *PostgresStore) LockBlob(ctx context.Context, sha string) (func(), error) {
+	conn, err := s.locks.Acquire(ctx)
+	if err != nil {
+		return nil, err
+	}
+	key := blobLockKey(sha)
+	if _, err := conn.Exec(ctx, "SELECT pg_advisory_lock($1)", key); err != nil {
+		// A wait cut short may still be granted before the server sees
+		// the cancellation; closing the connection ends its session, and
+		// with it any lock it got.
+		_ = conn.Conn().Close(context.Background())
+		conn.Release()
+		return nil, err
+	}
+	return func() {
+		// Unlock even when ctx was canceled. If this fails the connection
+		// is closed instead, which also releases the lock.
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if _, err := conn.Exec(ctx, "SELECT pg_advisory_unlock($1)", key); err != nil {
+			_ = conn.Conn().Close(ctx)
+		}
+		conn.Release()
+	}, nil
+}
+
 func (s *PostgresStore) Grants(ctx context.Context) ([]Grant, error) {
 	rows, err := s.pool.Query(ctx, `SELECT schema_name, name, grantee, grantee_type, privilege, granted_by, granted_at
 		FROM igloo_ml.grants ORDER BY schema_name, name, grantee_type, grantee, privilege`)
@@ -237,4 +286,57 @@ func (s *PostgresStore) RevokeGrant(ctx context.Context, g Grant) error {
 	return err
 }
 
-func (s *PostgresStore) Close() { s.pool.Close() }
+func (s *PostgresStore) ForgetGrantee(ctx context.Context, granteeType, grantee string) error {
+	_, err := s.pool.Exec(ctx, `DELETE FROM igloo_ml.grants WHERE grantee_type = $1 AND grantee = $2`, granteeType, grantee)
+	return err
+}
+
+func (s *PostgresStore) DisownModels(ctx context.Context, owner, tombstone string) error {
+	_, err := s.pool.Exec(ctx, `UPDATE igloo_ml.models SET owner = $2 WHERE owner = $1`, owner, tombstone)
+	return err
+}
+
+func (s *PostgresStore) ForgetDropped(ctx context.Context, principals func(context.Context) (Principals, error)) (int, int, error) {
+	// The database's clock, which stamps models, grants, users and roles.
+	var asked time.Time
+	if err := s.pool.QueryRow(ctx, `SELECT now()`).Scan(&asked); err != nil {
+		return 0, 0, err
+	}
+	p, err := principals(ctx)
+	if err != nil {
+		return 0, 0, err
+	}
+	users, usersCreated := namesAndTimes(p.Users)
+	roles, rolesCreated := namesAndTimes(p.Roles)
+	tag, err := s.pool.Exec(ctx, `UPDATE igloo_ml.models m SET owner = owner || $4
+		WHERE created_at < $1 AND owner NOT LIKE ('%' || $4) AND NOT EXISTS (
+			SELECT 1 FROM unnest($2::text[], $3::timestamptz[]) u (name, created_at) WHERE u.name = m.owner AND u.created_at <= m.created_at)`,
+		asked, users, usersCreated, droppedSuffix)
+	if err != nil {
+		return 0, 0, err
+	}
+	disowned := int(tag.RowsAffected())
+	tag, err = s.pool.Exec(ctx, `WITH p (type, name, created_at) AS (
+			SELECT 'user', * FROM unnest($2::text[], $3::timestamptz[])
+			UNION ALL SELECT 'role', * FROM unnest($4::text[], $5::timestamptz[]))
+		DELETE FROM igloo_ml.grants g WHERE granted_at < $1 AND NOT EXISTS (
+			SELECT 1 FROM p WHERE p.type = g.grantee_type AND p.name = g.grantee AND p.created_at <= g.granted_at)`,
+		asked, users, usersCreated, roles, rolesCreated)
+	if err != nil {
+		return disowned, 0, err
+	}
+	return disowned, int(tag.RowsAffected()), nil
+}
+
+func namesAndTimes(m map[string]time.Time) ([]string, []time.Time) {
+	names, times := make([]string, 0, len(m)), make([]time.Time, 0, len(m))
+	for name, t := range m {
+		names, times = append(names, name), append(times, t)
+	}
+	return names, times
+}
+
+func (s *PostgresStore) Close() {
+	s.pool.Close()
+	s.locks.Close()
+}

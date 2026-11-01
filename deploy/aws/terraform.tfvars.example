@@ -24,6 +24,14 @@ name_prefix = "igloo"
 # node_use_spot       = true
 # node_instance_types = ["r7gd.xlarge", "r6gd.xlarge", "r8gd.xlarge"]
 
+# Distributed-execution workers on Spot nodes (on-demand when Spot has no
+# capacity), from zero nodes; and one large worker on an on-demand
+# r7gd.16xlarge. Prices let auto mode weigh cost.
+# workers_enabled             = true
+# workers_price_per_hour      = 0.30
+# large_worker_enabled        = true
+# large_worker_price_per_hour = 4.36
+
 tags = {
   Team = "data"
 }

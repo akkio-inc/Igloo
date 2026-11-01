@@ -46,16 +46,18 @@ func serveGateway() error {
 	reg := prometheus.NewRegistry()
 	reg.MustRegister(collectors.NewGoCollector(), collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))
 	gw := gateway.New(gateway.Options{
-		Backend:        cfg.Backend,
-		ConsoleBackend: cfg.ConsoleBackend,
-		FlightBackend:  cfg.FlightBackend,
-		IcebergBackend: cfg.IcebergBackend,
-		ActivityURL:    cfg.ActivityURL,
-		SuspendAfter:   cfg.SuspendAfter,
-		ResumeTimeout:  cfg.ResumeTimeout,
-		Compute:        compute,
-		Metrics:        gateway.NewMetrics(reg),
-		Log:            log,
+		Backend:          cfg.Backend,
+		ConsoleBackend:   cfg.ConsoleBackend,
+		FlightBackend:    cfg.FlightBackend,
+		IcebergBackend:   cfg.IcebergBackend,
+		ActivityURL:      cfg.ActivityURL,
+		SuspendAfter:     cfg.SuspendAfter,
+		ResumeTimeout:    cfg.ResumeTimeout,
+		FirstByteTimeout: cfg.FirstByteTimeout,
+		MaxWaiting:       cfg.MaxWaiting,
+		Compute:          compute,
+		Metrics:          gateway.NewMetrics(reg),
+		Log:              log,
 	})
 
 	ln, err := net.Listen("tcp", cfg.ListenAddr)

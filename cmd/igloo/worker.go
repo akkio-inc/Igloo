@@ -25,6 +25,7 @@ import (
 	"github.com/akkio-inc/igloo/internal/engine"
 	"github.com/akkio-inc/igloo/internal/erasure"
 	"github.com/akkio-inc/igloo/internal/gateway"
+	"github.com/akkio-inc/igloo/internal/icebergrest"
 	"github.com/akkio-inc/igloo/internal/memlimit"
 	"github.com/akkio-inc/igloo/internal/prefetch"
 	"github.com/akkio-inc/igloo/internal/spot"
@@ -75,6 +76,17 @@ func serveWorker() error {
 	if p := eng.Prefetcher(); p != nil {
 		opts.Prefetch = prefetchTasks(p)
 	}
+	// What machine it runs on, for coordinators that were not told its
+	// price (package prices): on EC2, outside Kubernetes, whose chart tells
+	// them and whose pods seldom reach the metadata service.
+	if cfg.Workers.SpotNotice && os.Getenv("KUBERNETES_SERVICE_HOST") == "" {
+		dctx, dcancel := context.WithTimeout(context.Background(), 2*time.Second)
+		if in, err := spot.DescribeEC2(dctx, spot.EC2); err == nil {
+			opts.InstanceType, opts.Region, opts.Spot, opts.Instance = in.Type, in.Region, in.Spot, in.ID
+			log.Info("running on EC2", "instance_type", in.Type, "region", in.Region, "spot", in.Spot)
+		}
+		dcancel()
+	}
 	if opts.Erasure, err = workerErasure(eng, &opts, cfg.Workers.IsolatedPurgeAfter); err != nil {
 		return err
 	}
@@ -112,6 +124,13 @@ func serveWorker() error {
 				http.Error(rw, "shutting down", http.StatusServiceUnavailable)
 				return
 			}
+			if w.Retiring() {
+				// Not ready, so that Kubernetes removes this pod first when a
+				// coordinator scales the workers down (see distributed's
+				// pool.shrink).
+				http.Error(rw, "retiring", http.StatusServiceUnavailable)
+				return
+			}
 			if err := eng.Ping(ctx); err != nil {
 				http.Error(rw, "engine: "+err.Error(), http.StatusServiceUnavailable)
 				return
@@ -132,7 +151,9 @@ func serveWorker() error {
 
 	// On a Spot Instance, AWS says two minutes ahead that it takes the
 	// instance back: the worker takes no more tasks from then on, which
-	// coordinators run elsewhere, and finishes those it has until then.
+	// coordinators run elsewhere, finishes those it has and serves the
+	// exchange files on its disk until then (see Worker.Drain), as it does
+	// for drainTimeout when a signal stops it.
 	notices := make(chan spot.Notice, 1)
 	if cfg.Workers.SpotNotice {
 		go func() {
@@ -147,25 +168,31 @@ func serveWorker() error {
 			}
 		}()
 	}
-	grace := shutdownTimeout
+	grace := drainTimeout
 	var reclaimed time.Time
 	select {
 	case err := <-errc:
 		return err
 	case <-ctx.Done():
 	case n := <-notices:
-		grace, reclaimed = max(time.Until(n.Time)-spotMargin, shutdownTimeout), n.Time
+		grace, reclaimed = n.Grace(spotMargin, shutdownTimeout), n.Time
 		log.Warn("AWS is taking this instance back; finishing the tasks running and taking no more",
 			"action", n.Action, "at", n.Time, "grace", grace.Round(time.Second))
 	}
 	stopping.Store(true)
-	log.Info("shutting down")
+	log.Info("shutting down: taking no more tasks, finishing those running and serving the exchange files on this worker's disk",
+		"for_at_most", grace.Round(time.Second))
 	shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), grace)
 	defer cancelShutdown()
+	_ = w.Drain(shutdownCtx)
+	// What is left of the grace, at least a moment to end the connections.
+	deadline, _ := shutdownCtx.Deadline()
+	stopCtx, cancelStop := context.WithTimeout(context.Background(), max(time.Until(deadline), time.Second))
+	defer cancelStop()
 	if httpSrv != nil {
-		_ = httpSrv.Shutdown(shutdownCtx)
+		_ = httpSrv.Shutdown(stopCtx)
 	}
-	err = w.Shutdown(shutdownCtx)
+	err = w.Shutdown(stopCtx)
 	if !reclaimed.IsZero() {
 		// Exiting now, the worker would be started again by its supervisor
 		// and take tasks it cannot finish: it stays down until AWS has
@@ -185,6 +212,19 @@ func newCoordinator(ctx context.Context, cfg config.Config, source distributed.S
 	if err != nil {
 		return nil, err
 	}
+	// The large worker, started and stopped as the others, by its own
+	// Deployment, commands or instances.
+	l := cfg.Workers.Large
+	var large distributed.PoolOptions
+	if l.Address != "" {
+		lc, err := workerCompute(ctx, config.Workers{Compute: l.Compute, K8sNamespace: cfg.Workers.K8sNamespace, K8sDeployment: l.K8sDeployment,
+			Max: 1, StartCommand: l.StartCommand, StopCommand: l.StopCommand, EC2InstanceIDs: l.EC2InstanceIDs})
+		if err != nil {
+			return nil, fmt.Errorf("large worker: %w", err)
+		}
+		large = distributed.PoolOptions{Addresses: []string{l.Address}, Compute: lc, MaxWorkers: 1,
+			IdleAfter: cfg.Workers.IdleAfter, IdleAuto: cfg.Workers.IdleAuto, StartTimeout: cfg.Workers.StartTimeout}
+	}
 	// The file system keeps its context for every request, long after
 	// startup.
 	files, err := catalog.FS(context.WithoutCancel(ctx), cfg.Storage, cfg.Storage.Location)
@@ -192,6 +232,10 @@ func newCoordinator(ctx context.Context, cfg config.Config, source distributed.S
 		return nil, fmt.Errorf("distributed execution: open the warehouse: %w", err)
 	}
 	threads, err := eng.Threads(ctx)
+	if err != nil {
+		return nil, err
+	}
+	credentials, err := workerWriteCredentials(ctx, cfg, log)
 	if err != nil {
 		return nil, err
 	}
@@ -203,13 +247,51 @@ func newCoordinator(ctx context.Context, cfg config.Config, source distributed.S
 		Pool: distributed.PoolOptions{
 			Addresses: cfg.Workers.Addresses, Compute: compute, MaxWorkers: cfg.Workers.Max,
 			IdleAfter: cfg.Workers.IdleAfter, IdleAuto: cfg.Workers.IdleAuto, StartTimeout: cfg.Workers.StartTimeout,
+			Warm: cfg.Workers.Warm,
 		},
+		WorkerPrice: cfg.Workers.Price, Price: cfg.PricePerHour, Large: large, LargeCores: l.Cores, LargeMemory: l.Memory, LargePrice: l.Price,
+		WorkerInstanceType: cfg.Workers.InstanceType, WorkerSpot: cfg.Workers.Spot, Region: cfg.Workers.Region,
+		LargeInstanceType: l.InstanceType, LargeSpot: l.Spot,
+		NoWorkerWrites: cfg.Workers.NoWrites, WriteCredentials: credentials,
 	}, log)
 	if err != nil {
 		return nil, fmt.Errorf("distributed execution: %w", err)
 	}
-	log.Info("distributed execution is on", "workers", cfg.Workers.Addresses, "compute", cfg.Workers.Compute, "max_workers", cfg.Workers.Max)
+	log.Info("distributed execution is on", "workers", cfg.Workers.Addresses, "compute", cfg.Workers.Compute, "max_workers", cfg.Workers.Max,
+		"large_worker", l.Address)
 	return co, nil
+}
+
+// workerWriteCredentials returns what makes the credentials a task's attempt
+// writes a table's files with, limited to its directory, with no right to
+// delete, for an hour: nil where none can be made (GCS and Azure, and S3 without
+// IGLOO_S3_STS_ROLE_ARN), and workers write with their own identity, as far
+// as the deployment grants it; or none, and this replica writes the tables
+// (see distributed.ErrWriteDenied).
+func workerWriteCredentials(ctx context.Context, cfg config.Config, log *slog.Logger) (func(context.Context, string) (*distributed.WriteCredentials, error), error) {
+	if cfg.Workers.NoWrites {
+		log.Info("workers write no tables' files (IGLOO_WORKER_WRITES=off)")
+		return nil, nil
+	}
+	v, err := icebergrest.NewS3Vendor(ctx, cfg.Storage, log)
+	if err != nil {
+		return nil, fmt.Errorf("distributed execution: credentials for workers' writes: %w", err)
+	}
+	if v == nil {
+		log.Info("workers write tables' files with their own identity, which needs write access to directories named " + distributed.WriteDirMark +
+			"* under tables' locations and no more: without it, this replica writes them (docs/distributed-execution.md)")
+		return nil, nil
+	}
+	s3 := cfg.Storage.S3
+	return func(ctx context.Context, dir string) (*distributed.WriteCredentials, error) {
+		c, err := v.Vend(ctx, dir, icebergrest.AddFiles, "worker-write")
+		if err != nil {
+			return nil, err
+		}
+		return &distributed.WriteCredentials{KeyID: c.Config["s3.access-key-id"], Secret: c.Config["s3.secret-access-key"],
+			SessionToken: c.Config["s3.session-token"], Region: s3.Region, Endpoint: s3.Endpoint, URLStyle: s3.URLStyle, UseSSL: s3.UseSSL,
+			Expires: c.Expires}, nil
+	}, nil
 }
 
 // footprints learns what statements held at once, by their shapes: the
@@ -257,7 +339,12 @@ func seedHistory(ctx context.Context, seed func([]distributed.Run), fp footprint
 			switch {
 			case q.PlanKey == "":
 			case q.Outcome == audit.OutcomeOK:
-				rs = append(rs, distributed.Run{Key: q.PlanKey, Workers: q.Workers, Duration: q.Duration, Memory: q.Memory})
+				rs = append(rs, distributed.Run{Key: q.PlanKey, Workers: q.Workers, Large: distributed.OnLarge(q.Placement), Duration: q.Duration,
+					Memory: q.Memory})
+			case q.Workers > 0 && q.Outcome == audit.OutcomeError:
+				// It failed on workers, as when one ran out of memory.
+				rs = append(rs, distributed.Run{Key: q.PlanKey, Workers: q.Workers, Large: distributed.OnLarge(q.Placement), Duration: q.Duration,
+					Memory: q.Memory, Failed: true, At: q.Start})
 			case q.Workers == 0 && q.SQLState == "53200":
 				// It ran out of memory on one machine.
 				rs = append(rs, distributed.Run{Key: q.PlanKey, OutOfMemory: true, Memory: q.Memory})
@@ -349,16 +436,46 @@ func workerCompute(ctx context.Context, w config.Workers) (distributed.Compute, 
 		if err != nil {
 			return nil, err
 		}
-		return distributed.StartStop{Start: e.Start, Stop: e.Stop}, nil
+		return ec2Workers{e}, nil
 	}
 	return nil, nil
 }
 
 // kubernetesWorkers scales the workers' Deployment up as statements need
-// workers, never below what another Igloo replica asked for.
+// workers, never below what another Igloo replica asked for, and down past
+// workers retired while others work (see distributed.Shrinker), whose pods
+// are not ready and go first.
 type kubernetesWorkers struct{ k *gateway.Kubernetes }
 
 func (k kubernetesWorkers) Scale(ctx context.Context, n int) error { return k.k.ScaleAtLeast(ctx, n) }
+
+func (k kubernetesWorkers) Shrink(ctx context.Context, retired []distributed.RetiredWorker, running int) (bool, error) {
+	return k.k.ShrinkTo(ctx, running-len(retired), running)
+}
+
+// ec2Workers starts as many of the workers' instances as statements need,
+// stops them all when idle, and stops those of workers retired while
+// others work (see distributed.Shrinker), as their instance metadata names
+// them.
+type ec2Workers struct{ e *gateway.EC2 }
+
+func (e ec2Workers) Scale(ctx context.Context, n int) error {
+	if n == 0 {
+		return e.e.Stop(ctx)
+	}
+	return e.e.StartUpTo(ctx, n)
+}
+
+func (e ec2Workers) Shrink(ctx context.Context, retired []distributed.RetiredWorker, _ int) (bool, error) {
+	var ids []string
+	for _, r := range retired {
+		if r.Instance == "" {
+			return false, nil
+		}
+		ids = append(ids, r.Instance)
+	}
+	return true, e.e.StopInstances(ctx, ids)
+}
 
 // prefetchTasks reads ahead, as each task starts, the blocks of the files
 // its tables' views read, until the task ends (see package prefetch).
@@ -379,6 +496,9 @@ func prefetchScans(scans []distributed.Scan) []prefetch.Scan {
 		ps := prefetch.Scan{Filtered: sc.Filtered, FieldIDs: make([]int32, len(sc.FieldIDs)), Files: make([]prefetch.File, len(sc.Files))}
 		for i, id := range sc.FieldIDs {
 			ps.FieldIDs[i] = int32(id)
+		}
+		for _, id := range sc.Filters {
+			ps.Filters = append(ps.Filters, int32(id))
 		}
 		for i, f := range sc.Files {
 			ps.Files[i] = prefetch.File{Path: f.Path, Size: f.Size}

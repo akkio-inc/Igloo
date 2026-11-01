@@ -760,6 +760,59 @@ func TestDownload(t *testing.T) {
 	}
 }
 
+// TestDownloadRepeatsTheRunsSettings downloads a query with the statements
+// that ran before it in the worksheet's run, as worksheets.js sends them.
+func TestDownloadRepeatsTheRunsSettings(t *testing.T) {
+	tc := newTestConsole(t, false)
+	admin := tc.signedIn(t, "igloo")
+	_, events := admin.query(`CREATE SCHEMA tenant_a;
+		CREATE TABLE orders AS SELECT 'main' AS what;
+		CREATE TABLE tenant_a.orders AS SELECT 'tenant_a' AS what`)
+	for _, ev := range events {
+		if ev.Error != nil {
+			t.Fatalf("setup: %+v", ev.Error)
+		}
+	}
+	download := func(before ...string) (int, string) {
+		t.Helper()
+		resp := admin.do("POST", "/api/download", map[string]any{"sql": "SELECT what FROM orders", "before": before}, nil)
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return resp.StatusCode, string(body)
+	}
+
+	// The worksheet's query read tenant_a.orders, and so does its download.
+	if status, body := download("SET search_path = tenant_a", "SELECT 1"); status != http.StatusOK || body != "what\ntenant_a\n" {
+		t.Errorf("after SET search_path: %d %q", status, body)
+	}
+	if status, body := download("BEGIN", "COMMIT", "USE tenant_a"); status != http.StatusOK || body != "what\ntenant_a\n" {
+		t.Errorf("after USE: %d %q", status, body)
+	}
+	// What changes data is never run again, nor what changed every
+	// session's settings: the download reads the table as it is.
+	if status, body := download("INSERT INTO orders VALUES ('again')", "SET GLOBAL search_path = tenant_a"); status != http.StatusOK || body != "what\nmain\n" {
+		t.Errorf("after INSERT: %d %q", status, body)
+	}
+	// Nor what follows a setting in the same entry.
+	if status, body := download("SET search_path = tenant_a; DELETE FROM orders"); status != http.StatusOK || body != "what\ntenant_a\n" {
+		t.Errorf("after SET and DELETE in one entry: %d %q", status, body)
+	}
+	// What a new session cannot have without running more, the download
+	// refuses rather than read another table.
+	for _, before := range [][]string{
+		{"CREATE TEMP TABLE orders AS SELECT 'temp' AS what"},
+		{"CREATE VIEW temp.main.orders AS SELECT 'temp' AS what"},
+		{"BEGIN", "INSERT INTO orders VALUES ('uncommitted')"},
+		{"SET VARIABLE s = (SELECT 'tenant_a')"},
+	} {
+		if status, body := download(before...); status != http.StatusBadRequest || !strings.Contains(body, `"0A000"`) {
+			t.Errorf("after %q: %d %s", before, status, body)
+		}
+	}
+}
+
 func TestPagesAndHeaders(t *testing.T) {
 	tc := newTestConsole(t, false)
 	client := tc.srv.Client()
@@ -832,6 +885,30 @@ func TestLoopback(t *testing.T) {
 	} {
 		if got := loopback(host); got != want {
 			t.Errorf("loopback(%q) = %v", host, got)
+		}
+	}
+}
+
+// Without TLS, a sign-in (and SCIM, which uses the same rule) must be
+// addressed to localhost and come from this machine or a private network,
+// as through Docker's published ports: the Host header alone, which a
+// client may set to anything, used to let a request in from anywhere.
+func TestSignInWithoutTLSOnlyFromNearby(t *testing.T) {
+	c := &Console{}
+	for _, tc := range []struct {
+		host, peer string
+		want       bool
+	}{
+		{"localhost:8443", "127.0.0.1:50123", true},
+		{"localhost:8443", "[::1]:50123", true},
+		{"127.0.0.1:8443", "172.18.0.1:50123", true},
+		{"localhost:8443", "198.51.100.23:50123", false},
+		{"igloo.example.com:8443", "127.0.0.1:50123", false},
+	} {
+		r := httptest.NewRequest("POST", "/api/login", nil)
+		r.Host, r.RemoteAddr = tc.host, tc.peer
+		if got := c.signInAllowed(r) == nil; got != tc.want {
+			t.Errorf("Host %s from %s: allowed is %v", tc.host, tc.peer, got)
 		}
 	}
 }

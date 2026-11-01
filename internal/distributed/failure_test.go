@@ -428,7 +428,7 @@ func TestShuffleFiles(t *testing.T) {
 	dir := filepath.Join(h.dir, "warehouse", config.ShuffleDir, "q", "s0", "0", "a0")
 	cols := []Column{{Name: "i", Type: "BIGINT"}, {Name: "s", Type: "VARCHAR"}, {Name: "__b", Type: "INTEGER"}}
 	res, err := w.shuffle(t.Context(), conn, dir,
-		fmt.Sprintf("SELECT i, 'x' || (i %% 1000) AS s, CAST(hash(i) %% %d AS INTEGER) AS __b FROM range(3000000) t(i)", parts), cols, parts)
+		fmt.Sprintf("SELECT i, 'x' || (i %% 1000) AS s, CAST(hash(i) %% %d AS INTEGER) AS __b FROM range(3000000) t(i)", parts), cols, parts, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -464,12 +464,12 @@ func TestShuffleRowGroupBytes(t *testing.T) {
 	}
 	cols := []Column{{Name: "id", Type: "VARCHAR"}, {Name: "a", Type: "VARCHAR[]"}, {Name: "b", Type: "VARCHAR[]"},
 		{Name: "c", Type: "VARCHAR[]"}, {Name: "d", Type: "VARCHAR[]"}, {Name: "__b", Type: "INTEGER"}}
-	if rows := shuffleRowGroup(w.opts.MemoryBytes, cap(w.slots), parts, cols); rows != minShuffleRowGroup {
+	if rows := shuffleRowGroup(w.opts.MemoryBytes, w.slotCount, parts, cols); rows != minShuffleRowGroup {
 		t.Fatalf("rows a group by types: %d", rows)
 	}
 	query := fmt.Sprintf("SELECT md5(i::VARCHAR) AS id, %s AS a, %s AS b, %s AS c, %s AS d, CAST(hash(i) %% %d AS INTEGER) AS __b FROM range(160000) t(i)",
 		list(1), list(7), list(13), list(17), parts)
-	res, err := w.shuffle(t.Context(), conn, dir, query, cols, parts)
+	res, err := w.shuffle(t.Context(), conn, dir, query, cols, parts, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -889,11 +889,18 @@ func TestLocalEstimate(t *testing.T) {
 	h := newHarness(t, 0.01, 3, 2)
 	h.tables["lineitem"].Bytes = 1 << 30
 	_, err := h.co.Plan(t.Context(), `SELECT l_returnflag, count(*) FROM lineitem GROUP BY 1`, harnessEnv{h}, ModeAuto)
-	if d, ok := LocalEstimate(err); !ok || d <= 0 || !strings.Contains(err.Error(), "one machine is faster") {
+	if d, ok := LocalEstimate(err); !ok || d <= 0 || !strings.Contains(err.Error(), "auto mode chose one machine") {
 		t.Errorf("auto mode's choice of one machine: %v, %v %v", err, d, ok)
+	}
+	// The workers' estimate, which the guard waits for too.
+	if d, ok := WorkersEstimate(err); !ok || d < startCost*time.Second {
+		t.Errorf("workers' estimate: %v %v", d, ok)
 	}
 	if _, ok := LocalEstimate(unsupported("nothing to divide among workers")); ok {
 		t.Error("an unsupported statement has a local estimate")
+	}
+	if _, ok := WorkersEstimate(unsupported("nothing to divide among workers")); ok {
+		t.Error("an unsupported statement has a workers' estimate")
 	}
 	if _, ok := LocalBudget(err); ok {
 		t.Error("a statement that never ran on workers has a budget on one machine")
@@ -1044,6 +1051,7 @@ func TestFootprintKeepsAStatementHere(t *testing.T) {
 	h.co.opts.MemoryBytes = 8 << 20
 	h.tables["lineitem"].Bytes = 1 << 30
 	h.tables["orders"].Bytes = 1 << 28
+	h.noPlans = true
 	q := `SELECT o_orderpriority, count(*) FROM orders JOIN lineitem ON l_orderkey = o_orderkey GROUP BY 1`
 	ctx := t.Context()
 	plan, d, err := h.co.plan(ctx, q, harnessEnv{h}, ModeAuto, true, nil)

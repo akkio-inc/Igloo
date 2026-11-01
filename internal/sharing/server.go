@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/netip"
 	"slices"
 	"strconv"
 	"strings"
@@ -68,7 +69,7 @@ type ServerOptions struct {
 	Tables TableSource
 	// Protection names the policies of a catalog table. Tables with
 	// policies are never served; until a Protection is set (here or with
-	// SetProtection), no table is.
+	// SetProtection), and while it fails, no table is.
 	Protection Protection
 }
 
@@ -170,7 +171,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	h.Set("X-Content-Type-Options", "nosniff")
 	h.Set("Cache-Control", "no-store")
 	h.Set("Referrer-Policy", "no-referrer")
-	if r.TLS == nil && !loopback(r.Host) {
+	if !Secure(r) {
 		writeError(w, &apiError{status: http.StatusForbidden, code: "PERMISSION_DENIED",
 			msg: "the Delta Sharing endpoint accepts unencrypted requests only at localhost; " +
 				"configure TLS (IGLOO_TLS_CERT_FILE and IGLOO_TLS_KEY_FILE) to share across a network"})
@@ -304,9 +305,16 @@ func (s *Server) Recipient(r *http.Request) (string, error) {
 	return c.recipient, nil
 }
 
-// Secure reports whether a request came over TLS, or to localhost: the
-// only requests that may carry a bearer token or data.
-func Secure(r *http.Request) bool { return r.TLS != nil || loopback(r.Host) }
+// Secure reports whether a request came over TLS, or to localhost from
+// this machine or a private network: the only requests that may carry a
+// bearer token or data. The Host header catches a client sent to the
+// endpoint across a network without TLS by mistake; since a client may
+// send any Host, the request must also come from nearby (see privatePeer).
+// It is no access control: a client on a private network that reaches the
+// port can address it as localhost.
+func Secure(r *http.Request) bool {
+	return r.TLS != nil || loopback(r.Host) && privatePeer(r.RemoteAddr)
+}
 
 // bearer looks up a bearer token, through a short-lived cache.
 func (s *Server) bearer(ctx context.Context, id string) (bearerToken, error) {
@@ -902,4 +910,22 @@ func loopback(host string) bool {
 	}
 	ip := net.ParseIP(host)
 	return ip != nil && ip.IsLoopback()
+}
+
+// sharedAddressSpace is 100.64.0.0/10 (RFC 6598), which some Kubernetes
+// networks give pods.
+var sharedAddressSpace = netip.MustParsePrefix("100.64.0.0/10")
+
+// privatePeer reports whether addr, a client's address as its connection
+// reports it, is on this machine or a private network, as the Iceberg REST
+// catalog requires of clients without TLS. It cannot be this machine
+// alone: Docker's published ports, which the single-machine setup binds to
+// loopback, present a client on the host as the bridge network's gateway.
+func privatePeer(addr string) bool {
+	ap, err := netip.ParseAddrPort(addr)
+	if err != nil {
+		return false
+	}
+	ip := ap.Addr().Unmap()
+	return ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || sharedAddressSpace.Contains(ip)
 }

@@ -19,13 +19,16 @@ import (
 // on any column (set on it or through a tag), cannot be added to a share,
 // and a shared table that gains one is refused to recipients from then on:
 // its version, metadata and files, and every download of a file listed
-// before.
+// before. While a replica cannot tell which policies are in force, as it
+// could not read them for too long, it serves no table.
 
 // Protection names the masking and row access policies that protect the
 // catalog table schema.table, and none when nothing does. Igloo's SQL
 // server provides it (pgwire.Server.ProtectedBy), from the policies in
-// force on this replica.
-type Protection func(ctx context.Context, schema, table string) []string
+// force on this replica. It fails once those could not be read for too
+// long (IGLOO_ACCESS_MAX_STALENESS), as a policy attached on another
+// replica meanwhile would not be known.
+type Protection func(ctx context.Context, schema, table string) ([]string, error)
 
 // ProtectedError says a table has policies that recipients cannot apply.
 type ProtectedError struct {
@@ -64,14 +67,19 @@ func (pr *protection) set(p Protection) {
 	pr.p.Store(&p)
 }
 
-// check returns a ProtectedError if policies protect schema.table, and
-// errPoliciesUnknown if no Protection is set.
+// check returns a ProtectedError if policies protect schema.table,
+// errPoliciesUnknown if no Protection is set, and the Protection's error
+// if it fails.
 func (pr *protection) check(ctx context.Context, schema, table string) error {
 	p := pr.p.Load()
 	if p == nil {
 		return errPoliciesUnknown
 	}
-	if names := (*p)(ctx, schema, table); len(names) > 0 {
+	names, err := (*p)(ctx, schema, table)
+	if err != nil {
+		return err
+	}
+	if len(names) > 0 {
 		return &ProtectedError{Schema: schema, Table: table, Policies: names}
 	}
 	return nil
@@ -94,7 +102,8 @@ func refusal(shared SharedTable) *apiError {
 }
 
 // checkTable refuses a shared table whose catalog table has policies, and
-// notes them for the history.
+// notes them for the history. While its policies cannot be checked, the
+// table is unavailable.
 func (s *Server) checkTable(ctx context.Context, c *call, t SharedTable) error {
 	err := s.protection.check(ctx, t.SourceSchema, t.SourceTable)
 	var pe *ProtectedError
@@ -106,8 +115,14 @@ func (s *Server) checkTable(ctx context.Context, c *call, t SharedTable) error {
 		s.log.Warn("refused a shared table that has policies", "recipient", recipientName(c), "share", t.Share,
 			"table", t.SourceSchema+"."+t.SourceTable, "policies", pe.Policies)
 		return refusal(t)
-	case err != nil:
+	case errors.Is(err, errPoliciesUnknown):
 		return &apiError{status: http.StatusServiceUnavailable, code: "TEMPORARILY_UNAVAILABLE", msg: err.Error()}
+	case err != nil:
+		// Why is the provider's business; the log says.
+		s.log.Warn("refused a shared table whose policies cannot be checked", "recipient", recipientName(c), "share", t.Share,
+			"table", t.SourceSchema+"."+t.SourceTable, "err", err)
+		return &apiError{status: http.StatusServiceUnavailable, code: "TEMPORARILY_UNAVAILABLE",
+			msg: "the provider cannot check the table's policies right now; try again shortly"}
 	}
 	return nil
 }

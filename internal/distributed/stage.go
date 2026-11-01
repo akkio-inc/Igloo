@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/sync/errgroup"
@@ -57,6 +58,24 @@ type Stage struct {
 
 	fragment    node
 	placeholder string
+	// completes says the stage completes an aggregation's groups from
+	// partial results it reads by partition, whose partitions hold them
+	// whole: one task may complete them all (see execution.groups).
+	completes bool
+	// merge, for a stage whose rows are the statement's result, ordered by
+	// ORDER BY without LIMIT, are the columns its tasks sort their rows by,
+	// which the coordinator merges their files by (see merge.go).
+	merge []mergeKey
+	// enough, for a stage whose rows go to the coordinator to take any so
+	// many of them (LIMIT without ORDER BY), is that many: once the tasks
+	// that ended sent as many, the others are stopped, and the coordinator
+	// reads what those sent.
+	enough int64
+	// writeSQL, for a stage whose rows are the result of a statement that
+	// fills a table, row by row (see markWrites), is the query that gives a
+	// task's rows of the result: its tasks write them, where the statement
+	// has a target (see writes.go).
+	writeSQL string
 }
 
 // Input is a relation a stage's fragment reads under a view name: a
@@ -64,9 +83,13 @@ type Stage struct {
 type Input struct {
 	View string
 	// Table is a catalog table. Split divides its data files among the
-	// stage's tasks; otherwise every task reads all of them.
-	Table *Table
-	Split bool
+	// stage's tasks; Bucketed gives each task the files of some buckets of
+	// its bucketing Bucket (see bucket.go); otherwise every task reads all
+	// of them.
+	Table    *Table
+	Split    bool
+	Bucketed bool
+	Bucket   int
 	// Exchange is the rows earlier stages wrote. Partitioned gives each task
 	// one partition; otherwise every task reads all of them.
 	Exchange    *Exchange
@@ -82,8 +105,15 @@ type Exchange struct {
 	Keys []string
 	// Casts are the types the keys are hashed as, or "" for their own:
 	// integers of every width are hashed as BIGINT, so that equal values of
-	// different types land in the same partition.
+	// different types land in the same partition. A cast may instead be an
+	// expression of the key, upper(%s), whose value is hashed (see
+	// keyExpression).
 	Casts []string
+	// Buckets, if not 0, says its rows go to the partitions the files of a
+	// table bucketed by its one key into so many buckets are read by, beside
+	// which a stage reads them (see bucket.go): by the key's Iceberg bucket
+	// rather than its hash.
+	Buckets int
 	// purpose says what the exchange is for, in logs and tests.
 	purpose string
 }
@@ -96,6 +126,8 @@ func (s *Stage) String() string {
 		switch {
 		case in.Table != nil && in.Split:
 			fmt.Fprintf(&b, " split %s", in.Table)
+		case in.Table != nil && in.Bucketed:
+			fmt.Fprintf(&b, " buckets of %s", in.Table)
 		case in.Exchange != nil && in.Partitioned:
 			fmt.Fprintf(&b, " partitions of exchange %d", in.Exchange.ID)
 		case in.Exchange != nil:
@@ -104,6 +136,9 @@ func (s *Stage) String() string {
 	}
 	if s.Out != nil {
 		fmt.Fprintf(&b, " to exchange %d (%s)", s.Out.ID, s.Out.purpose)
+		if s.Out.Buckets > 0 {
+			fmt.Fprintf(&b, " by bucket[%d]", s.Out.Buckets)
+		}
 	} else {
 		b.WriteString(" to the coordinator")
 	}
@@ -125,14 +160,23 @@ func (s *Stage) partitioned() bool {
 	return slices.ContainsFunc(s.Inputs, func(in Input) bool { return in.Exchange != nil && in.Partitioned })
 }
 
-// hashKey returns the expression a key column is hashed by.
+// hashKey returns the expression a key column is hashed by: the column, as
+// a type, or in an expression of it (see keyExpression).
 func hashKey(name, cast string) string {
 	e := quoteIdent(name)
-	if cast != "" {
+	switch {
+	case keyExpression(cast):
+		e = fmt.Sprintf(cast, e)
+	case cast != "":
 		e = "CAST(" + e + " AS " + cast + ")"
 	}
 	return e
 }
+
+// keyExpression says whether an exchange's key cast is an expression of
+// the key column, %s, such as upper(%s), rather than a type: rows are
+// partitioned by its value, as a join on upper(a.x) = upper(b.y) needs.
+func keyExpression(cast string) bool { return strings.Contains(cast, "%s") }
 
 // exchangeSQL wraps a stage's fragment for writing to its exchange: the
 // fragment's rows, renamed, with __b, the partition of each.
@@ -152,6 +196,10 @@ func exchangeSQL(s *Stage, parts int) string {
 			keys[i] = hashKey(k, s.Out.Casts[i])
 		}
 		b = fmt.Sprintf("CAST(hash(%s) %% %d AS INTEGER)", strings.Join(keys, ", "), parts)
+		if s.Out.Buckets > 0 {
+			// NULL keys are where a bucketed table's are (see bucketGroups).
+			b = fmt.Sprintf("CAST(COALESCE(iceberg_bucket(%d, %s), 0) %% %d AS INTEGER)", s.Out.Buckets, keys[0], parts)
+		}
 	}
 	return "SELECT *, " + b + " AS __b FROM (" + inner + ") AS __igloo_x"
 }
@@ -194,6 +242,10 @@ type execution struct {
 	// variables are the values the coordinator computed, which tasks set
 	// before they run (see values.go).
 	variables []variable
+	// target, if set, says the tasks of a stage that can write the
+	// statement's rows do, and written lists what they wrote (see writes.go).
+	target  *WriteTarget
+	written []WrittenFile
 	// local says workers write exchanges to their own disks (see localFor).
 	local bool
 	// erased is the latest deletion of erasure requests the coordinator
@@ -204,8 +256,11 @@ type execution struct {
 	// parts is how many partitions every exchange has.
 	parts int
 	// smaller is how many times the statement ran again because a task ran
-	// out of memory: each halves the tasks (see Execute).
+	// out of memory: each halves the tasks (see Execute). slots are the
+	// workers' slots each task takes, and the shares of a worker's memory
+	// it has (see retryShape); 0 means 1.
 	smaller int
+	slots   int
 	// roots are the statement's directories in object storage for
 	// exchanges (see spreadRoots).
 	roots     []string
@@ -250,6 +305,9 @@ type jobResult struct {
 	files   []string
 	columns []Column
 	workers map[string]bool
+	// merged, if set, is the files merged as they are read (see
+	// mergeOrdered).
+	merged *MergedView
 }
 
 // run runs every stage, each once the exchanges it reads are complete.
@@ -367,7 +425,7 @@ func (e *execution) prefetchUsed(ctx context.Context, s *Stage) map[string]Scan 
 		in := env[strings.ToLower(u.name)]
 		var sc Scan
 		w.read(&sc, in.Table.Columns, u)
-		used[in.View] = Scan{FieldIDs: append([]int{}, sc.FieldIDs...), Filtered: sc.Filtered}
+		used[in.View] = Scan{FieldIDs: append([]int{}, sc.FieldIDs...), Filtered: sc.Filtered, Filters: append([]int{}, sc.Filters...)}
 	}
 	return used
 }
@@ -395,7 +453,8 @@ func prefetchOf(used map[string]Scan, view string, files []File) *viewPrefetch {
 	if !ok {
 		return nil
 	}
-	p := &viewPrefetch{Sizes: make([]int64, len(files)), Used: append([]int{}, sc.FieldIDs...), Filtered: sc.Filtered}
+	p := &viewPrefetch{Sizes: make([]int64, len(files)), Used: append([]int{}, sc.FieldIDs...), Filtered: sc.Filtered,
+		Filters: append([]int{}, sc.Filters...)}
 	for i, f := range files {
 		p.Sizes[i] = f.Size
 	}
@@ -428,7 +487,20 @@ func (e *execution) stage(ctx context.Context, s *Stage) error {
 		tasks = len(shares)
 	}
 	var groups [][]int
-	if s.partitioned() {
+	// Tables read by bucket: each task reads the files of some buckets, and
+	// the partitions of the exchanges written to those buckets.
+	var buckets [][]int
+	var bucketFiles map[string][][]File
+	if n := s.bucketCount(); n > 0 {
+		var err error
+		if buckets, bucketFiles, err = e.bucketGroups(s, n); err != nil {
+			return err
+		}
+		tasks = len(buckets)
+		if s.partitioned() {
+			groups = buckets
+		}
+	} else if s.partitioned() {
 		groups = e.groups(s)
 		tasks = len(groups)
 	}
@@ -440,6 +512,7 @@ func (e *execution) stage(ctx context.Context, s *Stage) error {
 	var wholeBytes int64
 	for _, in := range s.Inputs {
 		switch {
+		case in.Table != nil && in.Bucketed:
 		case in.Table != nil && !in.Split:
 			def := viewDef{Name: in.View, Columns: in.Table.Columns, Rows: rowCount(e.files[in.Table.key()])}
 			def.Files, def.Deletes = paths(e.files[in.Table.key()]), deletesOf(e.files[in.Table.key()])
@@ -459,14 +532,25 @@ func (e *execution) stage(ctx context.Context, s *Stage) error {
 		}
 	}
 
+	// A stage that writes the statement's rows sends none.
+	writes := e.target != nil && s.writeSQL != ""
 	var res *jobResult
-	if s.Out == nil {
+	if s.Out == nil && !writes {
 		res = &jobResult{files: make([]string, tasks), workers: map[string]bool{}}
 	}
 	var mu sync.Mutex
 	g, gctx := errgroup.WithContext(ctx)
+	// A stage that needs only so many rows, any of them, stops its other
+	// tasks once those that ended sent that many (see Stage.enough).
+	tctx, stop := context.WithCancel(gctx)
+	defer stop()
+	var sent atomic.Int64
+	var stopped atomic.Bool
 	for i := range tasks {
 		task := &taskRequest{Query: e.qid, Task: s.ID*10000 + i, Version: e.co.opts.Version, Settings: e.settings, Erased: e.erased}
+		if e.slots > 1 {
+			task.Slots = e.slots
+		}
 		// bytes are what it reads of a table's share, reads all it reads.
 		var bytes int64
 		reads := wholeBytes
@@ -474,6 +558,16 @@ func (e *execution) stage(ctx context.Context, s *Stage) error {
 			switch {
 			case in.Table != nil && in.Split:
 				share := shares[i]
+				for _, f := range share {
+					bytes += f.Size
+				}
+				task.Views = append(task.Views, viewDef{Name: in.View, Columns: in.Table.Columns, Files: paths(share), Rows: rowCount(share),
+					Deletes: deletesOf(share), Prefetch: prefetchOf(used, in.View, share)})
+			case in.Table != nil && in.Bucketed:
+				var share []File
+				for _, b := range buckets[i] {
+					share = append(share, bucketFiles[in.View][b]...)
+				}
 				for _, f := range share {
 					bytes += f.Size
 				}
@@ -493,7 +587,10 @@ func (e *execution) stage(ctx context.Context, s *Stage) error {
 			}
 		}
 		out := ""
-		if s.Out == nil {
+		if writes {
+			task.SQL = writeSQL(s, e.target)
+			task.Write = writeRequestFor(e.target, e.target.Dir+"/"+e.qid+"/s"+strconv.Itoa(s.ID)+"-"+strconv.Itoa(i))
+		} else if s.Out == nil {
 			task.SQL, task.Columns = s.SQL, s.Columns
 			out = filepath.Join(e.dir, fmt.Sprintf("%d-%d.parquet", s.ID, i))
 		} else {
@@ -514,14 +611,18 @@ func (e *execution) stage(ctx context.Context, s *Stage) error {
 		}
 		g.Go(func() error {
 			var sp *spool
-			if s.Out == nil {
+			if s.Out == nil && !writes {
 				sp = e.sp
 			}
 			first := i % len(e.ws)
 			if owners != nil {
 				first = owners[i]
 			}
-			w, head, err := e.co.dispatch(gctx, task, e.ws, first, out, sp)
+			w, head, err := e.co.dispatch(tctx, task, e.ws, first, out, sp)
+			if err != nil && stopped.Load() && gctx.Err() == nil {
+				// Not needed: the tasks that ended sent enough rows.
+				return nil
+			}
 			if err != nil {
 				if OutOfMemory(err) && groups != nil && len(groups[i]) == 1 {
 					return &onePartition{err: err, rows: e.exchangeRows(s)}
@@ -542,6 +643,9 @@ func (e *execution) stage(ctx context.Context, s *Stage) error {
 			if s.Out != nil {
 				return e.received(s, task, head, w)
 			}
+			if writes {
+				return e.writtenBy(task, head, w)
+			}
 			mu.Lock()
 			defer mu.Unlock()
 			res.files[i] = out
@@ -551,11 +655,20 @@ func (e *execution) stage(ctx context.Context, s *Stage) error {
 			} else if !slices.Equal(res.columns, head.Columns) {
 				return fmt.Errorf("workers returned different columns for stage %d", s.ID)
 			}
+			if s.enough > 0 && sent.Add(head.Rows) >= s.enough && !stopped.Swap(true) {
+				e.co.log.Debug("a stage's tasks sent the rows it needs; stopping the others", "query", e.qid, "stage", s.ID,
+					"rows", sent.Load(), "enough", s.enough)
+				stop()
+			}
 			return nil
 		})
 	}
 	if err := g.Wait(); err != nil {
 		return err
+	}
+	if res != nil && stopped.Load() {
+		// Only the files of the tasks that ended.
+		res.files = slices.DeleteFunc(res.files, func(f string) bool { return f == "" })
 	}
 	if res != nil {
 		e.mu.Lock()

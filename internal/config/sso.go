@@ -43,6 +43,11 @@ type OIDC struct {
 	// password sign in with an access token from the provider whose
 	// audience includes it.
 	AccessTokenAudience string
+	// AccessTokenIDClaim, when set, names a claim holding the account's
+	// immutable ID at the provider, such as Entra ID's oid: an access token
+	// whose subject is not the ID token's is the account's when this claim
+	// matches the one recorded at sign-in.
+	AccessTokenIDClaim string
 }
 
 // Enabled reports whether single sign-on is configured.
@@ -88,6 +93,7 @@ func loadOIDC(cfg *Config, lookup func(string) (string, bool), addErr func(strin
 		GroupsClaim:         get("IGLOO_OIDC_GROUPS_CLAIM", "groups"),
 		DisplayName:         get("IGLOO_OIDC_DISPLAY_NAME", "SSO"),
 		AccessTokenAudience: get("IGLOO_OIDC_ACCESS_TOKEN_AUDIENCE", ""),
+		AccessTokenIDClaim:  get("IGLOO_OIDC_ACCESS_TOKEN_ID_CLAIM", ""),
 		AllowedGroups:       list("IGLOO_OIDC_ALLOWED_GROUPS"),
 	}
 	for _, d := range list("IGLOO_OIDC_ALLOWED_DOMAINS") {
@@ -131,7 +137,8 @@ func loadOIDC(cfg *Config, lookup func(string) (string, bool), addErr func(strin
 
 	if o.Issuer == "" {
 		for _, key := range []string{"IGLOO_OIDC_CLIENT_ID", "IGLOO_OIDC_CLIENT_SECRET", "IGLOO_OIDC_CLIENT_SECRET_FILE",
-			"IGLOO_OIDC_ALLOWED_DOMAINS", "IGLOO_OIDC_ALLOWED_GROUPS", "IGLOO_OIDC_ACCESS_TOKEN_AUDIENCE"} {
+			"IGLOO_OIDC_ALLOWED_DOMAINS", "IGLOO_OIDC_ALLOWED_GROUPS", "IGLOO_OIDC_ACCESS_TOKEN_AUDIENCE",
+			"IGLOO_OIDC_ACCESS_TOKEN_ID_CLAIM"} {
 			if get(key, "") != "" {
 				addErr("%s is set but IGLOO_OIDC_ISSUER is not", key)
 			}
@@ -162,7 +169,19 @@ func loadOIDC(cfg *Config, lookup func(string) (string, bool), addErr func(strin
 	if o.AccessTokenAudience != "" && o.AccessTokenAudience == o.ClientID {
 		addErr("IGLOO_OIDC_ACCESS_TOKEN_AUDIENCE must differ from IGLOO_OIDC_CLIENT_ID, or ID tokens would sign in to SQL")
 	}
-	for _, c := range []string{o.UsernameClaim, o.GroupsClaim} {
+	if o.AccessTokenIDClaim != "" {
+		if o.AccessTokenAudience == "" {
+			addErr("IGLOO_OIDC_ACCESS_TOKEN_ID_CLAIM is set but IGLOO_OIDC_ACCESS_TOKEN_AUDIENCE is not")
+		}
+		// Providers give a deleted account's email or username to someone
+		// else, so they must not stand for the account.
+		switch strings.ToLower(o.AccessTokenIDClaim) {
+		case "email", "preferred_username", "upn", "unique_name", "name", "username", strings.ToLower(o.UsernameClaim):
+			addErr("IGLOO_OIDC_ACCESS_TOKEN_ID_CLAIM must name a claim holding the account's immutable ID, such as oid (Entra ID) "+
+				"or uid (Okta), not %s, which may pass to another person", o.AccessTokenIDClaim)
+		}
+	}
+	for _, c := range []string{o.UsernameClaim, o.GroupsClaim, o.AccessTokenIDClaim} {
 		if strings.ContainsAny(c, " ,") {
 			addErr("an OIDC claim name may not contain spaces or commas, got %q", c)
 		}

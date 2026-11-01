@@ -33,6 +33,9 @@ const (
 	tasksPath  = "/v1/tasks"
 	statusPath = "/v1/status"
 	purgePath  = "/v1/purge"
+	// retirePath has a worker take no more tasks, so that it can be
+	// stopped alone (see pool.shrink), or take them again.
+	retirePath = "/v1/retire"
 )
 
 // taskRequest is one fragment over one share of the data.
@@ -73,12 +76,27 @@ type taskRequest struct {
 	// purged through less purges first, and one purged through more
 	// refuses the task (see erasure.go).
 	Erased int64 `json:"erased,omitempty"`
+	// Slots is how many of the worker's slots the task takes (see
+	// taskSlots), and so how many times a task's share of the worker's
+	// memory it has: more than one when a task over one partition ran out
+	// of memory and more partitions would not fit their writers (see
+	// retryShape).
+	Slots int `json:"slots,omitempty"`
+	// Write, if set, makes the task write its rows as files of a table,
+	// instead of sending them back; the response lists the files (see
+	// writes.go).
+	Write *writeRequest `json:"write,omitempty"`
 }
 
 // purgeRequest has a worker purge what erasure requests deleted through
 // Through, Unix nanoseconds (see erasure.go).
 type purgeRequest struct {
 	Through int64 `json:"through"`
+}
+
+// retireRequest retires a worker, or with Retire false takes it back.
+type retireRequest struct {
+	Retire bool `json:"retire"`
 }
 
 // setting is a session setting the fragment runs with.
@@ -129,9 +147,10 @@ type viewPrefetch struct {
 	// reads only row counts.
 	Used []int `json:"used"`
 	// Filtered says the task's query filters the view by one of its
-	// columns, so DuckDB may skip row groups: the prefetcher reads less of
-	// it ahead (see Scan.Filtered).
-	Filtered bool `json:"filtered,omitempty"`
+	// columns, Filters, so DuckDB may skip row groups: the prefetcher reads
+	// less of it ahead (see Scan.Filtered).
+	Filtered bool  `json:"filtered,omitempty"`
+	Filters  []int `json:"filters,omitempty"`
 }
 
 // fileDeletes are the delete files of one data file of a view.
@@ -158,9 +177,13 @@ type taskResult struct {
 	// Columns are the result's columns, with their DuckDB types.
 	Columns []Column `json:"columns,omitempty"`
 	Rows    int64    `json:"rows"`
-	// Files are a shuffle task's output files.
+	// Files are a shuffle task's output files, or the files of a table a
+	// task wrote.
 	Files []shuffleFile `json:"files,omitempty"`
 	Error *taskErr      `json:"error,omitempty"`
+	// attempt is the directory the attempt that answered was given to
+	// write under, as the coordinator knows it (see checkWritten).
+	attempt string
 }
 
 // shuffleFile is a file of rows a shuffle task wrote for one partition.
@@ -195,10 +218,16 @@ type taskErr struct {
 	// Throttled says object storage turned the task's requests away for
 	// now (see throttled): the same task may well run a moment later.
 	Throttled bool `json:"throttled,omitempty"`
+	// CacheRace says a read of the worker's read cache raced another over
+	// a block's file (see prefetch.BlockRace): the same task runs again.
+	CacheRace bool `json:"cache_race,omitempty"`
 	// Erased, if set, says the worker refused the task: it was purged of
 	// what erasure requests deleted through Erased, later than the
 	// statement began (see erasure.go).
 	Erased int64 `json:"erased,omitempty"`
+	// WriteDenied says object storage refused the task's write of a table's
+	// files (see writeDenied).
+	WriteDenied bool `json:"write_denied,omitempty"`
 }
 
 func (e *taskErr) Error() string { return e.Message }
@@ -208,6 +237,12 @@ func (e *taskErr) Error() string { return e.Message }
 type throttledError struct{ msg string }
 
 func (e *throttledError) Error() string { return e.msg }
+
+// cacheRaceError is a task that failed because a read of the worker's read
+// cache raced another over a block's file (see taskErr.CacheRace).
+type cacheRaceError struct{ msg string }
+
+func (e *cacheRaceError) Error() string { return e.msg }
 
 // throttleSigns are how a request object storage turned away for now
 // reads in DuckDB's errors (HTTP Error: Request returned HTTP 503 for HTTP
@@ -247,6 +282,16 @@ type workerStatus struct {
 	// not say.
 	Slots   int `json:"slots,omitempty"`
 	Threads int `json:"threads,omitempty"`
+	// InstanceType, Region and Spot say what machine it runs on, where its
+	// cloud's metadata says (see WorkerOptions).
+	InstanceType string `json:"instance_type,omitempty"`
+	Region       string `json:"region,omitempty"`
+	Spot         bool   `json:"spot,omitempty"`
+	// Instance is its cloud instance's ID, where its metadata says, for
+	// stopping it alone; Retiring says it takes no more tasks, about to be
+	// stopped (see pool.shrink).
+	Instance string `json:"instance,omitempty"`
+	Retiring bool   `json:"retiring,omitempty"`
 	// Boot is random to each run of the worker.
 	Boot        string  `json:"boot,omitempty"`
 	Running     int     `json:"running"`

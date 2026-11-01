@@ -82,6 +82,10 @@ type Query struct {
 	// runs (distributed.Plan.Key), so that where it ran faster decides where
 	// it runs next, after a restart too; empty for others.
 	PlanKey string
+	// Placement is where such a statement ran and why: this replica, how
+	// many workers, or the large worker, and auto mode's reason
+	// (distributed.Plan.Placement); empty for others.
+	Placement string
 	// Shape identifies the statements alike but for their literals, the
 	// workload controller's key for what they allocate (see
 	// workload.Controller.Observe); empty for statements that do not count

@@ -3,6 +3,7 @@ package distributed
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io/fs"
 	"log/slog"
 	"maps"
@@ -71,6 +72,9 @@ func TestProbedRelations(t *testing.T) {
 	}
 	t.Cleanup(func() { co.Close() })
 	h.co = co
+	// The coordinator completes the few groups of orders' priorities, as
+	// the stages' names below expect.
+	co.aggregation = aggGather
 	query := func(filter string) string {
 		return `WITH aud AS (SELECT DISTINCT l_orderkey AS k FROM lineitem WHERE ` + filter + `)
 			SELECT o.o_orderpriority, count(*), sum(o.o_totalprice) FROM orders AS o JOIN aud ON aud.k = o.o_orderkey GROUP BY 1 ORDER BY 1`
@@ -174,6 +178,81 @@ func TestProbedRelations(t *testing.T) {
 			t.Errorf("measured small before: orders' partitioning started, in %v", stages)
 		}
 	}
+}
+
+// A relation of uncertain size whose tables' statistics bound it under
+// what every worker may read, as the distinct members of an audience by
+// their column's distinct count, is measured with the workers to itself
+// the first time: the table's partitioning, which a plan with its size
+// does not need, does not start beside it. Without the statistics, it
+// does. At a hundred times the data, partitioning 16 workers' tables to
+// meet an audience of 1.9 million beside it took a report 305 s, where
+// measured first it took 50 s.
+func TestProbedByStatistics(t *testing.T) {
+	h := newHarness(t, 0.01, 2, 3)
+	rec := &stageTasks{tasks: map[string]int64{}}
+	co, err := NewCoordinator(Options{
+		Source: fileSource{h}, Secret: testSecret, Version: "test", TempDir: filepath.Join(h.dir, "coordinator2"),
+		Warehouse: filepath.Join(h.dir, "warehouse") + "/", Cores: 2, Pool: PoolOptions{Addresses: []string{
+			h.lns[0].Addr().String(), h.lns[1].Addr().String(), h.lns[2].Addr().String()}},
+		Storage: recordingStorage{NewStorage(icebergio.LocalFS{}), h},
+	}, slog.New(rec))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { co.Close() })
+	h.co = co
+	co.aggregation = aggGather
+	co.maxBroadcast = h.tables["orders"].Bytes / 2
+	run := func(q string) (*Plan, *Execution, []string) {
+		t.Helper()
+		rec.mu.Lock()
+		clear(rec.tasks)
+		rec.mu.Unlock()
+		_, _, plan, ex, err := h.run(t.Context(), q, ModeOn)
+		if err != nil {
+			t.Fatal(err)
+		}
+		rec.mu.Lock()
+		stages := slices.Collect(maps.Keys(rec.tasks))
+		rec.mu.Unlock()
+		return plan, ex, stages
+	}
+	q := `WITH aud AS (SELECT DISTINCT l_orderkey AS k FROM lineitem WHERE l_quantity = %d)
+		SELECT o.o_orderpriority, count(*) FROM orders AS o JOIN aud ON aud.k = o.o_orderkey GROUP BY 1 ORDER BY 1`
+	partitioned := func(stages []string) bool {
+		return slices.ContainsFunc(stages, func(s string) bool { return strings.Contains(s, "split main.orders to exchange") })
+	}
+	// No statistics: orders' partitioning starts beside the relation.
+	plan, ex, stages := run(fmt.Sprintf(q, 4))
+	if len(plan.uncertain) != 1 || plan.uncertain[0].small || len(ex.Probes) != 1 || !partitioned(stages) {
+		t.Errorf("without statistics: uncertain %v, probes %v, stages %v", plan.uncertain, ex.Probes, stages)
+	}
+	// ANALYZE's distinct count of the orders' keys: 15,000 of 8 bytes, under
+	// what every worker may read.
+	h.tables["lineitem"].Distinct = map[string]int64{"l_orderkey": 15_000}
+	plan, ex, stages = run(fmt.Sprintf(q, 5))
+	if len(plan.uncertain) != 1 || !plan.uncertain[0].small || len(ex.Probes) != 1 || !strings.Contains(ex.Probes[0], "read whole") || partitioned(stages) {
+		t.Errorf("bound by statistics: uncertain %v, probes %v, stages %v", plan.uncertain, ex.Probes, stages)
+	}
+	if !h.check(fmt.Sprintf(q, 5)) {
+		t.Error("did not run distributed")
+	}
+	// A count that does not bound it under what every worker may read.
+	h.tables["lineitem"].Distinct = map[string]int64{"l_orderkey": h.tables["orders"].Bytes}
+	if plan := mustPlan(t, h, fmt.Sprintf(q, 6)); len(plan.uncertain) != 1 || plan.uncertain[0].small {
+		t.Errorf("a large distinct count: %v", plan.uncertain)
+	}
+}
+
+// mustPlan plans q forced onto the harness's workers.
+func mustPlan(t *testing.T, h *harness, q string) *Plan {
+	t.Helper()
+	p, err := h.co.Plan(t.Context(), q, harnessEnv{h}, ModeOn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return p
 }
 
 // A relation measured once, which the plan made with its size read whole

@@ -406,8 +406,8 @@ func TestIglooClassification(t *testing.T) {
 	}
 }
 
-// Igloo's classes train on a sample of large inputs, the same sample for
-// the same rows.
+// Igloo's classes train on a sample of large inputs, a little smaller than
+// the limit, the same sample for the same rows.
 func TestIglooTrainsOnASample(t *testing.T) {
 	t.Parallel()
 	store := models.NewMemoryStore()
@@ -426,12 +426,61 @@ func TestIglooTrainsOnASample(t *testing.T) {
 		Sampled int `json:"sampled_rows"`
 		Input   int `json:"input_rows"`
 	}
-	if err := json.Unmarshal([]byte(m.Metrics), &summary); err != nil || summary.Input != 1500 || summary.Sampled < 400 || summary.Sampled > 600 {
+	if err := json.Unmarshal([]byte(m.Metrics), &summary); err != nil || summary.Input != 1500 || summary.Sampled < 300 || summary.Sampled > 500 {
 		t.Errorf("summary %s: %v", m.Metrics, err)
 	}
 	mustExec(t, conn, create)
 	if again, _ := store.Get(context.Background(), "public", "sampled"); again.Blob != m.Blob {
 		t.Error("a second sample differs")
+	}
+}
+
+// Rows that repeat are sampled like any others, each copy on its own: two
+// rows 750 times each give a sample with both, not every row or none; and
+// the seed seeds the sample.
+func TestIglooSamplesRepeatedRows(t *testing.T) {
+	t.Parallel()
+	store := models.NewMemoryStore()
+	cs := startCatalogServer(t, func(o *Options) { o.Models, o.trainRows = store, 500 })
+	mustExec(t, cs.admin, `CREATE TABLE lake.public.repeated AS SELECT i % 2 = 0 AS converted, (i % 2) * 10.0 AS spend FROM range(1500) t(i)`)
+	conn := snowflakeConn(t, cs.admin)
+	sampled := func(seed int) int {
+		t.Helper()
+		mustExec(t, conn, `CREATE OR REPLACE IGLOO.ML.CLASSIFICATION repeated_model(INPUT_DATA => TABLE(repeated),
+			TARGET_COLNAME => 'converted', CONFIG_OBJECT => {'algorithm': 'logistic', 'seed': `+strconv.Itoa(seed)+`})`)
+		m, err := store.Get(context.Background(), "public", "repeated_model")
+		if err != nil {
+			t.Fatal(err)
+		}
+		var summary struct {
+			Sampled int `json:"sampled_rows"`
+			Input   int `json:"input_rows"`
+		}
+		if err := json.Unmarshal([]byte(m.Metrics), &summary); err != nil || summary.Input != 1500 || summary.Sampled < 300 ||
+			summary.Sampled > 500 {
+			t.Errorf("seed %d: summary %s: %v", seed, m.Metrics, err)
+		}
+		return summary.Sampled
+	}
+	if first, second := sampled(0), sampled(1); first == second {
+		t.Errorf("seeds 0 and 1 both sample %d rows", first)
+	}
+
+	// A sample that comes out empty fails CREATE, saying so: of 1,500 rows,
+	// a sample that aims at less than one often has none.
+	tiny := startCatalogServer(t, func(o *Options) { o.trainRows = 1 })
+	mustExec(t, tiny.admin, `CREATE TABLE lake.public.repeated AS SELECT i % 2 = 0 AS converted, (i % 2) * 10.0 AS spend FROM range(1500) t(i)`)
+	conn = snowflakeConn(t, tiny.admin)
+	empty := 0
+	for seed := range 10 {
+		_, err := conn.Exec(context.Background(), `CREATE OR REPLACE IGLOO.ML.CLASSIFICATION repeated_model(INPUT_DATA => TABLE(repeated),
+			TARGET_COLNAME => 'converted', CONFIG_OBJECT => {'seed': `+strconv.Itoa(seed)+`})`)
+		if pgCode(err) == "54000" && strings.Contains(err.Error(), "a sample of them came out empty") {
+			empty++
+		}
+	}
+	if empty == 0 {
+		t.Error("no empty sample was refused as such")
 	}
 }
 

@@ -526,8 +526,9 @@ func (h *Handler) deleteUser(w http.ResponseWriter, r *http.Request) {
 		h.serverError(w, err)
 		return
 	}
-	if err := h.sso.RefreshRoles(ctx, u.Name); err != nil {
-		h.log.Warn("cannot update a deprovisioned user's roles", "user", u.Name, "err", err)
+	// The user is disabled already; Run applies what fails here.
+	if err := h.applyChanges(ctx); err != nil {
+		h.log.Warn("cannot apply the group mappings after deprovisioning a user yet", "user", u.Name, "err", err)
 	}
 	h.changed(u.Name)
 	h.log.Info("SCIM deprovisioned a user, who is now disabled", "user", u.Name, "by", caller(r))

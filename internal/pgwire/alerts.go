@@ -993,6 +993,9 @@ func (s *Server) runAlert(ctx context.Context, j tasks.Job) (int64, error) {
 		s.notify.Record(ctx, rec)
 		return rows, err
 	}
+	if err := s.stillDue(ctx, j); err != nil {
+		return finish(notify.StateSkipped, -1, err)
+	}
 
 	def, err := decodeAlert(j.Statement)
 	if err != nil {
@@ -1138,7 +1141,8 @@ func (s *Server) RunningStatements() []notify.Statement {
 	return out
 }
 
-// forgetGrantee drops the integration grants of a dropped user or role.
+// forgetGrantee drops the integration and model grants of a dropped user
+// or role.
 func (s *Server) forgetGrantee(granteeType, name string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -1147,5 +1151,8 @@ func (s *Server) forgetGrantee(granteeType, name string) {
 	}
 	if err := s.ai.Store().ForgetGrantee(ctx, granteeType, name); err != nil {
 		s.log.Warn("could not remove the AI integration grants of a dropped "+granteeType, granteeType, name, "err", err)
+	}
+	if err := s.models.ForgetGrantee(ctx, granteeType, name); err != nil {
+		s.log.Warn("could not remove the model grants of a dropped "+granteeType, granteeType, name, "err", err)
 	}
 }

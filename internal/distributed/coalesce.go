@@ -177,7 +177,7 @@ func exchangePartitions(stages []*Stage, ws []*worker, n int, upload int64) int 
 		}
 	}
 	parts := max(partitions(n, split, partitionBytes), min(partitionsFor(stages, taskMemory(ws), n), maxPartitions))
-	if most := writerPartitions(stages, ws, upload); most > 0 {
+	if most := writerPartitions(stages, ws, upload, 1); most > 0 {
 		parts = min(parts, max(most, n))
 	}
 	return parts
@@ -524,10 +524,12 @@ func matchesPattern(fragment node, t *Table) bool {
 // memory in, at the width of the widest exchange's rows. Rows of 400
 // strings took a writer of 3 GB out of memory over 128 partitions and 256,
 // even in row groups of 2,048 rows. A file in object storage takes upload
-// bytes more, its upload's buffer (see uploadBuffer). It is 0 when the
-// workers' memory is not known or no stage writes an exchange.
-func writerPartitions(stages []*Stage, ws []*worker, upload int64) int {
-	budget := taskMemory(ws) / 2
+// bytes more, its upload's buffer (see uploadBuffer). A task that takes
+// slots of a worker's slots has as many shares (see taskRequest.Slots). It
+// is 0 when the workers' memory is not known or no stage writes an
+// exchange.
+func writerPartitions(stages []*Stage, ws []*worker, upload int64, slots int) int {
+	budget := taskMemory(ws) * int64(max(slots, 1)) / 2
 	_, width := exchangeEstimates(stages)
 	var widest int64
 	for _, w := range width {
@@ -548,10 +550,18 @@ func uploadBytes(warehouse string) int64 {
 	return 0
 }
 
+// smallCompletion is the most memory, as rowMemory reckons it, the partial
+// results of a stage that completes an aggregation's groups may take for
+// one task to complete them all: a statement grouped by a column of few
+// values, which partitions complete as they would many, waits for one
+// task rather than a round of them.
+const smallCompletion = 64 << 20
+
 // groups returns the partitions each task of stage s, which reads
 // exchanges by partition, reads.
 func (e *execution) groups(s *Stage) [][]int {
 	mem := make([]int64, e.parts)
+	var total int64
 	for _, in := range s.Inputs {
 		if in.Exchange == nil || !in.Partitioned {
 			continue
@@ -560,9 +570,18 @@ func (e *execution) groups(s *Stage) [][]int {
 		per := rowMemory(x.columns)
 		for p, rows := range x.partRows {
 			mem[p] += rows * per
+			total += rows * per
 		}
 	}
-	return groupPartitions(mem, taskMemory(e.ws)>>e.smaller, totalSlots(e.ws))
+	if s.completes && total <= smallCompletion && e.smaller == 0 {
+		all := make([]int, e.parts)
+		for p := range all {
+			all[p] = p
+		}
+		return [][]int{all}
+	}
+	slots := max(e.slots, 1)
+	return groupPartitions(mem, taskMemory(e.ws)*int64(slots)>>e.smaller, max(totalSlots(e.ws)/slots, 1))
 }
 
 // totalSlots returns how many tasks the workers ws run at once together, and

@@ -1,0 +1,18 @@
+{{- /*
+Compute classes are custom resources that GKE provides. They are installed
+through Helm rather than the Kubernetes provider's kubernetes_manifest,
+which needs the cluster's API to plan and so could not be created in the
+same apply as the cluster.
+*/ -}}
+{{- range .Values.classes }}
+---
+apiVersion: cloud.google.com/v1
+kind: ComputeClass
+metadata:
+  name: {{ .name }}
+  labels:
+    app.kubernetes.io/part-of: igloo
+    app.kubernetes.io/managed-by: {{ $.Release.Service }}
+spec:
+  {{- toYaml .spec | nindent 2 }}
+{{- end }}

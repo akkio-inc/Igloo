@@ -139,7 +139,9 @@ may (`can_login`). If someone's account at the provider is replaced, so its
 subject changes, their next sign-in is refused as belonging to someone else
 until an admin unlinks the old account: `ALTER USER ana SSO NULL` (console:
 *Unlink SSO*). Igloo never relinks by itself, since a reused email may now be
-another person's.
+another person's. For the same reason, once a user is linked, the
+provider's [access tokens](#identity-provider-access-tokens) are theirs only
+by the linked account's subject or immutable ID, never by email.
 
 ## Groups and roles
 
@@ -159,7 +161,10 @@ lists and, with [SCIM](#scim-provisioning), the groups it pushed:
 Without [SCIM](#scim-provisioning), roles change at sign-in only: a user who
 leaves a group keeps its roles in SQL sessions and access tokens until they
 next sign in to the console, or an admin changes them. With SCIM they change
-as soon as the provider pushes the group.
+as soon as the provider pushes the group. SCIM alone decides who is in a
+group it pushes: a token that lists that group counts for nothing, so
+removing someone from it at the provider takes its roles away at once. The
+token's other groups still count, as without SCIM.
 
 ## Passwords and single sign-on users
 
@@ -239,7 +244,9 @@ catalog's session lasts an hour at most, never longer than the token.
   every login in `igloo.login_history` with `auth_method` `token` and the
   token's `token_name`.
 - **Revoking** a token (`DROP TOKEN`) stops new logins at once and ends the
-  SQL and Arrow Flight SQL sessions it opened within 30 seconds, and its
+  SQL and Arrow Flight SQL sessions it opened within 30 seconds (a replica
+  that cannot read the metadata database refuses their statements after
+  `IGLOO_ACCESS_MAX_STALENESS` instead), and its
   Iceberg REST catalog sessions at their next request. A session also ends,
   before its next statement or request, once its token has expired. Storage
   credentials the catalog already handed an engine for a table's files last
@@ -259,8 +266,26 @@ that already get one (for instance with a device-code login). Set
 `IGLOO_OIDC_ACCESS_TOKEN_AUDIENCE` to the audience the provider puts in
 access tokens meant for Igloo, such as `api://igloo` (Entra ID) or a custom
 authorization server's audience (Okta). Igloo then checks such a token's
-signature, issuer, audience and expiry, and that it is the user's: their
-linked account, their email, or a username that maps to their name.
+signature, issuer, audience and expiry, and that it is the user's. For a
+user linked to an account, it must be that account's: the same subject as
+the ID token they sign in to the console with, or, with
+`IGLOO_OIDC_ACCESS_TOKEN_ID_CLAIM`, the same immutable ID. A user not linked
+yet is matched as their first console sign-in would match them: by their
+email, or by a username that maps to their name.
+
+Some providers give access tokens a subject of their own: Okta's is the
+username, and Entra ID's differs between applications. Set
+`IGLOO_OIDC_ACCESS_TOKEN_ID_CLAIM` to the claim that holds the account's
+immutable ID in their access tokens, `uid` for Okta and `oid` for Entra ID.
+Igloo records it at each console sign-in, from the ID token's claim of that
+name (Entra ID's has `oid` with the default `profile` scope), or from its
+subject when it has none, as Okta's ID tokens carry the `uid` of its access
+tokens as their subject. Each user then signs in to the console once before
+their access tokens work. The claim must never pass to another person, so
+`email`, `preferred_username`, `upn` and the username claim are refused.
+Earlier versions accepted such tokens when their verified email was the
+linked account's; they no longer do, since a provider may give a deleted
+account's email to someone new.
 
 Because SCRAM never shows the server the secret, which checking such a
 token needs, Igloo asks these users' clients for the password in clear text
@@ -356,12 +381,21 @@ How Igloo treats what the provider sends:
 | `active: false` / `true` | `ALTER USER name NOLOGIN` / `LOGIN`. |
 | `userName`, `emails`, `name`, `displayName`, `externalId` | Kept; the primary email becomes the user's email. Other attributes are accepted and ignored. |
 | Delete a user | Disables the user and stops managing them; their groups' roles go. An admin drops the user when they wish (`DROP USER`). |
-| Groups and members | Kept; a group's display name is what `GRANT role TO SSO GROUP 'name'` matches. Members must be users the provider provisioned. Roles follow membership changes at once, and at sign-in the token's groups count too. |
+| Groups and members | Kept; a group's display name is what `GRANT role TO SSO GROUP 'name'` matches. Members must be users the provider provisioned. Roles follow membership changes at once. A token's groups count at sign-in too, except groups SCIM pushes, whose SCIM members alone have their roles. |
 
 Changes are logged with the token that made them. Without TLS, SCIM is
 accepted only at `localhost`, as sign-ins are. Service accounts are never
 provisioned, and Igloo never deactivates its last enabled admin who is a
 person.
+
+Igloo records whose groups each change affects along with the change. If
+it then cannot apply their roles, for instance because the metadata
+database is briefly out of reach, it keeps the change, answers a change or
+deletion of a group with an error (500), and applies the roles when the
+provider sends the request again, or by itself within a minute. Replicas
+apply one user's roles one at a time, through a lock in the metadata
+database that sign-ins take too, so when two change the user's groups at
+once, the roles that stay are those of the groups as both left them.
 
 ## Failed logins
 
@@ -377,7 +411,10 @@ no more guesses: while as many logins for a user, or from an address, are
 running as it has failures left, the next one waits for one of them to end,
 for up to 10 seconds. A pool that opens many sessions at once, such as dbt's
 threads or a BI tool's, signs them all in; a login that has waited 10
-seconds is refused with `too many failed logins`.
+seconds is refused with `too many failed logins`. A SQL client that has not
+signed in within 30 seconds of connecting (`IGLOO_LOGIN_TIMEOUT`) is
+disconnected, which ends its login, so connections left hanging halfway
+through hold none for long.
 
 ## Troubleshooting
 

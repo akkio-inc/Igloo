@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"maps"
+	"math"
 	"slices"
 	"strings"
 	"sync"
@@ -30,6 +31,10 @@ type uncertain struct {
 	key      string
 	out      *Exchange
 	estimate int64
+	// small says the statistics of the tables it reads bound it under what
+	// every worker may read (see sizeBound): it is measured with the
+	// workers to itself, as one measured small lately is.
+	small bool
 }
 
 // outcome is how a relation of uncertain size came out: measured at size,
@@ -237,17 +242,194 @@ func selectiveFilter(c node) bool {
 
 // uncertainOf returns the relations of uncertain size among a candidate's
 // inputs read by partition, when other large inputs are partitioned to
-// meet them.
-func uncertainOf(c *candidate) []uncertain {
+// meet them, and whether statistics bound each under what every worker
+// may read.
+func (pl *planner) uncertainOf(c *candidate) []uncertain {
 	if len(c.keyed) < 2 {
 		return nil
 	}
 	var out []uncertain
 	for _, k := range c.keyed {
 		if k.rel != nil && !k.rel.known && k.rel.key != "" && k.rel.out != nil && uncertainSize(k.rel) {
-			out = append(out, uncertain{name: k.item.name, key: k.rel.key, out: k.rel.out, estimate: k.rel.bytes})
+			u := uncertain{name: k.item.name, key: k.rel.key, out: k.rel.out, estimate: k.rel.bytes}
+			if bound, ok := pl.sizeBound(k.rel.q, k.rel.scope, 0); ok && bound <= pl.opts.maxBroadcast {
+				u.small = true
+			}
+			out = append(out, u)
 		}
 	}
+	return out
+}
+
+// smallByStatistics reports whether statistics bound every relation of u
+// under what every worker may read.
+func smallByStatistics(u []uncertain) bool {
+	for _, r := range u {
+		if !r.small {
+			return false
+		}
+	}
+	return len(u) > 0
+}
+
+// sizeBound bounds the size of the rows of query node q by the statistics
+// of the tables it reads (the distinct counts of ANALYZE, or of Iceberg's
+// theta sketches): a grouping, by GROUP BY or DISTINCT, of their columns
+// makes no more rows than the product of the columns' distinct counts; a
+// conjunct of its WHERE clause comparing a column to a value with = keeps
+// no more of a table's rows than the rows over the column's distinct
+// count; a query of one relation, as of a common table expression, makes
+// no more rows than it. Its size is its rows at the memory its result's
+// columns take (memoryBytes), which for 1.9 million IDs of 32 characters,
+// an audience, came to 61.9 MB measured. ok is false where the statistics
+// bound nothing. An audience, the distinct members of one version of a
+// lookup of every audience, is estimated at the lookup's size, which may
+// be a thousand times its own: partitioning 16 workers' tables to meet it
+// beside it, at a hundred times the data, took a report 305 s where,
+// measured first, it took 50 s.
+func (pl *planner) sizeBound(q node, scope cteScope, depth int) (int64, bool) {
+	if depth > 8 || str(q["type"]) != "SELECT_NODE" {
+		return 0, false
+	}
+	sc := scope.with(q)
+	var tables []*Table
+	var inner []node
+	var innerScopes []cteScope
+	var visit func(ref node)
+	visit = func(ref node) {
+		switch str(ref["type"]) {
+		case "JOIN":
+			visit(child(ref, "left"))
+			visit(child(ref, "right"))
+		case "SUBQUERY":
+			inner, innerScopes = append(inner, subqueryNode(ref)), append(innerScopes, sc)
+		case "BASE_TABLE":
+			parts := tableParts(ref)
+			if len(parts) == 1 {
+				if d := sc.find(parts[0]); d != nil {
+					inner, innerScopes = append(inner, d.query()), append(innerScopes, d.scope)
+					return
+				}
+			}
+			if t, err := pl.table(parts); err == nil {
+				tables = append(tables, t)
+			}
+		}
+	}
+	visit(child(q, "from_table"))
+	// The tables of the relations it reads, for their columns' counts.
+	all := slices.Clone(tables)
+	for i, n := range inner {
+		all = append(all, pl.tablesOf(n, innerScopes[i], depth+1)...)
+	}
+	column := func(e any) (Column, int64, bool) {
+		n, _ := e.(node)
+		if str(n["class"]) != "COLUMN_REF" {
+			return Column{}, 0, false
+		}
+		names := list(n, "column_names")
+		if len(names) == 0 {
+			return Column{}, 0, false
+		}
+		name := strings.ToLower(str(names[len(names)-1]))
+		var col Column
+		var ndv int64
+		for _, t := range all {
+			for _, c := range t.Columns {
+				if strings.EqualFold(c.Name, name) && t.Distinct[name] > ndv {
+					col, ndv = c, t.Distinct[name]
+				}
+			}
+		}
+		return col, ndv, ndv > 0
+	}
+	width := func() float64 {
+		var w float64
+		for _, item := range list(q, "select_list") {
+			if c, _, ok := column(item); ok {
+				w += memoryBytes(c.Type)
+			} else {
+				w += planExprWidth
+			}
+		}
+		return max(w, planExprWidth)
+	}
+	rows := math.Inf(1)
+	keys := list(q, "group_expressions")
+	if len(keys) == 0 && hasModifier(q, "DISTINCT_MODIFIER") {
+		keys = list(q, "select_list")
+	}
+	if len(keys) > 0 {
+		product := 1.0
+		for _, k := range keys {
+			_, ndv, ok := column(k)
+			if !ok {
+				product = math.Inf(1)
+				break
+			}
+			product *= float64(ndv)
+		}
+		rows = min(rows, product)
+	}
+	if len(tables) == 1 && len(inner) == 0 && tables[0].Rows > 0 {
+		kept := float64(tables[0].Rows)
+		for _, c := range conjuncts(child(q, "where_clause")) {
+			if str(c["type"]) != "COMPARE_EQUAL" || !selectiveFilter(c) {
+				continue
+			}
+			for _, side := range []string{"left", "right"} {
+				if _, ndv, ok := column(child(c, side)); ok {
+					kept = min(kept, float64(tables[0].Rows)/float64(ndv))
+				}
+			}
+		}
+		rows = min(rows, kept)
+	}
+	if len(tables) == 0 && len(inner) == 1 {
+		if b, ok := pl.sizeBound(inner[0], innerScopes[0], depth+1); ok {
+			// No more rows than the relation it reads.
+			if !math.IsInf(rows, 1) {
+				b = min(b, int64(math.Ceil(rows*width())))
+			}
+			return b, true
+		}
+	}
+	if math.IsInf(rows, 1) {
+		return 0, false
+	}
+	return int64(math.Ceil(rows * width())), true
+}
+
+// tablesOf returns the catalog tables query node q reads, through its
+// subqueries and common table expressions.
+func (pl *planner) tablesOf(q node, scope cteScope, depth int) []*Table {
+	if depth > 8 || str(q["type"]) != "SELECT_NODE" {
+		return nil
+	}
+	sc := scope.with(q)
+	var out []*Table
+	var visit func(ref node)
+	visit = func(ref node) {
+		switch str(ref["type"]) {
+		case "JOIN":
+			visit(child(ref, "left"))
+			visit(child(ref, "right"))
+		case "SUBQUERY":
+			out = append(out, pl.tablesOf(subqueryNode(ref), sc, depth+1)...)
+		case "BASE_TABLE":
+			parts := tableParts(ref)
+			if len(parts) == 1 {
+				if d := sc.find(parts[0]); d != nil {
+					out = append(out, pl.tablesOf(d.query(), d.scope, depth+1)...)
+					return
+				}
+			}
+			if t, err := pl.table(parts); err == nil {
+				out = append(out, t)
+			}
+		}
+	}
+	visit(child(q, "from_table"))
 	return out
 }
 
@@ -279,7 +461,10 @@ func (co *Coordinator) runProbing(ctx context.Context, plan *Plan, run *executio
 		outs[u.out.ID] = true
 	}
 	first := producers(plan.Stages, outs)
-	speculate := !co.outcomes.smallLately(plan.uncertain, time.Now())
+	// Measured small lately, or bound small by statistics, the relations
+	// are measured with the workers to themselves: partitioning tables to
+	// meet them beside them is work thrown away once they are read whole.
+	speculate := !co.outcomes.smallLately(plan.uncertain, time.Now()) && !smallByStatistics(plan.uncertain)
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	decided := make(chan struct{})
@@ -391,7 +576,7 @@ func (co *Coordinator) runProbing(ctx context.Context, plan *Plan, run *executio
 		if x == nil || exchanges[id] == nil {
 			continue
 		}
-		if readWhole[id] || slices.Equal(exchanges[id].Keys, w.Keys) && slices.Equal(exchanges[id].Casts, w.Casts) {
+		if readWhole[id] || slices.Equal(exchanges[id].Keys, w.Keys) && slices.Equal(exchanges[id].Casts, w.Casts) && exchanges[id].Buckets == w.Buckets {
 			again.exchanges[id] = x
 			reused[id] = true
 		}

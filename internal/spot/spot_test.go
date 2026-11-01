@@ -65,3 +65,50 @@ func TestWatchEC2Off(t *testing.T) {
 		t.Errorf("got %v, want ErrNotEC2", err)
 	}
 }
+
+// A machine that heard a notice finishes its work until the margin before
+// the time given, and at least the floor.
+func TestGrace(t *testing.T) {
+	n := Notice{Action: "terminate", Time: time.Now().Add(2 * time.Minute)}
+	if g := n.Grace(10*time.Second, 30*time.Second); g < 109*time.Second || g > 110*time.Second {
+		t.Errorf("two minutes ahead: grace %s", g)
+	}
+	n.Time = time.Now().Add(20 * time.Second)
+	if g := n.Grace(10*time.Second, 30*time.Second); g != 30*time.Second {
+		t.Errorf("twenty seconds ahead: grace %s, want the floor", g)
+	}
+}
+
+// TestDescribeEC2 checks what the metadata service says of the machine.
+func TestDescribeEC2(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPut && r.URL.Path == "/latest/api/token" {
+			_, _ = rw.Write([]byte("tok"))
+			return
+		}
+		if r.Header.Get("X-aws-ec2-metadata-token") != "tok" {
+			http.Error(rw, "", http.StatusUnauthorized)
+			return
+		}
+		switch r.URL.Path {
+		case "/latest/meta-data/instance-id":
+			_, _ = rw.Write([]byte("i-0123456789abcdef0"))
+		case "/latest/meta-data/instance-type":
+			_, _ = rw.Write([]byte("m7gd.2xlarge"))
+		case "/latest/meta-data/placement/region":
+			_, _ = rw.Write([]byte("us-east-2"))
+		case "/latest/meta-data/instance-life-cycle":
+			_, _ = rw.Write([]byte("spot"))
+		default:
+			http.NotFound(rw, r)
+		}
+	}))
+	defer srv.Close()
+	in, err := DescribeEC2(context.Background(), srv.URL)
+	if err != nil || in != (Instance{ID: "i-0123456789abcdef0", Type: "m7gd.2xlarge", Region: "us-east-2", Spot: true}) {
+		t.Errorf("instance %+v, %v", in, err)
+	}
+	if _, err := DescribeEC2(context.Background(), "http://127.0.0.1:1"); !errors.Is(err, ErrNotEC2) {
+		t.Errorf("no metadata service: %v", err)
+	}
+}

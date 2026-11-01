@@ -23,6 +23,7 @@ import (
 	"github.com/akkio-inc/igloo/internal/catalog"
 	"github.com/akkio-inc/igloo/internal/catalogproxy"
 	"github.com/akkio-inc/igloo/internal/config"
+	"github.com/akkio-inc/igloo/internal/memlimit"
 	"github.com/akkio-inc/igloo/internal/models"
 	"github.com/akkio-inc/igloo/internal/policy"
 	"github.com/akkio-inc/igloo/internal/prefetch"
@@ -83,6 +84,10 @@ type Engine struct {
 	aiHook atomic.Pointer[aiHookBox]
 	// models scores models and serves their methods' results (see Models).
 	models *models.Runtime
+	// purges are what EmptyCache empties beside the read cache (see
+	// OnEmptyCache).
+	purgeMu sync.Mutex
+	purges  []func()
 	// forecasting forecasts with the model pack's models (see Forecasting).
 	forecasting *tsforecast.Service
 	// catMu keeps binding, walking and changing the attached catalog's
@@ -98,6 +103,11 @@ type Engine struct {
 	bitmaps bool
 	log     *slog.Logger
 }
+
+// OpenPartitionFiles is how many files of a partitioned write DuckDB keeps
+// open, one a partition: a write into a table of more partitions than that,
+// such as bucket(2048, column), makes small files again.
+const OpenPartitionFiles = 1024
 
 // Open starts DuckDB and, when a catalog is configured, attaches it. It keeps
 // retrying the attach until ctx is done. Once set up, DuckDB is locked down
@@ -154,13 +164,24 @@ func (e *Engine) Connect(ctx context.Context) (*duckdb.Conn, error) {
 	}
 
 	conn := c.(*duckdb.Conn)
-	for _, stmt := range e.connectStmts {
-		if _, err := conn.ExecContext(ctx, stmt, nil); err != nil {
-			return nil, errors.Join(fmt.Errorf("select default schema: %w", err), conn.Close())
-		}
+	if err := e.UseDefaultSchema(ctx, conn); err != nil {
+		return nil, errors.Join(err, conn.Close())
 	}
 
 	return conn, nil
+}
+
+// UseDefaultSchema puts conn back on the schema and search path a new
+// connection starts with: the catalog's default schema, then its views'
+// schema in the local database. DuckDB's own default, which its RESET of
+// the search path restores, is its own database with an empty path.
+func (e *Engine) UseDefaultSchema(ctx context.Context, conn *duckdb.Conn) error {
+	for _, stmt := range e.connectStmts {
+		if _, err := conn.ExecContext(ctx, stmt, nil); err != nil {
+			return fmt.Errorf("select default schema: %w", err)
+		}
+	}
+	return nil
 }
 
 // sqlConn opens a database/sql connection to DuckDB, which duckdb-go
@@ -176,6 +197,18 @@ func (e *Engine) sqlConn(ctx context.Context) (*sql.Conn, func(), error) {
 		return nil, nil, errors.Join(err, db.Close())
 	}
 	return conn, func() { _, _ = conn.Close(), db.Close() }, nil
+}
+
+// RegisterFunctions runs register on a connection of the engine's
+// database, to register functions every session's statements may call,
+// as DuckDB registers them for the database.
+func (e *Engine) RegisterFunctions(ctx context.Context, register func(*sql.Conn) error) error {
+	conn, release, err := e.sqlConn(ctx)
+	if err != nil {
+		return err
+	}
+	defer release()
+	return register(conn)
 }
 
 // keepOpen hides the engine's connector's Close from database/sql, which
@@ -237,7 +270,10 @@ func (e *Engine) LocalDatabase() string { return e.local }
 // so DuckDB fails the statement instead (see catalogproxy's shared holds,
 // and SharedRefusals). A step that walks or erases without the exclusive
 // side fails rather than crash the instance, and a query prepared under
-// the shared side is prepared again under the exclusive one.
+// the shared side is prepared again under the exclusive one, as a run is
+// bound again under it (see pgwire's runBound). The proxy cannot serve the
+// request, nor wait for the other binds to end: it cannot tell which
+// session made it, and the session that did holds the shared side itself.
 //
 // Once it has the lock, it gives back the catalog's names to the tables
 // that binds named in another case (see respell), before the holder lists
@@ -259,6 +295,32 @@ func (e *Engine) CatalogLock() func() {
 		e.catLocked.Store(0)
 		e.catMu.Unlock()
 	}
+}
+
+// CatalogTryLock is CatalogLock for work that may as well not happen,
+// such as maintenance's commit of a rewrite of a table's files: it takes
+// the lock only when nobody holds it, trying for up to wait, without
+// queuing for it as CatalogLock does, which would hold up every session's
+// binds behind a long holder. ok is false, with nothing to release, when
+// it did not get the lock in time or ctx ended.
+func (e *Engine) CatalogTryLock(ctx context.Context, wait time.Duration) (release func(), ok bool) {
+	deadline := time.Now().Add(wait)
+	for !e.catMu.TryLock() {
+		if time.Now().After(deadline) {
+			return nil, false
+		}
+		select {
+		case <-ctx.Done():
+			return nil, false
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+	e.catLocked.Store(time.Now().UnixNano())
+	e.respell()
+	return func() {
+		e.catLocked.Store(0)
+		e.catMu.Unlock()
+	}, true
 }
 
 // CatalogShare takes the catalog lock shared, for binding a statement
@@ -341,6 +403,10 @@ func (e *Engine) ListingsGeneration() uint64 { return e.proxy.Generation() }
 // catalogproxy.Proxy.DataVersion).
 func (e *Engine) DataVersion() uint64 { return e.proxy.DataVersion() }
 
+// TablesVersion changes whenever one of the tables loads loaded may have
+// changed (see catalogproxy.Proxy.TablesVersion).
+func (e *Engine) TablesVersion(loads []catalogproxy.Load) uint64 { return e.proxy.TablesVersion(loads) }
+
 // RecordLoads records the catalog's tables DuckDB loads until the func it
 // returns is called, which returns them (see catalogproxy's RecordLoads).
 func (e *Engine) RecordLoads() func() []catalogproxy.Load { return e.proxy.RecordLoads() }
@@ -403,6 +469,16 @@ func (e *Engine) ForgetMissingSchema(ctx context.Context, schema string) bool {
 		err = rerr
 	}
 	return err == nil
+}
+
+// ForgetTable has DuckDB forget the table name of schema, of the catalog,
+// which the catalog renamed to as though DuckDB heard the rename fail, so
+// that DuckDB stops listing it: until stop is called, DuckDB's next DROP
+// TABLE of name loads the table as as, and drops nothing in the catalog
+// (see catalogproxy's Forget). The caller runs the drop holding the
+// catalog lock exclusively.
+func (e *Engine) ForgetTable(schema, name, as string) (stop func()) {
+	return e.proxy.Forget(strings.Split(schema, "."), name, as)
 }
 
 // LoadSchemas makes the catalog views (information_schema, pg_catalog,
@@ -668,6 +744,17 @@ func (e *Engine) setup(ctx context.Context, cfg config.Config, log *slog.Logger,
 	if err := exec("SET GLOBAL ignore_target_file_size_for_partitioned_tables = true"); err != nil {
 		return fmt.Errorf("configure iceberg writes: %w", err)
 	}
+	// DuckDB keeps 100 of a partitioned write's files open, and past that
+	// closes them and starts new ones: a CREATE TABLE ... AS of a table
+	// partitioned by bucket(256, column) wrote thousands of files of a few
+	// thousand rows, each a request to object storage, at a fifth of a
+	// core for 35 minutes, as the shuffle files of distributed execution
+	// did (see distributed's worker). With every partition's file open, a
+	// write makes a file a partition, whose row groups maintenance sizes
+	// for that many (see maintenance's sizeRowGroups).
+	if err := exec(fmt.Sprintf("SET GLOBAL partitioned_write_max_open_files = %d", OpenPartitionFiles)); err != nil {
+		return fmt.Errorf("configure iceberg writes: %w", err)
+	}
 	attach := attachStatement(cfg.Catalog, e.proxy.URL())
 	for {
 		err := exec(attach)
@@ -804,12 +891,28 @@ func threadsFor(cfg config.Config, perCore int, memory int64) int {
 	return 0
 }
 
-// configure applies cfg's DuckDB settings with exec, then its threads (see
-// threadsFor), which depend on the memory limit those settings leave, as
-// query reads it.
+// processMemory is the memory the process may use (memlimit.Total), zero
+// where it cannot be read. A variable, for tests.
+var processMemory = func() int64 {
+	total, _ := memlimit.Total()
+	return total
+}
+
+// configure applies cfg's DuckDB settings with exec, its memory limit
+// memlimit.DuckDBLimit of the process's memory where cfg sets none, then
+// its threads (see threadsFor), which depend on the memory limit those
+// settings leave, as query reads it.
 func configure(cfg config.Config, perCore int, exec func(string) error, query func(string) (string, error)) error {
 	d := cfg.DuckDB
 	d.Threads = 0
+	if d.MemoryLimit == "" {
+		// DuckDB's own default, 80% of the machine's memory, leaves too
+		// little for what it holds past its limit as it spills, beside
+		// the rest of the process and the memory watch's margins.
+		if n := memlimit.DuckDBLimit(processMemory()); n > 0 {
+			d.MemoryLimit = fmt.Sprintf("%dMiB", n>>20)
+		}
+	}
 	for _, stmt := range settingStatements(d) {
 		if err := exec(stmt); err != nil {
 			return fmt.Errorf("configure duckdb (%s): %w", stmt, err)

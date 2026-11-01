@@ -539,19 +539,24 @@ func domainError(err error) error {
 	return err
 }
 
-// iglooDenied is the refusal of a change to what Igloo keeps for ID domains
-// and bitmap indexes: their schemas and the policies that guard them.
+// iglooDenied is the refusal of a change to what Igloo keeps for ID
+// domains, bitmap indexes and refreshes: their schemas and the policies
+// that guard them.
 func iglooDenied() error {
 	return pgerror.WithCode(fmt.Errorf("permission denied: the schemas %s and the row access policies %s are Igloo's own, which keep ID domains' "+
-		"dictionaries and bitmap indexes; use CREATE and DROP ID DOMAIN, and ALTER TABLE ... ADD and DROP BITMAP INDEX",
-		strings.Join(iglooSchemas, " and "), strings.Join(iglooPolicies, " and ")), codes.InsufficientPrivilege)
+		"dictionaries, bitmap indexes and the state of materialized views and dynamic tables; use CREATE and DROP ID DOMAIN, ALTER TABLE ... "+
+		"ADD and DROP BITMAP INDEX, and the statements on materialized views and dynamic tables",
+		strings.Join(iglooSchemas, ", "), strings.Join(iglooPolicies, ", ")), codes.InsufficientPrivilege)
 }
 
 // iglooSchemaWrites refuses, whoever the user, a statement of type t that
 // would write, create, drop or alter anything in Igloo's own schemas
 // (dictionaries and bitmap indexes), which only Igloo changes. Any write
-// that names one counts.
-func iglooSchemaWrites(t duckdb.StmtType, query string) error {
+// that names one counts. A name that does not, a table's alone, resolves
+// as DuckDB resolves it on the session's search path and current schema,
+// which reach none of Igloo's schemas (see iglooOnPath); were they to,
+// every write is refused.
+func (s *Server) iglooSchemaWrites(ctx context.Context, sess *session, t duckdb.StmtType, query string) error {
 	if !slices.Contains(tableWrites, t) {
 		return nil
 	}
@@ -561,6 +566,11 @@ func iglooSchemaWrites(t duckdb.StmtType, query string) error {
 	}
 	if tokensOf(query).mentions(names) {
 		return iglooDenied()
+	}
+	if s.catalogName() != "" {
+		if on, err := s.iglooOnPath(ctx, sess); err != nil || on {
+			return iglooDenied()
+		}
 	}
 	return nil
 }
@@ -588,8 +598,11 @@ const memberCheck = 5 * time.Second
 type memberCache struct {
 	mu      sync.Mutex
 	checked time.Time
-	version int64
-	loaded  bool
+	// confirmed is when the store last answered, which membersCurrent
+	// holds to the maximum staleness.
+	confirmed time.Time
+	version   int64
+	loaded    bool
 	// tables are schema.table and names the tables' names, lower case.
 	tables, names map[string]bool
 	// domains are the domains each table's columns are members of, by
@@ -607,7 +620,13 @@ func (s *Server) memberTables(ctx context.Context) (tables, names map[string]boo
 	c := &s.members
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.loaded && time.Since(c.checked) < memberCheck {
+	// Asked at least four times within the maximum staleness, so that
+	// members the store answers for are never as old as that.
+	every := memberCheck
+	if s.maxStale > 0 {
+		every = min(every, s.maxStale/4)
+	}
+	if c.loaded && time.Since(c.checked) < every {
 		return c.tables, c.names
 	}
 	c.checked = time.Now()
@@ -617,6 +636,7 @@ func (s *Server) memberTables(ctx context.Context) (tables, names map[string]boo
 		return c.tables, c.names
 	}
 	if c.loaded && v == c.version {
+		c.confirmed = c.checked
 		return c.tables, c.names
 	}
 	snap, err := s.idDomains.Load(ctx)
@@ -636,10 +656,41 @@ func (s *Server) memberTables(ctx context.Context) (tables, names map[string]boo
 	}
 	changed := c.loaded
 	c.tables, c.names, c.domains, c.version, c.loaded, c.snap = tables, names, domains, v, true, snap
+	c.confirmed = c.checked
 	if changed {
 		s.catalogChanged()
 	}
 	return tables, names
+}
+
+// membersCurrent fails once ID domains' members have not been read from
+// the store for maxStale (IGLOO_ACCESS_MAX_STALENESS), as the policies'
+// check does (governance.current): a table whose columns joined a domain
+// on another replica meanwhile would not be protected as a member here.
+// It asks the store only once they are that old, as when no statement has
+// needed them for a while: a load that finds members changed counts as a
+// change of the catalog, which every statement asking would make far more
+// often than the statements that use the members do.
+func (s *Server) membersCurrent(ctx context.Context) error {
+	if s.maxStale <= 0 {
+		return nil
+	}
+	age := s.membersAge()
+	if age < s.maxStale {
+		return nil
+	}
+	s.memberTables(ctx)
+	if age = s.membersAge(); age >= s.maxStale {
+		return staleAccess("ID domains' members", age)
+	}
+	return nil
+}
+
+// membersAge is how long ago the store last answered memberTables.
+func (s *Server) membersAge() time.Duration {
+	s.members.mu.Lock()
+	defer s.members.mu.Unlock()
+	return time.Since(s.members.confirmed)
 }
 
 // memberSnapshot returns the domains and members as memberTables last

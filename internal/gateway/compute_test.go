@@ -64,6 +64,32 @@ func (f *fakeScale) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 func itoa(i int) string { b, _ := json.Marshal(i); return string(b) }
 
+// ShrinkTo lowers the count only from what the caller saw, and loses a
+// race rather than undo another change.
+func TestShrinkTo(t *testing.T) {
+	fake := &fakeScale{replicas: 6, version: 3}
+	srv := httptest.NewTLSServer(fake)
+	defer srv.Close()
+	token := filepath.Join(t.TempDir(), "token")
+	if err := os.WriteFile(token, []byte("token\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	k := &Kubernetes{Namespace: "ns", Deployment: "workers", client: srv.Client(), base: srv.URL, tokenFile: token}
+	ctx := context.Background()
+	// Pods starting: 6 asked for, 5 seen.
+	if ok, err := k.ShrinkTo(ctx, 3, 5); ok || err != nil || fake.replicas != 6 {
+		t.Fatalf("from 5 of 6: %v %v, replicas %d", ok, err, fake.replicas)
+	}
+	if ok, err := k.ShrinkTo(ctx, 4, 6); !ok || err != nil || fake.replicas != 4 || !strings.Contains(fake.patches[0], `"resourceVersion":"3"`) {
+		t.Fatalf("from 6 to 4: %v %v, replicas %d, patches %v", ok, err, fake.replicas, fake.patches)
+	}
+	// Scaled up by another between the read and the patch: left alone.
+	fake.race = func() { fake.replicas, fake.version = 8, fake.version+1 }
+	if ok, err := k.ShrinkTo(ctx, 2, 4); ok || err != nil || fake.replicas != 8 {
+		t.Fatalf("during a race: %v %v, replicas %d", ok, err, fake.replicas)
+	}
+}
+
 func TestScaleAtLeast(t *testing.T) {
 	fake := &fakeScale{replicas: 3, version: 7}
 	srv := httptest.NewTLSServer(fake)

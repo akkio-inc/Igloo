@@ -4,6 +4,7 @@ import (
 	"context"
 	"io"
 	"log/slog"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -17,8 +18,9 @@ import (
 // TestCreateTableAsInSteps checks CREATE TABLE ... AS of an Iceberg table,
 // which Igloo carries out in steps (see stagedCreate): every form of query
 // fills the table, a table that exists gives DuckDB's error or, with IF NOT
-// EXISTS, is left alone, and a query that fails part way leaves nothing
-// behind.
+// EXISTS, is left alone, a query that fails part way leaves nothing
+// behind, and a table partitioned by bucket, as Snowflake's CLUSTER BY
+// (BUCKET(n, column)) makes one, gets its partition spec.
 func TestCreateTableAsInSteps(t *testing.T) {
 	t.Parallel()
 	env := newCatalogEnv(t)
@@ -60,6 +62,17 @@ func TestCreateTableAsInSteps(t *testing.T) {
 		t.Errorf("after the replace: %d rows, want 9", n)
 	}
 
+	mustExec(t, conn, "CREATE OR REPLACE TABLE "+tbl+" PARTITIONED BY (bucket(4, n)) AS SELECT range AS n FROM range(100)")
+	if n := count(t, conn, "SELECT count(*) FROM "+tbl); n != 100 {
+		t.Errorf("bucketed: %d rows, want 100", n)
+	}
+	if env.fake != nil {
+		if spec := env.fake.Metadata("public", tbl).PartitionSpec(); !strings.Contains(spec.String(), "bucket[4]") {
+			t.Errorf("bucketed: partition spec %s", spec.String())
+		}
+	}
+	mustExec(t, conn, "CREATE OR REPLACE TABLE "+tbl+" AS SELECT range AS n FROM range(9)")
+
 	failing := "SELECT CASE WHEN range = 5 THEN error('boom') ELSE range END AS n FROM range(10)"
 	if err := runQuery(conn, "CREATE TABLE "+tbl+"_failed AS "+failing); err == nil || !strings.Contains(err.Error(), "boom") {
 		t.Errorf("a query that fails: %v", err)
@@ -73,14 +86,42 @@ func TestCreateTableAsInSteps(t *testing.T) {
 	if n := count(t, conn, "SELECT count(*) FROM information_schema.tables WHERE table_name LIKE '"+tbl+"%'"); n != 1 {
 		t.Errorf("%d tables named %s..., want only %s", n, tbl, tbl)
 	}
+
+	// Temporary tables, in steps too (see tempCreate), as DuckDB makes them.
+	mustExec(t, conn, "CREATE TEMP TABLE steps_tmp AS SELECT range AS n FROM range(5)")
+	if n := count(t, conn, "SELECT count(*) FROM steps_tmp"); n != 5 {
+		t.Errorf("a temporary table: %d rows, want 5", n)
+	}
+	if err := runQuery(conn, "CREATE TEMP TABLE steps_tmp AS SELECT 1 AS n"); err == nil || !strings.Contains(err.Error(), "already exists") {
+		t.Errorf("CREATE TEMP TABLE of a table that exists: %v", err)
+	}
+	mustExec(t, conn, "CREATE OR REPLACE TEMP TABLE steps_tmp AS SELECT range AS n, 'x' AS s FROM range(7)")
+	if got := texts(t, conn, "SELECT count(*), min(s) FROM steps_tmp"); len(got) != 1 || got[0] != "7|x" {
+		t.Errorf("a replaced temporary table: %v", got)
+	}
+	if err := runQuery(conn, "CREATE OR REPLACE TEMP TABLE steps_tmp AS "+failing); err == nil || !strings.Contains(err.Error(), "boom") {
+		t.Errorf("a temporary replace whose query fails: %v", err)
+	}
+	if err := runQuery(conn, "CREATE TEMP TABLE steps_failed AS "+failing); err == nil || !strings.Contains(err.Error(), "boom") {
+		t.Errorf("a temporary table whose query fails: %v", err)
+	}
+	if got := texts(t, conn, "SELECT table_name FROM duckdb_tables() WHERE temporary ORDER BY 1"); !slices.Equal(got, []string{"steps_tmp"}) {
+		t.Errorf("temporary tables %v, want only steps_tmp", got)
+	}
+	if n := count(t, conn, "SELECT count(*) FROM steps_tmp"); n != 7 {
+		t.Errorf("after a failed temporary replace: %d rows, want the 7 of before", n)
+	}
 }
 
 // TestCreateTableAsDoesNotStopOtherSessions checks that CREATE TABLE ... AS
-// of an Iceberg table holds the catalog lock only while it changes the
-// catalog: while it reads a slow table of a connection, another session
-// prepares and runs statements and lists the catalog. As one DuckDB
-// statement it held the lock for as long as it read, and every other
-// session waited.
+// holds the catalog lock only while it changes the catalog: while it reads
+// a slow table of a connection, another session prepares and runs
+// statements, lists the catalog and signs in. As one DuckDB statement it
+// held the lock for as long as it read, and every other session waited: of
+// an Iceberg table, in a transaction block too, and of a temporary table,
+// as dbt makes one for each incremental model, and of a table partitioned
+// by bucket, which ran as one statement for 35 minutes on a large table.
+// So did EXECUTE of a query prepared in SQL.
 func TestCreateTableAsDoesNotStopOtherSessions(t *testing.T) {
 	t.Parallel()
 	needExtensions(t)
@@ -92,7 +133,7 @@ func TestCreateTableAsDoesNotStopOtherSessions(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer remote.Close(ctx) //nolint:errcheck
-	if _, err := remote.Exec(ctx, "CREATE VIEW "+schema+".slow AS SELECT pg_sleep(4)::text AS x, 1 AS n"); err != nil {
+	if _, err := remote.Exec(ctx, "CREATE VIEW "+schema+".slow AS SELECT pg_sleep(6)::text AS x, 1 AS n"); err != nil {
 		t.Fatal(err)
 	}
 	store := federation.NewMemoryStore()
@@ -108,31 +149,87 @@ func TestCreateTableAsDoesNotStopOtherSessions(t *testing.T) {
 	writer := env.admin(t, pgx.QueryExecModeSimpleProtocol)
 	other := env.admin(t, pgx.QueryExecModeSimpleProtocol)
 
-	for _, create := range []string{"CREATE TABLE ", "CREATE OR REPLACE TABLE "} {
-		done := make(chan error, 1)
+	slow := "SELECT n FROM crm." + schema + ".slow"
+	for _, c := range []struct {
+		name, setup, stmt, after, rows string
+	}{
+		{"CREATE TABLE ... AS", "", "CREATE TABLE " + env.table + " AS " + slow, "", env.table},
+		{"CREATE OR REPLACE TABLE ... AS", "", "CREATE OR REPLACE TABLE " + env.table + " AS " + slow, "", env.table},
+		{"a bucketed one", "", "CREATE OR REPLACE TABLE " + env.table + " PARTITIONED BY (bucket(4, n)) AS " + slow, "", env.table},
+		{"one in a transaction block", "BEGIN", "CREATE OR REPLACE TABLE " + env.table + " AS " + slow, "COMMIT", env.table},
+		{"a temporary one", "", "CREATE TEMP TABLE slow_copy AS " + slow, "", "slow_copy"},
+		{"a temporary one replaced", "", "CREATE OR REPLACE TEMP TABLE slow_copy AS " + slow, "", "slow_copy"},
+		{"a temporary one in a block, as dbt makes them", "BEGIN", "CREATE TEMPORARY TABLE slow_tmp AS (" + slow + ")", "COMMIT", "slow_tmp"},
+		{"EXECUTE of a query prepared in SQL", "PREPARE slow_read AS " + slow, "EXECUTE slow_read", "DEALLOCATE slow_read", ""},
+	} {
+		if c.setup != "" {
+			mustExec(t, writer, c.setup)
+		}
 		start := time.Now()
-		go func() {
-			_, err := writer.Exec(ctx, create+env.table+" AS SELECT n FROM crm."+schema+".slow")
-			done <- err
-		}()
-		time.Sleep(time.Second)
-		for _, q := range []string{"SELECT 42", "SELECT count(*) FROM information_schema.tables"} {
-			qctx, cancel := context.WithTimeout(ctx, 2*time.Second)
-			var n int64
-			err := other.QueryRow(qctx, q).Scan(&n)
-			cancel()
-			if err != nil {
-				t.Errorf("%s while %s... reads: %v", q, create, err)
+		ended := alongside(t, other, env.url("igloo", adminPassword), func() error {
+			_, err := writer.Exec(ctx, c.stmt)
+			return err
+		}, c.name)
+		if took := ended.Sub(start); took < 6*time.Second {
+			t.Errorf("%s took %s: the source was not slow", c.name, took)
+		}
+		if c.after != "" {
+			mustExec(t, writer, c.after)
+		}
+		if c.rows != "" {
+			if n := count(t, writer, "SELECT count(*) FROM "+c.rows); n != 1 {
+				t.Errorf("%s: %d rows, want 1", c.name, n)
 			}
 		}
-		if err := <-done; err != nil {
-			t.Fatalf("%s: %v", create, err)
+	}
+}
+
+// alongside runs run, a statement that reads a slow source, and a second
+// in: on other, a statement and a listing of the catalog, and a login at
+// url. Each must end before run does: had run held the catalog lock, they
+// would have waited for it. It returns when run ended, and fails the test
+// if run failed.
+func alongside(t *testing.T, other *pgx.Conn, url string, run func() error, what string) time.Time {
+	t.Helper()
+	ctx := context.Background()
+	type result struct {
+		err error
+		at  time.Time
+	}
+	done := make(chan result, 1)
+	go func() {
+		err := run()
+		done <- result{err, time.Now()}
+	}()
+	time.Sleep(time.Second)
+	var names []string
+	var ends []time.Time
+	for _, q := range []string{"SELECT 42", "SELECT count(*) FROM information_schema.tables"} {
+		qctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		var n int64
+		if err := other.QueryRow(qctx, q).Scan(&n); err != nil {
+			t.Errorf("%s while %s reads: %v", q, what, err)
 		}
-		if took := time.Since(start); took < 4*time.Second {
-			t.Errorf("%s took %s: the source was not slow", create, took)
-		}
-		if n := count(t, other, "SELECT count(*) FROM "+env.table); n != 1 {
-			t.Errorf("%s: %d rows, want 1", create, n)
+		cancel()
+		names, ends = append(names, q), append(ends, time.Now())
+	}
+	lctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	login, err := pgx.Connect(lctx, url)
+	cancel()
+	if err != nil {
+		t.Errorf("signing in while %s reads: %v", what, err)
+	} else {
+		_ = login.Close(ctx)
+	}
+	names, ends = append(names, "signing in"), append(ends, time.Now())
+	r := <-done
+	if r.err != nil {
+		t.Fatalf("%s: %v", what, r.err)
+	}
+	for i, end := range ends {
+		if !end.Before(r.at) {
+			t.Errorf("%s while %s reads waited for it to end", names[i], what)
 		}
 	}
+	return r.at
 }

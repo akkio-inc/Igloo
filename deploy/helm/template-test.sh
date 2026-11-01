@@ -41,7 +41,7 @@ render -f test-values/pools.yaml >"$work/pools.yaml"
 check "a pool's Deployment knows its pool" '"acme"' "$(env_of Deployment igloo-pool-acme IGLOO_POOL)"
 check "and its price" '"2.72"' "$(env_of Deployment igloo-pool-acme IGLOO_PRICE_PER_HOUR)"
 check "a pool leaves maintenance to the default pool" '"false"' "$(env_of Deployment igloo-pool-acme IGLOO_MAINTENANCE)"
-check "DuckDB's memory follows the pool's limit" '"52428MiB"' "$(env_of Deployment igloo-pool-acme IGLOO_DUCKDB_MEMORY_LIMIT)"
+check "DuckDB's memory follows the pool's limit" '"48059MiB"' "$(env_of Deployment igloo-pool-acme IGLOO_DUCKDB_MEMORY_LIMIT)"
 check "a pool adds its extraEnv to the release's" 'analytics|2h' \
   "$(env_of Deployment igloo-pool-acme IGLOO_CATALOG_SCHEMA)|$(env_of Deployment igloo-pool-acme IGLOO_STATEMENT_TIMEOUT)"
 check "a pool that scales to zero leaves its replicas to its gateway" "" "$(doc Deployment igloo-pool-acme | grep -E '^  replicas:' || true)"
@@ -103,6 +103,18 @@ render "${bundled[@]}" --set workers.enabled=true --set workers.exchanges=local 
 check "exchanges through object storage by default" '"object"' \
   "$(docf "$work/object.yaml" Deployment igloo | grep -A1 -E '^ +- name: IGLOO_EXCHANGES$' | sed -n 's/^ *value: //p')"
 check "workers take tasks from igloo pods only" "server" "$(admitted "$work/object.yaml")"
+writes_env() { docf "$1" Deployment igloo | grep -A1 -E '^ +- name: IGLOO_WORKER_WRITES$' | sed -n 's/^ *value: //p'; }
+sa_of() { docf "$1" Deployment igloo-workers | sed -n 's/^ *serviceAccountName: //p'; }
+check "workers with the igloo pods' identity write no table's files" '"off"|igloo' "$(writes_env "$work/object.yaml")|$(sa_of "$work/object.yaml")"
+render "${bundled[@]}" --set workers.enabled=true --set workers.serviceAccount.create=true \
+  --set 'workers.serviceAccount.annotations.eks\.amazonaws\.com/role-arn=arn:aws:iam::123456789012:role/w' >"$work/own-sa.yaml"
+check "workers with an identity of their own write them" '"on"|igloo-worker' "$(writes_env "$work/own-sa.yaml")|$(sa_of "$work/own-sa.yaml")"
+check "their service account carries its annotations" 'eks.amazonaws.com/role-arn: arn:aws:iam::123456789012:role/w' \
+  "$(docf "$work/own-sa.yaml" ServiceAccount igloo-worker | grep -o 'eks.amazonaws.com/role-arn: .*')"
+render "${bundled[@]}" --set workers.enabled=true --set workers.writes=true >"$work/writes-on.yaml"
+check "workers.writes true turns them on" '"on"' "$(writes_env "$work/writes-on.yaml")"
+render "${bundled[@]}" --set workers.enabled=true --set workers.serviceAccount.create=true --set workers.writes=false >"$work/writes-off.yaml"
+check "workers.writes false turns them off" '"off"' "$(writes_env "$work/writes-off.yaml")"
 check "workers.exchanges local sets IGLOO_EXCHANGES" '"local"' \
   "$(docf "$work/local.yaml" Deployment igloo | grep -A1 -E '^ +- name: IGLOO_EXCHANGES$' | sed -n 's/^ *value: //p')"
 check "and lets workers reach each other's task port" "server worker" "$(admitted "$work/local.yaml")"
@@ -116,6 +128,97 @@ if render "${bundled[@]}" --set workers.enabled=true --set workers.exchanges=nvm
 else
   pass "refuses workers.exchanges=nvme"
 fi
+
+echo "the large worker"
+render -f test-values/large-worker.yaml >"$work/large.yaml"
+envf() { docf "$1" "$2" "$3" | grep -A1 -E "^ +- name: $4\$" | sed -n 's/^ *value: //p'; }
+lw() { envf "$work/large.yaml" Deployment igloo "$1"; }
+check "igloo pods find the large worker" '"igloo-workers-large:7433"|kubernetes|"igloo-workers-large"' \
+  "$(lw IGLOO_LARGE_WORKER)|$(lw IGLOO_LARGE_WORKER_COMPUTE)|$(lw IGLOO_LARGE_WORKER_K8S_DEPLOYMENT)"
+check "and know its size and price" '"60"|"336418MiB"|"4.35"' \
+  "$(lw IGLOO_LARGE_WORKER_CORES)|$(lw IGLOO_LARGE_WORKER_MEMORY)|$(lw IGLOO_LARGE_WORKER_PRICE_PER_HOUR)"
+check "and the workers' price" '"0.31"' "$(lw IGLOO_WORKER_PRICE_PER_HOUR)"
+check "and the machines, for list prices" '"m7gd.4xlarge"|"true"|"us-east-2"|"r7gd.16xlarge"|' \
+  "$(lw IGLOO_WORKER_INSTANCE_TYPE)|$(lw IGLOO_WORKER_SPOT)|$(lw IGLOO_CLOUD_REGION)|$(lw IGLOO_LARGE_WORKER_INSTANCE_TYPE)|$(lw IGLOO_LARGE_WORKER_SPOT)"
+check "a pool on demand says so" '' "$(envf "$work/large.yaml" Deployment igloo-pool-reporting IGLOO_WORKER_SPOT)"
+check "its DuckDB limit is the one igloo pods estimate with" "$(lw IGLOO_LARGE_WORKER_MEMORY)" \
+  "$(envf "$work/large.yaml" Deployment igloo-workers-large IGLOO_DUCKDB_MEMORY_LIMIT)"
+check "it starts with no pods and runs igloo worker" '  replicas: 0|args: ["worker"]' \
+  "$(docf "$work/large.yaml" Deployment igloo-workers-large | grep -E '^  replicas:')|$(docf "$work/large.yaml" Deployment igloo-workers-large | grep -o 'args: .*')"
+check "with the workers' secret" "$(docf "$work/large.yaml" Deployment igloo-workers | grep -A3 'name: IGLOO_WORKER_SECRET' | tr -d ' \n')" \
+  "$(docf "$work/large.yaml" Deployment igloo-workers-large | grep -A3 'name: IGLOO_WORKER_SECRET' | tr -d ' \n')"
+check "its own resources, volumes and scheduling" 'cpu: "60"|sizeLimit: 2000Gi|sizeLimit: 800Gi|igloo.dev/node: large-worker|key: igloo.dev/large-worker' \
+  "$(docf "$work/large.yaml" Deployment igloo-workers-large | grep -o 'cpu: .*')|$(docf "$work/large.yaml" Deployment igloo-workers-large | grep -o 'sizeLimit: [0-9]*Gi' | tr '\n' '|')$(docf "$work/large.yaml" Deployment igloo-workers-large | grep -o 'igloo.dev/node: .*')|$(docf "$work/large.yaml" Deployment igloo-workers-large | grep -o 'key: igloo.dev/.*')"
+check "the workers keep theirs" 'igloo.dev/node: workers' "$(docf "$work/large.yaml" Deployment igloo-workers | grep -o 'igloo.dev/node: .*')"
+check "a headless Service of its own" "  clusterIP: None|app.kubernetes.io/component: worker-large" \
+  "$(docf "$work/large.yaml" Service igloo-workers-large | grep -E '^  clusterIP:')|$(docf "$work/large.yaml" Service igloo-workers-large | sed -n '/^  selector:/,/^  ports:/p' | grep -o 'app.kubernetes.io/component: .*')"
+check "igloo pods may scale it, and only it" 'resourceNames: ["igloo-workers-large"]' \
+  "$(docf "$work/large.yaml" Role igloo-workers-large | grep -o 'resourceNames: .*')"
+check "it takes tasks from igloo pods and exchanges with the workers" "server worker worker-large" \
+  "$(docf "$work/large.yaml" NetworkPolicy igloo-workers-large | sed -n '/ingress:/,/port: http/p' | grep -o 'component: .*' | sed 's/component: //' | tr '\n' ' ' | sed 's/ $//')"
+check "and the workers exchange with it" "server worker worker-large" \
+  "$(docf "$work/large.yaml" NetworkPolicy igloo-workers | sed -n '/ingress:/,/port: http/p' | grep -o 'component: .*' | sed 's/component: //' | tr '\n' ' ' | sed 's/ $//')"
+pl() { envf "$work/large.yaml" Deployment igloo-pool-acme "$1"; }
+check "a pool has a large worker of its own" '"igloo-pool-acme-workers-large:7433"|"31"|"300GiB"|"3.1"' \
+  "$(pl IGLOO_LARGE_WORKER)|$(pl IGLOO_LARGE_WORKER_CORES)|$(pl IGLOO_LARGE_WORKER_MEMORY)|$(pl IGLOO_LARGE_WORKER_PRICE_PER_HOUR)"
+check "which the pool's gateway stops with the pool" '"igloo-pool-acme-workers-large"' \
+  "$(envf "$work/large.yaml" Deployment igloo-pool-acme-gateway IGLOO_GATEWAY_K8S_LARGE_WORKER_DEPLOYMENT)"
+check "and may scale" '"igloo-pool-acme" "igloo-pool-acme-workers" "igloo-pool-acme-workers-large"' \
+  "$(docf "$work/large.yaml" Role igloo-pool-acme-gateway | sed -n '/resourceNames:/,/verbs:/p' | grep -v 'verbs:' | grep -o '"[^"]*"' | tr '\n' ' ' | sed 's/ $//')"
+check "a pool can turn it off" "0|" \
+  "$(grep -c 'name: igloo-pool-reporting-workers-large' "$work/large.yaml")|$(envf "$work/large.yaml" Deployment igloo-pool-reporting IGLOO_LARGE_WORKER)"
+if grep -q 'workers-large\|IGLOO_LARGE_WORKER\|IGLOO_WORKER_PRICE' "$work/object.yaml"; then
+  fail "no large worker or worker price by default"
+else
+  pass "no large worker or worker price by default"
+fi
+if out=$(render "${bundled[@]}" --set workers.large.enabled=true 2>&1); then
+  fail "refuses workers.large without workers"
+elif grep -q 'workers.large.enabled needs workers.enabled' <<<"$out"; then
+  pass "refuses workers.large without workers"
+else
+  fail "refuses workers.large without workers with a message about it: $out"
+fi
+
+echo "the read cache"
+cv() { envf "$1" Deployment igloo "$2"; }
+volume() { docf "$1" Deployment igloo | sed -n '/^      volumes:/,$p' | sed -n "/- name: $2\$/,/- name: /p"; }
+check "igloo pods cache on a 50Gi emptyDir, 90% of it for the cache, which shares the disk" 'sizeLimit: 50Gi|"true"|"46080MiB"|"false"' \
+  "$(volume "$work/plain.yaml" cache | grep -o 'sizeLimit: .*')|$(cv "$work/plain.yaml" IGLOO_CACHE_EPHEMERAL)|$(cv "$work/plain.yaml" IGLOO_CACHE_SIZE)|$(cv "$work/plain.yaml" IGLOO_CACHE_DEDICATED)"
+check "mounted at the image's cache directory, with a writable /tmp" "mountPath: /var/lib/igloo/cache|mountPath: /tmp" \
+  "$(docf "$work/plain.yaml" Deployment igloo | grep -o 'mountPath: /var/lib/igloo/cache')|$(docf "$work/plain.yaml" Deployment igloo | grep -o 'mountPath: /tmp$')"
+render "${bundled[@]}" --set cacheVolume.sizeLimit=20Gi >"$work/cache-sized.yaml"
+check "a smaller emptyDir" 'sizeLimit: 20Gi|"18432MiB"' \
+  "$(volume "$work/cache-sized.yaml" cache | grep -o 'sizeLimit: .*')|$(cv "$work/cache-sized.yaml" IGLOO_CACHE_SIZE)"
+render "${bundled[@]}" --set cacheVolume.sizeLimit= >"$work/cache-unsized.yaml"
+check "an emptyDir without a limit, the cache sized from its disk" 'emptyDir:|' \
+  "$(volume "$work/cache-unsized.yaml" cache | grep -o 'emptyDir:.*')|$(cv "$work/cache-unsized.yaml" IGLOO_CACHE_SIZE)"
+render "${bundled[@]}" --set cacheVolume.type=ephemeral --set cacheVolume.sizeLimit=100Gi --set cacheVolume.storageClass=gp3 >"$work/cache-ephemeral.yaml"
+check "an ephemeral volume of the pod's own, which the cache has to itself" 'storageClassName: gp3|storage: 100Gi|"92160MiB"|"true"|"true"' \
+  "$(volume "$work/cache-ephemeral.yaml" cache | grep -o 'storageClassName: .*')|$(volume "$work/cache-ephemeral.yaml" cache | grep -o 'storage: .*')|$(cv "$work/cache-ephemeral.yaml" IGLOO_CACHE_SIZE)|$(cv "$work/cache-ephemeral.yaml" IGLOO_CACHE_EPHEMERAL)|$(cv "$work/cache-ephemeral.yaml" IGLOO_CACHE_DEDICATED)"
+claim=(--set cacheVolume.type=persistentVolumeClaim --set cacheVolume.existingClaim=igloo-cache --set replicaCount=1 --set strategy.type=Recreate)
+render "${bundled[@]}" "${claim[@]}" >"$work/cache-claim.yaml"
+check "a claim, which outlives the pod, for one pod at a time" 'claimName: igloo-cache|"false"|"true"|type: Recreate|' \
+  "$(volume "$work/cache-claim.yaml" cache | grep -o 'claimName: .*')|$(cv "$work/cache-claim.yaml" IGLOO_CACHE_EPHEMERAL)|$(cv "$work/cache-claim.yaml" IGLOO_CACHE_DEDICATED)|$(docf "$work/cache-claim.yaml" Deployment igloo | sed -n '/^  strategy:/,/^  selector:/p' | grep -o 'type: .*')|$(docf "$work/cache-claim.yaml" Deployment igloo | grep -o 'rollingUpdate' || true)"
+if render "${bundled[@]}" "${claim[@]}" --set 'pools[0].name=a' --set 'pools[0].replicaCount=1' --set 'pools[0].cacheVolume.existingClaim=a-cache' >/dev/null 2>&1; then
+  pass "a pool with a claim of its own"
+else
+  fail "a pool with a claim of its own"
+fi
+for invalid in "cacheVolume.type=ephemeral,cacheVolume.sizeLimit=" "cacheVolume.type=persistentVolumeClaim,replicaCount=1,strategy.type=Recreate" \
+  "cacheVolume.type=persistentVolumeClaim,cacheVolume.existingClaim=c,strategy.type=Recreate" \
+  "cacheVolume.type=persistentVolumeClaim,cacheVolume.existingClaim=c,replicaCount=1" \
+  "cacheVolume.type=persistentVolumeClaim,cacheVolume.existingClaim=c,replicaCount=1,strategy.type=Recreate,autoscaling.enabled=true" \
+  "cacheVolume.type=persistentVolumeClaim,cacheVolume.existingClaim=c,replicaCount=1,strategy.type=Recreate,pools[0].name=a,pools[0].replicaCount=1" \
+  "cacheVolume.type=nfs"; do
+  if out=$(render "${bundled[@]}" --set "$invalid" 2>&1); then
+    fail "refuses $invalid"
+  elif grep -q 'cacheVolume' <<<"$out"; then
+    pass "refuses $invalid"
+  else
+    fail "refuses $invalid with a message about the cache volume: $out"
+  fi
+done
 
 echo "the admin password"
 # A generated password is long enough for Igloo to create the account with.

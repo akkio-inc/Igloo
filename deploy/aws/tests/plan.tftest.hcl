@@ -432,6 +432,313 @@ run "defaults" {
     condition     = output.sql_endpoint == null && strcontains(output.next_steps, "port-forward svc/igloo 5433:5432")
     error_message = "Without expose_sql, there is no SQL endpoint and next steps use port-forward."
   }
+
+  # --- No workers by default ------------------------------------------------
+
+  assert {
+    condition = (
+      length(output.worker_node_groups) == 0 &&
+      keys(module.eks.eks_managed_node_groups) == ["default"] &&
+      length(helm_release.cluster_autoscaler) == 0 &&
+      length(aws_iam_role.cluster_autoscaler) == 0 &&
+      !contains(keys(yamldecode(helm_release.igloo[0].values[0])), "workers")
+    )
+    error_message = "Without workers_enabled there must be no worker node groups, no cluster autoscaler and no workers values, so existing deployments are unchanged."
+  }
+}
+
+################################################################################
+# Distributed-execution workers
+################################################################################
+
+run "workers_on_spot_with_on_demand_fallback" {
+  command = plan
+
+  variables {
+    workers_enabled        = true
+    workers_price_per_hour = 0.35
+  }
+
+  # m7gd.4xlarge and m6gd.4xlarge: 16 vCPUs, 64 GiB, 950 GB of NVMe.
+  override_data {
+    target = data.aws_ec2_instance_type.worker
+    values = { default_vcpus = 16, memory_size = 65536, instance_storage_supported = true, total_instance_storage = 950 }
+  }
+  override_resource {
+    target = module.eks.module.eks_managed_node_group["workers-spot"].aws_eks_node_group.this
+    values = { resources = [{ autoscaling_groups = [{ name = "eks-workers-spot-0123" }], remote_access_security_group_id = "" }] }
+  }
+  override_resource {
+    target = module.eks.module.eks_managed_node_group["workers-ondemand"].aws_eks_node_group.this
+    values = { resources = [{ autoscaling_groups = [{ name = "eks-workers-ondemand-4567" }], remote_access_security_group_id = "" }] }
+  }
+  override_resource {
+    target = aws_iam_role.cluster_autoscaler
+    values = { arn = "arn:aws:iam::123456789012:role/igloo-cluster-autoscaler" }
+  }
+
+  assert {
+    condition = (
+      keys(output.worker_node_groups) == ["workers-ondemand", "workers-spot"] &&
+      output.worker_node_groups["workers-spot"].capacity_type == "SPOT" &&
+      output.worker_node_groups["workers-ondemand"].capacity_type == "ON_DEMAND" &&
+      alltrue([for g in output.worker_node_groups : g.min_size == 0 && g.max_size == 4 && g.instance_types == tolist(["m7gd.4xlarge", "m6gd.4xlarge"])])
+    )
+    error_message = "Workers must get a Spot node group and an on-demand one to fall back to, both from zero to workers_max nodes."
+  }
+
+  assert {
+    condition = alltrue([
+      for g in output.worker_node_groups :
+      g.labels == { "igloo.dev/node" = "workers" } && g.taint_key == "igloo.dev/workers" &&
+      g.ami_type == "AL2023_ARM_64_STANDARD" && g.local_storage == "RAID0"
+    ])
+    error_message = "Worker node groups must be labelled and tainted for workers, on the arm64 AMI, with their instance store RAID0ed under kubelet."
+  }
+
+  assert {
+    condition     = output.node_group.capacity_type == "ON_DEMAND" && output.node_group.min_size == 2 && contains(keys(module.eks.eks_managed_node_groups), "default")
+    error_message = "The default node group, where igloo pods run, must stay as it was."
+  }
+
+  assert {
+    condition = (
+      yamldecode(helm_release.igloo[0].values[0]).workers.enabled == true &&
+      yamldecode(helm_release.igloo[0].values[0]).workers.maxReplicas == 4 &&
+      yamldecode(helm_release.igloo[0].values[0]).workers.pricePerHour == 0.35 &&
+      yamldecode(helm_release.igloo[0].values[0]).workers.instanceType == "m7gd.4xlarge" &&
+      yamldecode(helm_release.igloo[0].values[0]).workers.spot == true &&
+      yamldecode(helm_release.igloo[0].values[0]).workers.region == "us-east-1" &&
+      yamldecode(helm_release.igloo[0].values[0]).workers.large.enabled == false
+    )
+    error_message = "The chart must turn workers on, with workers_max and the workers' price, and no large worker."
+  }
+
+  assert {
+    condition = (
+      yamldecode(helm_release.igloo[0].values[0]).workers.resources.requests.cpu == "14" &&
+      yamldecode(helm_release.igloo[0].values[0]).workers.resources.requests.memory == "54Gi" &&
+      yamldecode(helm_release.igloo[0].values[0]).workers.resources.limits.memory == "54Gi" &&
+      yamldecode(helm_release.igloo[0].values[0]).workers.duckdb.spillVolume.sizeLimit == "486Gi" &&
+      yamldecode(helm_release.igloo[0].values[0]).workers.cacheVolume.sizeLimit == "221Gi"
+    )
+    error_message = "Worker pods must fill one node (90% of its vCPUs, 85% of its memory), with spill and cache sized to 55% and 25% of its instance store."
+  }
+
+  assert {
+    condition = (
+      yamldecode(helm_release.igloo[0].values[0]).workers.nodeSelector == { "igloo.dev/node" = "workers" } &&
+      yamldecode(helm_release.igloo[0].values[0]).workers.tolerations == [{ key = "igloo.dev/workers", operator = "Equal", value = "true", effect = "NoSchedule" }]
+    )
+    error_message = "Worker pods must select and tolerate the worker node groups, Spot and on-demand alike."
+  }
+
+  assert {
+    condition = (
+      yamldecode(helm_release.cluster_autoscaler[0].values[0]).autoscalingGroups == [
+        { name = "eks-workers-ondemand-4567", minSize = 0, maxSize = 4 },
+        { name = "eks-workers-spot-0123", minSize = 0, maxSize = 4 },
+      ] &&
+      helm_release.cluster_autoscaler[0].namespace == "kube-system" &&
+      helm_release.cluster_autoscaler[0].version == "9.59.0"
+    )
+    error_message = "The cluster autoscaler must scale the worker node groups' autoscaling groups, and only them."
+  }
+
+  assert {
+    condition = (
+      yamldecode(helm_release.cluster_autoscaler[0].values[0]).extraArgs.expander == "priority" &&
+      yamldecode(helm_release.cluster_autoscaler[0].values[0]).extraArgs["max-node-provision-time"] == "5m" &&
+      contains(yamldecode(helm_release.cluster_autoscaler[0].values[0]).expanderPriorities["50"], "^eks-workers-spot-.*") &&
+      yamldecode(helm_release.cluster_autoscaler[0].values[0]).expanderPriorities["10"] == [".*"]
+    )
+    error_message = "The cluster autoscaler must prefer the Spot group and back it off quickly when it gets no capacity."
+  }
+
+  assert {
+    condition = (
+      yamldecode(helm_release.cluster_autoscaler[0].values[0]).rbac.serviceAccount.name == "cluster-autoscaler" &&
+      yamldecode(helm_release.cluster_autoscaler[0].values[0]).rbac.serviceAccount.annotations["eks.amazonaws.com/role-arn"] == "arn:aws:iam::123456789012:role/igloo-cluster-autoscaler" &&
+      jsondecode(aws_iam_role.cluster_autoscaler[0].assume_role_policy).Statement[0].Condition.StringEquals["oidc.eks.us-east-1.amazonaws.com/id/EXAMPLE:sub"] == "system:serviceaccount:kube-system:cluster-autoscaler"
+    )
+    error_message = "The cluster autoscaler's role must be assumable only by kube-system/cluster-autoscaler, which the chart annotates with it."
+  }
+
+  assert {
+    condition = (
+      one([for s in jsondecode(aws_iam_role_policy.cluster_autoscaler[0].policy).Statement : s.Resource if s.Sid == "ScaleWorkerNodeGroups"]) == [
+        "arn:aws:autoscaling:us-east-1:123456789012:autoScalingGroup:*:autoScalingGroupName/eks-workers-ondemand-4567",
+        "arn:aws:autoscaling:us-east-1:123456789012:autoScalingGroup:*:autoScalingGroupName/eks-workers-spot-0123",
+      ] &&
+      contains(one([for s in jsondecode(aws_iam_role_policy.cluster_autoscaler[0].policy).Statement : s.Action if s.Sid == "Describe"]), "eks:DescribeNodegroup")
+    )
+    error_message = "The cluster autoscaler may resize only the worker node groups, and must read managed node groups to scale them from zero."
+  }
+}
+
+run "workers_write_with_no_right_of_their_own" {
+  command = plan
+
+  variables {
+    workers_enabled = true
+  }
+
+  override_resource {
+    target = aws_iam_role.worker[0]
+    values = { arn = "arn:aws:iam::123456789012:role/igloo-worker" }
+  }
+
+  assert {
+    condition     = yamldecode(helm_release.igloo[0].values[0]).workers.serviceAccount.name == "igloo-worker" && yamldecode(helm_release.igloo[0].values[0]).workers.serviceAccount.annotations["eks.amazonaws.com/role-arn"] == "arn:aws:iam::123456789012:role/igloo-worker"
+    error_message = "Workers must have a service account and role of their own."
+  }
+
+  assert {
+    condition     = endswith(jsondecode(aws_iam_role.worker[0].assume_role_policy).Statement[0].Condition.StringEquals[keys(jsondecode(aws_iam_role.worker[0].assume_role_policy).Statement[0].Condition.StringEquals)[1]], "system:serviceaccount:igloo:igloo-worker") || endswith(jsondecode(aws_iam_role.worker[0].assume_role_policy).Statement[0].Condition.StringEquals[keys(jsondecode(aws_iam_role.worker[0].assume_role_policy).Statement[0].Condition.StringEquals)[0]], "system:serviceaccount:igloo:igloo-worker")
+    error_message = "Only the workers' service account may assume their role."
+  }
+
+  # Writes: only exchanges. No delete anywhere, and nothing that writes a
+  # table's location.
+  assert {
+    condition = alltrue([
+      for s in jsondecode(aws_iam_role_policy.worker_warehouse[0].policy).Statement :
+      endswith(s.Resource, "/warehouse/_igloo_shuffle/*") if can(s.Action[0])
+    ]) && !strcontains(aws_iam_role_policy.worker_warehouse[0].policy, "DeleteObject")
+    error_message = "The workers' role may write only under _igloo_shuffle, and delete nothing."
+  }
+
+  assert {
+    condition     = !strcontains(aws_iam_role_policy.worker_warehouse[0].policy, "sts:AssumeRole") && jsondecode(aws_iam_role.engines.assume_role_policy).Statement[0].Principal.AWS == aws_iam_role.service["igloo"].arn
+    error_message = "Workers must not be able to assume the role table files are written with."
+  }
+}
+
+run "workers_on_demand_without_instance_store" {
+  command = plan
+
+  variables {
+    workers_enabled        = true
+    workers_spot           = false
+    workers_instance_types = ["m7i.4xlarge"]
+    workers_memory         = "56Gi"
+  }
+
+  override_data {
+    target = data.aws_ec2_instance_type.worker
+    values = { default_vcpus = 16, memory_size = 65536, instance_storage_supported = false, total_instance_storage = 0 }
+  }
+
+  assert {
+    condition = (
+      keys(output.worker_node_groups) == ["workers-ondemand"] &&
+      output.worker_node_groups["workers-ondemand"].ami_type == "AL2023_x86_64_STANDARD" &&
+      output.worker_node_groups["workers-ondemand"].local_storage == "none"
+    )
+    error_message = "workers_spot=false must leave only the on-demand group; x86 types without instance store get the x86 AMI and no localStorage setting."
+  }
+
+  assert {
+    condition = (
+      yamldecode(helm_release.igloo[0].values[0]).workers.resources.requests.memory == "56Gi" &&
+      yamldecode(helm_release.igloo[0].values[0]).workers.resources.requests.cpu == "14" &&
+      yamldecode(helm_release.igloo[0].values[0]).workers.duckdb.spillVolume.sizeLimit == "50Gi" &&
+      yamldecode(helm_release.igloo[0].values[0]).workers.cacheVolume.sizeLimit == "20Gi"
+    )
+    error_message = "workers_memory must override the derived size, and without instance store spill and cache take half and a fifth of the root volume."
+  }
+}
+
+run "large_worker" {
+  command = plan
+
+  variables {
+    workers_enabled             = true
+    large_worker_enabled        = true
+    large_worker_price_per_hour = 4.355
+  }
+
+  override_data {
+    target = data.aws_ec2_instance_type.worker["m7gd.4xlarge"]
+    values = { default_vcpus = 16, memory_size = 65536, instance_storage_supported = true, total_instance_storage = 950 }
+  }
+  override_data {
+    target = data.aws_ec2_instance_type.worker["m6gd.4xlarge"]
+    values = { default_vcpus = 16, memory_size = 65536, instance_storage_supported = true, total_instance_storage = 950 }
+  }
+  # r7gd.16xlarge: 64 vCPUs, 512 GiB, 2 x 1900 GB of NVMe.
+  override_data {
+    target = data.aws_ec2_instance_type.worker["r7gd.16xlarge"]
+    values = { default_vcpus = 64, memory_size = 524288, instance_storage_supported = true, total_instance_storage = 3800 }
+  }
+  override_resource {
+    target = module.eks.module.eks_managed_node_group["large-worker-ondemand"].aws_eks_node_group.this
+    values = { resources = [{ autoscaling_groups = [{ name = "eks-large-worker-ondemand-89ab" }], remote_access_security_group_id = "" }] }
+  }
+
+  assert {
+    condition = (
+      keys(output.worker_node_groups) == ["large-worker-ondemand", "workers-ondemand", "workers-spot"] &&
+      output.worker_node_groups["large-worker-ondemand"].capacity_type == "ON_DEMAND" &&
+      output.worker_node_groups["large-worker-ondemand"].instance_types == tolist(["r7gd.16xlarge"]) &&
+      output.worker_node_groups["large-worker-ondemand"].min_size == 0 &&
+      output.worker_node_groups["large-worker-ondemand"].max_size == 1 &&
+      output.worker_node_groups["large-worker-ondemand"].labels == { "igloo.dev/node" = "large-worker" } &&
+      output.worker_node_groups["large-worker-ondemand"].taint_key == "igloo.dev/large-worker" &&
+      output.worker_node_groups["large-worker-ondemand"].local_storage == "RAID0"
+    )
+    error_message = "The large worker must get an on-demand r7gd.16xlarge node group of its own, from zero to one node, labelled and tainted for it."
+  }
+
+  assert {
+    condition = (
+      yamldecode(helm_release.igloo[0].values[0]).workers.large.enabled == true &&
+      yamldecode(helm_release.igloo[0].values[0]).workers.large.pricePerHour == 4.355 &&
+      yamldecode(helm_release.igloo[0].values[0]).workers.large.instanceType == "r7gd.16xlarge" &&
+      yamldecode(helm_release.igloo[0].values[0]).workers.large.spot == false &&
+      yamldecode(helm_release.igloo[0].values[0]).workers.large.resources.requests.cpu == "57" &&
+      yamldecode(helm_release.igloo[0].values[0]).workers.large.resources.limits.memory == "435Gi" &&
+      yamldecode(helm_release.igloo[0].values[0]).workers.large.duckdb.spillVolume.sizeLimit == "1946Gi" &&
+      yamldecode(helm_release.igloo[0].values[0]).workers.large.cacheVolume.sizeLimit == "884Gi" &&
+      yamldecode(helm_release.igloo[0].values[0]).workers.large.nodeSelector == { "igloo.dev/node" = "large-worker" } &&
+      yamldecode(helm_release.igloo[0].values[0]).workers.large.tolerations[0].key == "igloo.dev/large-worker"
+    )
+    error_message = "The chart's workers.large must fill the large worker's node and select it."
+  }
+
+  assert {
+    condition     = yamldecode(helm_release.igloo[0].values[0]).workers.resources.requests.cpu == "14" && yamldecode(helm_release.igloo[0].values[0]).workers.nodeSelector == { "igloo.dev/node" = "workers" }
+    error_message = "The small workers must keep their own size and nodes."
+  }
+
+  assert {
+    condition     = contains([for g in yamldecode(helm_release.cluster_autoscaler[0].values[0]).autoscalingGroups : g.name], "eks-large-worker-ondemand-89ab")
+    error_message = "The cluster autoscaler must scale the large worker's node group too."
+  }
+}
+
+run "large_worker_on_spot" {
+  command = plan
+
+  variables {
+    workers_enabled      = true
+    large_worker_enabled = true
+    large_worker_spot    = true
+  }
+
+  override_data {
+    target = data.aws_ec2_instance_type.worker
+    values = { default_vcpus = 64, memory_size = 524288, instance_storage_supported = true, total_instance_storage = 3800 }
+  }
+
+  assert {
+    condition = (
+      output.worker_node_groups["large-worker-spot"].capacity_type == "SPOT" &&
+      output.worker_node_groups["large-worker-ondemand"].capacity_type == "ON_DEMAND" &&
+      contains(yamldecode(helm_release.cluster_autoscaler[0].values[0]).expanderPriorities["50"], "^eks-large-worker-spot-.*")
+    )
+    error_message = "large_worker_spot must add a Spot group the autoscaler prefers, keeping the on-demand one to fall back to."
+  }
 }
 
 ################################################################################
@@ -750,6 +1057,27 @@ run "rejects_bad_memory_quantity" {
   }
 
   expect_failures = [var.igloo_memory]
+}
+
+run "rejects_large_worker_without_workers" {
+  command = plan
+
+  variables {
+    large_worker_enabled = true
+  }
+
+  expect_failures = [var.large_worker_enabled]
+}
+
+run "rejects_mixed_worker_architectures" {
+  command = plan
+
+  variables {
+    workers_enabled        = true
+    workers_instance_types = ["m7gd.4xlarge", "m7i.4xlarge"]
+  }
+
+  expect_failures = [var.workers_instance_types]
 }
 
 run "rejects_session_arn_as_cluster_admin" {

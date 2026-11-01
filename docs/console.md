@@ -23,8 +23,18 @@ which is shown with its SQLSTATE and the line its statement starts on. Each
 statement's result appears in its own tab, with column names and types, the
 command tag, the row count and the time taken. The grid shows the first
 10,000 rows of a result; Download CSV runs the query again and saves every
-row. Worksheets are kept in the browser's local storage, per user, and
-results only in memory: nothing about them is stored in Igloo.
+row. It runs the query in a new session, after making again the settings
+that statements before it in the run made (`SET`, `RESET`, `USE`,
+`DISCARD`, and Snowflake's `ALTER SESSION` and `UNSET`), so that it reads
+the same tables with the same settings. Nothing that changes data is run
+again: the download reads tables as they are when it runs. It refuses a
+query that ran after temporary objects were made, inside a transaction
+block, or after a setting computed by an expression
+(`SET VARIABLE x = (SELECT ...)`), which it could not match without
+running more. Worksheets are kept in the browser's local storage, per
+user, and results only in memory: nothing about them is stored in Igloo.
+Console tabs open side by side share them: a worksheet added, changed or
+closed in one tab shows in the others.
 
 Keys in the editor: Tab and Shift+Tab indent and outdent, Escape leaves the
 editor. In the results grid: arrow keys move, Enter (or a double click)
@@ -135,7 +145,7 @@ directly.
 Each request runs in a SQL session of its own, which counts against
 `IGLOO_MAX_CONNECTIONS` while it lasts and shows on the compute page as
 `console <address>`, the session's `client_address` in the history. Settings such as `SET search_path` therefore last for
-one run of a worksheet, not across runs. Closing the browser tab or pressing
+one run of a worksheet, and its downloads, not across runs. Closing the browser tab or pressing
 Cancel cancels the running statement.
 
 The console keeps no state on the server. Its session lives in a cookie,
@@ -166,8 +176,13 @@ does not keep a [scale-to-zero](scale-to-zero.md) deployment awake.
   Unlike SQL clients, which use SCRAM, a browser sends the password itself,
   inside the HTTPS connection. Without TLS the console accepts sign-ins only
   from a browser that reached it as `localhost` (on the same machine, or
-  through an SSH tunnel or `kubectl port-forward`), so a password never
-  crosses a network unencrypted. Behind a load balancer or ingress that ends
+  through Docker's published ports, an SSH tunnel or `kubectl port-forward`),
+  so a password does not cross a network unencrypted by mistake: the
+  request must name `localhost` in its `Host` header and come from this
+  machine or a private network. That is a guard, not an access control: a
+  client on a private network that can reach the port can address it as
+  `localhost`, so keep a console without TLS bound to loopback, as the
+  single-machine setup does. Behind a load balancer or ingress that ends
   TLS, configure TLS on Igloo too, so the hop to Igloo is encrypted, and
   keep the request's `Host` header, which the console compares with the
   browser's `Origin`.

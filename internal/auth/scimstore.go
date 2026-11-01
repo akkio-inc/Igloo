@@ -3,13 +3,15 @@ package auth
 import (
 	"context"
 	"errors"
+	"slices"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 )
 
 // PostgresStore keeps SCIM provisioning in igloo_auth.scim_users,
-// igloo_auth.scim_groups and igloo_auth.scim_members.
+// igloo_auth.scim_groups, igloo_auth.scim_members and
+// igloo_auth.scim_changes.
 
 const scimUserColumns = `user_name, external_id, scim_user_name, display_name, given_name, family_name, created_at, updated_at`
 
@@ -50,8 +52,10 @@ func (s *PostgresStore) DeleteSCIMUser(ctx context.Context, user string) error {
 		if _, err := tx.Exec(ctx, `DELETE FROM igloo_auth.scim_members WHERE user_name = $1`, user); err != nil {
 			return err
 		}
-		_, err := tx.Exec(ctx, `DELETE FROM igloo_auth.scim_users WHERE user_name = $1`, user)
-		return err
+		if _, err := tx.Exec(ctx, `DELETE FROM igloo_auth.scim_users WHERE user_name = $1`, user); err != nil {
+			return err
+		}
+		return markSCIMChanges(ctx, tx, []string{user})
 	})
 }
 
@@ -96,7 +100,10 @@ func (s *PostgresStore) CreateSCIMGroup(ctx context.Context, g SCIMGroup) error 
 			g.ID, g.DisplayName, g.ExternalID); err != nil {
 			return err
 		}
-		return setSCIMMembers(ctx, tx, g.ID, g.Members)
+		if err := setSCIMMembers(ctx, tx, g.ID, g.Members); err != nil {
+			return err
+		}
+		return markSCIMChanges(ctx, tx, g.Members)
 	})
 	return scimGroupError(err)
 }
@@ -116,6 +123,7 @@ func (s *PostgresStore) ModifySCIMGroup(ctx context.Context, id string, change f
 		if err != nil {
 			return err
 		}
+		before := slices.Clone(g.Members)
 		if err := change(&g); err != nil {
 			return err
 		}
@@ -123,7 +131,10 @@ func (s *PostgresStore) ModifySCIMGroup(ctx context.Context, id string, change f
 			WHERE id = $1`, id, g.DisplayName, g.ExternalID); err != nil {
 			return err
 		}
-		return setSCIMMembers(ctx, tx, id, g.Members)
+		if err := setSCIMMembers(ctx, tx, id, g.Members); err != nil {
+			return err
+		}
+		return markSCIMChanges(ctx, tx, append(before, g.Members...))
 	})
 	return scimGroupError(err)
 }
@@ -151,16 +162,76 @@ func scimGroupError(err error) error {
 }
 
 func (s *PostgresStore) DeleteSCIMGroup(ctx context.Context, id string) error {
-	tag, err := s.pool.Exec(ctx, `DELETE FROM igloo_auth.scim_groups WHERE id = $1`, id)
-	if err == nil && tag.RowsAffected() == 0 {
-		return ErrSCIMNotFound
+	return pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+		// The row lock keeps members from joining before it goes.
+		var one int
+		err := tx.QueryRow(ctx, `SELECT 1 FROM igloo_auth.scim_groups WHERE id = $1 FOR UPDATE`, id).Scan(&one)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrSCIMNotFound
+		}
+		if err != nil {
+			return err
+		}
+		rows, err := tx.Query(ctx, `SELECT user_name FROM igloo_auth.scim_members WHERE group_id = $1`, id)
+		if err != nil {
+			return err
+		}
+		members, err := pgx.CollectRows(rows, pgx.RowTo[string])
+		if err != nil {
+			return err
+		}
+		if _, err := tx.Exec(ctx, `DELETE FROM igloo_auth.scim_groups WHERE id = $1`, id); err != nil {
+			return err
+		}
+		return markSCIMChanges(ctx, tx, members)
+	})
+}
+
+// markSCIMChanges records, in tx, that the groups of users changed. The
+// mark is the transaction's ID, which no other change has. Changes mark
+// users after changing members, and in name order, so that concurrent
+// ones take their locks in one order.
+func markSCIMChanges(ctx context.Context, tx pgx.Tx, users []string) error {
+	if users == nil {
+		users = []string{}
 	}
+	_, err := tx.Exec(ctx, `INSERT INTO igloo_auth.scim_changes (user_name, mark)
+		SELECT name, txid_current() FROM igloo_auth.users WHERE name = ANY ($1) ORDER BY name
+		ON CONFLICT (user_name) DO UPDATE SET mark = EXCLUDED.mark`, users)
+	return err
+}
+
+func (s *PostgresStore) SCIMChanges(ctx context.Context) ([]SCIMChange, error) {
+	rows, err := s.pool.Query(ctx, `SELECT user_name, mark FROM igloo_auth.scim_changes ORDER BY user_name`)
+	if err != nil {
+		return nil, err
+	}
+	return pgx.CollectRows(rows, func(row pgx.CollectableRow) (SCIMChange, error) {
+		var c SCIMChange
+		err := row.Scan(&c.User, &c.Mark)
+		return c, err
+	})
+}
+
+func (s *PostgresStore) SCIMChangeApplied(ctx context.Context, c SCIMChange) error {
+	_, err := s.pool.Exec(ctx, `DELETE FROM igloo_auth.scim_changes WHERE user_name = $1 AND mark = $2`, c.User, c.Mark)
 	return err
 }
 
 func (s *PostgresStore) UserSCIMGroups(ctx context.Context, user string) ([]string, error) {
-	rows, err := s.pool.Query(ctx, `SELECT g.display_name FROM igloo_auth.scim_members m
+	rows, err := s.db(ctx).Query(ctx, `SELECT g.display_name FROM igloo_auth.scim_members m
 		JOIN igloo_auth.scim_groups g ON g.id = m.group_id WHERE m.user_name = $1 ORDER BY 1`, user)
+	if err != nil {
+		return nil, err
+	}
+	return pgx.CollectRows(rows, pgx.RowTo[string])
+}
+
+func (s *PostgresStore) SCIMGroupNames(ctx context.Context, names []string) ([]string, error) {
+	if names == nil {
+		names = []string{}
+	}
+	rows, err := s.db(ctx).Query(ctx, `SELECT display_name FROM igloo_auth.scim_groups WHERE display_name = ANY ($1) ORDER BY 1`, names)
 	if err != nil {
 		return nil, err
 	}

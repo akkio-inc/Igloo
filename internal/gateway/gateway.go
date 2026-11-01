@@ -17,6 +17,7 @@
 package gateway
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -26,8 +27,10 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 )
 
@@ -58,14 +61,24 @@ type Options struct {
 	IcebergBackend string
 	// ActivityURL is Igloo's /activity endpoint. Every address its host
 	// resolves to is asked, so a headless Kubernetes Service covers all
-	// replicas. Empty means the gateway judges idleness by traffic alone,
-	// and may stop Igloo during a long query that sends nothing.
+	// replicas. While a replica does not answer, Igloo is not stopped
+	// unless it refuses connections. Empty means the gateway judges
+	// idleness by traffic alone, and may stop Igloo during a long query
+	// that sends nothing.
 	ActivityURL string
 	// SuspendAfter is how long Igloo must be idle before it is stopped.
 	SuspendAfter time.Duration
 	// ResumeTimeout bounds how long a client waits for Igloo to start.
 	ResumeTimeout time.Duration
-	Compute       Compute
+	// FirstByteTimeout is how long a client has, from connecting, to send
+	// its first bytes; until it has, the gateway neither starts Igloo nor
+	// connects to it. Zero means defaultFirstByteTimeout.
+	FirstByteTimeout time.Duration
+	// MaxWaiting is how many connections may wait at once, for their
+	// first bytes or for Igloo to start; further ones are closed at once.
+	// Zero means defaultMaxWaiting.
+	MaxWaiting int
+	Compute    Compute
 	// Metrics may be nil.
 	Metrics *Metrics
 	Log     *slog.Logger
@@ -116,13 +129,46 @@ type Gateway struct {
 	// lastStart is how long the last start of the compute took, by which
 	// starts for scheduled work come early.
 	lastStart time.Duration
+	// learning says the gateway starts Igloo to learn when scheduled work
+	// is due, until Igloo runs (see learnSchedule).
+	learning bool
+	// retryAt is when a start for scheduled work that failed is tried
+	// again, and retryWait how long it waits for that.
+	retryAt   time.Time
+	retryWait time.Duration
+	// waiting counts the connections not yet forwarded (see admit), and
+	// warned is when one refused or timed out was last logged.
+	waiting int
+	warned  time.Time
 }
+
+// scheduleRetryMax bounds the wait between starts for scheduled work that
+// keep failing.
+const scheduleRetryMax = 5 * time.Minute
+
+// A connection is held to limits until the gateway forwards it. Its
+// client must send its first bytes within FirstByteTimeout of connecting,
+// before the gateway starts Igloo or connects to it; every protocol the
+// gateway forwards has the client speak first. And only MaxWaiting
+// connections may wait at once, for their first bytes or for Igloo to
+// start; further ones are closed as soon as they are accepted. Once a
+// client has sent something, it waits for Igloo as long as a start takes
+// (ResumeTimeout). Without these, every connection held a socket and a
+// goroutine for as long as its client kept it open, sending nothing, and
+// started the compute. Igloo then holds connections to its own limits
+// until they sign in (IGLOO_LOGIN_TIMEOUT).
+const (
+	defaultFirstByteTimeout = 30 * time.Second
+	defaultMaxWaiting       = 200
+)
 
 // New returns a gateway; call Serve to accept connections.
 func New(opts Options) *Gateway {
 	if opts.Log == nil {
 		opts.Log = slog.New(slog.DiscardHandler)
 	}
+	opts.FirstByteTimeout = cmp.Or(opts.FirstByteTimeout, defaultFirstByteTimeout)
+	opts.MaxWaiting = cmp.Or(opts.MaxWaiting, defaultMaxWaiting)
 	g := &Gateway{
 		opts:    opts,
 		dialer:  net.Dialer{Timeout: 2 * time.Second, KeepAlive: 30 * time.Second},
@@ -204,6 +250,12 @@ func (g *Gateway) accept(ctx context.Context, ln net.Listener, backend string, w
 			}
 			return err
 		}
+		if !g.admit() {
+			g.warn("refused a connection: too many connections waiting", "client", conn.RemoteAddr().String(),
+				"max", g.opts.MaxWaiting)
+			_ = conn.Close()
+			continue
+		}
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -216,13 +268,27 @@ func (g *Gateway) handle(ctx context.Context, client net.Conn, addr string) {
 	g.track(client, true)
 	defer g.track(client, false)
 	defer client.Close() //nolint:errcheck
+	doneWaiting := sync.OnceFunc(g.release)
+	defer doneWaiting()
 
+	first, err := g.firstBytes(client)
+	if err != nil {
+		if errors.Is(err, os.ErrDeadlineExceeded) {
+			g.warn("closed a connection that sent nothing within the first-byte timeout",
+				"client", client.RemoteAddr().String(), "timeout", g.opts.FirstByteTimeout)
+		}
+		return
+	}
 	backend, err := g.connect(ctx, addr)
+	doneWaiting()
 	if err != nil {
 		g.opts.Log.Warn("could not reach igloo", "client", client.RemoteAddr().String(), "err", err)
 		return
 	}
 	defer backend.Close() //nolint:errcheck
+	if _, err := backend.Write(first); err != nil {
+		return
+	}
 
 	done := make(chan struct{}, 2)
 	pipe := func(dst, src net.Conn) {
@@ -309,6 +375,8 @@ func (g *Gateway) start(w *wake) {
 	if err == nil {
 		g.state = stateRunning
 		g.lastStart = elapsed
+		g.retryAt, g.retryWait = time.Time{}, 0
+		g.learning = false
 		g.touch()
 	} else {
 		g.state = stateUnknown
@@ -347,7 +415,9 @@ func (g *Gateway) waitReady(ctx context.Context) error {
 // learnSchedule asks Igloo, when the gateway starts, when scheduled work
 // is next due. If Igloo cannot be asked, it is presumably stopped, and the
 // gateway has no way to know when to start it for its schedules; it
-// starts it now, to find out the next time it stops it.
+// starts it now, to find out the next time it stops it. A start that
+// fails is tried again as one for scheduled work is (see
+// startForSchedule), until Igloo runs, as it does for a client too.
 func (g *Gateway) learnSchedule(ctx context.Context) {
 	if g.opts.ActivityURL == "" {
 		return
@@ -355,34 +425,61 @@ func (g *Gateway) learnSchedule(ctx context.Context) {
 	if _, _, err := g.busy(ctx); err == nil || ctx.Err() != nil {
 		return
 	}
-	g.opts.Log.Info("starting igloo to learn when its scheduled work is due")
-	if err := g.wake(ctx); err != nil && ctx.Err() == nil {
-		g.opts.Log.Error("could not start igloo", "err", err)
-	}
+	g.mu.Lock()
+	g.learning = g.state != stateRunning
+	g.mu.Unlock()
+	g.startForSchedule(ctx)
 }
 
 // startForSchedule starts the stopped compute when scheduled work is due,
 // early by as long as the last start took, so that the work starts about
-// on time.
+// on time, or when the gateway has yet to learn when that is. The due time
+// is kept until a start succeeds: one that fails is tried again, after a
+// wait that doubles with each failure up to scheduleRetryMax, rather than
+// leaving the work until a client connects.
 func (g *Gateway) startForSchedule(ctx context.Context) {
 	g.mu.Lock()
-	st, due, known, early := g.state, g.due, g.dueKnown, g.lastStart
+	st, due, known, learning, early, retryAt := g.state, g.due, g.dueKnown, g.learning, g.lastStart, g.retryAt
 	g.mu.Unlock()
-	if st == stateRunning || st == stateStarting || !known || due.IsZero() || time.Until(due) > early {
+	if st == stateRunning || st == stateStarting || time.Now().Before(retryAt) {
 		return
 	}
-	g.opts.Log.Info("starting igloo for scheduled work", "due", due.UTC().Format(time.RFC3339))
+	var (
+		what string
+		args []any
+	)
+	switch {
+	case learning:
+		what = "to learn when its scheduled work is due"
+	case known && !due.IsZero() && time.Until(due) <= early:
+		what, args = "for scheduled work", []any{"due", due.UTC().Format(time.RFC3339)}
+	default:
+		return
+	}
+	g.opts.Log.Info("starting igloo "+what, args...)
+	if err := g.wake(ctx); err != nil {
+		if ctx.Err() != nil {
+			return
+		}
+		g.mu.Lock()
+		g.retryWait = min(max(2*g.retryWait, g.checkEvery()), scheduleRetryMax)
+		g.retryAt = time.Now().Add(g.retryWait)
+		wait := g.retryWait
+		g.mu.Unlock()
+		g.opts.Log.Error("could not start igloo "+what, "retry_in", wait, "err", err)
+		return
+	}
 	// The work is underway once Igloo runs; the next due time comes from
 	// Igloo the next time it stops.
 	g.setDue(time.Time{}, false)
-	if err := g.wake(ctx); err != nil && ctx.Err() == nil {
-		g.opts.Log.Error("could not start igloo for scheduled work", "err", err)
-	}
 }
 
 func (g *Gateway) setDue(due time.Time, known bool) {
 	g.mu.Lock()
 	g.due, g.dueKnown = due, known
+	if known {
+		g.learning = false
+	}
 	g.mu.Unlock()
 	g.opts.Metrics.setNextDue(due)
 }
@@ -390,11 +487,7 @@ func (g *Gateway) setDue(due time.Time, known bool) {
 // suspendWhenIdle stops the compute after SuspendAfter without client
 // traffic or running work, and starts it when scheduled work is due.
 func (g *Gateway) suspendWhenIdle(ctx context.Context) {
-	interval := min(g.opts.SuspendAfter/4, 10*time.Second)
-	if interval <= 0 {
-		interval = time.Second
-	}
-	ticker := time.NewTicker(interval)
+	ticker := time.NewTicker(g.checkEvery())
 	defer ticker.Stop()
 	for {
 		select {
@@ -409,6 +502,16 @@ func (g *Gateway) suspendWhenIdle(ctx context.Context) {
 	}
 }
 
+// checkEvery is how often the gateway checks whether to stop the compute
+// or start it for scheduled work.
+func (g *Gateway) checkEvery() time.Duration {
+	interval := min(g.opts.SuspendAfter/4, 10*time.Second)
+	if interval <= 0 {
+		interval = time.Second
+	}
+	return interval
+}
+
 func (g *Gateway) suspendIfIdle(ctx context.Context) error {
 	g.mu.Lock()
 	st, quiet := g.state, g.quiet()
@@ -418,15 +521,24 @@ func (g *Gateway) suspendIfIdle(ctx context.Context) error {
 	}
 	if g.opts.ActivityURL != "" {
 		busy, asked, err := g.busy(ctx)
-		if err != nil {
-			g.opts.Log.Debug("could not read igloo activity", "err", err)
-		}
 		if busy {
 			return nil
 		}
-		if !asked {
-			// Without an answer the next due time may be stale; forget it
-			// rather than start Igloo for work that is not due.
+		if err != nil && !g.refused(ctx) {
+			// A replica that does not answer may be running a statement or
+			// scheduled work that sends nothing: not knowing is not idle.
+			// Only an Igloo that refuses SQL connections is known to be
+			// down, so that stopping it interrupts nothing.
+			if ctx.Err() == nil {
+				g.opts.Log.Warn("not stopping igloo: could not read its activity", "err", err)
+			}
+			return nil
+		}
+		if !asked && st == stateRunning {
+			// Igloo was running, and may have run that work since it last
+			// answered: without an answer the due time may be stale.
+			// Forget it rather than start Igloo for work that is not due.
+			// After a start that failed, it is kept for the next try.
 			g.setDue(time.Time{}, false)
 		}
 	}
@@ -463,6 +575,18 @@ func (g *Gateway) suspendIfIdle(ctx context.Context) error {
 	return nil
 }
 
+// refused reports whether Igloo's SQL port refuses connections, so that
+// Igloo is known not to run. A dial that times out says nothing: a
+// partition between the gateway and Igloo looks the same.
+func (g *Gateway) refused(ctx context.Context) bool {
+	conn, err := g.dialer.DialContext(ctx, "tcp", g.opts.Backend)
+	if err != nil {
+		return errors.Is(err, syscall.ECONNREFUSED)
+	}
+	_ = conn.Close()
+	return false
+}
+
 // waitDown polls Igloo's SQL port until it refuses connections.
 func (g *Gateway) waitDown(ctx context.Context) error {
 	for {
@@ -492,9 +616,9 @@ type activityReport struct {
 
 // busy asks every Igloo replica behind ActivityURL whether it is working,
 // worked within SuspendAfter, or has scheduled work due within it, and
-// remembers when that work is due. A replica that cannot be asked is
-// taken to be idle: it is down, or it is not serving clients. asked says
-// whether any replica answered.
+// remembers when that work is due. A replica that cannot be asked counts
+// as neither busy nor idle: err says which could not, and the caller
+// decides. asked says whether any replica answered.
 func (g *Gateway) busy(ctx context.Context) (busy, asked bool, err error) {
 	u, err := url.Parse(g.opts.ActivityURL)
 	if err != nil {
@@ -558,9 +682,15 @@ func (g *Gateway) activity(ctx context.Context, u string) (activityReport, error
 	return report, json.NewDecoder(resp.Body).Decode(&report)
 }
 
+// setState notes the compute's state. Once Igloo is known to run, the
+// gateway learns its schedule the next time it stops it, without starting
+// it for that (see learnSchedule).
 func (g *Gateway) setState(s state) {
 	g.mu.Lock()
 	g.state = s
+	if s == stateRunning {
+		g.learning = false
+	}
 	g.mu.Unlock()
 	g.opts.Metrics.setRunning(s == stateRunning)
 }
@@ -577,6 +707,56 @@ func (g *Gateway) track(client net.Conn, open bool) {
 		delete(g.clients, client)
 	}
 	g.opts.Metrics.connections(len(g.clients), open)
+}
+
+// admit counts a connection as waiting, reporting false when MaxWaiting
+// already are.
+func (g *Gateway) admit() bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.waiting >= g.opts.MaxWaiting {
+		return false
+	}
+	g.waiting++
+	return true
+}
+
+// release counts a connection admitted as no longer waiting: it is
+// forwarded, or closed.
+func (g *Gateway) release() {
+	g.mu.Lock()
+	g.waiting--
+	g.mu.Unlock()
+}
+
+// firstBytes waits up to FirstByteTimeout for the client to send
+// something, and returns what it sent, for the gateway to pass on to
+// Igloo.
+func (g *Gateway) firstBytes(client net.Conn) ([]byte, error) {
+	_ = client.SetReadDeadline(time.Now().Add(g.opts.FirstByteTimeout))
+	buf := make([]byte, 4096)
+	n, err := client.Read(buf)
+	if n == 0 {
+		return nil, cmp.Or(err, io.ErrNoProgress)
+	}
+	_ = client.SetReadDeadline(time.Time{})
+	g.touch()
+	return buf[:n], nil
+}
+
+// warn logs msg, at most once a minute: connections that send nothing
+// come in floods.
+func (g *Gateway) warn(msg string, args ...any) {
+	g.mu.Lock()
+	now := time.Now()
+	quiet := now.Sub(g.warned) < time.Minute
+	if !quiet {
+		g.warned = now
+	}
+	g.mu.Unlock()
+	if !quiet {
+		g.opts.Log.Warn(msg, args...)
+	}
 }
 
 func (g *Gateway) touch() { g.traffic.Store(time.Now().UnixNano()) }

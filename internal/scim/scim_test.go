@@ -4,12 +4,14 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -22,20 +24,27 @@ type fixture struct {
 	t       *testing.T
 	dir     *auth.MemoryDirectory
 	sso     *sso.Service
+	h       *Handler
 	srv     *httptest.Server
 	token   string
 	changed []string
 }
 
-func newFixture(t *testing.T) *fixture {
+// newFixture serves SCIM from a directory in memory. links, if given,
+// wraps the directory as single sign-on's store of group mappings.
+func newFixture(t *testing.T, links ...func(*auth.MemoryDirectory) auth.SSOStore) *fixture {
 	t.Helper()
 	ctx := context.Background()
 	f := &fixture{t: t, dir: auth.NewMemoryDirectory()}
 	if _, err := f.dir.EnsureAdmin(ctx, "root", "v"); err != nil {
 		t.Fatal(err)
 	}
+	var ssoStore auth.SSOStore = f.dir
+	for _, wrap := range links {
+		ssoStore = wrap(f.dir)
+	}
 	svc, err := sso.New(sso.Options{Config: config.OIDC{Issuer: "https://idp.example.com", ClientID: "igloo",
-		UsernameClaim: "email", GroupsClaim: "groups", CreateUsers: true}, Users: f.dir, Accounts: f.dir, SSO: f.dir, SCIM: f.dir})
+		UsernameClaim: "email", GroupsClaim: "groups", CreateUsers: true}, Users: f.dir, Accounts: f.dir, SSO: ssoStore, SCIM: f.dir})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -46,6 +55,7 @@ func newFixture(t *testing.T) *fixture {
 	if err != nil {
 		t.Fatal(err)
 	}
+	f.h = h
 	f.srv = httptest.NewServer(h)
 	t.Cleanup(f.srv.Close)
 	return f
@@ -415,6 +425,144 @@ func TestGroups(t *testing.T) {
 	}
 	if code, _ := f.call("PATCH", "/Groups/"+id, map[string]any{"Operations": []any{}}); code != http.StatusNotFound {
 		t.Errorf("patching a deleted group: %d", code)
+	}
+}
+
+// TestSCIMDecidesItsGroups: a group the provider pushes has the members
+// SCIM says, whatever the groups saved from a sign-in's token: removing
+// someone from it takes its roles away at once. The token's other groups
+// still count.
+func TestSCIMDecidesItsGroups(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	if code, _ := f.call("POST", "/Users", map[string]any{"userName": "ana@agency.com"}); code != http.StatusCreated {
+		t.Fatalf("provisioning ana: %d", code)
+	}
+	if err := f.dir.CreateRole(ctx, "analysts"); err != nil {
+		t.Fatal(err)
+	}
+	for _, m := range []auth.GroupRole{{Group: "Data Team", Role: "analysts"}, {Group: "Igloo Writers", Role: "writer"}} {
+		if err := f.dir.GrantGroupRole(ctx, m); err != nil {
+			t.Fatal(err)
+		}
+	}
+	code, out := f.call("POST", "/Groups", map[string]any{"displayName": "Igloo Writers", "members": []map[string]any{{"value": "ana"}}})
+	if code != http.StatusCreated {
+		t.Fatalf("POST /Groups: %d %v", code, out)
+	}
+	id := out["id"].(string)
+	signIn := func() {
+		t.Helper()
+		if _, err := f.sso.SignIn(ctx, sso.Identity{Issuer: "https://idp.example.com", Subject: "s-ana", Username: "ana@agency.com",
+			Email: "ana@agency.com", Groups: []string{"Igloo Writers", "Data Team"}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	signIn()
+	if u := f.user("ana"); u.Role != auth.RoleWriter || !slices.Equal(f.roles("ana"), []string{"analysts"}) {
+		t.Fatalf("after signing in: %s %v", u.Role, f.roles("ana"))
+	}
+
+	code, _ = f.call("PATCH", "/Groups/"+id, map[string]any{"schemas": []string{schemaPatch},
+		"Operations": []any{map[string]any{"op": "remove", "path": `members[value eq "ana"]`}}})
+	if code != http.StatusNoContent {
+		t.Fatalf("removing ana: %d", code)
+	}
+	if u := f.user("ana"); u.Role != auth.RoleNone || !slices.Equal(f.roles("ana"), []string{"analysts"}) {
+		t.Errorf("after SCIM removed ana from Igloo Writers: %s %v", u.Role, f.roles("ana"))
+	}
+	// A token that still lists the group does not put her back in it.
+	signIn()
+	if u := f.user("ana"); u.Role != auth.RoleNone || !slices.Equal(f.roles("ana"), []string{"analysts"}) {
+		t.Errorf("after signing in with a token listing Igloo Writers: %s %v", u.Role, f.roles("ana"))
+	}
+	// Once SCIM no longer pushes the group, the token decides again.
+	if code, _ := f.call("DELETE", "/Groups/"+id, nil); code != http.StatusNoContent {
+		t.Fatalf("DELETE /Groups: %d", code)
+	}
+	signIn()
+	if u := f.user("ana"); u.Role != auth.RoleWriter {
+		t.Errorf("after the group stopped being pushed: %s", u.Role)
+	}
+}
+
+// failingMappings is a directory whose group mappings cannot be read
+// while fail is set, as when the metadata database is out of reach.
+type failingMappings struct {
+	*auth.MemoryDirectory
+	fail atomic.Bool
+}
+
+func (d *failingMappings) GroupRoles(ctx context.Context) ([]auth.GroupRole, error) {
+	if d.fail.Load() {
+		return nil, errors.New("the metadata database is out of reach")
+	}
+	return d.MemoryDirectory.GroupRoles(ctx)
+}
+
+// TestGroupChangeRetriesRoles: a group change whose roles cannot be applied
+// is kept but answered with an error, and the provider's retry applies
+// them, though the change it repeats finds nothing left to do.
+func TestGroupChangeRetriesRoles(t *testing.T) {
+	var links *failingMappings
+	f := newFixture(t, func(d *auth.MemoryDirectory) auth.SSOStore {
+		links = &failingMappings{MemoryDirectory: d}
+		return links
+	})
+	ctx := context.Background()
+	if code, _ := f.call("POST", "/Users", map[string]any{"userName": "ana@agency.com"}); code != http.StatusCreated {
+		t.Fatalf("provisioning ana: %d", code)
+	}
+	if err := f.dir.GrantGroupRole(ctx, auth.GroupRole{Group: "Igloo Writers", Role: "writer"}); err != nil {
+		t.Fatal(err)
+	}
+	code, out := f.call("POST", "/Groups", map[string]any{"displayName": "Igloo Writers", "members": []map[string]any{{"value": "ana"}}})
+	if code != http.StatusCreated || f.user("ana").Role != auth.RoleWriter {
+		t.Fatalf("POST /Groups: %d %v, ana is %s", code, out, f.user("ana").Role)
+	}
+	id := out["id"].(string)
+	remove := map[string]any{"schemas": []string{schemaPatch},
+		"Operations": []any{map[string]any{"op": "remove", "path": `members[value eq "ana"]`}}}
+
+	links.fail.Store(true)
+	if code, _ := f.call("PATCH", "/Groups/"+id, remove); code != http.StatusInternalServerError {
+		t.Errorf("a change whose roles could not be applied: %d", code)
+	}
+	if g, _ := f.dir.SCIMGroup(ctx, id); len(g.Members) != 0 {
+		t.Errorf("the change was not kept: %v", g.Members)
+	}
+	links.fail.Store(false)
+	if code, _ := f.call("PATCH", "/Groups/"+id, remove); code != http.StatusNoContent {
+		t.Errorf("the retry: %d", code)
+	}
+	if u := f.user("ana"); u.Role != auth.RoleNone {
+		t.Errorf("after the retry ana is %s", u.Role)
+	}
+	if c, _ := f.dir.SCIMChanges(ctx); len(c) != 0 {
+		t.Errorf("changes left after the retry: %+v", c)
+	}
+
+	// Without a retry, Run applies them.
+	links.fail.Store(true)
+	add := map[string]any{"schemas": []string{schemaPatch},
+		"Operations": []any{map[string]any{"op": "add", "path": "members", "value": []map[string]any{{"value": "ana"}}}}}
+	if code, _ := f.call("PATCH", "/Groups/"+id, add); code != http.StatusInternalServerError || f.user("ana").Role != auth.RoleNone {
+		t.Errorf("adding ana while the mappings cannot be read: %d, ana is %s", code, f.user("ana").Role)
+	}
+	links.fail.Store(false)
+	runCtx, stop := context.WithCancel(ctx)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		f.h.Run(runCtx, 10*time.Millisecond)
+	}()
+	for deadline := time.Now().Add(5 * time.Second); f.user("ana").Role != auth.RoleWriter && time.Now().Before(deadline); {
+		time.Sleep(10 * time.Millisecond)
+	}
+	stop()
+	<-done
+	if u := f.user("ana"); u.Role != auth.RoleWriter {
+		t.Errorf("Run did not apply the change: ana is %s", u.Role)
 	}
 }
 

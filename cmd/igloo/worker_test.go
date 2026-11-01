@@ -78,6 +78,14 @@ func TestSeedHistory(t *testing.T) {
 			t.Errorf("seeded footprint of %s %d (%v), want %d", shape, got, ok, w)
 		}
 	}
+	// Proof for auto mode that a shape fits only from completed runs: not
+	// g's, whose latest run was cancelled holding more, nor h's, all the
+	// memory of a run cancelled after ten minutes.
+	for shape, completed := range map[string]bool{"a": true, "e": true, "f": true, "g": false, "h": false} {
+		if _, ok := footprints.Completed(shape); ok != completed {
+			t.Errorf("seeded footprint of %s completed %v", shape, ok)
+		}
+	}
 	// Without a coordinator, footprints all the same.
 	footprints = workload.NewController(22 * gb)
 	seedHistory(context.Background(), nil, footprints, 22*gb, store, slog.New(slog.NewTextHandler(io.Discard, nil)))

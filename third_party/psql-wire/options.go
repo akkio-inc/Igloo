@@ -272,9 +272,10 @@ func ErrorSanitizer(fn func(error) error) OptionFn {
 	}
 }
 
-// MessageBufferSize sets the message buffer size which is allocated once a new
-// connection gets constructed. If a negative value or zero value is provided is
-// the default message buffer size used.
+// MessageBufferSize sets the largest message a client may send. If a negative
+// value or zero value is provided is the default message buffer size used.
+// Igloo patch: it is no longer allocated for every connection (see
+// buffer.ReadBufferSize).
 func MessageBufferSize(size int) OptionFn {
 	return func(srv *Server) error {
 		srv.BufferedMsgSize = size

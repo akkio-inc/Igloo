@@ -1,0 +1,4 @@
+# GKE ComputeClasses (cloud.google.com/v1), each {name, spec}. deploy/gcp
+# fills this in; pods choose a class with the node selector
+# cloud.google.com/compute-class: <name>.
+classes: []

@@ -2280,8 +2280,8 @@ func (s *Service) cache(ctx context.Context, r *Request) error {
 }
 
 // caches counts the caches emptied since r deleted files, and those of
-// replicas not running now, which will be when they start, and names the
-// running replicas that have yet to.
+// replicas not running now whose disks stay, which will be when they
+// start, and names the running replicas that have yet to.
 func (s *Service) caches(ctx context.Context, r *Request) (emptied, pending int, waiting []string, err error) {
 	if r.DeletedThrough.IsZero() {
 		return 0, 0, nil, nil
@@ -2311,6 +2311,8 @@ func (s *Service) caches(ctx context.Context, r *Request) (emptied, pending int,
 		case worker:
 			// Not pending: one whose cache outlives it is left (see
 			// workersLeft), and one whose cache goes with it holds nothing.
+		case strings.HasPrefix(c.ID, PodCache):
+			// Not pending either: its disk went with its pod.
 		case !strings.HasPrefix(c.ID, MemoryCache) && now.Sub(c.Seen) < staleCache:
 			pending++
 		}
@@ -2407,6 +2409,9 @@ func (s *Service) verify(ctx context.Context, r *Request) (string, error) {
 	if v.Models, err = s.modelsRemaining(ctx, r); err != nil {
 		return "", err
 	}
+	if v.Views, err = s.viewsRemaining(ctx, r); err != nil {
+		return "", err
+	}
 	var waiting []string
 	if v.Caches, v.Pending, waiting, err = s.caches(ctx, r); err != nil {
 		return "", err
@@ -2422,6 +2427,8 @@ func (s *Service) verify(ctx context.Context, r *Request) (string, error) {
 	switch {
 	case v.Rows > 0 || v.Files > 0 || v.Bounds > 0 || v.Statistics > 0:
 		next = StepDelete
+	case v.Views > 0:
+		next = StepViews
 	case v.IDSets > 0:
 		next = StepExpire
 	case v.Storage > 0 || v.Orphans > 0:
@@ -2533,7 +2540,7 @@ func (v *Verification) String() string {
 		{v.Rows, "rows"}, {v.Files, "files"}, {v.Bounds, "manifest bounds"}, {v.Statistics, "Parquet statistics"},
 		{v.Storage, "deleted files in storage"}, {v.Orphans, "recent orphan files"}, {v.Sharing, "sharing copies"},
 		{v.History, "history records"}, {v.Derived, "derived entries"}, {v.Models, "models or their old blobs"},
-		{v.IDSets, "sets of ids"}, {int64(v.Workers), "workers that have not purged"},
+		{v.IDSets, "sets of ids"}, {v.Views, "materialized views or dynamic tables"}, {int64(v.Workers), "workers that have not purged"},
 	} {
 		if c.n > 0 {
 			parts = append(parts, fmt.Sprintf("%d %s", c.n, c.what))

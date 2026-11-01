@@ -18,6 +18,7 @@ import (
 	"errors"
 	"log/slog"
 	"net"
+	"net/netip"
 	"strings"
 	"sync"
 
@@ -131,10 +132,13 @@ type service struct {
 const handshakeMethod = "/arrow.flight.protocol.FlightService/Handshake"
 
 // errUnencrypted refuses a client on a connection without TLS that does
-// not reach the server as localhost. It mirrors the web console's rule
-// for sign-ins: basic authentication sends the password itself, so
-// without TLS it may only travel inside this machine, or through an SSH
-// tunnel or kubectl port-forward that encrypts it.
+// not reach the server as localhost, from this machine or a private
+// network. It mirrors the web console's rule for sign-ins: basic
+// authentication sends the password itself, so without TLS it may only
+// travel inside this machine, or through an SSH tunnel or kubectl
+// port-forward that encrypts it. The :authority catches a client sent
+// across a network by mistake; since a client may send any, its address
+// must be nearby too (see privatePeer).
 var errUnencrypted = status.Error(codes.PermissionDenied,
 	"this connection is not encrypted, so Igloo accepts Flight SQL clients only at localhost; "+
 		"configure TLS (IGLOO_TLS_CERT_FILE and IGLOO_TLS_KEY_FILE) to connect from other machines")
@@ -143,7 +147,7 @@ var errUnencrypted = status.Error(codes.PermissionDenied,
 // every call but the handshake must carry a session's bearer token. It
 // returns ctx with the caller's session.
 func (s *Server) authorize(ctx context.Context, method string) (context.Context, error) {
-	if !s.tls && !loopback(authority(ctx)) {
+	if !s.tls && !(loopback(authority(ctx)) && privatePeer(peerAddr(ctx))) {
 		return ctx, errUnencrypted
 	}
 	if method == handshakeMethod {
@@ -201,6 +205,27 @@ func loopback(host string) bool {
 	}
 	ip := net.ParseIP(host)
 	return ip != nil && ip.IsLoopback()
+}
+
+// sharedAddressSpace is 100.64.0.0/10 (RFC 6598), which some Kubernetes
+// networks give pods.
+var sharedAddressSpace = netip.MustParsePrefix("100.64.0.0/10")
+
+// privatePeer reports whether addr, a client's address as its connection
+// reports it, is on this machine or a private network, as the Iceberg REST
+// catalog requires of clients without TLS. It cannot be this machine
+// alone: Docker's published ports, which the single-machine setup binds to
+// loopback, present a client on the host as the bridge network's gateway.
+func privatePeer(addr net.Addr) bool {
+	if addr == nil {
+		return false
+	}
+	ap, err := netip.ParseAddrPort(addr.String())
+	if err != nil {
+		return false
+	}
+	ip := ap.Addr().Unmap()
+	return ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || sharedAddressSpace.Contains(ip)
 }
 
 // connStats ties sessions to the connection they were opened on: each

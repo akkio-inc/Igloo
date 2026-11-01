@@ -2,6 +2,7 @@ package distributed
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -34,7 +35,15 @@ type parser struct {
 	templates map[string]node
 	// types are type names as DuckDB prints them (see typeName).
 	types map[string]string
+	// printed are the texts of trees printed lately, by the SHA-256 of
+	// their JSON, and printedBytes their length in all (see print).
+	printed      map[[sha256.Size]byte]string
+	printedBytes int
 }
+
+// maxPrinted bounds the length of the texts the parser keeps of trees it
+// printed; past it, it forgets them all.
+const maxPrinted = 32 << 20
 
 func newParser() (*parser, error) {
 	connector, err := duckdb.NewConnector("", nil)
@@ -48,7 +57,7 @@ func newParser() (*parser, error) {
 			return nil, errors.Join(fmt.Errorf("set up parser: %w", err), db.Close())
 		}
 	}
-	return &parser{db: db, templates: map[string]node{}, types: map[string]string{}}, nil
+	return &parser{db: db, templates: map[string]node{}, types: map[string]string{}, printed: map[[sha256.Size]byte]string{}}, nil
 }
 
 func (p *parser) close() error { return p.db.Close() }
@@ -92,8 +101,51 @@ func (p *parser) parse(query string) (node, error) {
 
 // print turns a query node back into SQL, and checks that DuckDB parses
 // that SQL into the same tree, so a construct DuckDB cannot print
-// faithfully is caught before anything runs.
+// faithfully is caught before anything runs. It keeps the texts of the
+// trees it printed: the planner prints the same parts of a statement again
+// and again as it tries one plan after another, to describe them and to
+// know relations by, and each print costs two trips through DuckDB and
+// several walks of the tree, most of the time of planning a long chain of
+// common table expressions.
 func (p *parser) print(n node) (string, error) {
+	key, keyed := printKey(n)
+	if keyed {
+		p.mu.Lock()
+		text, ok := p.printed[key]
+		p.mu.Unlock()
+		if ok {
+			return text, nil
+		}
+	}
+	text, err := p.printAnew(n)
+	if err != nil || !keyed {
+		return text, err
+	}
+	p.mu.Lock()
+	if _, ok := p.printed[key]; !ok {
+		if p.printedBytes+len(text) > maxPrinted {
+			clear(p.printed)
+			p.printedBytes = 0
+		}
+		p.printed[key] = text
+		p.printedBytes += len(text)
+	}
+	p.mu.Unlock()
+	return text, nil
+}
+
+// printKey keys a tree's text in parser.printed: the SHA-256 of its JSON,
+// whose maps encoding/json writes in the order of their keys.
+func printKey(n node) ([sha256.Size]byte, bool) {
+	raw, err := json.Marshal(n)
+	if err != nil {
+		return [sha256.Size]byte{}, false
+	}
+	return sha256.Sum256(raw), true
+}
+
+// printAnew prints n through DuckDB, as print does.
+func (p *parser) printAnew(n node) (string, error) {
 	n, err := p.crossAsInner(stripTopK(n))
 	if err != nil {
 		return "", err
@@ -421,11 +473,13 @@ type errUnsupported struct {
 	// key is the statement's plan key when auto mode chose one machine
 	// for a statement that could run on workers (PlanKey), and oneMachine
 	// how long one machine was estimated to take it, in seconds, when
-	// workers could run it (LocalEstimate); tookOnWorkers is what its last
-	// run on workers took, when auto mode tries one machine after it
-	// (LocalBudget).
+	// workers could run it (LocalEstimate), and onWorkers how long the
+	// workers auto mode would have run it on, their start included
+	// (WorkersEstimate); tookOnWorkers is what its last run on workers
+	// took, when auto mode tries one machine after it (LocalBudget).
 	key           string
 	oneMachine    float64
+	onWorkers     float64
 	tookOnWorkers float64
 }
 
@@ -454,6 +508,20 @@ func LocalEstimate(err error) (d time.Duration, ok bool) {
 	var u *errUnsupported
 	if errors.As(err, &u) && u.key != "" && u.oneMachine > 0 {
 		return time.Duration(u.oneMachine * float64(time.Second)), true
+	}
+	return 0, false
+}
+
+// WorkersEstimate returns how long auto mode estimated the workers it
+// would have run a statement on take it, starting them if they are
+// stopped, for a statement it chose to run on one machine though workers
+// could run it, as err, Plan's error, says: the session's guard runs the
+// statement on them only once its run here has taken that long (see the
+// server's guard). ok is false for any other statement.
+func WorkersEstimate(err error) (d time.Duration, ok bool) {
+	var u *errUnsupported
+	if errors.As(err, &u) && u.key != "" && u.oneMachine > 0 && u.onWorkers > 0 {
+		return time.Duration(u.onWorkers * float64(time.Second)), true
 	}
 	return 0, false
 }

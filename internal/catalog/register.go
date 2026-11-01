@@ -47,7 +47,11 @@ func (c *Client) Register(ctx context.Context, ident table.Identifier, metadataL
 	case status < 200 || status > 299:
 		return nil, &apiError{status: status, body: string(data)}
 	}
-	return c.LoadTable(ctx, ident)
+	tbl, err := c.LoadTable(ctx, ident)
+	if err != nil {
+		return nil, fmt.Errorf("the catalog registered %s, but loading it failed: %w", strings.Join(ident, "."), err)
+	}
+	return tbl, nil
 }
 
 // NamespaceLocation is where the catalog puts the tables of a namespace

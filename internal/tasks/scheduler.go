@@ -28,7 +28,13 @@ const (
 	// writeTimeout bounds recording a run after it ends, even when
 	// Igloo is shutting down.
 	writeTimeout = 10 * time.Second
+	// heldInterval is how often a run checks that it still holds its
+	// job's lock.
+	heldInterval = 2 * time.Second
 )
+
+// errLockLost is the cause of a run canceled because it lost its lock.
+var errLockLost = errors.New("the run lost its lock, as when its connection to the metadata database drops, so another run of the job could start")
 
 // Runner runs a job as its owner, with the owner's privileges at the time.
 // It returns the rows the run loaded, wrote or returned, or -1;
@@ -69,6 +75,8 @@ type Scheduler struct {
 	dueErr  error
 	hasDue  bool
 	nowFunc func() time.Time
+	// heldEvery is how often a run checks its lock (heldInterval).
+	heldEvery time.Duration
 }
 
 // NewScheduler schedules the jobs in store.
@@ -87,6 +95,7 @@ func NewScheduler(store Store, opts Options) *Scheduler {
 		kick:       make(chan struct{}, 1),
 		slots:      make(chan struct{}, maxConcurrentRuns),
 		nowFunc:    time.Now,
+		heldEvery:  heldInterval,
 	}
 }
 
@@ -216,18 +225,26 @@ func (s *Scheduler) fire(ctx context.Context, r Runner, j Job, now time.Time) {
 	}
 }
 
-// RunNow runs j at once, as EXECUTE TASK and REFRESH MATERIALIZED VIEW
-// do, and records the run. ErrRunning means it is running already.
+// RunNow runs j at once, as EXECUTE TASK, REFRESH MATERIALIZED VIEW and
+// ALTER DYNAMIC TABLE ... REFRESH do, and records the run. ErrRunning means it is running already.
 func (s *Scheduler) RunNow(ctx context.Context, r Runner, j Job) (Run, error) {
 	return s.execute(ctx, r, j, TriggerManual, time.Time{})
 }
 
 // execute runs j unless it is running already, and records the run. A
 // scheduled run that finds j running is recorded as skipped.
+//
+// The job's lock is a lease (Store.TryLease): a session advisory lock,
+// which Postgres releases when its connection drops, and a lease row that
+// keeps another replica from taking the lock again until this run lets it
+// go, or the row expires once this replica can no longer renew it. So the
+// run checks that it still holds the lease right before it starts, and
+// every heldEvery while it runs, and is canceled once it does not, before
+// the row can expire.
 func (s *Scheduler) execute(ctx context.Context, r Runner, j Job, trigger string, scheduled time.Time) (Run, error) {
 	run := Run{ID: audit.NewID(s.nowFunc()), Kind: j.Kind, Name: j.Name, User: j.Owner, Trigger: trigger,
 		Scheduled: scheduled, Start: s.nowFunc(), Rows: -1}
-	unlock, ok, err := s.store.TryLock(ctx, JobKey(j.Kind, j.Name))
+	lease, ok, err := s.store.TryLease(ctx, JobKey(j.Kind, j.Name))
 	if err != nil {
 		return run, fmt.Errorf("lock %s %s: %w", j.Kind, j.Name, err)
 	}
@@ -240,7 +257,7 @@ func (s *Scheduler) execute(ctx context.Context, r Runner, j Job, trigger string
 		s.end(j, run)
 		return run, nil
 	}
-	defer unlock()
+	defer lease.Release()
 	// Holding the lock, any run still marked running was left by a
 	// replica that stopped.
 	if err := s.store.AbandonRuns(ctx, j.Kind, j.Name); err != nil {
@@ -252,7 +269,20 @@ func (s *Scheduler) execute(ctx context.Context, r Runner, j Job, trigger string
 		s.write(ctx, run)
 	}
 
-	run.Rows, err = r.RunJob(context.WithValue(ctx, runKey{}, run), j)
+	runCtx, cancel := context.WithCancelCause(ctx)
+	defer cancel(nil)
+	if err = lease.Held(ctx); err != nil {
+		cancel(fmt.Errorf("%w: %w", errLockLost, err))
+	} else {
+		stop := s.watch(runCtx, lease, cancel)
+		var detail string
+		run.Rows, err = r.RunJob(context.WithValue(context.WithValue(runCtx, runKey{}, run), detailKey{}, &detail), j)
+		run.Detail = detail
+		stop()
+	}
+	if cause := context.Cause(runCtx); errors.Is(cause, errLockLost) && err != nil && !errors.Is(err, ErrIdle) {
+		err = fmt.Errorf("canceled: %w", cause)
+	}
 	run.End = s.nowFunc()
 	switch {
 	case errors.Is(err, ErrIdle):
@@ -273,6 +303,40 @@ func (s *Scheduler) execute(ctx context.Context, r Runner, j Job, trigger string
 		s.suspend(ctx, j, err)
 	}
 	return run, err
+}
+
+// watch checks every heldEvery that lease is still held, until stop is
+// called, and cancels the run, whose context is ctx, once it is not. stop
+// returns once the checks have, so the lease can be released.
+func (s *Scheduler) watch(ctx context.Context, lease Lease, cancel context.CancelCauseFunc) (stop func()) {
+	done := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		tick := time.NewTicker(s.heldEvery)
+		defer tick.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-ctx.Done():
+				return
+			case <-tick.C:
+			}
+			hctx, hcancel := context.WithTimeout(ctx, writeTimeout)
+			err := lease.Held(hctx)
+			hcancel()
+			if err != nil && ctx.Err() == nil {
+				cancel(fmt.Errorf("%w: %w", errLockLost, err))
+				return
+			}
+		}
+	}()
+	return func() {
+		close(done)
+		wg.Wait()
+	}
 }
 
 // end tells Options.Ended about a run that ended.

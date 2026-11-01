@@ -2,6 +2,7 @@ package config
 
 import (
 	"log/slog"
+	"maps"
 	"os"
 	"path/filepath"
 	"slices"
@@ -35,8 +36,11 @@ func TestLoadDefaults(t *testing.T) {
 	if !cfg.Storage.S3.UseSSL || cfg.Storage.S3.URLStyle != "vhost" {
 		t.Errorf("unexpected S3 defaults: %+v", cfg.Storage.S3)
 	}
-	if cfg.StatementTimeout != 0 || cfg.MaxConnections != 100 {
-		t.Errorf("unexpected limits: timeout %s, max connections %d", cfg.StatementTimeout, cfg.MaxConnections)
+	if cfg.StatementTimeout != 0 || cfg.MaxConnections != 100 || cfg.LoginTimeout != 30*time.Second {
+		t.Errorf("unexpected limits: timeout %s, max connections %d, login timeout %s", cfg.StatementTimeout, cfg.MaxConnections, cfg.LoginTimeout)
+	}
+	if cfg.AccessMaxStaleness != 2*time.Minute {
+		t.Errorf("access max staleness: %s", cfg.AccessMaxStaleness)
 	}
 	if m := cfg.Maintenance; !m.Enabled || m.Interval != time.Hour || m.Retention != 7*24*time.Hour {
 		t.Errorf("unexpected maintenance defaults: %+v", m)
@@ -143,11 +147,19 @@ func TestCache(t *testing.T) {
 	if c, err := load(map[string]string{"IGLOO_CACHE_DIR": "/c", "IGLOO_CACHE_SIZE": "0"}); err != nil || c.Dir != "" {
 		t.Errorf("0 should turn the cache off: %+v, %v", c, err)
 	}
+	if c, err := load(map[string]string{"IGLOO_CACHE_DIR": "/c", "IGLOO_CACHE_EPHEMERAL": "true"}); err != nil || !c.Ephemeral {
+		t.Errorf("a cache that goes with its pod: %+v, %v", c, err)
+	}
+	if c, err := load(map[string]string{"IGLOO_CACHE_DIR": "/c", "IGLOO_CACHE_DEDICATED": "true"}); err != nil || !c.Dedicated {
+		t.Errorf("a cache on a volume of its own: %+v, %v", c, err)
+	}
 	for _, bad := range []map[string]string{
 		{"IGLOO_CACHE_DIR": "/c", "IGLOO_CACHE_SIZE": "lots"},
 		{"IGLOO_CACHE_DIR": "/c", "IGLOO_CACHE_SIZE": "-1GB"},
 		{"IGLOO_CACHE_DIR": "/c", "IGLOO_CACHE_SIZE": "0.1"},
 		{"IGLOO_CACHE_DIR": "relative/cache"},
+		{"IGLOO_CACHE_DIR": "/c", "IGLOO_CACHE_EPHEMERAL": "sometimes"},
+		{"IGLOO_CACHE_DIR": "/c", "IGLOO_CACHE_DEDICATED": "mostly"},
 	} {
 		if _, err := load(bad); err == nil {
 			t.Errorf("%v accepted", bad)
@@ -179,18 +191,23 @@ func TestParseSize(t *testing.T) {
 
 func TestLimits(t *testing.T) {
 	cfg, err := Load(env(map[string]string{
-		"IGLOO_ADMIN_PASSWORD":    "password",
-		"IGLOO_STATEMENT_TIMEOUT": "90m",
-		"IGLOO_MAX_CONNECTIONS":   "20",
-		"IGLOO_SHUTDOWN_DELAY":    "5s",
+		"IGLOO_ADMIN_PASSWORD":       "password",
+		"IGLOO_STATEMENT_TIMEOUT":    "90m",
+		"IGLOO_MAX_CONNECTIONS":      "20",
+		"IGLOO_SHUTDOWN_DELAY":       "5s",
+		"IGLOO_LOGIN_TIMEOUT":        "1m",
+		"IGLOO_ACCESS_MAX_STALENESS": "10m",
 	}))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.StatementTimeout.Minutes() != 90 || cfg.MaxConnections != 20 || cfg.ShutdownDelay.Seconds() != 5 {
-		t.Errorf("got timeout %s, max connections %d", cfg.StatementTimeout, cfg.MaxConnections)
+	if cfg.StatementTimeout.Minutes() != 90 || cfg.MaxConnections != 20 || cfg.ShutdownDelay.Seconds() != 5 || cfg.LoginTimeout != time.Minute ||
+		cfg.AccessMaxStaleness != 10*time.Minute {
+		t.Errorf("got timeout %s, max connections %d, login timeout %s, access max staleness %s",
+			cfg.StatementTimeout, cfg.MaxConnections, cfg.LoginTimeout, cfg.AccessMaxStaleness)
 	}
-	for k, v := range map[string]string{"IGLOO_STATEMENT_TIMEOUT": "soon", "IGLOO_MAX_CONNECTIONS": "0"} {
+	for k, v := range map[string]string{"IGLOO_STATEMENT_TIMEOUT": "soon", "IGLOO_MAX_CONNECTIONS": "0", "IGLOO_LOGIN_TIMEOUT": "0",
+		"IGLOO_ACCESS_MAX_STALENESS": "never"} {
 		if _, err := Load(env(map[string]string{"IGLOO_ADMIN_PASSWORD": "password", k: v})); err == nil {
 			t.Errorf("%s=%s accepted", k, v)
 		}
@@ -464,14 +481,30 @@ func TestErasureKey(t *testing.T) {
 	}
 }
 
-// IGLOO_EXCHANGES says where workers exchange rows: object storage unless
-// set to local or auto.
+// IGLOO_PREFETCH reads ahead unless set to false.
+func TestPrefetchSetting(t *testing.T) {
+	cfg, err := Load(env(map[string]string{"IGLOO_ADMIN_PASSWORD": "password"}))
+	if err != nil || !cfg.Prefetch.Enabled {
+		t.Fatalf("default: %v %v", cfg.Prefetch.Enabled, err)
+	}
+	cfg, err = Load(env(map[string]string{"IGLOO_ADMIN_PASSWORD": "password", "IGLOO_PREFETCH": "false"}))
+	if err != nil || cfg.Prefetch.Enabled {
+		t.Fatalf("false: %v %v", cfg.Prefetch.Enabled, err)
+	}
+	if _, err := Load(env(map[string]string{"IGLOO_ADMIN_PASSWORD": "password", "IGLOO_PREFETCH": "sometimes"})); err == nil {
+		t.Error("IGLOO_PREFETCH=sometimes should be refused")
+	}
+}
+
+// IGLOO_EXCHANGES says where workers exchange rows: auto (their disks
+// where every worker has room and runs outside Kubernetes) unless set to
+// object or local.
 func TestExchanges(t *testing.T) {
 	cfg, err := Load(env(map[string]string{"IGLOO_ADMIN_PASSWORD": "password"}))
-	if err != nil || cfg.Workers.Exchanges != "object" {
+	if err != nil || cfg.Workers.Exchanges != "auto" {
 		t.Fatalf("default: %q %v", cfg.Workers.Exchanges, err)
 	}
-	for _, v := range []string{"local", "auto"} {
+	for _, v := range []string{"object", "local", "auto"} {
 		cfg, err = Load(env(map[string]string{"IGLOO_ADMIN_PASSWORD": "password", "IGLOO_EXCHANGES": v}))
 		if err != nil || cfg.Workers.Exchanges != v {
 			t.Fatalf("%s: %q %v", v, cfg.Workers.Exchanges, err)
@@ -546,6 +579,22 @@ func TestStatementReservations(t *testing.T) {
 	}
 }
 
+func TestWorkerWrites(t *testing.T) {
+	for v, want := range map[string]bool{"": false, "on": false, "off": true, "false": true} {
+		m := map[string]string{"IGLOO_ADMIN_PASSWORD": "password"}
+		if v != "" {
+			m["IGLOO_WORKER_WRITES"] = v
+		}
+		cfg, err := Load(env(m))
+		if err != nil || cfg.Workers.NoWrites != want {
+			t.Errorf("IGLOO_WORKER_WRITES=%q: %v %v, want %v", v, cfg.Workers.NoWrites, err, want)
+		}
+	}
+	if _, err := Load(env(map[string]string{"IGLOO_ADMIN_PASSWORD": "password", "IGLOO_WORKER_WRITES": "sometimes"})); err == nil {
+		t.Error("IGLOO_WORKER_WRITES=sometimes should be refused")
+	}
+}
+
 func TestWorkerSpotNotice(t *testing.T) {
 	for v, want := range map[string]bool{"": true, "on": true, "off": false, "false": false} {
 		m := map[string]string{"IGLOO_ADMIN_PASSWORD": "password"}
@@ -559,6 +608,74 @@ func TestWorkerSpotNotice(t *testing.T) {
 	}
 	if _, err := Load(env(map[string]string{"IGLOO_ADMIN_PASSWORD": "password", "IGLOO_WORKER_SPOT_NOTICE": "sometimes"})); err == nil {
 		t.Error("IGLOO_WORKER_SPOT_NOTICE=sometimes should be refused")
+	}
+}
+
+// A pool's large worker: its address, how to start it, its size and its
+// price, and the workers' price.
+func TestLargeWorker(t *testing.T) {
+	base := map[string]string{"IGLOO_ADMIN_PASSWORD": "password", "IGLOO_WORKERS": "workers", "IGLOO_WORKER_SECRET": strings.Repeat("s", 32),
+		"IGLOO_DUCKDB_TEMP_DIR": t.TempDir()}
+	with := func(kv map[string]string) map[string]string {
+		m := maps.Clone(base)
+		maps.Copy(m, kv)
+		return m
+	}
+	cfg, err := Load(env(with(map[string]string{
+		"IGLOO_LARGE_WORKER": "large", "IGLOO_LARGE_WORKER_COMPUTE": "kubernetes", "IGLOO_LARGE_WORKER_K8S_DEPLOYMENT": "igloo-workers-large",
+		"IGLOO_LARGE_WORKER_CORES": "60", "IGLOO_LARGE_WORKER_MEMORY": "367001MiB", "IGLOO_LARGE_WORKER_PRICE_PER_HOUR": "4.35",
+		"IGLOO_WORKER_PRICE_PER_HOUR": "0.48",
+	})))
+	l := cfg.Workers.Large
+	if err != nil || l.Address != "large:7433" || l.Compute != "kubernetes" || l.K8sDeployment != "igloo-workers-large" || l.Cores != 60 ||
+		l.Memory != 367001<<20 || l.Price != 4.35 || cfg.Workers.Price != 0.48 {
+		t.Errorf("large worker: %+v, workers' price %v, %v", l, cfg.Workers.Price, err)
+	}
+	if cfg, err := Load(env(base)); err != nil || cfg.Workers.Large.Address != "" || cfg.Workers.Price != 0 || cfg.Workers.Spot {
+		t.Errorf("none: %+v %v", cfg.Workers.Large, err)
+	}
+	// Instance types and Spot, for list prices.
+	cfg, err = Load(env(with(map[string]string{
+		"IGLOO_WORKER_INSTANCE_TYPE": "m7gd.2xlarge", "IGLOO_WORKER_SPOT": "true", "IGLOO_CLOUD_REGION": "us-east-2",
+		"IGLOO_LARGE_WORKER": "large", "IGLOO_LARGE_WORKER_INSTANCE_TYPE": "r7gd.16xlarge", "IGLOO_LARGE_WORKER_SPOT": "false",
+	})))
+	if err != nil || cfg.Workers.InstanceType != "m7gd.2xlarge" || !cfg.Workers.Spot || cfg.Workers.Region != "us-east-2" ||
+		cfg.Workers.Large.InstanceType != "r7gd.16xlarge" || cfg.Workers.Large.Spot {
+		t.Errorf("instance types: %+v, %v", cfg.Workers, err)
+	}
+	for name, kv := range map[string]map[string]string{
+		"without workers":       {"IGLOO_WORKERS": "", "IGLOO_LARGE_WORKER": "large"},
+		"two addresses":         {"IGLOO_LARGE_WORKER": "a,b"},
+		"no deployment":         {"IGLOO_LARGE_WORKER": "large", "IGLOO_LARGE_WORKER_COMPUTE": "kubernetes", "IGLOO_LARGE_WORKER_CORES": "60", "IGLOO_LARGE_WORKER_MEMORY": "400GiB"},
+		"started, size unknown": {"IGLOO_LARGE_WORKER": "large", "IGLOO_LARGE_WORKER_COMPUTE": "command", "IGLOO_LARGE_WORKER_START_COMMAND": "a", "IGLOO_LARGE_WORKER_STOP_COMMAND": "b"},
+		"bad compute":           {"IGLOO_LARGE_WORKER": "large", "IGLOO_LARGE_WORKER_COMPUTE": "magic"},
+		"bad memory":            {"IGLOO_LARGE_WORKER": "large", "IGLOO_LARGE_WORKER_MEMORY": "lots"},
+		"bad cores":             {"IGLOO_LARGE_WORKER": "large", "IGLOO_LARGE_WORKER_CORES": "0"},
+		"bad price":             {"IGLOO_WORKER_PRICE_PER_HOUR": "-1"},
+		"bad large price":       {"IGLOO_LARGE_WORKER": "large", "IGLOO_LARGE_WORKER_PRICE_PER_HOUR": "cheap"},
+		"bad spot":              {"IGLOO_WORKER_SPOT": "maybe"},
+	} {
+		if _, err := Load(env(with(kv))); err == nil {
+			t.Errorf("%s: no error", name)
+		}
+	}
+}
+
+func TestWorkerWarm(t *testing.T) {
+	for v, want := range map[string]int{"": 1, "0": 0, "3": 3, "off": -1, "OFF": -1} {
+		m := map[string]string{"IGLOO_ADMIN_PASSWORD": "password"}
+		if v != "" {
+			m["IGLOO_WORKER_WARM"] = v
+		}
+		cfg, err := Load(env(m))
+		if err != nil || cfg.Workers.Warm != want {
+			t.Errorf("IGLOO_WORKER_WARM=%q: %v %v, want %v", v, cfg.Workers.Warm, err, want)
+		}
+	}
+	for _, v := range []string{"-2", "some"} {
+		if _, err := Load(env(map[string]string{"IGLOO_ADMIN_PASSWORD": "password", "IGLOO_WORKER_WARM": v})); err == nil {
+			t.Errorf("IGLOO_WORKER_WARM=%s should be refused", v)
+		}
 	}
 }
 

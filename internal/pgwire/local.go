@@ -5,6 +5,7 @@ import (
 	"database/sql/driver"
 	"errors"
 	"fmt"
+	"regexp"
 	"strings"
 
 	"github.com/duckdb/duckdb-go/v2"
@@ -351,14 +352,15 @@ func localHasRoutine(ctx context.Context, conn *duckdb.Conn, local, name string)
 }
 
 // runSetting runs st, a SET, RESET or USE, and keeps the session's search
-// path in order: the local copies of views next to the catalog's schemas
-// on it (see keepViewsOnPath), and, for non-admins, the local database not
-// the current one, where unqualified CREATE and DROP would change it. Such
-// a SET is undone and refused.
+// path in order: a reset of it back to the path the session started with
+// (see resetsSearchPath), the local copies of views next to the catalog's
+// schemas on it (see keepViewsOnPath), and, for non-admins, the local
+// database not the current one, where unqualified CREATE and DROP would
+// change it. Such a SET is undone and refused.
 func (s *Server) runSetting(ctx context.Context, sess *session, st *statement, args []driver.NamedValue, w wire.DataWriter) error {
 	guard := s.catalogName() != "" && sess.currentUser().Role != auth.RoleAdmin
 	var before string
-	if guard {
+	if s.catalogName() != "" {
 		var err error
 		if before, err = settingValue(ctx, sess.conn, "search_path"); err != nil {
 			return err
@@ -368,7 +370,21 @@ func (s *Server) runSetting(ctx context.Context, sess *session, st *statement, a
 	if err := s.runStatement(ctx, sess, st, args, held); err != nil {
 		return err
 	}
-	if q := stripComments(st.query); s.ddl != nil && (setsSearchPath.MatchString(q) || useStatement.MatchString(q)) {
+	q := stripComments(st.query)
+	if s.catalogName() != "" {
+		// No one's unqualified names resolve to Igloo's own tables, whose
+		// checks look for their schemas' names (see iglooOnPath).
+		on, err := s.iglooOnPath(ctx, sess)
+		if err != nil || on {
+			return s.undoPath(ctx, sess, q, before, err)
+		}
+	}
+	if resetsSearchPath.MatchString(q) {
+		if err := s.engine.UseDefaultSchema(ctx, sess.conn); err != nil {
+			return err
+		}
+	}
+	if s.ddl != nil && (setsSearchPath.MatchString(q) || useStatement.MatchString(q)) {
 		if err := s.keepViewsOnPath(ctx, sess); err != nil {
 			s.log.Warn("could not keep views on the search path", "err", err)
 		}
@@ -388,6 +404,62 @@ func (s *Server) runSetting(ctx context.Context, sess *session, st *statement, a
 	}
 	return held.release()
 }
+
+// iglooOnPath says whether an unqualified name may resolve, in the
+// session, to a table of Igloo's own schemas (iglooSchemas: ID domains'
+// dictionaries, bitmap indexes, refreshes' state): a schema of them on its
+// search path, or its current schema, as DuckDB resolves them, whatever
+// the case or quoting they were set with. Igloo's checks of what a user's
+// statement names (indexReferences, iglooSchemaWrites) look for those
+// schemas' names, and the policy rewrite leaves alone only the reads of
+// bitmap indexes Igloo writes, named in full; so none of them may be
+// reached by an unqualified name.
+func (s *Server) iglooOnPath(ctx context.Context, sess *session) (bool, error) {
+	catalog := s.catalogName()
+	path, err := sessionPath(ctx, sess.conn)
+	if err != nil {
+		return false, err
+	}
+	for _, e := range path.entries {
+		db := e.db
+		if db == "" {
+			db = path.defaultDB
+		}
+		if strings.EqualFold(db, catalog) && isIglooSchema(e.schema) {
+			return true, nil
+		}
+	}
+	db, schema, err := currentSchema(ctx, sess.conn)
+	if err != nil {
+		return false, err
+	}
+	return strings.EqualFold(db, catalog) && isIglooSchema(schema), nil
+}
+
+// undoPath puts the session's search path back to before, after q, a SET
+// or USE, put one of Igloo's schemas on it (or could not be checked), and
+// refuses q. If the path still reaches them, it goes back to the default.
+func (s *Server) undoPath(ctx context.Context, sess *session, q, before string, cause error) error {
+	_, err := sess.conn.ExecContext(ctx, "SET SESSION search_path = "+quoteLiteral(before), nil)
+	if globalSetting.MatchString(q) {
+		if _, gerr := sess.conn.ExecContext(ctx, "RESET GLOBAL search_path", nil); err == nil {
+			err = gerr
+		}
+	}
+	if on, cerr := s.iglooOnPath(ctx, sess); err != nil || cerr != nil || on {
+		_, _ = sess.conn.ExecContext(ctx, "RESET search_path", nil)
+		_ = s.engine.UseDefaultSchema(ctx, sess.conn)
+	}
+	sess.settingGen++
+	if cause != nil {
+		return cause
+	}
+	return pgerror.WithCode(fmt.Errorf("permission denied: the schemas %s are Igloo's own and cannot be on the search path or the current schema; "+
+		"name other schemas' tables as usual", strings.Join(iglooSchemas, ", ")), codes.InsufficientPrivilege)
+}
+
+// globalSetting matches a SET of a setting's global value.
+var globalSetting = regexp.MustCompile(`(?is)^SET\s+GLOBAL\s`)
 
 // heldCompletion holds back a statement's command tag until release, so
 // the statement can still fail after running.

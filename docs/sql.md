@@ -88,9 +88,11 @@ Snowflake databases are catalogs of their own, such as
 | `CREATE TEMP TABLE`, `CREATE TEMP VIEW` | Yes; held in memory for the session only |
 | `COPY INTO table FROM 'location'` | Yes, outside transactions; see [loading](loading.md#copy-into) |
 | `CREATE [OR REPLACE] MATERIALIZED VIEW`, `REFRESH MATERIALIZED VIEW` | Yes, outside transactions; see [materialized views](loading.md#materialized-views) |
+| `CREATE [OR REPLACE] DYNAMIC TABLE`, `ALTER DYNAMIC TABLE ... REFRESH` | Yes, outside transactions; see [dynamic tables](loading.md#dynamic-tables) |
 | `CREATE [OR REPLACE] TABLE ... CLONE`, `CREATE [OR REPLACE] SCHEMA ... CLONE` | Yes, outside transactions; see [clones](#clones) |
 | `ALTER TABLE ... CREATE BRANCH`, `CREATE TAG`, `DROP BRANCH`, `DROP TAG`, `FAST FORWARD` | Yes, outside transactions; see [branches and tags](#branches-and-tags) |
 | `ALTER TABLE ... SET SORTED BY (...)`, `RESET SORTED BY` | Yes, outside transactions; see [sort orders](#sort-orders-and-clustering) |
+| `CREATE TABLE ... PARTITIONED BY (...)`, `ALTER TABLE ... SET PARTITIONED BY (...)`, `RESET PARTITIONED BY` | Yes; see [bucketed tables](#bucketed-tables) |
 | `CREATE TASK`, `CREATE PIPE` | Yes; see [tasks](loading.md#tasks) and [pipes](loading.md#pipes) |
 | `PRIMARY KEY`, `UNIQUE` | Accepted but not enforced |
 | `NOT NULL` | Enforced |
@@ -99,6 +101,12 @@ Snowflake databases are catalogs of their own, such as
 drops the old table and renames the new one into place. A failure while
 writing leaves the old table as it was. The swap is quick but not atomic: a
 query that starts in the instant between drop and rename finds no table.
+When the catalog fails during the swap, Igloo asks it what the drop or
+rename did before going on, and once the old table may be gone it never
+drops the new one. If the catalog cannot say (SQLSTATE 40003, for one), the
+statement fails with an error that names the temporary table holding the
+new data, `name__igloo_new_...`, and the `ALTER TABLE ... RENAME TO` that
+puts it in place.
 
 The catalog records nothing that depends on a table, so `DROP TABLE ...
 CASCADE` drops just the table, like `DROP TABLE`: views that read it fail
@@ -151,6 +159,43 @@ SELECT table_name, clustering_key FROM igloo.tables;  -- LINEAR(customer_id, day
   [clustering](operations.md#clustering)). `SYSTEM$CLUSTERING_DEPTH('t',
   '(column)')` measures by a column instead, as for a table without a key.
   It needs `SELECT` on the table and runs on its own.
+
+### Bucketed tables
+
+A table partitioned by the bucket transform of a column, `bucket(n,
+column)`, keeps the rows of each bucket of the column's hash in files of
+their own, as Iceberg's spec has every engine write them. Workers then join
+two such tables on their bucketed columns, group by the column or count its
+distinct values bucket by bucket, each reading the same buckets of every
+table, without exchanging rows first, and write what they join such a table
+to on that column into its buckets, leaving the table in place (see [bucketed
+tables](distributed-execution.md#bucketed-tables)):
+
+```sql
+CREATE TABLE lake.public.orders (order_id BIGINT, customer_id BIGINT, total DECIMAL(12,2))
+  PARTITIONED BY (bucket(32, customer_id));
+CREATE TABLE lake.public.visits PARTITIONED BY (bucket(64, customer_id)) AS SELECT * FROM staging.visits;
+ALTER TABLE lake.public.customers SET PARTITIONED BY (bucket(32, customer_id));
+ALTER TABLE lake.public.customers RESET PARTITIONED BY;  -- unpartitioned again
+```
+
+- `ALTER TABLE ... SET PARTITIONED BY` changes how files are written from
+  then on: files written before keep every bucket, so workers exchange the
+  table's rows until they are written again (a table created with the
+  partitioning, or filled after it is set, is bucketed throughout).
+- Tables meet bucket by bucket where one count divides the other (16 and
+  64, 32 and 32), and their columns hash alike: integers of any width, or
+  the same type. Choose counts of a few times the workers' cores at least:
+  a statement over the table runs in as many tasks.
+- A write into the table writes a file a bucket, with every bucket's file
+  open at once and a row group of each in memory, for up to 1,024 buckets;
+  more than that make small files. Writes of many buckets take more memory
+  and CPU than writes of an unpartitioned table.
+- Table maintenance compacts each bucket's small files into larger files of
+  that bucket. A table partitioned so is compacted, not clustered by its
+  [sort order](#sort-orders-and-clustering).
+- In Snowflake's dialect, `CLUSTER BY (BUCKET(32, customer_id))` does the
+  same (see [Snowflake SQL](snowflake-sql.md#statements)).
 
 ### Writing rows in order
 
@@ -209,10 +254,12 @@ pass, so Igloo runs in passes only a statement each of whose rows comes from
 one group: it reads the aggregate once, through layers that only add
 columns and filter rows, groups by one set of keys, and calls no function
 whose value can change from one run to the next (`random()`, `now()`;
-`error()` can be called). A statement that ran out of memory in one run is
-filled again in passes, if it is such a statement, and a pass that runs out
-of memory, its groups more than the plan estimated, runs again split in
-two, as do the passes after it, up to 64 passes. Each pass reads the
+`error()` can be called). A statement that ran out of memory in one run, or
+that the replica's memory watch stopped as the process neared its memory
+limit, is filled again in passes, if it is such a statement, under what is
+left of its statement timeout, and a pass that runs out of memory or is
+stopped, its groups more than the plan estimated, runs again split in two,
+as do the passes after it, up to 64 passes. Each pass reads the
 aggregate's input again; `igloo_aggregate_passes_total` counts these
 tables.
 
@@ -517,7 +564,9 @@ DROP ID DOMAIN people;
   Sharing](sharing.md), [clean rooms](clean-rooms.md), its Iceberg REST
   endpoint, reads of the warehouse's files). No one may write to, create,
   drop or alter anything in the schema `igloo_domains`, or change that
-  policy; their names still show in listings.
+  policy; their names still show in listings. Nor may anyone put it on the
+  search path or make it the current schema (`SET search_path`, `SET
+  schema`, `USE`), which `igloo_bitmaps` and `igloo_refresh` share.
 - A member column must have the domain's type and carry its tags. `SET ID
   DOMAIN` adds the column `_igloo_id_<column>` (`BIGINT`) beside it and
   records the membership in the table property
@@ -685,7 +734,10 @@ ALTER TABLE crm.segments DROP BITMAP INDEX people_by_segment;
   snapshot, and a prepared statement whose tables changed reads the tables
   until the bitmaps catch up. A statement whose bitmaps do not fit in the
   memory DuckDB has for them (`rb_memory_budget`) runs once more from the
-  tables. No statement may name `igloo_bitmaps`.
+  tables. No statement may name `igloo_bitmaps`, nor reach its tables
+  through the search path; only the reads Igloo writes skip the
+  `igloo_bitmap_index` policy, and any other read of an index's table gets
+  it, and no rows.
 
 
 
@@ -743,6 +795,7 @@ FROM igloo.login_history WHERE result = 'failure';
 | `job` | The task, pipe or materialized view it ran for, such as `task nightly`; `NULL` for a session's own statements |
 | `workers`, `stages`, `exchanges` | How many workers ran parts of the statement ([distributed execution](distributed-execution.md)), in how many stages of tasks, and how many exchanges of rows from one stage to later ones the stages wrote; 0 when it ran on one replica |
 | `plan_key` | For a statement that could run on workers, what identifies it across runs: its text without literals other than integers, and its tables' sizes to a factor of two; `auto` mode runs it where it was faster before ([distributed execution](distributed-execution.md#when)); `NULL` for others |
+| `placement` | For such a statement, where it ran and why: `this replica`, how many workers, or `the large worker`, and `auto` mode's reason, such as `4 workers: one machine should take 97 s and workers 33 s; 4 workers, 33 s, within a fifth of the fastest, 16 workers at 28 s, for 30% of its cost` (see [when](distributed-execution.md#when)); `NULL` for others |
 
 `igloo.login_history` has `event_time`, `user_name`, `result` (`success` or
 `failure`), `reason`, `client_address`, `application_name`, `session_id`,
@@ -942,6 +995,11 @@ CREATE OR REPLACE SCHEMA dev CLONE prod;       -- make dev a fresh copy of prod
   catalog](external-engines.md#clones), engines get no storage credentials
   for a clone, and cannot purge a table whose files clones read nor delete
   its files with the credentials they get for it.
+- **When the catalog fails.** A clone the catalog made though its answer
+  was lost, or reading the clone back failed, is kept and reported made.
+  When Igloo cannot learn whether the catalog made it, the statement fails
+  and says so; a clone it made is complete, and its source's files are
+  kept for it.
 - Tables of format version 1 and encrypted tables cannot be cloned, nor can
   a view on its own. `CLONE` runs outside transactions.
 

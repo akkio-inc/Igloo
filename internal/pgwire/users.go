@@ -609,6 +609,7 @@ func (s *Server) dropUser(ctx context.Context, cmd userCommand) error {
 		}
 		s.forgetGrantee(auth.GranteeUser, cmd.name)
 		s.disownJobs(cmd.name)
+		s.disownModels(cmd.name)
 	}
 	if errors.Is(err, auth.ErrNotFound) && cmd.ifExists {
 		err = nil

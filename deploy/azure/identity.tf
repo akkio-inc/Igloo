@@ -57,6 +57,67 @@ resource "azurerm_role_assignment" "catalog_storage" {
   principal_type       = "ServicePrincipal"
 }
 
+# Workers (with workers_enabled): an identity of their own, which reads the
+# warehouse and may change only the rows they exchange and statements'
+# directories of table files, named igloo-write-<hex> under a table's data/.
+# It may delete nothing. Azure has no credentials limited to one statement's
+# directory that DuckDB could use, so Igloo checks every file a worker says it
+# wrote before it commits it (docs/distributed-execution.md#security).
+locals {
+  worker_subject = "system:serviceaccount:${var.namespace}:${var.worker_service_account_name}"
+
+  blob_action = "Microsoft.Storage/storageAccounts/blobServices/containers/blobs"
+  blob_path   = "@Resource[${local.blob_action}:path]"
+  worker_write_condition = join(" ", [
+    "(!(ActionMatches{'${local.blob_action}/delete'}))",
+    "AND",
+    "(",
+    "(!(ActionMatches{'${local.blob_action}/write'}) AND !(ActionMatches{'${local.blob_action}/add/action'}) AND !(ActionMatches{'${local.blob_action}/move/action'}))",
+    "OR",
+    "(${local.blob_path} StringLike 'warehouse/_igloo_shuffle/*' OR ${local.blob_path} StringLike 'warehouse/*/data/igloo-write-*')",
+    ")",
+  ])
+}
+
+resource "azurerm_user_assigned_identity" "worker" {
+  count = var.workers_enabled ? 1 : 0
+
+  name                = "${var.name}-worker"
+  location            = azurerm_resource_group.this.location
+  resource_group_name = azurerm_resource_group.this.name
+  tags                = local.tags
+}
+
+resource "azurerm_federated_identity_credential" "worker" {
+  count = var.workers_enabled ? 1 : 0
+
+  name                      = "aks-${var.namespace}-${var.worker_service_account_name}"
+  user_assigned_identity_id = azurerm_user_assigned_identity.worker[0].id
+  issuer                    = azurerm_kubernetes_cluster.this.oidc_issuer_url
+  audience                  = local.oidc_audience
+  subject                   = local.worker_subject
+}
+
+resource "azurerm_role_assignment" "worker_read" {
+  count = var.workers_enabled ? 1 : 0
+
+  scope                = local.filesystem_scope
+  role_definition_name = "Storage Blob Data Reader"
+  principal_id         = azurerm_user_assigned_identity.worker[0].principal_id
+  principal_type       = "ServicePrincipal"
+}
+
+resource "azurerm_role_assignment" "worker_write" {
+  count = var.workers_enabled ? 1 : 0
+
+  scope                = local.filesystem_scope
+  role_definition_name = "Storage Blob Data Contributor"
+  principal_id         = azurerm_user_assigned_identity.worker[0].principal_id
+  principal_type       = "ServicePrincipal"
+  condition_version    = "2.0"
+  condition            = local.worker_write_condition
+}
+
 # Lakekeeper vends user-delegation SAS tokens, which requires requesting a
 # user delegation key. Azure only accepts that permission at storage account
 # scope or above. It grants no data access by itself: a SAS can never exceed
@@ -74,11 +135,15 @@ resource "azurerm_role_assignment" "catalog_delegator" {
 resource "time_sleep" "identity_propagation" {
   create_duration = "60s"
 
-  triggers = {
+  triggers = merge({
     igloo_credential   = azurerm_federated_identity_credential.igloo.id
     catalog_credential = azurerm_federated_identity_credential.catalog.id
     igloo_storage      = azurerm_role_assignment.igloo_storage.id
     catalog_storage    = azurerm_role_assignment.catalog_storage.id
     catalog_delegator  = azurerm_role_assignment.catalog_delegator.id
-  }
+    }, var.workers_enabled ? {
+    worker_credential = azurerm_federated_identity_credential.worker[0].id
+    worker_read       = azurerm_role_assignment.worker_read[0].id
+    worker_write      = azurerm_role_assignment.worker_write[0].id
+  } : {})
 }

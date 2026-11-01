@@ -38,6 +38,8 @@ services:
       IGLOO_DUCKDB_MEMORY_LIMIT: ${IGLOO_MEMORY_LIMIT:-}
       # Empty sizes the read cache from the free disk space; 0 turns it off.
       IGLOO_CACHE_SIZE: ${IGLOO_CACHE_SIZE:-}
+      # Read ahead, into the read cache, what statements are about to read.
+      IGLOO_PREFETCH: ${IGLOO_PREFETCH:-true}
       # Empty keeps 256 MiB of query results; 0 turns the result cache off.
       IGLOO_RESULT_CACHE_SIZE: ${IGLOO_RESULT_CACHE_SIZE:-}
       # How many queries may run at once; empty or off means no limit.
@@ -71,6 +73,7 @@ services:
       IGLOO_OIDC_PASSWORD_SIGNIN: ${IGLOO_OIDC_PASSWORD_SIGNIN:-true}
       IGLOO_OIDC_DISPLAY_NAME: ${IGLOO_OIDC_DISPLAY_NAME:-SSO}
       IGLOO_OIDC_ACCESS_TOKEN_AUDIENCE: ${IGLOO_OIDC_ACCESS_TOKEN_AUDIENCE:-}
+      IGLOO_OIDC_ACCESS_TOKEN_ID_CLAIM: ${IGLOO_OIDC_ACCESS_TOKEN_ID_CLAIM:-}
       IGLOO_TOKEN_MAX_LIFETIME: ${IGLOO_TOKEN_MAX_LIFETIME:-365d}
       # The compute pool, and what this machine costs an hour, for the
       # cost estimates of igloo.usage (docs/workload-management.md).
@@ -98,8 +101,10 @@ services:
       # large tables run in parts on the worker containers.
       IGLOO_WORKERS: ${IGLOO_WORKERS:-}
       IGLOO_WORKER_SECRET: ${IGLOO_WORKER_SECRET:-}
-      # Where workers exchange rows: object, local or auto (see .env).
-      IGLOO_EXCHANGES: ${IGLOO_EXCHANGES:-object}
+      # Where workers exchange rows: auto, object or local (see .env).
+      IGLOO_EXCHANGES: ${IGLOO_EXCHANGES:-auto}
+      # Whether workers write tables' files themselves (see .env).
+      IGLOO_WORKER_WRITES: ${IGLOO_WORKER_WRITES:-on}
     ports:
       # Loopback only by default. Set IGLOO_BIND=0.0.0.0 to accept remote
       # clients, and turn on TLS first (see .env).
@@ -162,6 +167,7 @@ services:
       IGLOO_DUCKDB_MEMORY_LIMIT: ${IGLOO_WORKER_MEMORY_LIMIT:-}
       IGLOO_DUCKDB_THREADS: ${IGLOO_WORKER_THREADS:-}
       IGLOO_CACHE_SIZE: ${IGLOO_CACHE_SIZE:-}
+      IGLOO_PREFETCH: ${IGLOO_PREFETCH:-true}
       IGLOO_S3_ENDPOINT: ${S3_ENDPOINT:-}
       IGLOO_S3_REGION: ${S3_REGION:?}
       IGLOO_S3_URL_STYLE: ${S3_URL_STYLE:?}

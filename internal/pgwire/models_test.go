@@ -5,7 +5,9 @@ import (
 	"database/sql"
 	"database/sql/driver"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	icebergio "github.com/apache/iceberg-go/io"
 	"github.com/duckdb/duckdb-go/v2"
@@ -425,6 +427,203 @@ func TestModelGrants(t *testing.T) {
 	expectDenied(t, bob, "CREATE OR REPLACE SNOWFLAKE.ML.CLASSIFICATION anas(INPUT_DATA => TABLE(leads), TARGET_COLNAME => 'converted')",
 		"does not own")
 	mustExec(t, ana, "DROP SNOWFLAKE.ML.CLASSIFICATION anas")
+}
+
+// TestDroppedModelOwners: dropping a user disowns their models, and
+// dropping a user or role takes back the models granted to them, so that a
+// user or role created later with the same name, as signing in with SSO
+// may create, gets neither.
+func TestDroppedModelOwners(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	store := models.NewMemoryStore()
+	cs := startCatalogServer(t, func(o *Options) { o.Models = store })
+	mustExec(t, cs.admin, leadsTable)
+	create := `CREATE OR REPLACE SNOWFLAKE.ML.CLASSIFICATION anas(INPUT_DATA => TABLE(lake.public.leads), TARGET_COLNAME => 'converted')`
+	ana := snowflakeConn(t, cs.user(t, "ana", auth.RoleWriter, pgx.QueryExecModeSimpleProtocol))
+	bob := cs.user(t, "bob", auth.RoleReader, pgx.QueryExecModeSimpleProtocol)
+	mustExec(t, cs.admin, "CREATE ROLE analysts")
+	mustExec(t, ana, create)
+	mustExec(t, ana, "GRANT USAGE ON SNOWFLAKE.ML.CLASSIFICATION anas TO USER bob")
+	mustExec(t, ana, "GRANT SNOWFLAKE.ML.CLASSIFICATION ROLE anas!MLCONSUMER TO ROLE analysts")
+	_, _ = ana.Close(ctx), bob.Close(ctx)
+	mustExec(t, cs.admin, "DROP USER ana")
+	mustExec(t, cs.admin, "DROP USER bob")
+	mustExec(t, cs.admin, "DROP ROLE analysts")
+	m, err := store.Get(ctx, "public", "anas")
+	if err != nil || m.Owner != "ana (dropped)" {
+		t.Errorf("after its owner was dropped: %+v, %v", m, err)
+	}
+	if gs, _ := store.Grants(ctx); len(gs) != 0 {
+		t.Errorf("grants to a dropped user and role are kept: %+v", gs)
+	}
+
+	// The same names again.
+	ana = snowflakeConn(t, cs.user(t, "ana", auth.RoleWriter, pgx.QueryExecModeSimpleProtocol))
+	bob = snowflakeConn(t, cs.user(t, "bob", auth.RoleReader, pgx.QueryExecModeSimpleProtocol))
+	carl := snowflakeConn(t, cs.user(t, "carl", auth.RoleReader, pgx.QueryExecModeSimpleProtocol))
+	mustExec(t, cs.admin, "CREATE ROLE analysts")
+	mustExec(t, cs.admin, "GRANT analysts TO carl")
+	predict := "SELECT count(*) FROM leads WHERE anas!PREDICT(INPUT_DATA => {*}):class = 'True'"
+	for name, conn := range map[string]*pgx.Conn{"ana": ana, "bob": bob, "carl": carl} {
+		expectCode(t, conn, predict, "42704", "does not exist or not authorized")
+		if got := texts(t, conn, "SHOW SNOWFLAKE.ML.CLASSIFICATION"); len(got) != 0 {
+			t.Errorf("the new %s sees %q", name, got)
+		}
+	}
+	expectCode(t, ana, "DROP SNOWFLAKE.ML.CLASSIFICATION anas", "42704", "does not exist")
+	expectDenied(t, ana, create, "does not own")
+	// An erasure request does not train it again as the new ana.
+	if err := cs.srv.retrainModel(ctx, m); err == nil || !strings.Contains(err.Error(), "ana (dropped)") {
+		t.Errorf("trained again for an erasure request: %v", err)
+	}
+
+	// Admins may still use it, and replace it as their own.
+	admin := snowflakeConn(t, cs.admin)
+	if got := texts(t, admin, "SHOW SNOWFLAKE.ML.CLASSIFICATION"); len(got) != 1 || !strings.HasSuffix(got[0], "|ana (dropped)") {
+		t.Errorf("SHOW: %q", got)
+	}
+	mustExec(t, admin, create)
+	if m, _ := store.Get(ctx, "public", "anas"); m.Owner != "igloo" {
+		t.Errorf("replaced by an admin, its owner is %q", m.Owner)
+	}
+}
+
+// TestForgetDroppedPrincipals: models and grants that users and roles
+// dropped before DROP disowned and removed them left behind are disowned
+// and removed as the server starts, those of a user or role created again
+// since included, and a user created again does not own the model.
+func TestForgetDroppedPrincipals(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	store := models.NewMemoryStore()
+	cs := startCatalogServer(t, func(o *Options) { o.Models = store })
+	mustExec(t, cs.admin, "CREATE USER don WITH PASSWORD 'don-password' ROLE writer")
+	mustExec(t, cs.admin, "CREATE USER carl WITH PASSWORD 'carl-password' ROLE reader")
+	mustExec(t, cs.admin, "CREATE ROLE keepers")
+	// What dropping ana, eve, bob and the role analysts left before.
+	for _, m := range []models.Model{{Name: "anas", Owner: "ana"}, {Name: "eves", Owner: "eve"}, {Name: "dons", Owner: "don"}} {
+		m.Schema, m.Class, m.TrainingSQL, m.Blob = "public", models.ClassClassification, "CREATE ...", strings.Repeat("a", 64)
+		if _, err := store.Put(ctx, m, false); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, g := range []models.Grant{{Grantee: "bob", GranteeType: "user"}, {Grantee: "analysts", GranteeType: "role"},
+		{Grantee: "carl", GranteeType: "user"}, {Grantee: "keepers", GranteeType: "role"}} {
+		g.Schema, g.Name, g.Privilege = "public", "dons", models.PrivilegeUsage
+		if err := store.AddGrant(ctx, g); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// ana, bob and analysts again.
+	ana := snowflakeConn(t, cs.user(t, "ana", auth.RoleWriter, pgx.QueryExecModeSimpleProtocol))
+	mustExec(t, cs.admin, "CREATE USER bob WITH PASSWORD 'bob-password' ROLE reader")
+	mustExec(t, cs.admin, "CREATE ROLE analysts")
+
+	for range 2 {
+		if err := cs.srv.ForgetDroppedPrincipals(ctx); err != nil {
+			t.Fatal(err)
+		}
+		list, _ := store.List(ctx)
+		var owners []string
+		for _, m := range list {
+			owners = append(owners, m.Name+" "+m.Owner)
+		}
+		if got := strings.Join(owners, ", "); got != "anas ana (dropped), dons don, eves eve (dropped)" {
+			t.Errorf("models: %s", got)
+		}
+		gs, _ := store.Grants(ctx)
+		var left []string
+		for _, g := range gs {
+			left = append(left, g.GranteeType+" "+g.Grantee)
+		}
+		if got := strings.Join(left, ", "); got != "user carl, role keepers" {
+			t.Errorf("grants left: %s", got)
+		}
+	}
+	if got := texts(t, ana, "SHOW SNOWFLAKE.ML.CLASSIFICATION"); len(got) != 0 {
+		t.Errorf("the new ana sees %q", got)
+	}
+}
+
+// pausingBlobs holds the first write of blob sha, once made, until resume
+// is closed.
+type pausingBlobs struct {
+	models.Blobs
+	sha             string
+	once            sync.Once
+	written, resume chan struct{}
+}
+
+func (b *pausingBlobs) Put(ctx context.Context, sha string, data []byte) error {
+	err := b.Blobs.Put(ctx, sha, data)
+	if sha == b.sha {
+		b.once.Do(func() {
+			close(b.written)
+			<-b.resume
+		})
+	}
+	return err
+}
+
+// TestModelBlobPublishedWhileDropped: dropping a model while another with
+// the same blob is created, between CREATE writing the blob and storing its
+// model, does not delete the blob the new model uses.
+func TestModelBlobPublishedWhileDropped(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	store := models.NewMemoryStore()
+	cs := startCatalogServer(t, func(o *Options) { o.Models = store })
+	mustExec(t, cs.admin, leadsTable)
+	create := `CREATE SNOWFLAKE.ML.CLASSIFICATION %s(
+		INPUT_DATA => SYSTEM$QUERY_REFERENCE('SELECT region, spend, visits, converted FROM leads'), TARGET_COLNAME => 'converted')`
+	dropping := snowflakeConn(t, cs.admin)
+	mustExec(t, dropping, strings.Replace(create, "%s", "first", 1))
+	first, err := store.Get(ctx, "public", "first")
+	if err != nil {
+		t.Fatal(err)
+	}
+	blobs := cs.srv.modelRuntime.Blobs()
+	paused := &pausingBlobs{Blobs: blobs, sha: first.Blob, written: make(chan struct{}), resume: make(chan struct{})}
+	cs.srv.modelRuntime.SetBlobs(paused)
+
+	creating := snowflakeConn(t, cs.testServer.admin(t, pgx.QueryExecModeSimpleProtocol))
+	created := make(chan error, 1)
+	go func() {
+		_, err := creating.Exec(ctx, strings.Replace(create, "%s", "second", 1))
+		created <- err
+	}()
+	select {
+	case <-paused.written:
+	case err := <-created:
+		t.Fatalf("CREATE did not write the blob: %v", err)
+	}
+	var dropErr error
+	dropped := make(chan struct{})
+	go func() {
+		_, dropErr = dropping.Exec(ctx, "DROP SNOWFLAKE.ML.CLASSIFICATION first")
+		close(dropped)
+	}()
+	// DROP waits for CREATE to store its model, or would have deleted the
+	// blob by now.
+	select {
+	case <-dropped:
+	case <-time.After(time.Second):
+	}
+	close(paused.resume)
+	if err := <-created; err != nil {
+		t.Fatal(err)
+	}
+	if <-dropped; dropErr != nil {
+		t.Fatal(dropErr)
+	}
+	second, err := store.Get(ctx, "public", "second")
+	if err != nil || second.Blob != first.Blob {
+		t.Fatalf("second: %+v, %v", second, err)
+	}
+	if _, err := blobs.Get(ctx, second.Blob); err != nil {
+		t.Errorf("the blob of a model just created: %v", err)
+	}
 }
 
 // localBlobs keeps model blobs in a local directory, the tests' warehouse.

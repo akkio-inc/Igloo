@@ -61,6 +61,11 @@ location = "eastus2"
 
 # Optional: cheaper, interruptible Igloo nodes.
 # spot_enabled = true
+
+# Optional: distributed-execution workers on Spot VMs (Regular ones when
+# Spot has no capacity), and one large worker.
+# workers_enabled      = true
+# large_worker_enabled = true
 EOF
 # With expose_sql, pass the certificate and key through the environment
 # (tfvars files cannot read files):
@@ -92,6 +97,7 @@ documented in [variables.tf](variables.tf).
 | Kubernetes Secrets | `igloo-admin`, `igloo-database`, `igloo-catalog-encryption` (+ `igloo-tls`) | Generated passwords and keys; the chart reads them by name. |
 | Helm release | `igloo` from `deploy/helm/igloo` | Skipped with `install_chart = false`; the `helm_values` output holds the values. |
 | Public IP | only with `expose_sql` | Static, so the address survives chart reinstalls. |
+| Worker node pools | only with `workers_enabled` | `workerspot` (Spot) and `workerreg` (Regular), `Standard_D16pds_v6` × 0-4, for [distributed-execution workers](#distributed-execution-workers); with `large_worker_enabled`, `largereg` (`Standard_E64pds_v6` × 0-1). The cluster autoscaler then uses the priority expander. |
 
 ### Role assignments
 
@@ -227,6 +233,67 @@ queries running on the old nodes end. A deployment made with the earlier
 default size keeps its nodes, and its managed OS disks, with
 `igloo_node_vm_size = "Standard_E4ps_v6"`.
 
+## Distributed-execution workers
+
+`workers_enabled = true` runs statements that read very large tables in
+parts on worker pods ([distributed execution](../../docs/distributed-execution.md)).
+It is off by default, so applying this version to an existing deployment
+changes nothing. With it on, the module adds two node pools for workers,
+both autoscaling from zero nodes to `workers_max` (4):
+
+Workers have a workload identity of their own: they read the warehouse, and
+may change only `_igloo_shuffle/` and statements' directories (`igloo-write-*`
+under a table's `data/`), by a role assignment condition, with no delete, as
+they [write tables' files](../../docs/distributed-execution.md#workers-writing-tables).
+
+- `workerspot`, Spot VMs of `workers_vm_size` (`Standard_D16pds_v6`: 16
+  vCPU, 64 GiB, 880 GiB local NVMe disk), unless `workers_spot = false`;
+- `workerreg`, Regular VMs of the same size, to fall back to.
+
+Both carry the node label `igloo.dev/node=workers` and the taint
+`igloo.dev/workers=true:NoSchedule`; the Spot pool also has the
+`kubernetes.azure.com/scalesetpriority=spot:NoSchedule` taint AKS gives Spot
+nodes. The chart's worker pods select the label and tolerate both taints,
+so they may land on either pool. Igloo pods stay on the Igloo pool (Regular
+unless `spot_enabled`): they hold client sessions. One worker fills a node
+(`workers_cpu` 14, `workers_memory` 54Gi), with an ephemeral OS disk on the
+local NVMe disk holding its spill (`workers_spill_size`, 480Gi) and read
+cache (`workers_cache_size`, 220Gi); change those four with
+`workers_vm_size`.
+
+Igloo scales the worker Deployment up when a statement needs workers and to
+zero when they are idle, and AKS's cluster autoscaler adds and removes the
+nodes. The module sets its expander to `priority` and creates the
+`cluster-autoscaler-priority-expander` ConfigMap in `kube-system`, which
+ranks the Spot pools (`.*workerspot.*`, `.*largespot.*`) at 50 and every
+other pool at 10, so the system and Igloo pools scale as before. The
+autoscaler tries the Spot pool first; when Azure has no Spot capacity or
+quota for the size, the scale set's failure, or at the latest a node that
+has not joined within `max_node_provisioning_time` (5 minutes), backs the
+Spot pool off, and the Regular pool gets the worker. A statement waits for
+workers at most `workers.startTimeout` (3 minutes) and then runs on its
+igloo pod, so a statement that meets a Spot shortage may run without
+workers. When Azure evicts a Spot VM, the worker's tasks fail over to other
+workers, as a lost worker's do; with `spot_max_price = -1` (the default)
+Azure evicts for capacity only, never for price.
+
+The large worker (`large_worker_enabled = true`) is one pod on a
+`Standard_E64pds_v6` (64 vCPU, 512 GiB, local NVMe) in its own pool,
+`largereg`, from zero to one node, which auto mode may run a whole
+statement on (see the chart's [large worker](../helm/igloo/README.md#a-large-worker)).
+It is Regular by default; `large_worker_spot = true` adds `largespot` and
+tries it first. Its spill and read cache (`large_worker_spill_size`,
+`large_worker_cache_size`) default to 480Gi and 220Gi, which fit one 880
+GiB local disk; a statement auto mode sends there is one that fits in its
+memory.
+
+Set `workers_price_per_hour` and `large_worker_price_per_hour` to what a
+node costs, so auto mode can weigh price. Spot VMs typically cost 60 to 90%
+less than Regular ones, varying by region and over time. Left at 0, the
+price is unknown. Workers need vCPU quota for the `Standard DPSv6 Family`
+(Regular), the low-priority quota (Spot), and with the large worker 64 more
+vCPUs of the `Standard EPSv6 Family`.
+
 ## Cost of the defaults
 
 Approximate pay-as-you-go list prices in East US 2, 730 hours a month. Check
@@ -247,6 +314,8 @@ for your region and any discounts.
 
 Spot Igloo nodes typically cut the node line by 60-90%. During rolling
 updates the autoscaler briefly adds an Igloo node (up to `igloo_node_max_count`).
+Worker and large-worker pools cost nothing while they have no nodes, and
+are billed per VM-hour while workers run.
 
 ## Security notes
 

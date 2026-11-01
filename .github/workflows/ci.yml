@@ -135,6 +135,11 @@ jobs:
       - name: Test the migration report
         run: make migrate-test
 
+      # bench/run.py's and bench/report.py's unit tests, on a fake Igloo
+      # and synthetic results: no platform to run against.
+      - name: Test the benchmark's scripts
+        run: make bench-test
+
   image:
     name: Image (${{ matrix.arch }})
     # Each architecture builds on its own native runner: cross-compiling cgo

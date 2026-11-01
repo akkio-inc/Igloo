@@ -1,8 +1,9 @@
 // Package tasks keeps Igloo's scheduled work and its history: tasks (one SQL
 // statement on a schedule), pipes (COPY INTO from a location, run every
-// minute or on a schedule), materialized views (a query kept as a table
-// and refreshed on demand or on a schedule) and alerts (a query on a
-// schedule that sends a notification when it returns rows). It also keeps
+// minute or on a schedule), materialized views and dynamic tables (a query
+// kept as a table and refreshed on demand or on a schedule, a dynamic
+// table's from its target lag) and alerts (a query on a schedule that
+// sends a notification when it returns rows). It also keeps
 // the load history of COPY INTO, which makes sure a file is loaded into a
 // table once.
 //
@@ -28,8 +29,13 @@ const (
 	KindTask             = "task"
 	KindPipe             = "pipe"
 	KindMaterializedView = "materialized view"
+	KindDynamicTable     = "dynamic table"
 	KindAlert            = "alert"
 )
+
+// Refreshed reports whether jobs of kind keep a query's result as a table
+// of the same name: materialized views and dynamic tables.
+func Refreshed(kind string) bool { return kind == KindMaterializedView || kind == KindDynamicTable }
 
 // States of a job.
 const (
@@ -63,9 +69,9 @@ const (
 	// read (ON_ERROR continue).
 	LoadPartial = "partially loaded"
 	LoadFailed  = "failed"
-	// LoadUnknown is a file whose load Igloo was stopped in the middle of:
-	// it may or may not be in the table, so it is not loaded again unless
-	// forced.
+	// LoadUnknown is a file whose load Igloo was stopped in the middle of,
+	// or whose commit failed without saying whether it was applied: it may
+	// or may not be in the table, so it is not loaded again unless forced.
 	LoadUnknown = "unknown"
 )
 
@@ -109,6 +115,10 @@ type Job struct {
 	CreatedAt time.Time
 	// LastRun is the latest run recorded, if any. Jobs and Job fill it in.
 	LastRun *Run
+	// Refresh is what a materialized view or dynamic table keeps between
+	// refreshes, as its runner encodes it: its options, and what its last
+	// refresh read (see package pgwire's refresh.go). Empty for others.
+	Refresh string
 }
 
 // Run is one run of a job.
@@ -127,6 +137,9 @@ type Run struct {
 	Error     string
 	// Rows is how many rows the run loaded, wrote or returned, or -1.
 	Rows int64
+	// Detail says what the run did beyond its outcome, as how a refresh
+	// went about it (see SetDetail).
+	Detail string
 }
 
 // Load is one attempt to load one file into a table.
@@ -173,6 +186,8 @@ type Store interface {
 	SetState(ctx context.Context, kind, name, state string, next time.Time) error
 	// SetSchedule changes a job's schedule and next run.
 	SetSchedule(ctx context.Context, kind, name, schedule, timezone string, next time.Time) error
+	// SetRefresh changes a job's Refresh.
+	SetRefresh(ctx context.Context, kind, name, refresh string) error
 	DropJob(ctx context.Context, kind, name string) error
 	// DisownJobs gives the jobs of owner, a user who was dropped, to
 	// tombstone, a name no user can have, and suspends them, so that a
@@ -190,7 +205,10 @@ type Store interface {
 	Lock(ctx context.Context, key string) (release func(), err error)
 	// TryLease takes the lock named key as TryLock does, as a lease that
 	// says whether it is still held: a lock is lost when its connection
-	// to the metadata database drops.
+	// to the metadata database drops, or when its holder cannot renew it
+	// in time. A lease is not taken again until its holder released it or
+	// it expired, and its holder takes it for lost before it expires (see
+	// PostgresStore.TryLease).
 	TryLease(ctx context.Context, key string) (lease Lease, ok bool, err error)
 
 	// WriteRun records r, or updates the run with its ID.
@@ -213,8 +231,9 @@ type Store interface {
 	DeleteLoads(ctx context.Context, ids []string) error
 	// Loads returns the loads v may see, newest first.
 	Loads(ctx context.Context, v audit.Viewer, p audit.Page) ([]Load, error)
-	// ForgetTable removes the load history and materialized view of a
-	// dropped table, catalog.schema.table; RenameTable moves them.
+	// ForgetTable removes the load history and the materialized view or
+	// dynamic table of a dropped table, catalog.schema.table; RenameTable
+	// moves them.
 	ForgetTable(ctx context.Context, table string) error
 	RenameTable(ctx context.Context, from, to string) error
 
@@ -229,6 +248,17 @@ type runKey struct{}
 func RunOf(ctx context.Context) (Run, bool) {
 	r, ok := ctx.Value(runKey{}).(Run)
 	return r, ok
+}
+
+// detailKey carries where a Runner's job leaves its run's Detail.
+type detailKey struct{}
+
+// SetDetail records detail as the Detail of the run ctx, passed to
+// Runner.RunJob, belongs to.
+func SetDetail(ctx context.Context, detail string) {
+	if d, ok := ctx.Value(detailKey{}).(*string); ok {
+		*d = detail
+	}
 }
 
 // JobKey names a job's lock.
@@ -254,8 +284,8 @@ func lockID(key string) int64 {
 // viewerSees reports whether v may see a record of user.
 func viewerSees(v audit.Viewer, user string) bool { return v.All || v.User == user }
 
-// mvName is the job name of a materialized view stored as table,
-// catalog.schema.table.
+// mvName is the job name of a materialized view or dynamic table stored
+// as table, catalog.schema.table.
 func mvName(table string) string {
 	if _, rest, ok := strings.Cut(table, "."); ok {
 		return rest

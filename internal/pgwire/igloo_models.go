@@ -86,9 +86,9 @@ func (s *Server) trainIglooModel(ctx context.Context, sess *session, user auth.U
 }
 
 // readTraining reads a model's training rows as user: every row of query,
-// or, above models.TrainRowLimit of them, a sample of about that many,
-// chosen by a hash of each row's values, so that the same rows give the
-// same sample.
+// or, above models.TrainRowLimit of them, a sample of a little fewer,
+// chosen by a hash of each row's values, its place among the rows equal to
+// it, and the seed, so that the same rows and seed give the same sample.
 func (s *Server) readTraining(ctx context.Context, sess *session, user auth.User, query string, a *models.IglooArgs) (*models.Table, error) {
 	shape, err := s.readRows(ctx, sess, user, "SELECT * FROM ("+query+") AS __igloo_in LIMIT 0")
 	if err != nil {
@@ -109,12 +109,26 @@ func (s *Server) readTraining(ctx context.Context, sess *session, user auth.User
 	if total <= limit {
 		return s.readRows(ctx, sess, user, query)
 	}
-	const buckets = 1_000_000
-	keep := int(math.Ceil(float64(limit) / float64(total) * buckets))
-	t, err := s.readRows(ctx, sess, user, "SELECT * FROM ("+query+") AS __igloo_in WHERE hash(__igloo_in) % "+
-		strconv.Itoa(buckets)+" < "+strconv.Itoa(keep))
+	seed, err := a.Seed()
 	if err != nil {
 		return nil, err
+	}
+	// Each row is kept when its hash is below the share of rows to keep.
+	// Rows equal to each other are told apart by their place among them,
+	// or all of them would be kept or none. A sample comes out within a
+	// few times the square root of the rows it aims at, so it aims below
+	// the limit by enough not to exceed it.
+	want := max(float64(limit)-5*math.Sqrt(float64(limit)), float64(limit)/2)
+	below := uint64(want / float64(total) * math.Exp2(64))
+	t, err := s.readRows(ctx, sess, user, "SELECT * EXCLUDE (__igloo_n) FROM (SELECT *, row_number() OVER (PARTITION BY __igloo_in) AS __igloo_n "+
+		"FROM ("+query+") AS __igloo_in) AS __igloo_in WHERE hash(__igloo_in, "+strconv.FormatUint(seed, 10)+") < CAST("+
+		strconv.FormatUint(below, 10)+" AS UBIGINT)")
+	if err != nil {
+		return nil, err
+	}
+	if t.N == 0 {
+		return nil, pgerror.WithCode(fmt.Errorf("INPUT_DATA has %d rows, more than the %d a model trains on, and a sample of them came out empty",
+			total, limit), codes.ProgramLimitExceeded)
 	}
 	a.Sampled, a.Total, a.Rows = true, total, t.N
 	return t, nil

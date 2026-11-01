@@ -17,7 +17,9 @@ locals {
     effect   = "NoSchedule"
   }] : []
 
-  helm_values = {
+  helm_values = merge(local.helm_base_values, local.workers_helm_values)
+
+  helm_base_values = {
     image = merge(
       { tag = var.image_tag },
       var.image_repository == "" ? {} : { repository = var.image_repository },
@@ -126,12 +128,16 @@ resource "helm_release" "igloo" {
     kubernetes_secret_v1.database,
     kubernetes_secret_v1.catalog_encryption_key,
     kubernetes_secret_v1.gcs_hmac,
+    kubernetes_secret_v1.worker_hmac,
+    google_service_account_iam_member.worker_workload_identity,
     kubernetes_secret_v1.tls,
     google_storage_bucket_iam_member.warehouse,
     google_service_account_iam_member.igloo_workload_identity,
     google_service_account_iam_member.catalog_workload_identity,
     google_sql_user.igloo,
     google_sql_database.igloo,
+    # Worker pods select their compute class.
+    helm_release.compute_classes,
   ]
 }
 

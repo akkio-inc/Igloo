@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"log/slog"
+	"strings"
 	"sync"
 	"time"
 )
@@ -22,6 +23,15 @@ type ReadCache interface {
 // MemoryCache starts the IDs of replicas without a cache on disk: what they
 // keep in memory goes when they stop, so they need not empty it then.
 const MemoryCache = "memory:"
+
+// PodCache starts the IDs of replicas' caches on a disk that goes with the
+// replica's pod or machine, as a Kubernetes emptyDir or ephemeral volume
+// does (IGLOO_CACHE_EPHEMERAL): a request waits for such a replica while
+// it runs, as for any other, and once it is gone counts its cache as gone
+// with it, not as pending. A replica made again on the same volume, as a
+// container restarted in its pod, goes on with the cache's ID and empties
+// it, if a request deleted files since, as one with a disk that stays.
+const PodCache = "pod:"
 
 // purgeInterval is how often replicas look for deletions.
 const purgeInterval = 15 * time.Second
@@ -193,12 +203,14 @@ func (p *Purger) empty(ctx context.Context, latest time.Time) error {
 	return p.store.Emptied(ctx, p.id, latest, token)
 }
 
-// rekey gives the cache on disk a new ID and empties it.
+// rekey gives the cache on disk a new ID, of the kind it had ("disk:" or
+// PodCache), and empties it.
 func (p *Purger) rekey(ctx context.Context) error {
 	if err := p.cache.EmptyCache(ctx); err != nil {
 		return err
 	}
-	id, token := "disk:"+randomHex(), "t:"+randomHex()
+	kind, _, _ := strings.Cut(p.id, ":")
+	id, token := kind+":"+randomHex(), "t:"+randomHex()
 	if err := p.save(id, token); err != nil {
 		return err
 	}

@@ -3,6 +3,7 @@ package config
 import (
 	"errors"
 	"fmt"
+	"math"
 	"net"
 	"strconv"
 	"strings"
@@ -30,23 +31,45 @@ type Workers struct {
 	IdleAuto  bool
 	// StartTimeout bounds how long a statement waits for workers to start.
 	StartTimeout time.Duration
+	// Warm is how many idle workers past those busy stay up while some
+	// work, where Compute can stop workers alone (IGLOO_WORKER_WARM, 1);
+	// -1 (off) stops them only all together.
+	Warm int
 	// Threshold is how long a statement must take on one machine before
 	// auto mode runs it on workers, unless it would run short of memory.
 	Threshold time.Duration
 	// Exchanges is where workers write the rows they exchange: object (the
-	// warehouse's object storage), local (their own disks), or auto (their
-	// own disks when every worker of a statement has room there and runs
-	// outside Kubernetes, object storage otherwise). ExchangeMax,
+	// warehouse's object storage), local (their own disks), or auto, the
+	// default (their own disks when every worker of a statement has room
+	// there and runs outside Kubernetes, object storage otherwise). ExchangeMax,
 	// on a worker, caps the bytes of exchanges on its disk; zero leaves
 	// them to the disk's free space.
 	Exchanges   string
 	ExchangeMax int64
+	// NoWrites keeps workers from writing tables' files, which they do for a
+	// statement that fills a table from a query, under a directory of the
+	// statement's (IGLOO_WORKER_WRITES, on): this replica then writes them.
+	NoWrites bool
 
 	K8sNamespace   string
 	K8sDeployment  string
 	StartCommand   string
 	StopCommand    string
 	EC2InstanceIDs []string
+
+	// Price is what a worker costs an hour, for auto mode's weighing of how
+	// many a statement runs on (IGLOO_WORKER_PRICE_PER_HOUR); zero for
+	// unknown.
+	Price float64
+	// Large is the compute pool's large worker, which a statement may run
+	// on alone (IGLOO_LARGE_WORKER*); no address for none.
+	Large LargeWorker
+	// InstanceType and Spot say what machines the workers are
+	// (IGLOO_WORKER_INSTANCE_TYPE, IGLOO_WORKER_SPOT), and Region where
+	// (IGLOO_CLOUD_REGION), for their list price where Price is not set.
+	InstanceType string
+	Spot         bool
+	Region       string
 
 	// ListenAddr is where a worker accepts tasks.
 	ListenAddr string
@@ -59,6 +82,32 @@ type Workers struct {
 	// requests that cannot reach it (IGLOO_WORKER_ISOLATED_PURGE_AFTER, a
 	// minute by default).
 	IsolatedPurgeAfter time.Duration
+}
+
+// LargeWorker configures a compute pool's large worker: a worker of many
+// times a small one's memory, which auto mode weighs against the small
+// workers and the server for running a statement whole
+// (docs/distributed-execution.md#a-large-worker).
+type LargeWorker struct {
+	// Address is its host:port.
+	Address string
+	// Compute starts and stops it, as Workers.Compute does the others, with
+	// its own Deployment, commands or instances; the Deployment's namespace
+	// is the workers'.
+	Compute        string
+	K8sDeployment  string
+	StartCommand   string
+	StopCommand    string
+	EC2InstanceIDs []string
+	// Cores and Memory are its cores and DuckDB memory limit, for estimates
+	// before it has answered; Price what it costs an hour, zero for
+	// unknown; InstanceType and Spot what machine it is, for its list
+	// price where Price is not set.
+	Cores        int
+	Memory       int64
+	Price        float64
+	InstanceType string
+	Spot         bool
 }
 
 // WorkerPort is the port workers listen on unless told otherwise.
@@ -88,7 +137,7 @@ func loadWorkers(lookup func(string) (string, bool), errs *[]error) Workers {
 		StartCommand:  get("IGLOO_WORKER_START_COMMAND", ""),
 		StopCommand:   get("IGLOO_WORKER_STOP_COMMAND", ""),
 		ListenAddr:    get("IGLOO_WORKER_LISTEN_ADDR", ":"+WorkerPort),
-		Exchanges:     get("IGLOO_EXCHANGES", "object"),
+		Exchanges:     get("IGLOO_EXCHANGES", "auto"),
 	}
 	if w.Exchanges != "object" && w.Exchanges != "local" && w.Exchanges != "auto" {
 		addErr("IGLOO_EXCHANGES must be object, local or auto, got %q", w.Exchanges)
@@ -113,10 +162,70 @@ func loadWorkers(lookup func(string) (string, bool), errs *[]error) Workers {
 		}
 		w.Addresses = append(w.Addresses, a)
 	}
-	for _, id := range strings.Split(get("IGLOO_WORKER_EC2_INSTANCE_IDS", ""), ",") {
-		if id = strings.TrimSpace(id); id != "" {
-			w.EC2InstanceIDs = append(w.EC2InstanceIDs, id)
+	ids := func(key string) []string {
+		var out []string
+		for _, id := range strings.Split(get(key, ""), ",") {
+			if id = strings.TrimSpace(id); id != "" {
+				out = append(out, id)
+			}
 		}
+		return out
+	}
+	w.EC2InstanceIDs = ids("IGLOO_WORKER_EC2_INSTANCE_IDS")
+	price := func(key string) float64 {
+		v := get(key, "0")
+		f, err := strconv.ParseFloat(v, 64)
+		if err != nil || f < 0 || math.IsInf(f, 0) || math.IsNaN(f) {
+			addErr("%s must be a price such as 0.58, or 0 for unknown, got %q", key, v)
+			return 0
+		}
+		return f
+	}
+	w.Price = price("IGLOO_WORKER_PRICE_PER_HOUR")
+	flag := func(key string) bool {
+		switch v := strings.ToLower(get(key, "false")); v {
+		case "true", "on", "1":
+			return true
+		case "false", "off", "0":
+		default:
+			addErr("%s must be true or false, got %q", key, v)
+		}
+		return false
+	}
+	w.InstanceType, w.Spot, w.Region = get("IGLOO_WORKER_INSTANCE_TYPE", ""), flag("IGLOO_WORKER_SPOT"), get("IGLOO_CLOUD_REGION", "")
+	w.Large = LargeWorker{
+		Address:        get("IGLOO_LARGE_WORKER", ""),
+		Compute:        get("IGLOO_LARGE_WORKER_COMPUTE", ""),
+		K8sDeployment:  get("IGLOO_LARGE_WORKER_K8S_DEPLOYMENT", ""),
+		StartCommand:   get("IGLOO_LARGE_WORKER_START_COMMAND", ""),
+		StopCommand:    get("IGLOO_LARGE_WORKER_STOP_COMMAND", ""),
+		EC2InstanceIDs: ids("IGLOO_LARGE_WORKER_EC2_INSTANCE_IDS"),
+		Price:          price("IGLOO_LARGE_WORKER_PRICE_PER_HOUR"),
+		InstanceType:   get("IGLOO_LARGE_WORKER_INSTANCE_TYPE", ""),
+		Spot:           flag("IGLOO_LARGE_WORKER_SPOT"),
+	}
+	if a := w.Large.Address; a != "" {
+		if _, _, err := net.SplitHostPort(a); err != nil {
+			a = net.JoinHostPort(a, WorkerPort)
+		}
+		if h, p, err := net.SplitHostPort(a); err != nil || h == "" || p == "" || strings.Contains(a, ",") {
+			addErr("IGLOO_LARGE_WORKER %q must be one host or host:port", w.Large.Address)
+		}
+		w.Large.Address = a
+	}
+	if v := get("IGLOO_LARGE_WORKER_CORES", ""); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 1 {
+			addErr("IGLOO_LARGE_WORKER_CORES must be a positive integer, got %q", v)
+		}
+		w.Large.Cores = n
+	}
+	if v := get("IGLOO_LARGE_WORKER_MEMORY", ""); v != "" {
+		n, err := ParseSize(v)
+		if err != nil || n <= 0 {
+			addErr("IGLOO_LARGE_WORKER_MEMORY must be a size such as 400GiB, got %q", v)
+		}
+		w.Large.Memory = n
 	}
 
 	v := get("IGLOO_WORKER_MAX", "4")
@@ -133,6 +242,13 @@ func loadWorkers(lookup func(string) (string, bool), errs *[]error) Workers {
 		}
 		return d
 	}
+	switch v := strings.ToLower(get("IGLOO_WORKER_WRITES", "on")); v {
+	case "on", "true":
+	case "off", "false":
+		w.NoWrites = true
+	default:
+		addErr("IGLOO_WORKER_WRITES must be on or off, got %q", v)
+	}
 	switch v := strings.ToLower(get("IGLOO_WORKER_SPOT_NOTICE", "on")); v {
 	case "on", "true":
 		w.SpotNotice = true
@@ -146,6 +262,16 @@ func loadWorkers(lookup func(string) (string, bool), errs *[]error) Workers {
 		w.IdleAfter = duration("IGLOO_WORKER_IDLE_AFTER", "10m")
 	}
 	w.StartTimeout = duration("IGLOO_WORKER_START_TIMEOUT", "3m")
+	switch v := strings.ToLower(get("IGLOO_WORKER_WARM", "1")); v {
+	case "off":
+		w.Warm = -1
+	default:
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 0 {
+			addErr("IGLOO_WORKER_WARM must be a number of workers, or off, got %q", v)
+		}
+		w.Warm = n
+	}
 	w.IsolatedPurgeAfter = duration("IGLOO_WORKER_ISOLATED_PURGE_AFTER", "1m")
 	if w.IsolatedPurgeAfter > 0 && w.IsolatedPurgeAfter < 10*time.Second {
 		addErr("IGLOO_WORKER_ISOLATED_PURGE_AFTER must be at least 10s: coordinators check workers every few seconds, got %s",
@@ -154,6 +280,9 @@ func loadWorkers(lookup func(string) (string, bool), errs *[]error) Workers {
 	w.Threshold = duration("IGLOO_WORKER_THRESHOLD", "1m")
 
 	if len(w.Addresses) == 0 {
+		if w.Large.Address != "" {
+			addErr("IGLOO_LARGE_WORKER needs IGLOO_WORKERS: the large worker belongs to a pool's workers")
+		}
 		return w
 	}
 	if len(w.Secret) < minWorkerSecret {
@@ -175,6 +304,29 @@ func loadWorkers(lookup func(string) (string, bool), errs *[]error) Workers {
 		}
 	default:
 		addErr("IGLOO_WORKER_COMPUTE must be kubernetes, command, ec2 or empty, got %q", w.Compute)
+	}
+	if l := w.Large; l.Address != "" {
+		switch l.Compute {
+		case "":
+		case "kubernetes":
+			if l.K8sDeployment == "" {
+				addErr("IGLOO_LARGE_WORKER_K8S_DEPLOYMENT must name the large worker's Deployment")
+			}
+		case "command":
+			if l.StartCommand == "" || l.StopCommand == "" {
+				addErr("IGLOO_LARGE_WORKER_START_COMMAND and IGLOO_LARGE_WORKER_STOP_COMMAND must both be set")
+			}
+		case "ec2":
+			if len(l.EC2InstanceIDs) == 0 {
+				addErr("IGLOO_LARGE_WORKER_EC2_INSTANCE_IDS must list the large worker's instance")
+			}
+		default:
+			addErr("IGLOO_LARGE_WORKER_COMPUTE must be kubernetes, command, ec2 or empty, got %q", l.Compute)
+		}
+		if l.Compute != "" && (l.Cores == 0 || l.Memory == 0) {
+			// Stopped, it is weighed by its size before it ever answers.
+			addErr("IGLOO_LARGE_WORKER_CORES and IGLOO_LARGE_WORKER_MEMORY must be set when IGLOO_LARGE_WORKER_COMPUTE starts it")
+		}
 	}
 	return w
 }

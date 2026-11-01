@@ -58,6 +58,30 @@ func (sc *scanner) keywords(words ...string) bool {
 	return true
 }
 
+// partitionedBy consumes a PARTITIONED BY (...) clause, as CREATE TABLE of
+// an Iceberg table takes before AS (and Snowflake's CLUSTER BY (BUCKET(n,
+// column)) becomes), and returns it, or "" when the statement does not go
+// on with one.
+func (sc *scanner) partitionedBy() string {
+	start := sc.i
+	if !sc.keywords("PARTITIONED", "BY") {
+		return ""
+	}
+	sc.skip()
+	if sc.i >= len(sc.s) || sc.s[sc.i] != '(' {
+		sc.i = start
+		return ""
+	}
+	end := matchParen(sc.s, sc.i)
+	if end < 0 {
+		sc.i = start
+		return ""
+	}
+	clause := "PARTITIONED BY " + sc.s[sc.i:end+1]
+	sc.i = end + 1
+	return clause
+}
+
 // name reads an identifier chain such as lake."My Schema".t. Bare parts are
 // folded to lower case, as DuckDB does; quoted parts keep their case.
 func (sc *scanner) name() ([]string, bool) {

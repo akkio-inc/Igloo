@@ -60,24 +60,32 @@ func TestProtectedBy(t *testing.T) {
 	t.Parallel()
 	cs := startPolicyServer(t)
 	ctx := context.Background()
+	protectedBy := func(schema, table string) []string {
+		t.Helper()
+		names, err := cs.srv.ProtectedBy(ctx, schema, table)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return names
+	}
 	mustExec(t, cs.admin, `CREATE MASKING POLICY pii_hash AS (val VARCHAR) RETURNS VARCHAR -> sha256(val)`)
 	mustExec(t, cs.admin, "CREATE TAG pii")
 	mustExec(t, cs.admin, "ALTER TAG pii SET MASKING POLICY pii_hash")
 	mustExec(t, cs.admin, "ALTER TABLE lake.crm.contacts ALTER COLUMN device_id SET TAG pii = 'device'")
-	if got := cs.srv.ProtectedBy(ctx, "CRM", "contacts"); !slices.Equal(got, []string{"client_rows", "mask_email", "pii_hash"}) {
+	if got := protectedBy("CRM", "contacts"); !slices.Equal(got, []string{"client_rows", "mask_email", "pii_hash"}) {
 		t.Errorf("ProtectedBy(crm.contacts) = %q", got)
 	}
-	if got := cs.srv.ProtectedBy(ctx, "public", "campaigns"); got != nil || cs.srv.Protected(ctx, "public", "campaigns") {
+	if got := protectedBy("public", "campaigns"); got != nil || cs.srv.Protected(ctx, "public", "campaigns") {
 		t.Errorf("a table without policies: %q", got)
 	}
 	// A tag with no masking policy protects nothing.
 	mustExec(t, cs.admin, "CREATE TAG cost_center")
 	mustExec(t, cs.admin, "ALTER TABLE lake.public.campaigns ALTER COLUMN client SET TAG cost_center = 'x'")
-	if got := cs.srv.ProtectedBy(ctx, "public", "campaigns"); got != nil {
+	if got := protectedBy("public", "campaigns"); got != nil {
 		t.Errorf("a table with only a plain tag: %q", got)
 	}
 	mustExec(t, cs.admin, "ALTER TABLE lake.public.campaigns ALTER COLUMN email SET TAG pii = 'email'")
-	if got := cs.srv.ProtectedBy(ctx, "public", "campaigns"); !slices.Equal(got, []string{"pii_hash"}) {
+	if got := protectedBy("public", "campaigns"); !slices.Equal(got, []string{"pii_hash"}) {
 		t.Errorf("a column masked through a tag: %q", got)
 	}
 }
@@ -179,8 +187,8 @@ func TestExternalTablesAndPolicies(t *testing.T) {
 			t.Errorf("%s: %v", sql, err)
 		}
 	}
-	if got := cs.srv.ProtectedBy(context.Background(), "public", "viewing"); got != nil {
-		t.Errorf("the external table has policies: %q", got)
+	if got, err := cs.srv.ProtectedBy(context.Background(), "public", "viewing"); err != nil || got != nil {
+		t.Errorf("the external table has policies: %q, %v", got, err)
 	}
 }
 

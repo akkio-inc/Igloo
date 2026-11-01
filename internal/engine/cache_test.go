@@ -23,19 +23,26 @@ func TestCacheLimits(t *testing.T) {
 	cases := []struct {
 		name                        string
 		total, avail, used, maxSize uint64
+		dedicated                   bool
 		wantLimit, wantReserve      uint64
 	}{
-		{"half of the free space", 100 * gib, 60 * gib, 0, 0, 30 * gib, 30 * gib},
-		{"the same after the cache filled up", 100 * gib, 30 * gib, 30 * gib, 0, 30 * gib, 30 * gib},
-		{"less once other files grow", 100 * gib, 10 * gib, 30 * gib, 0, 20 * gib, 20 * gib},
-		{"at most 100 GiB", 2048 * gib, 1500 * gib, 0, 0, 100 * gib, 1400 * gib},
-		{"nothing on a nearly full disk", 100 * gib, 4 * gib, 0, 0, 0, 5 * gib},
-		{"IGLOO_CACHE_SIZE", 100 * gib, 60 * gib, 0, 10 * gib, 10 * gib, 50 * gib},
-		{"IGLOO_CACHE_SIZE above the 100 GiB cap", 2048 * gib, 1500 * gib, 0, 500 * gib, 500 * gib, 1000 * gib},
-		{"IGLOO_CACHE_SIZE never fills the disk", 100 * gib, 60 * gib, 0, 1024 * gib, 55 * gib, 5 * gib},
+		{"half of the free space", 100 * gib, 60 * gib, 0, 0, false, 30 * gib, 30 * gib},
+		{"the same after the cache filled up", 100 * gib, 30 * gib, 30 * gib, 0, false, 30 * gib, 30 * gib},
+		{"less once other files grow", 100 * gib, 10 * gib, 30 * gib, 0, false, 20 * gib, 20 * gib},
+		{"at most 100 GiB", 2048 * gib, 1500 * gib, 0, 0, false, 100 * gib, 1400 * gib},
+		{"nothing on a nearly full disk", 100 * gib, 4 * gib, 0, 0, false, 0, 5 * gib},
+		{"IGLOO_CACHE_SIZE", 100 * gib, 60 * gib, 0, 10 * gib, false, 10 * gib, 50 * gib},
+		{"IGLOO_CACHE_SIZE above the 100 GiB cap", 2048 * gib, 1500 * gib, 0, 500 * gib, false, 500 * gib, 1000 * gib},
+		{"IGLOO_CACHE_SIZE takes at most half of the free space", 100 * gib, 60 * gib, 0, 1024 * gib, false, 30 * gib, 30 * gib},
+		{"IGLOO_CACHE_SIZE on a small disk", 30 * gib, 20 * gib, 0, 45 * gib, false, 10 * gib, 10 * gib},
+		{"and the same once full", 30 * gib, 10 * gib, 10 * gib, 45 * gib, false, 10 * gib, 10 * gib},
+		{"a volume of its own fills to IGLOO_CACHE_SIZE", 50 * gib, 50 * gib, 0, 45 * gib, true, 45 * gib, 5 * gib},
+		{"and stays there once full", 50 * gib, 5 * gib, 45 * gib, 45 * gib, true, 45 * gib, 5 * gib},
+		{"or to 100 GiB without it", 200 * gib, 200 * gib, 0, 0, true, 100 * gib, 100 * gib},
+		{"and still keeps 5% free", 50 * gib, 50 * gib, 0, 1024 * gib, true, 47.5 * gib, 2.5 * gib},
 	}
 	for _, c := range cases {
-		limit, reserve := cacheLimits(c.total, c.avail, c.used, c.maxSize)
+		limit, reserve := cacheLimits(c.total, c.avail, c.used, c.maxSize, c.dedicated)
 		if limit != c.wantLimit || reserve != c.wantReserve {
 			t.Errorf("%s: got limit %d GiB, reserve %d GiB; want %d GiB, %d GiB",
 				c.name, limit/gib, reserve/gib, c.wantLimit/gib, c.wantReserve/gib)
@@ -314,5 +321,21 @@ func TestCacheIdentity(t *testing.T) {
 	// Without a cache on disk, the process's own.
 	if id, _, save, err := (&Engine{}).CacheIdentity(); err != nil || save != nil || !strings.HasPrefix(id, "memory:") {
 		t.Errorf("without a cache on disk: %q %v %v", id, save != nil, err)
+	}
+
+	// On a volume that goes with the pod: an ID of that kind, kept across
+	// restarts in the pod.
+	cfg := s3Config(t.TempDir())
+	cfg.Cache.Ephemeral = true
+	pod := &Engine{}
+	if err := pod.setupCache((&recorder{}).exec, cfg, log); err != nil {
+		t.Fatal(err)
+	}
+	podID, podToken, _, err := pod.CacheIdentity()
+	if err != nil || !strings.HasPrefix(podID, "pod:") {
+		t.Fatalf("on a volume that goes with the pod: %q %v", podID, err)
+	}
+	if again, againToken, _, err := pod.CacheIdentity(); err != nil || again != podID || againToken != podToken {
+		t.Errorf("restarted in its pod: %q %q, want %q %q (%v)", again, againToken, podID, podToken, err)
 	}
 }

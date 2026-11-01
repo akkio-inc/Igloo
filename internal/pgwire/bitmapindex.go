@@ -421,10 +421,11 @@ func (s *Server) showIndexes(ctx context.Context, w wire.DataWriter) error {
 }
 
 // iglooSchemas are the catalog schemas whose tables are Igloo's own: ID
-// domains' dictionaries and bitmap indexes. iglooPolicies guard them.
+// domains' dictionaries, bitmap indexes, and materialized views' and
+// dynamic tables' state. iglooPolicies guard them.
 var (
-	iglooSchemas  = []string{iddomain.DictionarySchema, iddomain.IndexSchema}
-	iglooPolicies = []string{iddomain.DictionaryPolicy, iddomain.IndexPolicy}
+	iglooSchemas  = []string{iddomain.DictionarySchema, iddomain.IndexSchema, refreshSchema}
+	iglooPolicies = []string{iddomain.DictionaryPolicy, iddomain.IndexPolicy, refreshPolicy}
 )
 
 // isIglooSchema reports whether schema is one of iglooSchemas.

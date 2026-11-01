@@ -2,7 +2,10 @@ package distributed
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"iter"
+	"reflect"
 	"slices"
 	"strconv"
 	"strings"
@@ -22,7 +25,7 @@ type Source interface {
 	// may be a few seconds old: it decides only whether to distribute.
 	Table(ctx context.Context, schema, name string) (*Table, error)
 	// Refresh brings t to the table's current snapshot. It fails if the
-	// table's columns changed since.
+	// table's columns changed since, their types included.
 	Refresh(ctx context.Context, t *Table) error
 	// Files lists the data files of t's snapshot.
 	Files(ctx context.Context, t *Table) ([]File, error)
@@ -36,6 +39,9 @@ type File struct {
 	Rows int64 `json:"rows"`
 	// Deletes, if set, are the delete files that apply to it.
 	Deletes *Deletes `json:"deletes,omitempty"`
+	// Buckets are its bucket of each of its table's Buckets, -1 for the
+	// rows whose column is NULL.
+	Buckets []int `json:"-"`
 }
 
 // Deletes are the delete files that apply to a data file, as the scan's
@@ -111,6 +117,9 @@ func NewIceberg(cat *catalog.Client) *Iceberg {
 type icebergHandle struct {
 	tbl  *table.Table
 	snap *table.Snapshot
+	// columns are the table's columns as loaded, which Refresh compares:
+	// Coordinator.Table prints nested types afresh in the Table's own.
+	columns []Column
 }
 
 // Table returns a table's metadata, loaded at most tableTTL ago.
@@ -139,25 +148,35 @@ func (s *Iceberg) Table(ctx context.Context, schema, name string) (*Table, error
 	return &c, nil
 }
 
-// Refresh loads the table's current metadata into t.
+// Refresh loads the table's current metadata into t. The statement was
+// planned with t's columns, and workers read the new snapshot's files with
+// their types: a type promoted since, such as FLOAT to DOUBLE, would read
+// the new files' values as the old type, so any change to the columns,
+// nested fields included, keeps the statement on one machine.
 func (s *Iceberg) Refresh(ctx context.Context, t *Table) error {
+	h, ok := t.source.(*icebergHandle)
+	if !ok {
+		return fmt.Errorf("table %s was not loaded from the catalog", t)
+	}
 	fresh, err := s.load(ctx, t.Schema, t.Name)
 	if err != nil {
 		return err
 	}
-	if len(fresh.Columns) != len(t.Columns) {
+	if !slices.EqualFunc(fresh.Columns, h.columns, sameColumn) {
 		return unsupported("the columns of %s changed", t)
-	}
-	for i, c := range fresh.Columns {
-		if c.ID != t.Columns[i].ID || !strings.EqualFold(c.Name, t.Columns[i].Name) {
-			return unsupported("the columns of %s changed", t)
-		}
 	}
 	if fresh.Unsupported != "" {
 		return unsupported("table %s: %s", t, fresh.Unsupported)
 	}
 	t.Bytes, t.Snapshot, t.Versioned, t.source = fresh.Bytes, fresh.Snapshot, fresh.Versioned, fresh.source
 	return nil
+}
+
+// sameColumn reports whether workers read a and b, columns as loaded, the
+// same way: by the same field IDs and as the same type, nested fields
+// included. Names may differ in case alone, as DuckDB resolves them.
+func sameColumn(a, b Column) bool {
+	return a.ID == b.ID && strings.EqualFold(a.Name, b.Name) && a.Type == b.Type && reflect.DeepEqual(a.Nested, b.Nested)
 }
 
 // load loads a table's current metadata from the catalog.
@@ -174,11 +193,22 @@ func (s *Iceberg) load(ctx context.Context, schema, name string) (*Table, error)
 		}
 		t.Columns = append(t.Columns, c)
 	}
+	// Workers read a field as NULL from the data files written before it
+	// was added, which lack it; format version 3 gives it its initial
+	// default there, as DuckDB's own Iceberg scan does.
+	if name, ok := initialDefault(tbl.Schema().Fields()); ok && t.Unsupported == "" {
+		t.Unsupported = fmt.Sprintf("column %s has an initial default, which workers do not apply", name)
+	}
 	// A name mapping (schema.name-mapping.default) applies only to files
 	// without field IDs, which workers refuse; iceberg-go adds one to every
 	// table it compacts, whose files all have field IDs.
+	t.Distinct = distinctCounts(tbl.Properties()[catalog.DistinctCountsProperty])
 	snap := tbl.CurrentSnapshot()
-	t.source = &icebergHandle{tbl: tbl, snap: snap}
+	t.Buckets = icebergBuckets(ctx, tbl, snap)
+	// Iceberg's own statistics: the distinct counts other engines' theta
+	// sketches give the columns, where ANALYZE gave none.
+	t.Distinct = withSketchedDistinct(t.Distinct, tbl.Metadata().Statistics(), tbl.Schema(), snap)
+	t.source = &icebergHandle{tbl: tbl, snap: snap, columns: t.Columns}
 	if snap == nil {
 		return t, nil
 	}
@@ -227,11 +257,22 @@ func (s *Iceberg) Files(ctx context.Context, t *Table) ([]File, error) {
 		return nil, fmt.Errorf("plan scan of %s: %w", t, err)
 	}
 	files = make([]File, 0, len(tasks))
+	bucketed := len(t.Buckets) > 0
 	for _, task := range tasks {
 		if f := strings.ToUpper(string(task.File.FileFormat())); f != "PARQUET" {
 			return nil, unsupported("%s has %s files", t, f)
 		}
 		f := File{Path: task.File.FilePath(), Size: task.File.FileSizeBytes(), Rows: task.File.Count()}
+		if bucketed {
+			// A file whose bucket cannot be told leaves every file without
+			// one: a stage reading the table by bucket then fails, and the
+			// statement runs on one machine.
+			if f.Buckets, bucketed = fileBuckets(h.tbl.Metadata(), task.File, t.Buckets); !bucketed {
+				for i := range files {
+					files[i].Buckets = nil
+				}
+			}
+		}
 		if n := len(task.DeleteFiles) + len(task.DeletionVectorFiles) + len(task.EqualityDeleteFiles); n > 0 {
 			f.Deletes = &Deletes{}
 		}
@@ -283,6 +324,64 @@ func (s *Iceberg) Files(ctx context.Context, t *Table) ([]File, error) {
 	return files, nil
 }
 
+// distinctCounts reads the distinct counts ANALYZE keeps in a table's
+// property (catalog.DistinctCountsProperty), by lower-case column name;
+// nil if there are none or they cannot be read.
+func distinctCounts(prop string) map[string]int64 {
+	if prop == "" {
+		return nil
+	}
+	var counts map[string]int64
+	if err := json.Unmarshal([]byte(prop), &counts); err != nil {
+		return nil
+	}
+	out := make(map[string]int64, len(counts))
+	for name, n := range counts {
+		if n > 0 {
+			out[strings.ToLower(name)] = n
+		}
+	}
+	return out
+}
+
+// withSketchedDistinct adds to counts, distinct counts by lower-case
+// column name, those the table's statistics files give: the ndv property
+// of an apache-datasketches-theta-v1 blob of one field, of the snapshot
+// snap, or else of the latest snapshot that has statistics. A column
+// counts already keeps its count.
+func withSketchedDistinct(counts map[string]int64, files iter.Seq[table.StatisticsFile], schema *iceberg.Schema, snap *table.Snapshot) map[string]int64 {
+	var chosen *table.StatisticsFile
+	for f := range files {
+		switch {
+		case snap != nil && f.SnapshotID == snap.SnapshotID:
+			chosen = &f
+		case chosen == nil || (snap == nil || chosen.SnapshotID != snap.SnapshotID) && f.SnapshotID > chosen.SnapshotID:
+			chosen = &f
+		}
+	}
+	if chosen == nil || schema == nil {
+		return counts
+	}
+	for _, b := range chosen.BlobMetadata {
+		if b.Type != table.BlobTypeApacheDatasketchesThetaV1 || len(b.Fields) != 1 {
+			continue
+		}
+		ndv, err := strconv.ParseInt(b.Properties["ndv"], 10, 64)
+		field, ok := schema.FindFieldByID(int(b.Fields[0]))
+		if err != nil || ndv <= 0 || !ok {
+			continue
+		}
+		name := strings.ToLower(field.Name)
+		if counts == nil {
+			counts = map[string]int64{}
+		}
+		if _, have := counts[name]; !have {
+			counts[name] = ndv
+		}
+	}
+	return counts
+}
+
 // icebergColumn returns a column of Iceberg type t as DuckDB reads it: a
 // list as T[], a map as MAP(K, V), a struct as STRUCT(name T, ...), with
 // the nested fields' names and IDs. Struct fields' names are all quoted
@@ -330,6 +429,22 @@ func icebergColumn(name string, id int, t iceberg.Type) (Column, bool) {
 		c.Type = typ
 	}
 	return c, true
+}
+
+// initialDefault returns the dotted path of one of fields, or of a field
+// nested in them, that has an initial default.
+func initialDefault(fields []iceberg.NestedField) (string, bool) {
+	for _, f := range fields {
+		if f.InitialDefault != nil {
+			return f.Name, true
+		}
+		if nested, ok := f.Type.(iceberg.NestedType); ok {
+			if name, ok := initialDefault(nested.Fields()); ok {
+				return f.Name + "." + name, true
+			}
+		}
+	}
+	return "", false
 }
 
 // duckType returns the DuckDB type DuckDB reads an Iceberg primitive type

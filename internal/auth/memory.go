@@ -25,7 +25,13 @@ type MemoryDirectory struct {
 	ssoMembers map[string][]string
 	scimUsers  map[string]SCIMUser
 	scimGroups map[string]SCIMGroup
-	secret     []byte
+	// scimChanges are the marks of SCIMChanges, by user; scimMark is the
+	// last mark given.
+	scimChanges map[string]int64
+	scimMark    int64
+	secret      []byte
+	// rolesMu is LockRoles's lock.
+	rolesMu sync.Mutex
 }
 
 type memoryToken struct {
@@ -36,12 +42,13 @@ type memoryToken struct {
 // NewMemoryDirectory returns an empty directory.
 func NewMemoryDirectory() *MemoryDirectory {
 	d := &MemoryDirectory{
-		users:      map[string]User{},
-		tokens:     map[string]memoryToken{},
-		ssoMembers: map[string][]string{},
-		scimUsers:  map[string]SCIMUser{},
-		scimGroups: map[string]SCIMGroup{},
-		secret:     make([]byte, 32),
+		users:       map[string]User{},
+		tokens:      map[string]memoryToken{},
+		ssoMembers:  map[string][]string{},
+		scimUsers:   map[string]SCIMUser{},
+		scimGroups:  map[string]SCIMGroup{},
+		scimChanges: map[string]int64{},
+		secret:      make([]byte, 32),
 	}
 	_, _ = rand.Read(d.secret)
 	d.MemoryGrants = NewMemoryGrants(d)
@@ -160,6 +167,7 @@ func (d *MemoryDirectory) Delete(ctx context.Context, name string) error {
 	d.identities = slices.DeleteFunc(d.identities, func(i Identity) bool { return i.User == name })
 	delete(d.ssoMembers, name)
 	d.forgetSCIMUser(name)
+	delete(d.scimChanges, name)
 	d.mu.Unlock()
 	return d.ForgetUser(ctx, name)
 }
@@ -372,7 +380,8 @@ func (d *MemoryDirectory) UpdateIdentity(_ context.Context, id Identity) error {
 	defer d.mu.Unlock()
 	for k, i := range d.identities {
 		if i.Issuer == id.Issuer && i.Subject == id.Subject {
-			d.identities[k].Email, d.identities[k].Groups, d.identities[k].LastSignIn = id.Email, slices.Clone(id.Groups), time.Now()
+			d.identities[k].Email, d.identities[k].Groups, d.identities[k].AccountID = id.Email, slices.Clone(id.Groups), id.AccountID
+			d.identities[k].LastSignIn = time.Now()
 			return nil
 		}
 	}
@@ -486,6 +495,14 @@ func (d *MemoryDirectory) SyncRoles(ctx context.Context, user string, roles []st
 	return nil
 }
 
+// LockRoles implements SSOStore with one lock for every user: there is
+// one replica.
+func (d *MemoryDirectory) LockRoles(ctx context.Context, _ string, fn func(context.Context) error) error {
+	d.rolesMu.Lock()
+	defer d.rolesMu.Unlock()
+	return fn(ctx)
+}
+
 func (d *MemoryDirectory) SCIMUsers(context.Context) ([]SCIMUser, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -526,6 +543,7 @@ func (d *MemoryDirectory) DeleteSCIMUser(_ context.Context, user string) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	d.forgetSCIMUser(user)
+	d.markSCIMChanges([]string{user})
 	return nil
 }
 
@@ -564,7 +582,11 @@ func (d *MemoryDirectory) SCIMGroup(_ context.Context, id string) (SCIMGroup, er
 func (d *MemoryDirectory) CreateSCIMGroup(_ context.Context, g SCIMGroup) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	return d.putSCIMGroup(g, true)
+	if err := d.putSCIMGroup(g, true); err != nil {
+		return err
+	}
+	d.markSCIMChanges(d.scimGroups[g.ID].Members)
+	return nil
 }
 
 func (d *MemoryDirectory) ModifySCIMGroup(_ context.Context, id string, change func(*SCIMGroup) error) error {
@@ -574,12 +596,17 @@ func (d *MemoryDirectory) ModifySCIMGroup(_ context.Context, id string, change f
 	if !ok {
 		return ErrSCIMNotFound
 	}
+	before := g.Members
 	g.Members = slices.Clone(g.Members)
 	if err := change(&g); err != nil {
 		return err
 	}
 	g.ID = id
-	return d.putSCIMGroup(g, false)
+	if err := d.putSCIMGroup(g, false); err != nil {
+		return err
+	}
+	d.markSCIMChanges(append(slices.Clone(before), d.scimGroups[id].Members...))
+	return nil
 }
 
 // putSCIMGroup checks and stores g; d.mu is held.
@@ -612,9 +639,11 @@ func (d *MemoryDirectory) putSCIMGroup(g SCIMGroup, create bool) error {
 func (d *MemoryDirectory) DeleteSCIMGroup(_ context.Context, id string) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	if _, ok := d.scimGroups[id]; !ok {
+	g, ok := d.scimGroups[id]
+	if !ok {
 		return ErrSCIMNotFound
 	}
+	d.markSCIMChanges(g.Members)
 	delete(d.scimGroups, id)
 	return nil
 }
@@ -630,6 +659,49 @@ func (d *MemoryDirectory) UserSCIMGroups(_ context.Context, user string) ([]stri
 	}
 	slices.Sort(out)
 	return out, nil
+}
+
+func (d *MemoryDirectory) SCIMGroupNames(_ context.Context, names []string) ([]string, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	var out []string
+	for _, g := range d.scimGroups {
+		if slices.Contains(names, g.DisplayName) {
+			out = append(out, g.DisplayName)
+		}
+	}
+	slices.Sort(out)
+	return out, nil
+}
+
+// markSCIMChanges records that the groups of users changed; d.mu is held.
+func (d *MemoryDirectory) markSCIMChanges(users []string) {
+	d.scimMark++
+	for _, u := range users {
+		if _, ok := d.users[u]; ok {
+			d.scimChanges[u] = d.scimMark
+		}
+	}
+}
+
+func (d *MemoryDirectory) SCIMChanges(context.Context) ([]SCIMChange, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	out := make([]SCIMChange, 0, len(d.scimChanges))
+	for u, mark := range d.scimChanges {
+		out = append(out, SCIMChange{User: u, Mark: mark})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].User < out[j].User })
+	return out, nil
+}
+
+func (d *MemoryDirectory) SCIMChangeApplied(_ context.Context, c SCIMChange) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.scimChanges[c.User] == c.Mark {
+		delete(d.scimChanges, c.User)
+	}
+	return nil
 }
 
 var (

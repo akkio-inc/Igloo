@@ -319,8 +319,8 @@ to compare.
 
 | Verdict | Meaning |
 |---|---|
-| match | Same row count and checksum: the same values, in any order, numbers to 10 significant digits |
-| match within precision | The checksums differ, but row by row the values agree to the precision of the less precise side (Snowflake's `AVG` of a `NUMBER(12,2)` has 8 decimal places; DuckDB's is a double) |
+| match | Same row count and checksum: the same values, in any order. Integers and decimals are exact; where one side's value is binary floating point (a double), numbers agree to 10 significant digits |
+| match within precision | The checksums differ, but row by row the values agree to the precision of the less precise side: a decimal to its decimal places (Snowflake's `AVG` of a `NUMBER(12,2)` has 8; DuckDB's is a double), binary floating point also to one part in a billion. Integers, and decimals with the same decimal places, must be equal |
 | values differ | Same row count, different values; the report names the columns |
 | rows differ | Different row counts |
 | not compared | It was not re-run (over budget, too many rows, refused by the check) or failed at the source |

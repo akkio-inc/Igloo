@@ -76,6 +76,11 @@ const (
 	// for its tasks.
 	spotPoll   = 5 * time.Second
 	spotMargin = 10 * time.Second
+	// drainTimeout is how long a worker a signal stops finishes its tasks
+	// and serves the exchange files on its disk (see distributed's
+	// Worker.Drain): what a Spot Instance's two-minute interruption notice
+	// leaves it, as when a Spot node is drained before it is reclaimed.
+	drainTimeout = 2*time.Minute - spotMargin
 	// peakSampleEvery is how often the workload controller reads what
 	// DuckDB holds for running statements; a statement shorter than that
 	// may fall between two reads, and is learned by what it allocated.
@@ -401,8 +406,11 @@ func serve() error {
 	// Erasure requests erase ids from bitmap indexes through the SQL
 	// server, which is made after them (see pgwire.BitmapIDSets).
 	bitmapIDs := &pgwire.BitmapIDSets{}
-	// They train models again through it too (see pgwire.ModelRetrainer).
+	// They train models again through it too (see pgwire.ModelRetrainer),
+	// and replace materialized views and dynamic tables (see
+	// pgwire.ViewRebuilder).
 	retrainer := &pgwire.ModelRetrainer{}
+	views := &pgwire.ViewRebuilder{}
 	if cat != nil {
 		erasureStore, purger, err := openErasure(ctx, cfg, eng, log)
 		if err != nil {
@@ -416,9 +424,9 @@ func serve() error {
 			Store: erasureStore, Catalog: cat, Policies: policies.Load, Engine: eng, Jobs: jobs, Purger: purger,
 			Locks: cloneStore, Failed: notifier.ErasureFailed, Blocked: notifier.ErasureBlocked, Metrics: erasure.NewMetrics(reg), Log: log,
 			Locations: cat.Locations, Memory: rewriteMemory(cfg, memory), IDDomains: domains, IDSets: idSetsFor(cfg, bitmapIDs),
-			// What AI functions derived from the tables, cached, and the
-			// models trained from them.
-			Derived: []erasure.Derived{aiRuntime.Store()}, Models: retrainer,
+			// What AI functions derived from the tables, cached, the models
+			// trained from them, and the views refreshed from them.
+			Derived: []erasure.Derived{aiRuntime.Store()}, Models: retrainer, Views: views,
 		}, historyStore, taskStore)
 		if err != nil {
 			return err
@@ -493,6 +501,8 @@ func serve() error {
 		Metrics:             pgwire.NewMetrics(reg),
 		StatementTimeout:    cfg.StatementTimeout,
 		MaxConnections:      cfg.MaxConnections,
+		LoginTimeout:        cfg.LoginTimeout,
+		AccessMaxStaleness:  cfg.AccessMaxStaleness,
 		Version:             version,
 		DDL:                 objects,
 		Activity:            work,
@@ -549,6 +559,7 @@ func serve() error {
 	}
 	bitmapIDs.Bind(srv)
 	retrainer.Bind(srv)
+	views.Bind(srv)
 	// The AI functions run in this server's sessions; workers have none.
 	eng.SetAI(srv.AIHook())
 	// The AI cache's expired entries go, every hour, until shutdown.
@@ -574,6 +585,11 @@ func serve() error {
 	if eraser != nil {
 		eng.SetErasure(eraser.List, srv.ErasureViewer)
 	}
+	// Users and roles dropped before DROP USER and DROP ROLE disowned
+	// their models and removed their model grants left them behind.
+	if err := srv.ForgetDroppedPrincipals(ctx); err != nil {
+		log.Warn("could not disown the models, and remove the model grants, of dropped users and roles", "err", err)
+	}
 	if rooms != nil {
 		// Runs execute through the SQL server, as each room's identity.
 		// Each start writes the rooms' confinements again, in case a
@@ -586,6 +602,22 @@ func serve() error {
 	provisioning, err := openSCIM(users, single, func(user string) { srv.UserChanged(user) }, log)
 	if err != nil {
 		return err
+	}
+	// The roles of users whose groups SCIM changed, which a failure left
+	// behind, are applied until shutdown begins.
+	var scimHandler http.Handler
+	if provisioning != nil {
+		scimHandler = provisioning
+		scimCtx, stopSCIM := context.WithCancel(ctx)
+		scimDone := make(chan struct{})
+		go func() {
+			defer close(scimDone)
+			provisioning.Run(scimCtx, time.Minute)
+		}()
+		defer func() {
+			stopSCIM()
+			<-scimDone
+		}()
 	}
 
 	// Built-in alerts go out until shutdown begins.
@@ -632,7 +664,7 @@ func serve() error {
 			// Bitmap indexes hold ids, so they are built once ids are mapped.
 			srv.MapIDDomains(ctx)
 			srv.MaintainBitmapIndexes(ctx)
-		}, log)
+		}, srv.InTransaction, srv.HoldTable, log)
 		if err != nil {
 			return err
 		}
@@ -650,7 +682,7 @@ func serve() error {
 			return err
 		}
 		status := consoleStatus(cfg, started, work, health, schedule, maintains)
-		if consoleSrv, err = serveConsole(ctx, consoleLn, srv, users, single, provisioning, tlsConfig, status, errc, log); err != nil {
+		if consoleSrv, err = serveConsole(ctx, consoleLn, srv, users, single, scimHandler, tlsConfig, status, errc, log); err != nil {
 			_ = consoleLn.Close()
 			return err
 		}
@@ -879,7 +911,7 @@ func openSSO(cfg config.Config, users auth.Store, changed func(string), log *slo
 
 // openSCIM sets up SCIM provisioning, which comes with single sign-on. It
 // returns nil without single sign-on.
-func openSCIM(users auth.Store, single *sso.Service, changed func(string), log *slog.Logger) (http.Handler, error) {
+func openSCIM(users auth.Store, single *sso.Service, changed func(string), log *slog.Logger) (*scim.Handler, error) {
 	store, ok := users.(auth.SCIMStore)
 	accounts, _ := users.(auth.AccountStore)
 	tokens, _ := users.(auth.TokenStore)
@@ -992,11 +1024,25 @@ func openErasure(ctx context.Context, cfg config.Config, eng *engine.Engine, log
 		return nil, nil, fmt.Errorf("read cache ID: %w", err)
 	}
 	host, _ := os.Hostname()
-	purger := erasure.NewPurger(store, eng, cacheID, host, log)
+	purger := erasure.NewPurger(store, heldCache{eng}, cacheID, host, log)
 	if save != nil {
 		purger.OnDisk(token, save)
 	}
 	return store, purger, nil
+}
+
+// heldCache empties the replica's read cache while the prefetcher writes
+// nothing into it, as a worker's purge does: a block fetched before an
+// erasure request's purge, which may hold what the request deleted, must
+// not land after it.
+type heldCache struct{ eng *engine.Engine }
+
+func (h heldCache) EmptyCache(ctx context.Context) error {
+	p := h.eng.Prefetcher()
+	if p == nil {
+		return h.eng.EmptyCache(ctx)
+	}
+	return p.Hold(func() error { return h.eng.EmptyCache(ctx) })
 }
 
 // newEraser sets up erasure requests. They redact the query history and
@@ -1104,7 +1150,7 @@ func dropDuckDBCaches(ctx context.Context, eng *engine.Engine, log *slog.Logger)
 
 func startMaintenance(ctx context.Context, cfg config.Config, cat *catalog.Client, guard *clone.Guard, policies policy.Store,
 	memory memlimit.Plan, threads int, reg prometheus.Registerer, work *activity.Tracker, failed func(string, error), beforePass func(context.Context),
-	log *slog.Logger) (stop func(), lock *maintenance.PostgresLock, err error) {
+	busy func(string) bool, hold func(context.Context, string) (func(), bool), log *slog.Logger) (stop func(), lock *maintenance.PostgresLock, err error) {
 	budget := rewriteMemory(cfg, memory)
 	if memory.Go > 0 && budget > memory.Go/2 {
 		log.Warn("IGLOO_MAINTENANCE_MEMORY is more than half of Go's memory limit; compaction may leave too little for the rest of Igloo",
@@ -1123,6 +1169,8 @@ func startMaintenance(ctx context.Context, cfg config.Config, cat *catalog.Clien
 		Failed:     failed,
 		Clones:     guard,
 		BeforePass: beforePass,
+		Busy:       busy,
+		Hold:       hold,
 		DataRetention: func(ctx context.Context) (map[string]time.Duration, error) {
 			snap, err := policies.Load(ctx)
 			if err != nil {

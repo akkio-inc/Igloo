@@ -3,10 +3,12 @@ package distributed
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"maps"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/akkio-inc/igloo/internal/ai"
@@ -121,6 +123,14 @@ type Table struct {
 	// Bytes is the size of the table's data files, and Rows its records,
 	// zero if unknown.
 	Bytes, Rows int64
+	// Distinct are the approximate distinct counts of its columns, by
+	// lower-case name, as ANALYZE keeps them; a column without one is
+	// missing.
+	Distinct map[string]int64
+	// Buckets are the bucket transforms of its partition spec that every
+	// data file of its snapshot was written under (see bucket.go); each
+	// File's Buckets says the file's bucket of each.
+	Buckets []Bucketing
 	// Unsupported, if set, says why workers cannot read the table, such as
 	// delete files they cannot apply.
 	Unsupported string
@@ -163,12 +173,19 @@ type Plan struct {
 	// Key identifies the statement in the history of its runs, for
 	// Coordinator.Observe (see planKey).
 	Key string
-	// workers is how many workers the estimates call for (estimateTimes).
-	workers int
+	// workers is how many workers auto mode chose (see pick), and large
+	// says the large worker, alone; placement says where and why, for the
+	// query history.
+	workers   int
+	large     bool
+	placement string
 	// shortOfMemory says the statement would not fit in the coordinator's
 	// memory: its working set is over its share (estimateTimes), or it ran
-	// out of memory there before.
+	// out of memory there before. farBeyond says its working set by
+	// DuckDB's plan, whatever a run of its shape allocated here, is more
+	// than farBeyondRatio times the coordinator's room for it.
 	shortOfMemory bool
+	farBeyond     bool
 	// uncertain are relations of uncertain size its stages read by
 	// partition, with large tables partitioned to meet them; relKeys are
 	// the keys of the relations its exchanges hold, by exchange ID.
@@ -182,16 +199,54 @@ type Plan struct {
 	// values.go).
 	values   []*value
 	valueEnv ValueEnv
+	// writes says its tasks can write the table it fills (WorkersWrite), and
+	// target is how, once the caller said (Write).
+	writes bool
+	target *WriteTarget
 	// versions are the snapshots the statement reads tables at, AT
 	// (VERSION => n), by key: Execute runs it on workers only if each is
 	// the snapshot it loads (see pinVersion).
 	versions map[string]int64
+	// buckets say where bucketed tables are read by bucket, without an
+	// exchange, and why others are exchanged all the same, for EXPLAIN
+	// DISTRIBUTED (see bucket.go).
+	buckets []string
+	// streamMerged says the session reads a merge of sorted rows as a
+	// stream (see StreamMerged).
+	streamMerged bool
 }
+
+// StreamMerged has Execute leave a merge of the sorted rows a statement
+// reads to be made as the statement reads them, as a view the session
+// registers before it runs the execution's SQL (see Execution.Merged),
+// rather than merge them into a file first.
+func (p *Plan) StreamMerged() { p.streamMerged = true }
 
 // ShortOfMemory reports whether the statement would not fit in the
 // coordinator's memory, so that running it there instead of on workers
 // would fail, slowly.
 func (p *Plan) ShortOfMemory() bool { return p.shortOfMemory }
+
+// FitsHere reports whether the coordinator could run the statement itself,
+// should the workers chosen fail: not when its working set by DuckDB's
+// plan is far beyond the coordinator's memory (farBeyondRatio times its
+// room), whatever a run of its shape allocated there once, as at a tenth
+// of the data. At a hundred times the data, a report estimated at 250 GB
+// ran on the coordinator after the large worker failed, spilled 167 GB and
+// was killed after 9 minutes; 16 workers ran it in 729 s.
+func (p *Plan) FitsHere() bool { return !p.shortOfMemory && !p.farBeyond }
+
+// Workers is how many workers the statement was planned to run on, 1 for
+// the large worker; Large says it runs on the large worker.
+func (p *Plan) Workers() int { return p.workers }
+
+// Large reports whether the statement runs on the large worker alone.
+func (p *Plan) Large() bool { return p.large }
+
+// Placement says where auto mode, or the session's mode, runs the
+// statement and why: how many workers or the large worker, and the reason,
+// as the query history records it (see OnLarge).
+func (p *Plan) Placement() string { return p.placement }
 
 // job is a candidate on its way to stages: the tables its fragment reads,
 // by the names it reads them as.
@@ -243,6 +298,11 @@ type planOptions struct {
 	// workers are the workers the statement may run on, for weighing
 	// what every task reads whole.
 	workers int
+	// writes says the statement fills a table whose files workers may write
+	// (see writes.go): every row of a table may go to workers, which then
+	// need not cross to the coordinator (see rowsJob), and the stage whose
+	// rows are the result is made ready to write them (markWrites).
+	writes bool
 	// bitmaps says count(DISTINCT) of 32-bit unsigned IDs combines roaring
 	// bitmaps (combineBitmap): the rb extension is loaded, as on every
 	// machine, and the session turned them on (see bitmapsOn).
@@ -264,6 +324,21 @@ type planner struct {
 	opts planOptions
 	// aggs are the names of DuckDB's aggregate functions.
 	aggs map[string]bool
+	// producing are the relations being produced, by relationKey, and
+	// depth how many are nested: a relation never reads itself, and
+	// relations nest no deeper than maxRelationDepth (see relationExchange).
+	producing map[string]bool
+	depth     int
+	// started is when planning began, progress when it last planned a
+	// stage or described a part (Unix nanoseconds), and stalled why its
+	// limits ended it (see limitPlanning).
+	started  time.Time
+	progress atomic.Int64
+	stalled  atomic.Value
+	// describes are the session's descriptions of parts, by their text,
+	// for the statement (see describe), and profile what planning spent.
+	describes *describeCache
+	profile   planProfile
 
 	stages []*Stage
 	// exchanges counts the exchanges planned.
@@ -284,10 +359,14 @@ type planner struct {
 	ins int
 	// inlined are the entries of common table expressions read as their
 	// queries in their one reader's place (inline); inlines counts those
-	// reads, and noInline turns them off.
-	inlined  map[uintptr]bool
-	inlines  int
-	noInline bool
+	// reads, and noInline turns them off. grouped counts the subqueries
+	// planned to group where their tables' buckets are read, and noGrouped
+	// turns that off (see groupsByBucket).
+	inlined   map[uintptr]bool
+	inlines   int
+	noInline  bool
+	grouped   int
+	noGrouped bool
 	// fused numbers the views of stages fusePartitions took out.
 	fused int
 	// reasons say why candidates were not distributed, for logs.
@@ -310,6 +389,9 @@ type planner struct {
 	uncertain []uncertain
 	// relKeys are the keys of the relations exchanges hold, by exchange.
 	relKeys map[*Exchange]string
+	// bucketNotes say where bucketed tables were read by bucket, without
+	// an exchange, or why they were exchanged all the same (see bucket.go).
+	bucketNotes []string
 }
 
 type tableResult struct {
@@ -325,6 +407,7 @@ func newPlanner(ctx context.Context, env Env, p *parser, aggs map[string]bool, o
 // errUnsupported error when no part of it can run distributed.
 func (pl *planner) plan(stmt node) (*Plan, error) {
 	q := clone(stmt).(node)
+	pl.dropOrders(q)
 	pl.markTopK(q)
 	out, err := pl.query(q, true, nil)
 	if err != nil {
@@ -361,6 +444,9 @@ func (pl *planner) plan(stmt node) (*Plan, error) {
 			return nil, unsupported("%v", err)
 		}
 	}
+	if pl.opts.writes {
+		pl.markWrites(out)
+	}
 	pins, err := pl.pinReads(out)
 	if err != nil {
 		return nil, err
@@ -370,7 +456,7 @@ func (pl *planner) plan(stmt node) (*Plan, error) {
 		keys[x.ID] = k
 	}
 	return &Plan{Stages: pl.stages, final: out, pins: pins, local: pl.reasons, uncertain: written(pl.uncertain, pl.stages), relKeys: keys,
-		versions: pl.versions}, nil
+		versions: pl.versions, buckets: slices.Compact(slices.Clone(pl.bucketNotes))}, nil
 }
 
 // pinReads finds the tables the coordinator reads itself, in final, that
@@ -408,7 +494,7 @@ func (pl *planner) pinReads(final node) (map[string]string, error) {
 		if cte {
 			// A common table expression, unless it is named like a table
 			// the jobs read, which the name might mean here instead.
-			t, ok, terr := pl.env.Table(pl.ctx, parts)
+			t, ok, terr := pl.lookupTable(parts)
 			switch {
 			case terr != nil:
 				err = terr
@@ -417,7 +503,9 @@ func (pl *planner) pinReads(final node) (map[string]string, error) {
 			}
 			return err == nil
 		}
+		start := time.Now()
 		view, verr := pl.env.View(pl.ctx, parts)
+		pl.looked(start)
 		if verr != nil {
 			err = verr
 			return false
@@ -438,7 +526,7 @@ func (pl *planner) pinReads(final node) (map[string]string, error) {
 			}
 			return false
 		}
-		t, ok, terr := pl.env.Table(pl.ctx, parts)
+		t, ok, terr := pl.lookupTable(parts)
 		if terr != nil {
 			err = terr
 			return false
@@ -641,6 +729,9 @@ type candidate struct {
 	// tooDeep is a table that must be partitioned but lies in a subquery,
 	// which then becomes a relation.
 	tooDeep *tableUse
+	// noThrough says no table in a subquery is read by bucket: the
+	// candidate's inputs did not all meet by bucket with one that was.
+	noThrough bool
 	// columns are its result columns.
 	columns []Column
 	// ctes are the common table expressions its FROM sees, its own among
@@ -651,21 +742,45 @@ type candidate struct {
 	// columns the relation is to be written by.
 	relation bool
 	want     []string
+	// top says the candidate is the statement itself, whose result the
+	// coordinator sends the client.
+	top bool
+	// window, if set, are the columns that the window functions of a
+	// candidate that does not aggregate all partition their rows by: its
+	// stage reads its inputs by partition, keyed so that each task holds
+	// whole partitions of the windows (see windowColumns).
+	window []itemColumn
 }
 
 // job turns sel into a job if it qualifies and returns the combine step
 // that replaces it, or nil if it does not qualify.
 func (pl *planner) job(sel node, top bool, ctes cteScope) (node, error) {
+	if err := pl.budget(); err != nil {
+		return nil, err
+	}
 	sp := pl.save()
-	inlines := pl.inlines
-	c := &candidate{sel: sel}
+	inlines, grouped := pl.inlines, pl.grouped
+	c := &candidate{sel: sel, top: top}
 	j, b, err := pl.build(c, top, ctes)
+	if pl.ctx.Err() != nil {
+		// Out of time: the statement, not this part, runs on one machine.
+		pl.restore(sp)
+		return nil, pl.budget()
+	}
 	var combine node
 	if err == nil {
 		combine, err = pl.finish(j, b)
 	}
 	if err == nil {
-		pl.uncertain = append(pl.uncertain, uncertainOf(c)...)
+		pl.uncertain = append(pl.uncertain, pl.uncertainOf(c)...)
+	}
+	if err != nil && IsUnsupported(err) && pl.grouped > grouped && !pl.noGrouped {
+		// Its subqueries that group could not be read by bucket: they are
+		// relations.
+		pl.restore(sp)
+		pl.noGrouped = true
+		defer func() { pl.noGrouped = false }()
+		return pl.job(sel, top, ctes)
 	}
 	if err != nil && IsUnsupported(err) && pl.inlines > inlines && !pl.noInline {
 		// Some parts need a common table expression's rows in an exchange:
@@ -691,7 +806,16 @@ func (pl *planner) build(c *candidate, top bool, ctes cteScope) (*job, *jobBuild
 	if err := pl.analyze(c, ctes); err != nil {
 		return nil, nil, err
 	}
+	if err := pl.windowColumns(c); err != nil {
+		return nil, nil, err
+	}
 	if err := pl.chooseInputs(c); err != nil {
+		return nil, nil, err
+	}
+	if err := c.checkWindows(); err != nil {
+		return nil, nil, err
+	}
+	if err := c.checkSamples(); err != nil {
 		return nil, nil, err
 	}
 	var err error
@@ -714,10 +838,15 @@ func (pl *planner) build(c *candidate, top bool, ctes cteScope) (*job, *jobBuild
 	switch {
 	case c.aggregating(pl):
 		b, err = pl.aggregateJob(c)
-	case top:
-		b, err = pl.rowsJob(c)
 	default:
-		err = unsupported("a subquery without aggregation reads %s", c.largest())
+		// The statement, or a subquery or common table expression the
+		// coordinator reads: workers filter, project and compute windows,
+		// and the coordinator reads the rows they keep, where that cuts
+		// them (see rowsJob).
+		b, err = pl.rowsJob(c)
+		if err != nil && !top {
+			err = unsupported("a subquery without aggregation reads %s: %v", c.largest(), strings.TrimPrefix(err.Error(), "cannot distribute: "))
+		}
 	}
 	if err != nil {
 		return nil, nil, err
@@ -784,6 +913,10 @@ type scope struct {
 	// semiConds are the conjuncts of its semi joins' conditions, which hold
 	// for every pair of rows a semi join matches.
 	semiConds []node
+	// outerJoins are its LEFT, RIGHT and FULL joins of one item to another,
+	// whose sides may be read by partition by a key its condition makes
+	// equal (see outer.go).
+	outerJoins []*outerJoin
 	// For the FROM clause of a subquery that passes its rows through: the
 	// subquery's reference, the FROM clause it is in, its item there, and
 	// whether its rows may be divided among workers.
@@ -791,6 +924,9 @@ type scope struct {
 	outer      *scope
 	item       *fromItem
 	splittable bool
+	// outerSide says the subquery is a side of an outer join that may be
+	// read by partition: as a relation, for that (see outer.go).
+	outerSide bool
 }
 
 // fromItem is a table or subquery in a FROM clause.
@@ -820,6 +956,15 @@ type tableUse struct {
 	// semi says it is on the right side of a semi join that keeps the
 	// candidate's rows whole: it may be partitioned by the join's key.
 	semi bool
+	// outer says it is the side of an outer join that supplies NULLs, or a
+	// side of a FULL join: it may be partitioned by the join's key, with
+	// the other side partitioned alike (see outer.go). outerSub says it is
+	// in a subquery that is such a side, which is then a relation.
+	outer, outerSub bool
+	// grouped says it is in a subquery that groups by its bucket column:
+	// read by bucket beside what the subquery joins, or a relation, but
+	// never divided by shares (see groupsByBucket).
+	grouped bool
 }
 
 // hasColumn reports whether some item of sc has a column called name
@@ -914,12 +1059,57 @@ func (pl *planner) analyze(c *candidate, ctes cteScope) error {
 	} else {
 		parts = append(parts, sel["select_list"])
 	}
+	if !c.relation && c.aggregating(pl) {
+		// An aggregation's combine step runs on the coordinator, which
+		// computes there a scalar subquery that stands on its own, over the
+		// combined groups (see aggregation.rewrite).
+		if err := pl.combinedSubqueries([]any{sel["select_list"], sel["having"], sel["qualify"], sel["modifiers"]}, ctes); err != nil {
+			return err
+		}
+		parts = []any{sel["group_expressions"]}
+	}
 	for _, part := range parts {
 		if hasClass(part, "SUBQUERY") {
 			return unsupported("a subquery outside WHERE")
 		}
 	}
 	return checkLambdas(sel)
+}
+
+// combinedSubqueries checks that the subqueries in v, parts of an
+// aggregation the coordinator computes over the combined groups, are scalar
+// subqueries that stand on their own, which bind alone: one that reads the
+// aggregation's columns could not be computed over its groups. The
+// coordinator computes them from scratch, so they may read no more than it
+// reads in the time a statement must take to be worth workers.
+func (pl *planner) combinedSubqueries(v any, ctes cteScope) error {
+	limit := pl.opts.minBytes
+	if limit <= 0 {
+		limit = pl.opts.maxBroadcast
+	}
+	var err error
+	walk(v, func(n node) bool {
+		if err != nil || str(n["class"]) != "SUBQUERY" {
+			return err == nil
+		}
+		if str(n["subquery_type"]) != "SCALAR" {
+			err = unsupported("a subquery outside WHERE")
+			return false
+		}
+		q := subqueryNode(n)
+		if cols, cerr := pl.relationColumns(q, ctes, nil); cerr != nil || len(cols) != 1 {
+			err = unsupported("a scalar subquery outside WHERE that does not stand on its own")
+			return false
+		}
+		switch b, berr := pl.readBytes(q, ctes, 0); {
+		case berr != nil:
+			err = berr
+		case b > limit:
+			err = unsupported("a scalar subquery outside WHERE reads %s, more than the coordinator should read itself", gigabytes(b))
+		}
+		return false
+	})
+	return err
 }
 
 // scalarRelations makes the scalar subqueries in v, a select list computed
@@ -1015,8 +1205,11 @@ func clauses(sel node) []any {
 func (pl *planner) from(ref node, splittable bool, ctes cteScope, sc *scope, rd *reads) error {
 	switch t := str(ref["type"]); t {
 	case "BASE_TABLE":
-		if child(ref, "sample") != nil {
-			return unsupported("TABLESAMPLE")
+		if err := sampleOK(child(ref, "sample")); err != nil {
+			return err
+		}
+		if child(ref, "sample") != nil && len(tableParts(ref)) == 1 && ctes.find(tableParts(ref)[0]) != nil {
+			return unsupported("TABLESAMPLE of a common table expression")
 		}
 		version, pinned := pinnedVersion(ref)
 		if child(ref, "at_clause") != nil && !pinned {
@@ -1045,7 +1238,7 @@ func (pl *planner) from(ref node, splittable bool, ctes cteScope, sc *scope, rd 
 			}
 		}
 		tbl, err := pl.table(parts)
-		if IsUnsupported(err) {
+		if IsUnsupported(err) && child(ref, "sample") == nil {
 			// A view reads as its query, in place of its name.
 			sub, ok, verr := pl.expandView(ref, parts)
 			if verr != nil {
@@ -1082,12 +1275,16 @@ func (pl *planner) from(ref node, splittable bool, ctes cteScope, sc *scope, rd 
 		if err != nil {
 			return err
 		}
+		uses0, rels0 := len(rd.uses), len(rd.rels)
 		if err := pl.from(child(ref, "left"), splittable && left, ctes, sc, rd); err != nil {
 			return err
 		}
 		uses, rels := len(rd.uses), len(rd.rels)
 		if err := pl.from(child(ref, "right"), splittable && right, ctes, sc, rd); err != nil {
 			return err
+		}
+		if splittable {
+			sc.addOuterJoin(ref, rd, [3]int{uses0, uses, len(rd.uses)}, [3]int{rels0, rels, len(rd.rels)})
 		}
 		switch {
 		case str(ref["join_type"]) == "INNER" && str(ref["ref_type"]) != "ASOF":
@@ -1135,6 +1332,16 @@ func (pl *planner) from(ref node, splittable bool, ctes cteScope, sc *scope, rd 
 	case "SUBQUERY":
 		sub := subqueryNode(ref)
 		item := &fromItem{name: strings.ToLower(str(ref["alias"]))}
+		if sample := child(ref, "sample"); sample != nil {
+			// Sampled where its rows are made, only from a divided table's
+			// (see checkSamples).
+			if err := sampleOK(sample); err != nil {
+				return err
+			}
+			if rowQuery(sub) || perTaskQuery(sub) || str(sub["type"]) != "SELECT_NODE" || pl.opaque(sub) != "" || pl.forced[identity(ref)] {
+				return unsupported("TABLESAMPLE of a subquery workers would not divide")
+			}
+		}
 		if rowQuery(sub) {
 			// It reads no table: for each row of the items before it, which a
 			// lateral subquery may read, its rows depend on that row alone,
@@ -1156,6 +1363,9 @@ func (pl *planner) from(ref node, splittable bool, ctes cteScope, sc *scope, rd 
 			sc.items = append(sc.items, item)
 			return pl.filterSubqueries(sub, ctes, rd)
 		}
+		if !pl.forced[identity(ref)] && pl.groupsByBucket(sub, ctes) {
+			return pl.groupedFrom(ref, sub, item, splittable, ctes, sc, rd)
+		}
 		if str(sub["type"]) != "SELECT_NODE" || pl.opaque(sub) != "" || pl.forced[identity(ref)] {
 			// A relation workers compute.
 			return pl.relation(ref, sub, ctes, nil, splittable, sc, rd)
@@ -1176,6 +1386,30 @@ func (pl *planner) from(ref node, splittable bool, ctes cteScope, sc *scope, rd 
 // maxViewDepth bounds views read through other views.
 const maxViewDepth = 16
 
+// maxRelationDepth bounds how deeply relations workers compute nest, each
+// produced for the one that reads it: a report's common table expressions
+// nest a dozen deep at most.
+const maxRelationDepth = 64
+
+// errPlanBudget ends a planner's context once auto mode's limits of
+// planning a statement passed (see limitPlanning).
+var errPlanBudget = errors.New("planning ran past its limits")
+
+// budget fails once the planner's context ended, which auto mode's limits
+// end (see limitPlanning), as do the statement's timeout and a cancel
+// request: the planner checks it as it recurses, besides the calls into
+// the session that read the context.
+func (pl *planner) budget() error {
+	if err := pl.ctx.Err(); err != nil {
+		if errors.Is(context.Cause(pl.ctx), errPlanBudget) {
+			why, _ := pl.stalled.Load().(string)
+			return unsupported("%s", why)
+		}
+		return err
+	}
+	return nil
+}
+
 // expandView returns the subquery a reference to a view reads as: the
 // view's query, every table name in it qualified as DuckDB resolves it in
 // the view's body, aliased as the reference was (or by the view's name),
@@ -1188,7 +1422,9 @@ func (pl *planner) expandView(ref node, parts []string) (node, bool, error) {
 	if child(ref, "sample") != nil || child(ref, "at_clause") != nil {
 		return nil, false, nil
 	}
+	start := time.Now()
 	def, ok, err := pl.env.ViewDefinition(pl.ctx, parts)
+	pl.looked(start)
 	if err != nil || !ok {
 		return nil, false, err
 	}
@@ -1288,11 +1524,7 @@ func (pl *planner) describeFrom(ref node) ([]Column, error) {
 	if err != nil {
 		return nil, unsupported("%v", err)
 	}
-	cols, err := pl.env.Describe(pl.ctx, text)
-	if err != nil {
-		return nil, unsupported("describe: %v", err)
-	}
-	return cols, nil
+	return pl.describeText(text)
 }
 
 // rowFunctions are the table functions whose rows depend on their
@@ -1487,7 +1719,9 @@ func joinSides(ref node) (left, right bool, err error) {
 		return true, false, nil
 	case "RIGHT":
 		return false, true, nil
-	case "OUTER":
+	case "OUTER", "FULL":
+		// Neither side's rows may be divided by shares; both may be read
+		// by partition, by a key the condition makes equal (see outer.go).
 		return false, false, nil
 	default:
 		return false, false, unsupported("%s join", strings.ToLower(jt))
@@ -1717,18 +1951,30 @@ func outputColumns(sel node, sc *scope) []string {
 	return cols
 }
 
+// lookupTable resolves a table name as the session does (see Env.Table),
+// once per planner.
+func (pl *planner) lookupTable(parts []string) (*Table, bool, error) {
+	key := strings.ToLower(strings.Join(parts, "\x00"))
+	if r, ok := pl.tables[key]; ok {
+		return r.t, r.ok, nil
+	}
+	start := time.Now()
+	t, found, err := pl.env.Table(pl.ctx, parts)
+	pl.looked(start)
+	if err != nil {
+		return nil, false, err
+	}
+	pl.tables[key] = tableResult{t: t, ok: found}
+	return t, found, nil
+}
+
 // table resolves a table name to a catalog table that workers can read.
 func (pl *planner) table(parts []string) (*Table, error) {
-	key := strings.ToLower(strings.Join(parts, "\x00"))
-	r, ok := pl.tables[key]
-	if !ok {
-		t, found, err := pl.env.Table(pl.ctx, parts)
-		if err != nil {
-			return nil, err
-		}
-		r = tableResult{t: t, ok: found}
-		pl.tables[key] = r
+	t, found, err := pl.lookupTable(parts)
+	if err != nil {
+		return nil, err
 	}
+	r := tableResult{t: t, ok: found}
 	if !r.ok {
 		return nil, unsupported("%s is not a catalog table", strings.Join(parts, "."))
 	}
@@ -1768,9 +2014,19 @@ func (pl *planner) chooseInputs(c *candidate) error {
 	for _, r := range c.rels {
 		c.wholeBytes += r.bytes
 	}
+	if c.window != nil {
+		// Each task holds whole partitions of the windows: its inputs are
+		// read by partition, keyed by the windows' columns.
+		return pl.chooseKeyed(c)
+	}
 	if c.wholeBytes == 0 || c.wholeBytes <= pl.opts.maxBroadcast {
 		err := pl.chooseSplit(c)
-		if err == nil || c.wholeBytes == 0 || len(c.keyed) > 0 {
+		if err == nil && c.split != nil && len(c.keyed) == 0 {
+			pl.bucketSplit(c)
+		}
+		// A side of an outer join too large to read whole, which shares
+		// cannot divide, may be read by partition (see outer.go).
+		if err == nil || c.wholeBytes == 0 && !c.hasOuter() || len(c.keyed) > 0 {
 			return err
 		}
 	}
@@ -1786,6 +2042,11 @@ func (pl *planner) chooseSplit(c *candidate) error {
 		if largest == nil || u.table.Bytes > largest.table.Bytes {
 			largest = u
 		}
+	}
+	if (c.split == nil || largest.table.Bytes > c.split.table.Bytes) && largest != nil && largest.grouped {
+		// Read by bucket, or the subquery around it is a relation.
+		c.split = nil
+		return pl.chooseKeyed(c)
 	}
 	if c.split == nil {
 		return unsupported("no table whose rows can be divided among workers")
@@ -1842,8 +2103,15 @@ type jobBuild struct {
 	// columns rename the fragment's result columns positionally.
 	columns []string
 	// second, if set, completes an aggregation's groups partition by
-	// partition, before the combine step.
-	second *secondStage
+	// partition, before the combine step; third, if set, completes them
+	// from second's rows, partitioned by group (see aggregation.regroup).
+	second, third *secondStage
+	// merge are the columns the last stage's tasks sort their rows by, for
+	// a statement's result ordered by ORDER BY without LIMIT (see merge.go).
+	merge []mergeKey
+	// enough is the rows of any that its last stage needs (see
+	// Stage.enough), or 0.
+	enough int64
 }
 
 // viewMark is the key that marks a table reference with the view a
@@ -1963,6 +2231,7 @@ func (pl *planner) finish(j *job, b *jobBuild) (node, error) {
 		return nil, err
 	}
 	last.placeholder = fmt.Sprintf("__igloo_partials_%d", last.ID)
+	last.merge, last.enough = b.merge, b.enough
 	b.combine["from_table"] = placeholderRef(last.placeholder)
 	return b.combine, nil
 }
@@ -1984,21 +2253,28 @@ func (pl *planner) emit(j *job, b *jobBuild, out *Exchange) (*Stage, error) {
 	last := &Stage{fragment: b.fragment, Columns: b.columns}
 	for _, k := range j.keyed {
 		var x *Exchange
+		if k.use != nil && k.bucketed {
+			// Read by bucket, as the table's files keep its rows: no stage
+			// and no exchange of its own (see bucket.go).
+			last.Inputs = append(last.Inputs, Input{View: k.view, Table: k.use.table, Bucketed: true, Bucket: k.bucket})
+			continue
+		}
 		if k.use != nil {
 			// A stage per partitioned table, writing its rows to an exchange
 			// keyed by its side of the join key.
 			x = pl.exchange("join", k.keys, k.casts)
+			x.Buckets = k.into
 			pl.stage(&Stage{fragment: k.stage, Inputs: []Input{{View: k.view, Table: k.use.table, Split: true}}, Out: x})
 		} else {
 			var err error
-			if x, err = pl.relationExchange(k.rel, k.keys, k.casts); err != nil {
+			if x, err = pl.relationExchange(k.rel, k.keys, k.casts, k.into); err != nil {
 				return nil, err
 			}
 		}
 		last.Inputs = append(last.Inputs, Input{View: k.view, Exchange: x, Partitioned: true})
 	}
 	for _, w := range j.whole {
-		x, err := pl.relationExchange(w.rel, nil, nil)
+		x, err := pl.relationExchange(w.rel, nil, nil, 0)
 		if err != nil {
 			return nil, err
 		}
@@ -2008,12 +2284,15 @@ func (pl *planner) emit(j *job, b *jobBuild, out *Exchange) (*Stage, error) {
 		last.Inputs = append(last.Inputs, Input{View: v.name, Table: v.table, Split: v.name == j.splitView})
 	}
 	pl.stage(last)
-	if b.second != nil {
+	for _, next := range []*secondStage{b.second, b.third} {
+		if next == nil {
+			continue
+		}
 		// The partial results go to an exchange, which a second stage reads
 		// partition by partition (or, with no groups, whole).
-		last.Out = pl.exchange("aggregate", b.second.keys, make([]string, len(b.second.keys)))
-		last = pl.stage(&Stage{fragment: b.second.fragment, Columns: b.second.columns,
-			Inputs: []Input{{View: partialsView, Exchange: last.Out, Partitioned: !b.second.whole}}})
+		last.Out = pl.exchange("aggregate", next.keys, make([]string, len(next.keys)))
+		last = pl.stage(&Stage{fragment: next.fragment, Columns: next.columns, completes: true,
+			Inputs: []Input{{View: partialsView, Exchange: last.Out, Partitioned: !next.whole}}})
 	}
 	last.Out = out
 	return last, nil
@@ -2326,7 +2605,7 @@ func passesKey(s *Stage, x *Exchange) bool {
 		keyed = in
 		ix := in.Exchange
 		if len(ix.Keys) != len(x.Keys) || len(ix.Casts) != len(ix.Keys) || !strings.EqualFold(ix.Keys[i], parts[len(parts)-1]) ||
-			ix.Casts[i] != "" || x.Casts[i] != "" {
+			ix.Casts[i] != "" || x.Casts[i] != "" || ix.Buckets != x.Buckets {
 			return false
 		}
 	}
@@ -2383,6 +2662,7 @@ func isView(n node, name string) bool {
 func (pl *planner) stage(s *Stage) *Stage {
 	s.ID = len(pl.stages)
 	pl.stages = append(pl.stages, s)
+	pl.progressed()
 	return s
 }
 
@@ -2492,7 +2772,7 @@ func (pl *planner) checkTimeColumns(stmt node) error {
 			if len(parts) == 1 && slices.Contains(ctes, strings.ToLower(parts[0])) {
 				return false
 			}
-			t, ok, terr := pl.env.Table(pl.ctx, parts)
+			t, ok, terr := pl.lookupTable(parts)
 			switch {
 			case terr != nil:
 				err = terr
@@ -2557,7 +2837,9 @@ func (pl *planner) checkFunctions(fragment node) error {
 				err = unsupported("rb_count_distinct(id, key), which has no partials")
 				return false
 			}
+			start := time.Now()
 			user, uerr := pl.env.UserFunction(pl.ctx, name)
+			pl.looked(start)
 			switch {
 			case uerr != nil:
 				err = uerr

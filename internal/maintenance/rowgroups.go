@@ -48,7 +48,8 @@ func (m *Maintainer) sizeRowGroups(ctx context.Context, tbl *table.Table, log *s
 		return err
 	}
 	width := rowWidth(tbl.Schema().Fields())
-	limit := max(m.memory()/int64(max(m.opts.Threads, 1))/max(width, 1), filerewrite.DefaultRowGroupRows)
+	writers := max(int64(m.opts.Threads), openPartitions(tbl.Metadata().PartitionSpec()), 1)
+	limit := max(m.memory()/writers/max(width, 1), filerewrite.DefaultRowGroupRows)
 	rows := min(filerewrite.TargetRows(size, records), limit)
 	// The bytes a row drift with every insert; a size within 15% of the
 	// one in force is not worth a commit, unless that one no longer fits
@@ -70,6 +71,29 @@ func (m *Maintainer) sizeRowGroups(ctx context.Context, tbl *table.Table, log *s
 	}
 	log.Info("sized the row groups inserts write", "rows", rows, "bytes_a_row", size/records, "row_width", width)
 	return nil
+}
+
+// openPartitionFiles is how many files of a partitioned write DuckDB keeps
+// open (engine.OpenPartitionFiles).
+const openPartitionFiles = 1024
+
+// openPartitions is how many partitions' files an insert into a table of
+// spec holds open at once, each with a row group: the product of its
+// buckets, or as many as DuckDB keeps open for other transforms, whose
+// values are many; 1 for a table that is not partitioned.
+func openPartitions(spec iceberg.PartitionSpec) int64 {
+	n := int64(1)
+	for _, f := range spec.Fields() {
+		b, ok := f.Transform.(iceberg.BucketTransform)
+		if !ok {
+			return openPartitionFiles
+		}
+		n *= int64(max(b.NumBuckets, 1))
+		if n >= openPartitionFiles {
+			return openPartitionFiles
+		}
+	}
+	return n
 }
 
 // tableBytes returns the compressed bytes and the rows of tbl's data

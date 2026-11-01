@@ -51,7 +51,10 @@ with `SET` apply to their own session only.
   [access tokens](sso.md#access-tokens)).
 - Role changes, disabled and dropped users and revoked tokens reach open
   connections within 30 seconds; on the replica that made the change,
-  immediately.
+  immediately. A replica that cannot read the metadata database goes on
+  with the users, grants, policies and ID domains' members it read last
+  for up to `IGLOO_ACCESS_MAX_STALENESS` (2 minutes), then refuses its
+  sessions' statements with SQLSTATE `58000` until it can read them again.
 - After 10 failed logins for a user, or 50 from an address, within 15
   minutes, further logins for it are refused for a while
   ([details](sso.md#failed-logins)).
@@ -112,7 +115,8 @@ tags](security-policies.md) describes them.
   metadata database (schema `igloo_policy`); without one, in each replica's
   memory, lost on restart.
 - Changes apply at once on the replica that made them and within 30 seconds
-  on the others.
+  on the others; a replica that cannot read them refuses statements after
+  `IGLOO_ACCESS_MAX_STALENESS`, as for role changes.
 - Policies and tags stay with a table's name when the table is dropped, and
   renaming a table or column they protect or tag is refused: unset them
   first.
@@ -232,10 +236,21 @@ statements, `CREATE SECRET` and credential settings are replaced by `'***'`.
 Each Igloo replica is a complete query engine. A query runs on one replica,
 using all of its cores.
 
-- **Memory** is what matters most. DuckDB uses up to 80% of the memory it
-  sees, or `IGLOO_DUCKDB_MEMORY_LIMIT`. Under Kubernetes, set the limit to
-  about 80% of the container's memory limit (the Helm chart does this) so the
-  kernel does not kill the process. The rest of Igloo (the SQL endpoints,
+- **Memory** is what matters most. DuckDB uses up to
+  `IGLOO_DUCKDB_MEMORY_LIMIT`, by default what the container's memory limit,
+  or else the machine's memory, leaves after an eighth of it (at least
+  512 MiB), which Igloo keeps free before it lowers DuckDB's limit (below),
+  and a reserve of a twentieth (at least 256 MiB), less an eighth of the
+  limit itself, for what DuckDB holds beyond it as it spills; at least half
+  of the memory. That is about 73%: 45.2 GiB of 61.6. DuckDB's own default,
+  80%, left too little: finishing a `count(DISTINCT)` it had spilled, DuckDB
+  held 0.07 to 0.12 GiB a thread beyond its limit, 1.2 to 3 GiB at 24
+  threads, and at 24 threads on a replica of 61.6 GiB, with the metadata
+  database and the catalog beside it, a `count(DISTINCT)` of a billion IDs
+  into a table took 5 GiB more within a second, and Igloo canceled it to
+  keep the kernel from killing the process. Under Kubernetes the Helm chart
+  sets the same limit from the container's memory limit, so the kernel does
+  not kill the process. The rest of Igloo (the SQL endpoints,
   the catalog proxy, [table maintenance](#compaction-memory)) runs in the
   same process, in Go. Igloo limits Go's memory to what the container's
   memory limit, or else the machine's memory, leaves after DuckDB's limit
@@ -291,6 +306,11 @@ using all of its cores.
   `memory is nearly gone with no statement running` with the session,
   user and statement hash of the statement it canceled last. A statement
   that stops when canceled, and lets DuckDB stop, never leads to either.
+- **Memory that comes back.** Igloo fixes glibc's `mmap` threshold at 128 KiB,
+  so that DuckDB's buffers go back to the system when freed, rather than stay
+  in the allocator's arenas: after a sort that returned its rows, a process
+  kept 0.5 GiB where it had kept 3.4 GiB, with the same CPU seconds over TPC-H.
+  `GLIBC_TUNABLES=glibc.malloc.mmap_threshold=...` sets another.
 - **Spill disk.** Queries that need more memory than the limit write
   temporary files to `IGLOO_DUCKDB_TEMP_DIR`. Give it fast local disk, local
   NVMe where the machine has it ([spill on local NVMe](#spill-on-local-nvme)),
@@ -312,7 +332,8 @@ using all of its cores.
   matter more than such aggregates, set `IGLOO_DUCKDB_THREADS`.
 - **Cache disk.** The [read cache](#read-cache) keeps table files on local
   disk. Size the disk so your frequently read tables fit in half of its free
-  space, or set `IGLOO_CACHE_SIZE`.
+  space; `IGLOO_CACHE_SIZE` can cap the cache lower, or raise the 100 GiB
+  cap, but the cache never takes more than that half.
 
 A memory-optimized machine with 4 to 8 cores and 32 to 64 GB handles most
 datasets up to a few hundred GB of compressed Parquet comfortably. To size
@@ -330,8 +351,9 @@ log says
 with how many files and `bytes_freed`. Igloo deletes only the files DuckDB
 spills to, named `duckdb_temp_storage_*` and `duckdb_temp_block-*`, at the
 top of the directory, and the directories `igloo-sorted-write-*` where a
-[write of rows in order](sql.md#writing-rows-in-order) keeps them until it
-has written them, and leaves everything else.
+[write of rows in order](sql.md#writing-rows-in-order) or a
+[read of them](#reads-in-order-larger-than-memory) keeps them until it has
+finished with them, and leaves everything else.
 
 Give each Igloo process (each replica, compute pool and worker) a spill
 directory of its own, as the single-machine stack and the Helm chart do.
@@ -375,6 +397,36 @@ for the container images too: each process spills up to
 `IGLOO_DUCKDB_MAX_TEMP_SIZE` (in the chart, 90% of
 `duckdb.spillVolume.sizeLimit`), and a query that would need more fails
 with an error instead of filling the disk.
+
+### Reads in order larger than memory
+
+DuckDB's sort of more than its memory limit holds goes past the limit as it
+starts to return rows, by up to 40% on many threads, which on a machine with
+little to spare is the memory watch's to cancel. A `SELECT ... ORDER BY`
+whose plan estimates it takes more than half of the memory limit, and which
+reads all of its rows, sorts in runs on one machine, as workers do on
+several:
+
+1. One run of the query, without its `ORDER BY`, writes its rows to
+   uncompressed Parquet files in the spill directory, small enough to sort
+   well within memory.
+2. Each file is sorted, one at a time, into a run of its own.
+3. The runs are merged as the client reads them, so the first row comes as
+   the last run is sorted, not after the whole result has been sorted.
+
+On 72 million rows under a memory limit of 9.7 GiB on 16 threads, the process
+peaked at 3.5 GiB, where the same read sorted at once peaked at 10.6 to 13.9
+GiB, in the same time (103 seconds, 102 to 117 at once), and the first row
+came after 6 seconds. The files and runs take what the spill directory takes
+for such a sort; a read whose estimate passes `IGLOO_SORT_SPILL_BUDGET` sorts
+at once and is stopped as before. `igloo_large_sorts_total` counts these reads.
+
+Only an `ORDER BY` of the result's columns, by name, alias or position, of
+types the merge compares as DuckDB orders them (numbers, text without a
+collation, binary, dates and times, booleans), without `LIMIT` or `GROUP BY`,
+sorts this way. A statement with parameters, or one whose client reads a few rows
+at a time through a portal, sorts at once. So does any read if a step before
+its first row fails, with a warning in the log.
 
 ### When one machine is not enough
 
@@ -443,12 +495,42 @@ queries for them beyond their bind. So a `dbt` run swapping tables and a BI
 tool browsing schemas take turns with each other and with other sessions'
 statement preparation, for a moment each, while long reads and writes run
 alongside them undisturbed. `CREATE [OR REPLACE] TABLE ... AS` of a catalog
-table runs in steps for that reason: it creates the new table, empty, under
-a temporary name, fills it with an `INSERT`, which holds nothing, and renames
+table, `PARTITIONED BY (...)` before `AS` included, runs in steps for that
+reason: it creates the new table, empty, under a temporary name (with its
+partitioning), fills it with an `INSERT`, which holds nothing, and renames
 it into place, so only the create and the rename take the catalog, and the
-table appears under its name once it is complete. Other DDL holds the catalog
-for its whole run, and so does `CREATE TABLE ... AS` inside a transaction
-block or with parameters.
+table appears under its name once it is complete; inside a transaction
+block it runs so too, outside the block. `CREATE [OR REPLACE] TEMP TABLE ...
+AS`, as dbt makes one for each incremental model, runs in the same steps.
+`EXECUTE` of a query or a change of rows prepared in SQL holds what the
+statement would, nothing past its bind, and a materialized view's or a
+dynamic table's refresh takes the catalog only to plan and to change it.
+Other DDL holds the catalog for its whole run, as do `COPY INTO` and
+`CREATE TABLE ... AS` with parameters.
+
+An Igloo stopped in the middle of `CREATE TABLE ... AS` leaves its half-filled
+table under a temporary name (`name__igloo_new_...`), and one stopped in the
+middle of a create that DuckDB ran as one statement leaves a staged create,
+which Lakekeeper keeps holding the name, unseen: no table of the name can
+be read or dropped, yet no table can be renamed onto it. Igloo notes each
+table it is making in its schema's properties (`igloo.pending.*`) and
+forgets the note once the table is made, so a note left behind by a
+stopped process (an earlier one of the same host, or any process a day
+ago) proves what is under its name is Igloo's own: the next `CREATE TABLE
+... AS` of the name, or `DROP TABLE IF EXISTS` of it, clears it. Before it
+fills anything, `CREATE TABLE ... AS` checks that nothing else holds the
+name unseen, briefly putting an empty table under it when it is free, and
+fails at once if something does; an admin's `DROP TABLE name`, without `IF
+EXISTS`, releases such a hold, whoever left it.
+
+A full refresh of a materialized view or dynamic table writes the view's
+rows into a directory of their own under its table's data
+(`igloo-refresh-...`, or `igloo-write-...` where [workers write them](distributed-execution.md#workers-writing-tables)), noted the same way, and commits them in place of the
+table's files. One that fails or is canceled deletes its files; one an
+Igloo stopped before the commit leaves them, in no snapshot, and the view's
+next refresh deletes them, as does an erasure request's replacement of the
+view, which does not complete while such a note from before it remains.
+Files a snapshot holds stay, for snapshot expiry to delete.
 
 The turns cost throughput of short queries on a busy replica. On a shared
 18-core test machine, against the same build without them, 8 to 64 sessions
@@ -495,9 +577,12 @@ memory, in front of the disk cache.
   `read_parquet('s3://...')`, also record the object's ETag and are used only
   while it matches, so a file overwritten in place is fetched again.
   Directory listings and file sizes are never cached.
-- **Size.** Unless `IGLOO_CACHE_SIZE` says otherwise, the cache takes at most
-  half of the disk space that other files leave free, and at most 100 GiB.
-  It never fills the disk past 95%. Igloo remeasures every 5 minutes, so the
+- **Size.** The cache takes at most half of the disk space that other files
+  leave free, and at most 100 GiB, or `IGLOO_CACHE_SIZE`, which can lower or
+  raise that cap but never the half: a cache on a small disk it shares
+  cannot fill it. On a volume of its own (`IGLOO_CACHE_DEDICATED=true`, as
+  the Helm chart sets for an ephemeral volume or a claim), it fills to
+  `IGLOO_CACHE_SIZE` instead. It never fills the disk past 95%. Igloo remeasures every 5 minutes, so the
   cache gives way when other files (spill files, logs, a local object store)
   grow: it stops adding blocks, and drops the least recently used block each
   time a read misses. If less than 5% of the disk would be free even without
@@ -508,12 +593,18 @@ memory, in front of the disk cache.
   which survives restarts, `docker compose down` and machine stops. On
   Kubernetes, mount a volume there, and a small writable `/tmp` if the root
   filesystem is read-only (the extension that implements the cache needs
-  one). A PersistentVolumeClaim keeps the cache across pod restarts and
-  scaling to zero; any other volume is lost with the pod. Igloo sizes the
+  one); the Helm chart does both (`cacheVolume`, an `emptyDir` by default,
+  or an ephemeral volume or a claim). A PersistentVolumeClaim keeps the
+  cache across pod restarts and scaling to zero; any other volume is lost
+  with the pod, and then set `IGLOO_CACHE_EPHEMERAL=true`, as the chart
+  does, so erasure requests count it gone with the pod. Igloo sizes the
   cache from the free space of the filesystem it is on, which an `emptyDir`
   shares with the node: with an `emptyDir`, set `IGLOO_CACHE_SIZE` below its
-  `sizeLimit`. Instance-store (local NVMe) disks are fast, but empty when
-  the machine stops.
+  `sizeLimit`, as the chart does. On a volume of its own, set
+  `IGLOO_CACHE_DEDICATED=true` and `IGLOO_CACHE_SIZE` below the volume's
+  size. Instance-store (local NVMe) disks are fast, but empty when
+  the machine stops. A file share, such as EFS, Filestore or Azure Files,
+  keeps no extended attributes, so the cache cannot use it.
 - **Watching it.** `igloo_cache_size_bytes` and `igloo_cache_limit_bytes`
   ([metrics](#monitoring)) show its size and how large it may grow. The log
   says `read cache on` at startup, or why it is off. An admin can count an
@@ -552,28 +643,59 @@ not writable, Igloo logs a warning and runs without it.
 Reading object storage cold waits on requests, not on cores: each DuckDB
 thread reads a row group's column chunks a request round after another, so
 how fast a cold scan reads follows the threads, which Igloo caps by memory
-(see [sizing](#sizing)). With `IGLOO_PREFETCH=true`, Igloo reads ahead, into
-the read cache, the blocks of the data files a statement's scans are about
-to read, with `IGLOO_PREFETCH_CONCURRENCY` (256) requests in flight for all
-statements together, which take them in turn; DuckDB then reads the blocks
-from local disk. Against an object store with S3's latency, a cold scan on
-12 threads with prefetch ran 1.9 times as fast as on 32 threads without.
+(see [sizing](#sizing)). Igloo therefore reads ahead, into the read cache,
+the blocks of the data files a statement's scans are about to read, with
+`IGLOO_PREFETCH_CONCURRENCY` (256) requests in flight for all statements
+together, which take them in turn; DuckDB then reads the blocks from local
+disk. `IGLOO_PREFETCH=false` turns it off. Against an object store
+answering in 20 ms at 90 MB/s a connection, as S3 does, a cold scan of
+three columns of a 4 GB table took 2.4 s rather than 11.3 s on 16 cores,
+and 2.4 s rather than 6.6 s on three workers sharing them, fetching 1 to 3%
+more than DuckDB alone.
 
 - It reads each file's footer, then the blocks of the columns the statement
   reads (none for a scan that reads no column, as `COUNT(*)`'s), in the
   order the scan reads the files, and keeps at most a quarter
   of the cache's room for blocks DuckDB has not read yet, so they do not
-  evict each other or other statements' blocks first.
-- It tells the blocks DuckDB read by their access times. On a filesystem
-  mounted `noatime`, which keeps access times still, it tells them by the
-  kernel's events of opens of their files (inotify, on Linux), and the log
-  says so at startup. Where neither works, it cannot tell, and says so with
-  a warning: each statement then reads ahead at most 256 MiB in all, and
+  evict each other or other statements' blocks first. The room is what
+  the cache may still take as of its last measurement, and at most what
+  the disk has free now beyond the free space the cache's extension keeps,
+  which other files on the disk, such as spill files and a worker's
+  exchanges, take too. With no room, where the extension evicts a block on
+  each miss, it reads nothing ahead, not even footers, until there is.
+  It reads ahead only files whose objects have an ETag, which the
+  extension checks a block against.
+- A read of the cache that races another over a block (the extension
+  deletes a block it takes for stale or evicts by checking that the file
+  exists, then removing it) fails DuckDB's read of it with an I/O error
+  over the block's file. The statement runs again, up to three times,
+  before it has sent a row, and a worker's task runs again likewise: the
+  block is a copy of a range of a data file in object storage.
+- A scan the statement filters, by a `WHERE` clause or by a semi join or
+  an inner join to a relation such as an audience (whose keys DuckDB skips
+  row groups by), reads ahead in full only the files whose footers show
+  that no filter on those columns could skip a row group: every row group
+  holds values from across the file's range of each filtered column, the
+  file's range is not narrow within those of the scan's other files, and
+  no filtered column has a Bloom filter. Of other files it reads ahead the
+  footer alone, which DuckDB reads first, and once the files themselves
+  divide a filtered column's values, nothing further. In the lab above, a
+  scan of the last tenth of a date-ordered table fetched 1% more with
+  prefetch rather than 58% more, and a join of the table to an audience of
+  random devices took 2.6 s rather than 8.8.
+- It tells the blocks DuckDB read by their access times: it writes a block
+  an hour behind its modification time, and a read moves it on (cache_httpfs
+  sets both to the time it reads a block). On a filesystem mounted
+  `noatime`, which keeps access times still, it tells them by the kernel's
+  events of opens of their files (inotify, on Linux), and the log says so
+  at startup. Where neither works, it cannot tell, and says so with a
+  warning: each statement then reads ahead at most 256 MiB in all, and
   never more than its share of the cache's free room, so reading ahead
   evicts nothing; with a full cache it reads nothing ahead.
 - A block it has not fetched yet, or fails to, DuckDB fetches itself:
   prefetch only ever costs requests. Overfetch, blocks it read that the
-  scans did not, shows in `igloo_prefetch_unread_bytes_total`.
+  scans did not, shows in `igloo_prefetch_unread_bytes_total`, next to
+  `igloo_prefetch_bytes_total`.
 - It reads ahead for queries and for the queries of `CREATE TABLE ... AS`
   and `INSERT ... SELECT` that read catalog tables, other than tables that
   policies or a clean room protect, when the statement runs on the replica:
@@ -581,15 +703,13 @@ from local disk. Against an object store with S3's latency, a cold scan on
   each task's table files, as their own `IGLOO_PREFETCH` says, and the
   replica reads nothing ahead; exchanges' files, which the read cache
   leaves out, are not read ahead. The scans are those distributed
-  execution would plan; until filters prune their file lists, a scan of a
-  table the statement filters, or a task's of a table its part filters,
-  reads ahead at most 256 MiB, as does one of a table semi-joined, or
-  inner-joined to a relation such as an audience, whose keys DuckDB skips
-  row groups by. A session turns it off
-  for itself with `SET igloo_prefetch = off` (`RESET`, `SHOW igloo_prefetch`).
+  execution would plan. A session turns it off for itself with
+  `SET igloo_prefetch = off` (`RESET`, `SHOW igloo_prefetch`).
 - It needs the read cache, on a filesystem with extended attributes; it
   writes blocks as the cache's extension does. At startup the log says
-  `prefetch on`, or why it is off.
+  `prefetch on`, or why it is off. The Helm chart gives its igloo pods and
+  its workers a cache volume (`cacheVolume`, `workers.cacheVolume`), so
+  both read ahead.
 
 ## Result cache
 
@@ -597,11 +717,26 @@ A dashboard that several people open at once, or that asks the same
 question in several of its charts, sends the same query again and again
 over data that has not changed. Igloo keeps the result of such a query in
 memory and sends it again, without running the query, to the next
-statement that is the same text with the same parameters, from the same
-user with the same roles and settings, as long as no table has changed
-since. A statement that arrives while the same one is running waits for
-that run's result instead of running too. Snowflake does the same
-(`USE_CACHED_RESULT`).
+statement that is the same query with the same parameters and settings,
+as long as none of the tables it reads has changed since. A statement
+that arrives while the same one is running waits for that run's result
+instead of running too. Snowflake does the same (`USE_CACHED_RESULT`).
+Three users opening a five-chart dashboard three times, with a BI tool's
+run ID in each query's comment and a pipe loading a raw table between
+openings, had 36 of 45 chart queries answered from the cache, where
+keeping results by exact text and user, until any table changed, had
+none.
+
+- **The same query.** Statements are compared as written but for their
+  comments and spacing, which BI tools vary from one run to the next
+  (Looker's context comment, Metabase's header); string literals and
+  quoted names count as written, since `x = '5'`, `x = 5` and a parameter
+  of 5 can give different rows. A statement that no
+  [policy](security-policies.md) changes gives every user who may run it
+  the same rows, so its result is shared between users, once each
+  user's own statement has been checked against their grants. A
+  statement a row access or masking policy changes keeps its result to
+  its user and roles.
 
 - **What is kept.** Results of queries that read tables of the catalog,
   through views or not, and nothing else: not DuckDB's own tables,
@@ -616,11 +751,18 @@ that run's result instead of running too. Snowflake does the same
 - **Always current.** DuckDB loads every table a statement reads when it
   prepares the statement, through Igloo's [catalog
   proxy](#writes-when-the-catalog-fails), which sees each table's metadata
-  location, and each change Igloo makes. Once a table may have changed,
-  through this replica, another replica or another engine, no result kept
-  before is used again, and a result is kept only if no table changed
-  while its statement ran. A change to the catalog's views or to policies
-  makes the results kept before unused too.
+  location, and each change Igloo makes, with the tables it changes. Once
+  a table may have changed, through this replica, another replica or
+  another engine, no result of a statement that reads it kept before is
+  used again, and a result is kept only if none of its tables changed
+  while its statement ran; results of statements that read other tables
+  stay, through ELT that makes, replaces, renames or drops other tables,
+  makes schemas or refreshes materialized views: a dashboard over tables
+  ELT did not write kept 933 of 943 charts in the cache while ELT ran
+  alongside. A change the proxy cannot tell the tables of, to the
+  catalog's views, macros or connections, or to policies makes every
+  result kept before unused, and so does any DDL for the results it
+  answers before preparing a statement.
 - **Size.** Results take at most `IGLOO_RESULT_CACHE_SIZE` of memory, 256
   MiB unless set, each at most a sixteenth of it; the least recently used
   go first. `0` turns the cache off.
@@ -632,7 +774,7 @@ that run's result instead of running too. Snowflake does the same
   [concurrency on a replica](#concurrency-on-a-replica)), other statements
   one at a time. An admin's query whose result the cache kept, with no parameters, no
   policy that applies to it and nothing read from a connection, is also
-  known by its text: the next one of the same text, user, roles, dialect
+  known by its text: the next one of the same text (but for comments and spacing), user, roles, dialect
   and settings, with the catalog's tables, views and policies as they
   were, is answered without being prepared. The tables it read are loaded
   from the catalog again first, all at once and holding no lock, so a
@@ -641,6 +783,9 @@ that run's result instead of running too. Snowflake does the same
 - **In the history.** A statement answered from the cache is recorded with
   0 for `cpu_time_ms`, `bytes_read` and `memory_allocated_bytes`;
   `igloo_result_cache_total` counts them.
+- **Erasure.** An [erasure request](privacy.md) that deleted rows has
+  every replica empty its result cache, with its read cache; a statement
+  that began before keeps nothing.
 
 ## Connections to other databases
 
@@ -704,7 +849,10 @@ once whatever the catalog answers:
   are kept either way, so the table is never left referencing a missing
   file. If the write did not land, the [orphan
   cleanup](#table-maintenance) deletes them after three days, as it does
-  the files of statements that fail or roll back before they commit.
+  the files of statements that fail or roll back before they commit. A
+  `COPY INTO` or pipe that fails this way marks the files it was loading
+  `unknown` in the [load history](loading.md#loading-each-file-once), so
+  that it does not load them again.
 
 The log (component `catalog-proxy`) records each commit sent again and each
 outcome confirmed after an error. Catalogs that ignore `Idempotency-Key`
@@ -753,9 +901,19 @@ whose replicas share them and stop them once idle; each pool has its own.
   in psql, `Statement.cancel()` in JDBC, context cancellation in Go). The
   request, the statement timeout and the memory watch end a statement while
   it is still prepared too, which for a report whose CTEs become report API
-  calls can take seconds; it then does not run.
+  calls can take seconds; it then does not run. A canceled statement stops
+  when DuckDB next checks for an interruption, which some of its steps do
+  only once they end: a statement still running 30 seconds after its
+  cancel request or its timeout has its client's connection closed, so
+  that the client is not held, and the server logs `a statement canceled
+  or past its timeout has not stopped`, with DuckDB's progress. Its session
+  ends once DuckDB stops it.
 - `IGLOO_MAX_CONNECTIONS` caps sessions per replica; further logins fail with
-  SQLSTATE `53300`.
+  SQLSTATE `53300`. Connections that have not signed in yet are limited too:
+  as many may be signing in at once (at least 100), half of them from one
+  public client address (not from a loopback or private one, which a
+  gateway, pooler or load balancer gives all its clients), and each has `IGLOO_LOGIN_TIMEOUT` (30 seconds) to sign in
+  before it is closed.
 
 ## TLS
 
@@ -808,6 +966,7 @@ Igloo's metrics, besides the standard Go and process metrics:
 | `igloo_memory_exits_total` | | Times Igloo exited because a statement it canceled for running out of memory did not stop, or DuckDB went on with its work after it did, and memory was nearly gone (see [sizing](#sizing)) |
 | `igloo_snowflake_implicit_conversions_total` | | Statements in [Snowflake's dialect](snowflake-sql.md#implicit-conversions) that DuckDB could bind only with Snowflake's implicit conversions, which Igloo then made |
 | `igloo_sorted_writes_total` | | Writes of rows in order too large to sort at once within `IGLOO_SORT_SPILL_BUDGET`, which Igloo sorted [a range of the order at a time](sql.md#writing-rows-in-order) |
+| `igloo_large_sorts_total` | | [Reads in order larger than memory](#reads-in-order-larger-than-memory) that Igloo sorted in runs and merged |
 | `igloo_aggregate_passes_total` | | Tables `CREATE TABLE ... AS` filled in passes over its aggregate's groups, which would not have fit in memory in one ([aggregates too large for memory](sql.md#aggregates-too-large-for-memory)) |
 | `igloo_result_cache_total` | `outcome` = `hit`, `joined`, `missed`, `kept`, `unprepared` | Queries the [result cache](#result-cache) answered, answered with the result of the same query another session was running, or could not answer, and results it kept; `unprepared` counts the hits and joins answered before preparing the statement |
 | `igloo_result_cache_bytes` | | Memory the result cache's results take, as Igloo estimates it |
@@ -924,8 +1083,19 @@ snapshots they point at, are kept whatever the retentions, as long as the
 ref's or the table's `max-ref-age-ms` says, forever by default.
 
 Maintenance commits are ordinary Iceberg commits. A query that is running
-keeps reading the snapshot it started with; a write that commits at the same
-moment as compaction wins, and compaction tries again on the next pass. With
+keeps reading the snapshot it started with. A write commits only on top of
+the snapshots it read, so users' writes always win: maintenance leaves the
+files of a table alone while a write that reads or writes it runs, or while
+a transaction block (`BEGIN` ... `COMMIT`, as dbt's incremental models run)
+that has read or written it is open, unless the block has sat idle for 15
+minutes. A block that has listed the catalog (`information_schema`,
+`pg_catalog`, `SHOW`), as dbt does before each `MERGE`, holds back every
+table, since a listing takes the tables it lists into the block without
+saying which. It checks again just before it commits a rewrite, with sessions
+held off the table for that moment, and gives up the rewrite until the next
+pass if one uses it. It sees only its own replica's sessions: a write
+through another replica that loses to compaction is run again if it runs on
+its own, and fails with SQLSTATE `40001` in a block. With
 several replicas, only one maintains tables at a time; they coordinate through
 a lock in the metadata database, where they also record when passes ran. A
 replica that has just started, for example after [scaling to
@@ -1177,7 +1347,12 @@ replica without a metadata database, or a database restored from a
 backup, has the record back before anything is deleted. Deleting a table's
 files then takes a lock that cloning the table takes too (in the metadata
 database, so replicas share it), and reads the metadata of each of its
-clones. Whenever Igloo cannot tell what a clone needs (the metadata
+clones. The database releases the lock if the connection holding it
+drops: a clone that lost it before its shares were recorded fails, and is
+made again by running the statement again, and maintenance, or the
+deletion of the files of a table a clone replaced, checks that it still
+holds the lock before each thousand files it deletes, and keeps the rest
+once it does not; a later pass deletes them. Whenever Igloo cannot tell what a clone needs (the metadata
 database does not answer, a clone was renamed or dropped during the pass,
 or was made less than an hour ago), it keeps the table's files; a later
 pass deletes them.
@@ -1216,22 +1391,25 @@ clone's snapshots list, under each location.
 
 ## Scheduled work
 
-Tasks, pipes, materialized views ([loading and scheduling](loading.md)) and
-[alerts](alerts.md) run inside Igloo; nothing else needs scheduling. To
+Tasks, pipes, materialized views, dynamic tables ([loading and
+scheduling](loading.md)) and [alerts](alerts.md) run inside Igloo; nothing
+else needs scheduling. To
 hear of failed runs and loads without watching for them, switch on the
 [built-in alerts](alerts.md#built-in-operational-alerts). How they run:
 
 - Every replica runs a scheduler, which looks for due work every few
   seconds. Each due run is claimed by one replica through the metadata
-  database, and a session-level lock there keeps a job from running twice
-  at once on any replica; a run that comes due while the last one still
-  runs is recorded as `skipped`. Postgres releases the lock of a replica
-  that dies, and the next run marks the dead one's run `failed`.
+  database, and a session-level lock there, with a lease the run renews,
+  keeps a job from running twice at once on any replica (see
+  [Loading](loading.md#tasks)); a run that comes due while the last one
+  still runs is recorded as `skipped`. A replica that dies holds its jobs
+  up until their leases expire, within 30 seconds, and the next run marks
+  the dead one's run `failed`.
 - A replica runs at most four scheduled runs at once; further due work
   waits for a free slot or another replica. Each run is a session of its
   owner, which counts against `IGLOO_MAX_CONNECTIONS` while it lasts and
   shows on the console's compute page as `task <name>`, `pipe <name>`,
-  `materialized view <name>` or `alert <name>`.
+  `materialized view <name>`, `dynamic table <name>` or `alert <name>`.
 - Runs and loads count as running work on `/activity`, so a scale-to-zero
   gateway does not stop Igloo during one. On shutdown, Igloo starts no new
   runs; those under way get the 30 seconds running queries get, then are
@@ -1285,6 +1463,7 @@ and the catalog runs its database migrations before it serves. Read
 | SQLSTATE `42501`, `ST_Read goes through GDAL` | GDAL-based readers and writers are refused; load spatial data as GeoParquet, shapefiles or GeoJSON ([media analytics](media-analytics.md#loading-boundaries)). |
 | `CREATE TABLE` fails with `schema: data did not match any variant` | The table has a column the catalog cannot store, such as a `GEOMETRY`; store `ST_AsWKB(geom)` instead ([media analytics](media-analytics.md#loading-boundaries)). |
 | SQLSTATE `53300` | The replica is at `IGLOO_MAX_CONNECTIONS`. Use a connection pool, raise the limit, or add replicas. |
+| SQLSTATE `58000`, `cannot check this statement: the session's user could not be read from the metadata database for 2m0s` | The replica has not reached the metadata database (`IGLOO_METADATA_DATABASE_URL`) for longer than `IGLOO_ACCESS_MAX_STALENESS`, so it cannot tell whether the user, their grants or the policies changed. Statements run again once it can; check the database and the network to it. |
 | SQLSTATE `57P03`, `cannot open a session: waited 30s for the catalog lock, which a statement listing or changing the catalog has held for ...` | A listing or DDL has had the catalog to itself for that long ([concurrency on a replica](#concurrency-on-a-replica)); logins wait for it no longer. Try again; if it lasts, find the statement among those running in the console and cancel it. |
 | Log says `crashed outside Go code, in DuckDB or an extension; exiting`, and the replica restarts | DuckDB crashed on one of its own threads. Igloo exits with status 2 so that Docker or Kubernetes restarts it, rather than keep a session that will never finish; the goroutine dump that follows in the log shows the statements that were running. |
 | Log says `igloo: a C++ exception escaped DuckDB or an extension (...); exiting`, and the replica or worker restarts with status 134 | An exception nothing caught reached C++'s terminate, often while DuckDB cleaned up after running out of memory (the type in parentheses, mangled, says which: `N6duckdb20OutOfMemoryExceptionE`). Igloo exits at once rather than abort, which left workers hung; look at the memory warnings before it, and lower the statements' memory or raise the limit. |

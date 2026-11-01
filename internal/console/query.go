@@ -4,7 +4,10 @@ import (
 	"context"
 	"encoding/csv"
 	"encoding/json"
+	"errors"
 	"net/http"
+	"regexp"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -305,16 +308,32 @@ func truncate(s string, n int) string {
 	return s[:n]
 }
 
+// downloadRequest is a query of a worksheet's run to download, with the
+// statements that ran before it in that run, in order.
+type downloadRequest struct {
+	SQL    string   `json:"sql"`
+	Before []string `json:"before,omitempty"`
+}
+
 // download runs one query again and streams its whole result as CSV. Only
 // queries that read are run again; anything else is refused before it runs.
+// The query runs in a new session, which first makes again the settings
+// the statements before it changed (see settingsBefore).
 func (c *Console) download(w http.ResponseWriter, r *http.Request, req *request) {
-	var in queryRequest
-	if !readJSON(w, r, maxScript, &in) {
+	var in downloadRequest
+	// The query and the statements before it came from one script, which
+	// JSON's escapes can make longer.
+	if !readJSON(w, r, 2*maxScript, &in) {
 		return
 	}
 	stmts := sqllex.Split(in.SQL)
 	if len(stmts) != 1 {
 		writeError(w, http.StatusBadRequest, "send exactly one query to download")
+		return
+	}
+	settings, err := settingsBefore(in.Before)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error(), "code": string(codes.FeatureNotSupported)})
 		return
 	}
 	es, err := c.open(r.Context(), req.user, r, appConsole)
@@ -324,6 +343,13 @@ func (c *Console) download(w http.ResponseWriter, r *http.Request, req *request)
 		return
 	}
 	defer es.Close() //nolint:errcheck
+	for _, setting := range settings {
+		if err := es.Run(r.Context(), setting, &collect{}); err != nil {
+			e := toSQLError(err)
+			writeJSON(w, statusFor(e), map[string]any{"error": "the settings the query ran with: " + e.Message, "code": e.Code})
+			return
+		}
+	}
 
 	out := &csvWriter{w: w, rc: http.NewResponseController(w)}
 	err = es.RunQuery(r.Context(), stmts[0].Text, out)
@@ -338,6 +364,91 @@ func (c *Console) download(w http.ResponseWriter, r *http.Request, req *request)
 		panic(http.ErrAbortHandler)
 	}
 }
+
+// settingsBefore returns the statements of before, those that ran before a
+// query in a worksheet's run, that a download of the query runs again
+// first: SET, RESET, USE, DISCARD, and Snowflake's ALTER SESSION and
+// UNSET, which decide what the query's names mean and how it computes,
+// and change only the session. Nothing that changes data runs again: the
+// download reads tables as they are. A query whose session a new one
+// cannot match without running more is refused rather than downloaded
+// from other tables or with other values: one that ran after temporary
+// objects were made, inside a transaction block, or after a setting
+// computed by an expression, which could do anything an expression can.
+func settingsBefore(before []string) ([]string, error) {
+	// Each entry is split again, so that one holding a setting and then
+	// more statements runs only the setting again.
+	var stmts []string
+	for _, text := range before {
+		for _, s := range sqllex.Split(text) {
+			stmts = append(stmts, s.Text)
+		}
+	}
+	var settings []string
+	inBlock := false
+	for _, text := range stmts {
+		words := sqllex.CodeWords(text)
+		if len(words) == 0 {
+			continue
+		}
+		second := ""
+		if len(words) > 1 {
+			second = words[1]
+		}
+		switch words[0] {
+		case "SET", "RESET", "UNSET", "USE", "DISCARD", "ALTER":
+			if words[0] == "ALTER" && second != "SESSION" {
+				continue
+			}
+			if second == "GLOBAL" {
+				// It changed every session's setting, the new one's too.
+				continue
+			}
+			if strings.Contains(sqllex.CodeOnly(text), "(") {
+				return nil, errors.New("the query ran after a setting computed by an expression, " +
+					"which a download, running the query again in a new session, does not compute again")
+			}
+			settings = append(settings, text)
+		case "CREATE":
+			if createsTemporary(text, words) {
+				return nil, errors.New("the query ran after temporary objects were made, " +
+					"which a download, running the query again in a new session, would not have")
+			}
+		case "BEGIN", "START":
+			inBlock = true
+		case "COMMIT", "END", "ABORT":
+			inBlock = false
+		case "ROLLBACK":
+			// ROLLBACK TO a savepoint stays in the block.
+			inBlock = inBlock && slices.Contains(words, "TO")
+		}
+	}
+	if inBlock {
+		return nil, errors.New("the query ran inside a transaction block, whose changes a download, " +
+			"running the query again in a new session, would not see")
+	}
+	return settings, nil
+}
+
+// createsTemporary reports whether text, a CREATE statement with words,
+// makes a temporary object: CREATE [OR REPLACE] [LOCAL | GLOBAL] TEMP or
+// TEMPORARY (Snowflake's VOLATILE too), or one in DuckDB's temp catalog,
+// such as temp.main.t.
+func createsTemporary(text string, words []string) bool {
+	for _, w := range words[1:] {
+		switch w {
+		case "OR", "REPLACE", "LOCAL", "GLOBAL":
+			continue
+		case "TEMP", "TEMPORARY", "VOLATILE":
+			return true
+		}
+		break
+	}
+	return temporaryName.MatchString(sqllex.CodeOnly(text))
+}
+
+// temporaryName is a name in DuckDB's temp catalog.
+var temporaryName = regexp.MustCompile(`(?i)\btemp\s*\.`)
 
 // csvWriter streams a result as CSV, with a header row of column names.
 // NULLs are empty fields.

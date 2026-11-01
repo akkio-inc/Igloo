@@ -77,6 +77,12 @@ type statement struct {
 	// table, which Igloo carries out in steps so that filling the table
 	// does not hold the catalog lock (see runStagedCreate).
 	staged *stagedCreate
+	// loadsGen is the catalog's generation as the statement was prepared
+	// and its loads recorded (see fromCache).
+	loadsGen uint64
+	// tempFill is set for CREATE [OR REPLACE] TEMP TABLE ... AS, which
+	// Igloo carries out in steps for the same reason (see runTempCreate).
+	tempFill *tempCreate
 	// loads are the catalog's tables DuckDB loaded as it prepared the
 	// statement: those it reads (see prepareChecked).
 	loads []catalogproxy.Load
@@ -107,6 +113,15 @@ type statement struct {
 	// was prepared: they run under an ai.Statement begun before each run
 	// (see beginAI).
 	ai bool
+	// fill says the statement is the query a statement fills a table
+	// from, prepared for the planner (see fillSource); writer, if set, is
+	// how workers would write its rows (see tableWrite).
+	fill   bool
+	writer *tableWrite
+	// filled is where the query of a fill of a table ran, on workers or
+	// here, as for a read of it (see fillOn): for the query history, and
+	// for auto mode's history of the query.
+	filled *distParts
 }
 
 // prepare compiles query on conn. clientOIDs are parameter types the client
@@ -336,7 +351,16 @@ func (st *statement) run(ctx context.Context, args []driver.NamedValue, w wire.D
 		return st.runArrow(ctx, args, w, aw)
 	}
 
-	rows, err := st.stmt.QueryContext(ctx, args)
+	query := st.stmt.QueryContext
+	if drains(w) {
+		// DuckDB computes the rows as the client reads them, rather than
+		// all of them first: a sort of hundreds of millions of rows held
+		// every one in memory, past the server's, before its client got
+		// the first. Nothing else runs on the session's connection until
+		// the client has them all.
+		query = st.stmt.QueryStreamContext
+	}
+	rows, err := query(ctx, args)
 	if err != nil {
 		return err
 	}
@@ -360,6 +384,26 @@ func (st *statement) run(ctx context.Context, args []driver.NamedValue, w wire.D
 		return err
 	}
 	return w.Complete(commandTag(st.stmtType, st.query, int64(w.Written())))
+}
+
+// drains reports whether w, through Igloo's own wrappers, is a client's
+// that reads every row of the statement before the session runs anything
+// else (see wire.Drainer): not a portal's with a row limit, after which the
+// client may run other statements on the session before it reads on, nor
+// one of Igloo's own that reads a statement's rows.
+func drains(w wire.DataWriter) bool {
+	for {
+		switch x := w.(type) {
+		case *tagWriter:
+			w = x.DataWriter
+		case afterWriter:
+			w = x.DataWriter
+		case wire.Drainer:
+			return x.Drains()
+		default:
+			return false
+		}
+	}
 }
 
 // rowBatch is how many rows go to the client at a time. psql-wire sends a
@@ -455,7 +499,8 @@ func countOf(rows driver.Rows) (int64, error) {
 }
 
 // createsTableAs reports whether query is CREATE [OR REPLACE] [TEMP]
-// TABLE ... AS: it writes rows, which its command tag does not count.
+// TABLE name [PARTITIONED BY (...)] AS: it writes rows, which its command
+// tag does not count.
 func createsTableAs(query string) bool {
 	sc := &scanner{s: query}
 	if !sc.keywords("CREATE") {
@@ -469,6 +514,7 @@ func createsTableAs(query string) bool {
 	if _, ok := sc.name(); !ok {
 		return false
 	}
+	sc.partitionedBy()
 	return sc.keywords("AS")
 }
 

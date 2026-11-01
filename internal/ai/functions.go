@@ -232,7 +232,7 @@ type completion struct {
 // completeCall is the call that asks b's model for req's completion, keyed
 // by fn, its template's version, and opts.
 func (s *Statement) completeCall(fn, version string, b *binding, req CompletionRequest, opts any, refresh bool) *call {
-	key := cacheKey(fn, version, b.in.Provider, b.in.Target(), req.Model, canonical(opts), req.System, canonical(req.Messages),
+	key := cacheKey(fn, version, b.in.cacheScope(), req.Model, canonical(opts), req.System, canonical(req.Messages),
 		string(req.Schema), strconv.Itoa(req.MaxTokens))
 	est := Usage{InputTokens: requestTokens(req), OutputTokens: int64(min(max(req.MaxTokens, 64), 1024))}
 	return &call{key: key, fn: fn, b: b, model: req.Model, refresh: refresh, estimate: est,
@@ -591,7 +591,7 @@ func (s *Statement) CountTokens(rows []row) ([]any, error) {
 			continue
 		}
 		req := CompletionRequest{Model: provider, Messages: []Message{{Role: "user", Content: t}}}
-		key := cacheKey("ai_count_tokens", countVersion, b.in.Provider, b.in.Target(), provider, t)
+		key := cacheKey("ai_count_tokens", countVersion, b.in.cacheScope(), provider, t)
 		calls = append(calls, &call{key: key, fn: "ai_count_tokens", b: b, model: provider, refresh: o.bool("refresh"),
 			run: func(ctx context.Context) ([]byte, Usage, error) {
 				n, err := b.provider.CountTokens(ctx, req)

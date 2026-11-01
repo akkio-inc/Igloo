@@ -102,11 +102,12 @@ func (s *Server) recordAll(sess *session, recs []queryRecord) {
 	}
 }
 
-// runMemory is the memory a statement that ran on workers workers, or on
-// this replica if none, ran with (see distributed.Coordinator.RunMemory).
-func (s *Server) runMemory(workers int) int64 {
+// runMemory is the memory a statement that ran on workers workers, on the
+// large worker if large, or on this replica if neither, ran with (see
+// distributed.Coordinator.RunMemoryOn).
+func (s *Server) runMemory(workers int, large bool) int64 {
 	if s.dist != nil {
-		return s.dist.RunMemory(workers)
+		return s.dist.RunMemoryOn(workers, large)
 	}
 	if workers == 0 {
 		return s.queryMemory
@@ -144,8 +145,9 @@ func (s *Server) recordQuery(sess *session, r queryRecord) {
 		Stages:          r.parts.stages,
 		Exchanges:       r.parts.exchanges,
 		PlanKey:         r.parts.key,
+		Placement:       r.parts.placement,
 		Shape:           r.shape,
-		Memory:          s.runMemory(r.parts.workers),
+		Memory:          s.runMemory(r.parts.workers, r.parts.large),
 		Peak:            r.peak,
 	}
 	if sp := r.ai; sp != nil {

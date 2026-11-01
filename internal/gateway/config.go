@@ -20,6 +20,10 @@ type Config struct {
 	ActivityURL   string
 	SuspendAfter  time.Duration
 	ResumeTimeout time.Duration
+	// FirstByteTimeout and MaxWaiting hold connections to limits until
+	// they are forwarded (see Options).
+	FirstByteTimeout time.Duration
+	MaxWaiting       int
 
 	// ConsoleListenAddr and ConsoleBackend forward the web console too,
 	// when ConsoleBackend is set.
@@ -41,10 +45,12 @@ type Config struct {
 	K8sDeployment  string
 	K8sReplicas    int
 	// K8sWorkerDeployment, if set, is a Deployment of distributed-execution
-	// workers to stop along with Igloo.
-	K8sWorkerDeployment string
-	StartCommand        string
-	StopCommand         string
+	// workers to stop along with Igloo, and K8sLargeWorkerDeployment the
+	// Deployment of its large worker.
+	K8sWorkerDeployment      string
+	K8sLargeWorkerDeployment string
+	StartCommand             string
+	StopCommand              string
 }
 
 // LoadConfig reads the configuration using lookup, normally os.LookupEnv.
@@ -66,6 +72,7 @@ func LoadConfig(lookup func(string) (string, bool)) (Config, error) {
 		StartCommand:        get("IGLOO_GATEWAY_START_COMMAND", ""),
 		StopCommand:         get("IGLOO_GATEWAY_STOP_COMMAND", ""),
 	}
+	cfg.K8sLargeWorkerDeployment = get("IGLOO_GATEWAY_K8S_LARGE_WORKER_DEPLOYMENT", "")
 
 	var errs []error
 	addErr := func(format string, args ...any) { errs = append(errs, fmt.Errorf(format, args...)) }
@@ -120,6 +127,13 @@ func LoadConfig(lookup func(string) (string, bool)) (Config, error) {
 	}
 	cfg.SuspendAfter = duration("IGLOO_GATEWAY_SUSPEND_AFTER", "10m")
 	cfg.ResumeTimeout = duration("IGLOO_GATEWAY_RESUME_TIMEOUT", "5m")
+	cfg.FirstByteTimeout = duration("IGLOO_GATEWAY_FIRST_BYTE_TIMEOUT", defaultFirstByteTimeout.String())
+	maxWaiting := get("IGLOO_GATEWAY_MAX_WAITING", strconv.Itoa(defaultMaxWaiting))
+	if n, err := strconv.Atoi(maxWaiting); err != nil || n < 1 {
+		addErr("IGLOO_GATEWAY_MAX_WAITING must be a positive integer, got %q", maxWaiting)
+	} else {
+		cfg.MaxWaiting = n
+	}
 
 	switch cfg.Compute {
 	case "ec2":
@@ -151,21 +165,42 @@ func LoadConfig(lookup func(string) (string, bool)) (Config, error) {
 	return cfg, errors.Join(errs...)
 }
 
+// newKubernetes is NewKubernetes, a variable for tests.
+var newKubernetes = func(namespace, name string, replicas int) (Compute, error) {
+	k, err := NewKubernetes(namespace, name, replicas)
+	if err != nil {
+		return nil, err
+	}
+	return k, nil
+}
+
 // NewCompute returns the driver cfg.Compute names.
 func NewCompute(ctx context.Context, cfg Config) (Compute, error) {
 	switch cfg.Compute {
 	case "ec2":
 		return NewEC2(ctx, cfg.EC2InstanceIDs)
 	case "kubernetes":
-		k, err := NewKubernetes(cfg.K8sNamespace, cfg.K8sDeployment, cfg.K8sReplicas)
-		if err != nil || cfg.K8sWorkerDeployment == "" {
-			return k, err
-		}
-		workers, err := NewKubernetes(cfg.K8sNamespace, cfg.K8sWorkerDeployment, 0)
+		k, err := newKubernetes(cfg.K8sNamespace, cfg.K8sDeployment, cfg.K8sReplicas)
 		if err != nil {
 			return nil, err
 		}
-		return AlsoStops{Compute: k, Others: []Compute{workers}}, nil
+		// The workers' Deployments stop with Igloo; Igloo starts them itself
+		// when a statement needs them.
+		var others []Compute
+		for _, name := range []string{cfg.K8sWorkerDeployment, cfg.K8sLargeWorkerDeployment} {
+			if name == "" {
+				continue
+			}
+			w, err := newKubernetes(cfg.K8sNamespace, name, 0)
+			if err != nil {
+				return nil, err
+			}
+			others = append(others, w)
+		}
+		if len(others) == 0 {
+			return k, nil
+		}
+		return AlsoStops{Compute: k, Others: others}, nil
 	case "command":
 		return Command{StartCommand: cfg.StartCommand, StopCommand: cfg.StopCommand}, nil
 	}

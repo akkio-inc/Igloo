@@ -27,11 +27,13 @@ import (
 	"time"
 
 	"github.com/duckdb/duckdb-go/v2"
+	"golang.org/x/sync/semaphore"
 
 	"github.com/akkio-inc/igloo/internal/activity"
 	"github.com/akkio-inc/igloo/internal/config"
 	"github.com/akkio-inc/igloo/internal/deletefiles"
 	"github.com/akkio-inc/igloo/internal/memlimit"
+	"github.com/akkio-inc/igloo/internal/prefetch"
 	"github.com/akkio-inc/igloo/internal/snowflake"
 )
 
@@ -72,6 +74,14 @@ type WorkerOptions struct {
 	// estimate how fast workers read object storage cold by their threads
 	// a core; zero for unknown.
 	Threads int
+	// InstanceType, Region and Spot say what machine the worker runs on, as
+	// its cloud's metadata says, for coordinators to price it (package
+	// prices) where they were not told; empty for unknown.
+	InstanceType, Region string
+	Spot                 bool
+	// Instance is its cloud instance's ID, where its metadata says, which
+	// a coordinator stops when it stops the worker alone.
+	Instance string
 	// ExchangeBytes caps what exchanges on its disk, written or fetched,
 	// may take there (IGLOO_EXCHANGE_MAX_SIZE), as on a volume whose size
 	// its free space does not show; zero leaves them to the free space.
@@ -107,10 +117,19 @@ type Worker struct {
 	// beforeTask, if set, runs before each task; tests use it to make a
 	// worker fail or hang. r's context is the task's.
 	beforeTask func(rw http.ResponseWriter, r *http.Request) bool
+	// retiring says a coordinator retired the worker: it takes no more
+	// tasks and is not ready, so that it is stopped alone (see Retiring).
+	retiring atomic.Bool
+	// draining says it is stopping (see Drain): it takes no more tasks,
+	// and says it is retiring, whatever a coordinator asks.
+	draining atomic.Bool
 
-	// slots bound the tasks that run at once (see taskSlots); running are
-	// those running, which ShedMemory may cancel.
-	slots     chan struct{}
+	// slots bound the tasks that run at once (see taskSlots), of which a
+	// task takes one or more (taskRequest.Slots), and slotCount is how
+	// many there are; running are those running, which ShedMemory may
+	// cancel.
+	slots     *semaphore.Weighted
+	slotCount int
 	runningMu sync.Mutex
 	running   map[*runningTask]bool
 
@@ -185,8 +204,8 @@ func NewWorker(opts WorkerOptions, log *slog.Logger) (*Worker, error) {
 		return nil, fmt.Errorf("create directory for fetched exchanges: %w", err)
 	}
 	w := &Worker{opts: opts, transport: t, log: log.With("component", "worker"), activity: activity.New(),
-		slots: make(chan struct{}, cmp.Or(opts.Tasks, taskSlots(opts.Cores, opts.MemoryBytes))),
 		local: local, fetchRoot: filepath.Clean(fetchRoot), stopSweep: make(chan struct{}),
+		slotCount: cmp.Or(opts.Tasks, taskSlots(opts.Cores, opts.MemoryBytes)),
 		peers: &http.Client{
 			Transport: &http.Transport{TLSClientConfig: t.client.Clone(), MaxIdleConnsPerHost: fetchesPerTask, IdleConnTimeout: time.Minute,
 				// A worker answers at once, if only that it is busy; one that
@@ -197,6 +216,7 @@ func NewWorker(opts WorkerOptions, log *slog.Logger) (*Worker, error) {
 			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 		},
 		boot: newID()}
+	w.slots = semaphore.NewWeighted(int64(w.slotCount))
 	if !opts.Erasure.Through.IsZero() {
 		w.purged.Store(opts.Erasure.Through.UnixNano())
 		w.admitted.Store(opts.Erasure.Through.UnixNano())
@@ -206,6 +226,7 @@ func NewWorker(opts WorkerOptions, log *slog.Logger) (*Worker, error) {
 	mux.HandleFunc("POST "+tasksPath, w.serveTask)
 	mux.HandleFunc("GET "+statusPath, w.serveStatus)
 	mux.HandleFunc("POST "+purgePath, w.servePurge)
+	mux.HandleFunc("POST "+retirePath, w.serveRetire)
 	mux.HandleFunc("GET "+exchangesPath+"{qid}/{file...}", w.serveExchangeFile)
 	mux.HandleFunc("POST "+exchangesPath+"{qid}/keep", w.serveExchangeKeep)
 	mux.HandleFunc("DELETE "+exchangesPath+"{qid}", w.serveExchangeRemove)
@@ -238,18 +259,76 @@ func (w *Worker) Shutdown(ctx context.Context) error {
 	return w.srv.Shutdown(ctx)
 }
 
+// drainCheck is how often Drain checks what the worker still runs and
+// holds; a variable for tests.
+var drainCheck = 250 * time.Millisecond
+
+// Drain readies the worker to stop, as on a SIGTERM or a Spot Instance's
+// interruption notice: it takes no more tasks, which coordinators run on
+// other workers, finishes those it runs, and serves the exchange files on
+// its disk until the statements that read them remove them, as they do
+// when they end, or ctx ends. Shutdown then stops it. A worker that
+// stopped serving its files at once left readers of them nothing but to
+// run the parts that wrote them again, as if it had been lost. It returns
+// ctx's error if ctx ended first.
+func (w *Worker) Drain(ctx context.Context) error {
+	w.draining.Store(true)
+	t := time.NewTicker(drainCheck)
+	defer t.Stop()
+	logged := false
+	for {
+		tasks, _ := w.activity.Snapshot()
+		statements := w.local.statements()
+		if tasks == 0 && statements == 0 {
+			return nil
+		}
+		if !logged {
+			w.log.Info("stopping once the tasks running end and the statements reading this worker's exchange files remove them",
+				"tasks", tasks, "statements", statements)
+			logged = true
+		}
+		select {
+		case <-ctx.Done():
+			w.log.Warn("stopping with tasks running or exchange files that statements may still read", "tasks", tasks, "statements", statements)
+			return ctx.Err()
+		case <-t.C:
+		}
+	}
+}
+
 func (w *Worker) serveStatus(rw http.ResponseWriter, _ *http.Request) {
 	w.hear()
 	running, idle := w.activity.Snapshot()
 	rw.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(rw).Encode(workerStatus{
-		ID: w.opts.ID, Version: w.opts.Version, Cores: w.opts.Cores, MemoryBytes: w.opts.MemoryBytes, Threads: w.opts.Threads, Slots: cap(w.slots),
+		ID: w.opts.ID, Version: w.opts.Version, Cores: w.opts.Cores, MemoryBytes: w.opts.MemoryBytes, Threads: w.opts.Threads, Slots: w.slotCount,
+		InstanceType: w.opts.InstanceType, Region: w.opts.Region, Spot: w.opts.Spot, Instance: w.opts.Instance, Retiring: w.retiring.Load() || w.draining.Load(),
 		Boot:    w.boot,
 		Running: int(running), IdleSeconds: idle.Seconds(),
 		LocalRoom: w.localRoom(), Kubernetes: os.Getenv("KUBERNETES_SERVICE_HOST") != "",
 		Cache: w.opts.Erasure.Cache, Erased: w.purged.Load(), Alone: w.alone.Load(),
 	})
 }
+
+// serveRetire retires the worker, or takes it back, as a coordinator asks
+// (see pool.shrink), and answers its status.
+func (w *Worker) serveRetire(rw http.ResponseWriter, r *http.Request) {
+	w.hear()
+	var req retireRequest
+	if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&req); err != nil {
+		http.Error(rw, "bad retire: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	if w.retiring.Swap(req.Retire) != req.Retire {
+		w.log.Info("a coordinator changed whether this worker takes tasks", "retiring", req.Retire)
+	}
+	w.serveStatus(rw, r)
+}
+
+// Retiring reports whether a coordinator retired the worker, or it is
+// stopping: its readiness fails, so that Kubernetes, scaling its
+// Deployment down, stops it rather than a worker running tasks.
+func (w *Worker) Retiring() bool { return w.retiring.Load() || w.draining.Load() }
 
 // localRoom is the room the worker's disk has for exchanges: the share of
 // its exchange directory's free space a task may take, within
@@ -285,6 +364,10 @@ func taskSlots(cores int, memory int64) int {
 	}
 	return n
 }
+
+// taskSlots is how many of the worker's slots a task that asks for n
+// takes: at least one, and at most all.
+func (w *Worker) taskSlots(n int) int { return min(max(n, 1), w.slotCount) }
 
 // runningTask is a task while it runs, for ShedMemory and purges.
 type runningTask struct {
@@ -353,6 +436,12 @@ func (w *Worker) begin(t *runningTask) func() {
 
 func (w *Worker) serveTask(rw http.ResponseWriter, r *http.Request) {
 	w.hear()
+	if w.retiring.Load() || w.draining.Load() {
+		// Retired, or stopping: the coordinator runs the task on another
+		// worker.
+		http.Error(rw, "this worker is retiring", http.StatusServiceUnavailable)
+		return
+	}
 	defer w.activity.Begin()()
 	ctx, cancel := context.WithCancelCause(r.Context())
 	defer cancel(nil)
@@ -374,15 +463,15 @@ func (w *Worker) serveTask(rw http.ResponseWriter, r *http.Request) {
 		return
 	}
 	log := w.log.With("query", req.Query, "task", req.Task)
-	// Wait for a slot (see taskSlots); the coordinator's task waits with it.
-	select {
-	case w.slots <- struct{}{}:
-	case <-ctx.Done():
+	// Wait for its slots (see taskSlots); the coordinator's task waits
+	// with it.
+	take := int64(w.taskSlots(req.Slots))
+	if err := w.slots.Acquire(ctx, take); err != nil {
 		log.Debug("task canceled while it waited to run")
 		w.opts.Metrics.task("canceled", start)
 		return
 	}
-	defer func() { <-w.slots }()
+	defer w.slots.Release(take)
 	done, err := w.admit(ctx, &runningTask{query: req.Query, task: req.Task, started: time.Now(), cancel: cancel, erased: req.Erased})
 	if err != nil {
 		var te *taskErr
@@ -449,6 +538,13 @@ func (w *Worker) serveTask(rw http.ResponseWriter, r *http.Request) {
 			w.fail(rw, http.StatusUnprocessableEntity, te)
 			return
 		}
+		if req.Write != nil && writeDenied(err) {
+			log.Warn("object storage refused a task's write of a table's files", "err", err)
+			te.WriteDenied = true
+			w.opts.Metrics.task("error", start)
+			w.fail(rw, http.StatusUnprocessableEntity, te)
+			return
+		}
 		if te.Bitmap {
 			log.Warn("task's bitmaps did not fit in memory", "err", err)
 			w.opts.Metrics.task("bitmap_memory", start)
@@ -458,6 +554,14 @@ func (w *Worker) serveTask(rw http.ResponseWriter, r *http.Request) {
 		if te.OutOfMemory {
 			log.Warn("task ran out of memory", "err", err)
 			w.opts.Metrics.task("out_of_memory", start)
+			w.fail(rw, http.StatusUnprocessableEntity, te)
+			return
+		}
+		if !te.Data && prefetch.BlockRace(err) {
+			// The coordinator runs it again at once.
+			log.Warn("a task's read of the read cache raced another over a block", "err", err)
+			te.CacheRace = true
+			w.opts.Metrics.task("cache_race", start)
 			w.fail(rw, http.StatusUnprocessableEntity, te)
 			return
 		}
@@ -474,7 +578,7 @@ func (w *Worker) serveTask(rw http.ResponseWriter, r *http.Request) {
 		w.fail(rw, http.StatusUnprocessableEntity, te)
 		return
 	}
-	if req.Shuffle != "" {
+	if req.Shuffle != "" || req.Write != nil {
 		// The rows are in object storage; the response lists the files.
 		head, _ := json.Marshal(res)
 		rw.Header().Set("Content-Type", "application/json")
@@ -667,12 +771,16 @@ func (w *Worker) run(ctx context.Context, req *taskRequest) (string, *taskResult
 	if err != nil {
 		return "", nil, err
 	}
+	if req.Write != nil {
+		res, err := w.writeFiles(ctx, conn, req, query, cols)
+		return "", res, err
+	}
 	if req.Shuffle != "" && req.Local != "" {
 		res, err := w.shuffleLocal(ctx, conn, req, query, cols)
 		return "", res, err
 	}
 	if req.Shuffle != "" {
-		res, err := w.shuffle(ctx, conn, req.Shuffle, query, cols, req.Partitions)
+		res, err := w.shuffle(ctx, conn, req.Shuffle, query, cols, req.Partitions, req.Slots)
 		return "", res, err
 	}
 	// Columns Parquet would change cross as text; see transferType.
@@ -813,16 +921,20 @@ func rowWidth(cols []Column) int64 {
 
 // shuffle writes the rows of query, partitioned by its __b column, under
 // dir in the warehouse's exchanges, and lists the files written.
-func (w *Worker) shuffle(ctx context.Context, conn *duckdb.Conn, dir, query string, cols []Column, parts int) (*taskResult, error) {
+func (w *Worker) shuffle(ctx context.Context, conn *duckdb.Conn, dir, query string, cols []Column, parts, slots int) (*taskResult, error) {
 	if !w.allowed(dir+"/") || !strings.Contains(dir, "/"+config.ShuffleDir+"/") {
 		return nil, fmt.Errorf("shuffle directory %s is outside the warehouse's %s", dir, config.ShuffleDir)
 	}
-	return w.writePartitions(ctx, conn, dir, query, cols, parts)
+	return w.writePartitions(ctx, conn, dir, query, cols, parts, slots)
 }
 
 // writePartitions writes the rows of query, partitioned by its __b column,
-// under dir, and lists the files written.
-func (w *Worker) writePartitions(ctx context.Context, conn *duckdb.Conn, dir, query string, cols []Column, parts int) (*taskResult, error) {
+// under dir, and lists the files written, for a task that took slots of
+// the worker's slots (taskRequest.Slots).
+func (w *Worker) writePartitions(ctx context.Context, conn *duckdb.Conn, dir, query string, cols []Column, parts, slots int) (*taskResult, error) {
+	// The task's share of the worker's memory is that of one of shares
+	// tasks at once.
+	shares := max(w.slotCount/w.taskSlots(slots), 1)
 	if !slices.ContainsFunc(cols, func(c Column) bool { return c.Name == "__b" }) {
 		return nil, errors.New("a shuffle task's rows have no __b column")
 	}
@@ -855,7 +967,7 @@ func (w *Worker) writePartitions(ctx context.Context, conn *duckdb.Conn, dir, qu
 		return nil, err
 	}
 	if _, err := conn.ExecContext(ctx, fmt.Sprintf("SET SESSION partitioned_write_flush_threshold = %d",
-		shuffleFlush(w.opts.MemoryBytes, cap(w.slots), threadsOf(ctx, conn), cols)), nil); err != nil {
+		shuffleFlush(w.opts.MemoryBytes, shares, threadsOf(ctx, conn), cols)), nil); err != nil {
 		return nil, err
 	}
 	if uploadsInParts(dir) {
@@ -863,8 +975,8 @@ func (w *Worker) writePartitions(ctx context.Context, conn *duckdb.Conn, dir, qu
 			return nil, err
 		}
 	}
-	opts := fmt.Sprintf("FORMAT parquet, PARTITION_BY (__b), ROW_GROUP_SIZE %d", shuffleRowGroup(w.opts.MemoryBytes, cap(w.slots), parts, cols))
-	if n := shuffleRowGroupBytes(w.opts.MemoryBytes, cap(w.slots), parts); n > 0 {
+	opts := fmt.Sprintf("FORMAT parquet, PARTITION_BY (__b), ROW_GROUP_SIZE %d", shuffleRowGroup(w.opts.MemoryBytes, shares, parts, cols))
+	if n := shuffleRowGroupBytes(w.opts.MemoryBytes, shares, parts); n > 0 {
 		// DuckDB bounds a row group's bytes only where it need not keep
 		// the rows' order, which an exchange's partitions do not. The
 		// setting is global but for SET SESSION: set plainly, another
@@ -1096,7 +1208,7 @@ func (w *Worker) prefetchScans(req *taskRequest) []Scan {
 		if p == nil || len(p.Sizes) != len(v.Files) {
 			continue
 		}
-		sc := Scan{Table: v.Name, FieldIDs: slices.Clone(p.Used), Filtered: p.Filtered}
+		sc := Scan{Table: v.Name, FieldIDs: slices.Clone(p.Used), Filtered: p.Filtered, Filters: slices.Clone(p.Filters)}
 		for i, f := range v.Files {
 			if w.allowed(f) {
 				sc.Files = append(sc.Files, File{Path: f, Size: p.Sizes[i]})

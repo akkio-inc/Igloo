@@ -25,8 +25,8 @@ import (
 // fewer (coldRateAt), as DuckDB's threads are capped at 2 GiB of its
 // memory each (a worker of 8 cores and 24.6 GiB runs 12); tables a stage
 // filters selectively count a hundredth of their bytes and rows; and a
-// statement on workers pays for its start and for each stage (startCost,
-// stageCost). Against the scale environment's reports at 1x, 10x and
+// statement on workers pays for its start and for each level of its stages
+// (startCost, levelCost in fleet.go). Against the scale environment's reports at 1x, 10x and
 // 100x on a coordinator of 16 cores and 16 workers of 8, the estimates pick
 // the side that was faster by half again, or either where the two were
 // closer (see TestScaleReports), but for statements whose rows cost far
@@ -34,19 +34,13 @@ import (
 // took 251 s on one machine at 10x, estimated at 7 s), and joins through a
 // view's computed keys counted distinct (691 s on one machine and 170 s on
 // workers, estimated at 160 s and 153 s). Those run on one machine first,
-// and their history sends them to workers after (see choose). The worker
-// counts are those of the first estimates (see workerCount).
+// and their history sends them to workers after (see choose). How many
+// workers, or the large worker, is weighed in fleet.go.
 const (
-	coldRate  = 16e6
-	levelCost = 4.0
-	// startCost and stageCost are what a statement on workers takes beside
-	// reading: its own start, and each stage's round of tasks, which write
-	// their exchanges' partitions to object storage, the next stage listing
-	// and reading them. At ten times the data on 16 workers, reports of 2
-	// or 3 stages over a few gigabytes took 12 to 40 s, and of 23 to 26
-	// stages 153 to 183 s.
+	coldRate = 16e6
+	// startCost is what a statement on workers takes beside its stages: its
+	// own start, planning its tasks and reading their results.
 	startCost = 8.0
-	stageCost = 6.0
 	// DefaultThreshold is how long a statement must take on one machine,
 	// by its estimate or its last run there, before auto mode runs it on
 	// workers, unless it would run short of memory: below it, the
@@ -68,6 +62,20 @@ const (
 	heldFactor = 6
 	// Workers must be estimated this much faster than one machine.
 	speedup = 1.5
+	// shareCap is the most other statements on the replica auto mode counts
+	// as sharing its cores with a statement (see choose): beside three or
+	// more, a statement takes about four times as long there, and slows
+	// each of them.
+	shareCap = 3
+	// farBeyondRatio is how many times its room a working set must be for
+	// the coordinator not to run a statement whose workers failed (see
+	// Plan.FitsHere): 4 times, by the spill curve twice as long, where a
+	// report it ran at 6.8 times by its estimate was killed after 9 minutes
+	// and 167 GB of spill.
+	farBeyondRatio = 4
+	// footprintTrust is how many times what a run of a statement's shape
+	// allocated here its plan's working set may be and still yield to it.
+	footprintTrust = 3
 	// rowRate is how many rows a core goes through a second for each pass
 	// over them (see rowWork). It is the fastest of the scale environment's
 	// reports on one machine of 16 cores: two that went through 1.1 and
@@ -80,12 +88,6 @@ const (
 	// filterSelectivity is the share of a table's rows a filter on one of
 	// its columns by a constant is taken to keep (see rowWork).
 	filterSelectivity = 0.01
-	// spillFactor bounds how much longer one machine short of memory is
-	// estimated to take. The working set is guessed from the sizes of the
-	// tables its stages read, whole, where a report reads a few columns of
-	// some and a filtered audience of others: two reports that ran in 15 s
-	// on one machine at 10x were guessed at 7 times its memory.
-	spillFactor = 2
 	// workerThreadsPerCore are the threads a core coldRate is measured at
 	// (see engine's thread defaults).
 	workerThreadsPerCore = 4
@@ -130,19 +132,47 @@ const (
 // on workers.
 type estimate struct {
 	// bytes are what its stages read of tables, as selective filters leave
-	// them; exchanged what the stages that write exchanges read of them, in
-	// full; levels its stages' longest chain, and stages how many there are;
-	// rows the rows its stages go through (see rowWork).
-	bytes, exchanged int64
-	levels, stages   int
-	rows             float64
+	// them, and localBytes what one machine reads of them, by DuckDB's plan
+	// where it says (see planEstimate), or bytes; exchanged what the stages
+	// that write exchanges read of them, in full; levels its stages'
+	// longest chain, and stages how many there are; rows the rows its
+	// stages go through (see rowWork).
+	bytes, localBytes, exchanged int64
+	levels, stages               int
+	rows                         float64
 	// oneMachine is the coordinator's time, onWorkers that of workers,
-	// as many as workers says, in seconds.
+	// as many as workers says, or of the large worker if large, in seconds,
+	// by the estimates (see pick for the choice, which what the statement
+	// took before corrects).
 	oneMachine, onWorkers float64
 	workers               int
+	large                 bool
 	// memory says the working set is over memoryShare of the coordinator's
-	// memory, by workingSetFactor, and spills that it is by heldFactor.
-	memory, spills bool
+	// memory, by workingSetFactor, and spills that it is by heldFactor, as
+	// local says, whose oom says it should run out of memory there;
+	// farBeyond that the working set by DuckDB's plan, or else by the
+	// stages, is past farBeyondRatio times the room (see Plan.FitsHere).
+	memory, spills, farBeyond bool
+	local                     spill
+	// others are the statements running on the replica beside it, which
+	// share its cores (see choose).
+	others int
+	// stream is how long the client takes its rows, either way (see
+	// clientFieldRate); sorted is what its largest sort or window holds,
+	// and risky says that is near the replica's room (see riskyShare).
+	stream, sorted float64
+	risky          bool
+	// options are the ways on workers weighed, dollars says their costs are
+	// in dollars, and fleet why the one in workers and large, picked, was
+	// chosen.
+	options []option
+	dollars bool
+	fleet   string
+	picked  option
+	// planned says the working set is DuckDB's plan's, and parts what its
+	// operators hold.
+	planned bool
+	parts   []heldPart
 }
 
 // coldRateAt is how fast a core reads object storage cold at
@@ -165,6 +195,31 @@ type machine struct {
 	allocated int64
 }
 
+// atLimit is the share of a machine's memory limit past which what a
+// statement of a shape held over a run it completed there (see
+// Footprints) says only that it held its limit: it may have spilled any
+// amount. At ten times the data, from a cleared plan history, a report
+// whose plan held about 160 GB, three times the replica's 53 GB, was run
+// there on what a run of its shape had held, at the limit, estimated at
+// 47 s and fitting; it held 51 GB, spilled 35 GB, and the guard moved it
+// after 88 s. A report that held 38.5 GB of the 53, and did not spill,
+// still fits so.
+const atLimit = 0.9
+
+// fitsHere says a statement of the shape of the one estimated ran to its
+// end on m holding less than atLimit of m's memory limit: proof that it
+// fits there.
+func (m machine) fitsHere() bool {
+	return m.ranHere && (m.memory <= 0 || float64(m.allocated) < atLimit*float64(m.memory))
+}
+
+// Loads is an Env whose session knows how many other statements run on the
+// replica now, which share its cores with the statement being planned
+// (see choose).
+type Loads interface {
+	Others() int
+}
+
 // Footprints is an Env whose session knows what statements of the shape
 // of the one being planned did on this replica: Footprint returns what the
 // latest such statement allocated over its run, which it completed here,
@@ -182,9 +237,23 @@ type Footprints interface {
 type fleet struct {
 	// cores are a worker's cores, and threads its DuckDB threads, zero for
 	// unknown; running how many workers run; most how many may run; start
-	// how long starting more takes.
+	// how long starting more takes, and tail how long workers started stay
+	// up idle after. alone says idle workers stop alone while others work
+	// (see pool.shrink), so a statement on fewer of the running workers
+	// bills fewer.
 	cores, threads, running, most int
-	start                         time.Duration
+	start, tail                   time.Duration
+	alone                         bool
+	// memory is the smallest worker's memory limit, and price what a
+	// worker costs an hour, zero for unknown; replicaPrice is what the
+	// replica costs an hour, zero for unknown, and replicaCores its cores.
+	memory       int64
+	price        float64
+	replicaPrice float64
+	replicaCores int
+	// large is the compute pool's large worker, if it has one the
+	// statement may run on.
+	large *largeWorker
 }
 
 // estimateTimes estimates a plan's times on the coordinator, m, and on
@@ -196,16 +265,164 @@ func estimateTimes(stages []*Stage, m machine, f fleet) estimate {
 // features are what a plan's estimates are made of.
 type features struct {
 	// bytes are what its stages read of tables, as selective filters leave
-	// them (see filtersSelectively), and unfiltered in full; exchanged what
-	// the stages that write exchanges read of tables in full, and held as
-	// selective filters leave it.
-	bytes, unfiltered, exchanged int64
-	held                         float64
-	// rows are the rows its stages go through, and legacyRows as the first
-	// estimates counted them (see rowWork); levels its stages' longest
-	// chain, and stages how many there are.
-	rows, legacyRows float64
-	levels, stages   int
+	// them (see filtersSelectively); exchanged what the stages that write
+	// exchanges read of tables in full, and held as selective filters leave
+	// it.
+	bytes, exchanged int64
+	held             float64
+	// rows are the rows its stages go through (see rowWork); levels its
+	// stages' longest chain, and stages how many there are.
+	rows           float64
+	levels, stages int
+	// planSet is the working set DuckDB's plan of the statement holds,
+	// where planned says the session could plan it, and planParts what each
+	// of its operators holds (see workingSetOf); planBytes is what one
+	// machine reads of tables by the plan, zero where it does not say, and
+	// planWork the core-seconds its hash tables take (see planEstimate).
+	planSet   float64
+	planned   bool
+	planParts []heldPart
+	planBytes int64
+	planWork  float64
+	// fill says the statement fills a table from the query's rows, which
+	// this replica writes wherever the query runs, and planKeeps the share
+	// of the rows its scans read that the query's result has, by the plan
+	// (see fillCost).
+	fill      bool
+	planKeeps float64
+	// workersWrite says tasks write the rows, on as many cores as they run
+	// on, and none cross to this replica (see writes.go).
+	workersWrite bool
+	// planFields are the fields of its result's rows, which a read sends
+	// the client (see clientFieldRate), and planSorted what its largest
+	// sort or window holds, by the plan (see riskyShare); planJoins the
+	// share of its working set joins hold (see lenience).
+	planFields, planSorted, planJoins float64
+}
+
+// lenience is how many times one machine's room a working set by the plan
+// x may be estimated at and still count as fitting: slightSpill for what
+// joins hold, whose estimates ran high (a report's joins, estimated at 46
+// GB, 1.24 times the room, held 33 GB), and none for the rest. A report
+// whose aggregates and windows, counting people distinct over the values
+// of a FLATTEN, were estimated at 41 GB, 1.1 times the room, so fitting,
+// held 51 GB and spilled 35 GB, as its first run on one machine, from a
+// cleared plan history, did before the guard moved it. A working set not
+// by the plan keeps slightSpill.
+func (x features) lenience() float64 {
+	if !x.planned {
+		return slightSpill
+	}
+	return 1 + (slightSpill-1)*min(max(x.planJoins, 0), 1)
+}
+
+const (
+	// clientFieldRate is the fields a second a client takes of a result:
+	// 361 million rows of four columns, ordered, took 516 s to reach it,
+	// and 36 million 49 s, about 2.8 million fields a second either way.
+	// One machine's estimate counted none of it, 30 s for the 516.
+	clientFieldRate = 2.8e6
+	// riskyShare is the share of this replica's room for a statement past
+	// which a sort or window, holding that much, is risky there: DuckDB's
+	// sort takes about 40% more memory than its limit, and a sort of 361
+	// million rows of four columns, held at about 20 GB in a room of 37,
+	// finished within 2 GB of the memory watch's cancel. riskyWithin is how
+	// many times one machine's time workers may take and still run such a
+	// statement, where workers are configured.
+	riskyShare  = 0.5
+	riskyWithin = 1.25
+)
+
+// Fills is an Env whose statement fills a table from the query planned,
+// as CREATE TABLE ... AS does: this replica writes the table from the
+// query's rows wherever the query runs, from the workers' results where it
+// runs on workers (see fillCost). Its runs are kept apart from reads of the
+// same query.
+type Fills interface {
+	Fill() bool
+	// FillWrites says workers could write the table's files, if they may
+	// and its tasks hold its rows (see writes.go).
+	FillWrites() bool
+}
+
+const (
+	// fillWriteRate is the bytes of table files a second a core of this
+	// replica writes, compressed as it reads them: one of 16 cores wrote a
+	// billion rows of four columns, about 10 GB of files, in 163 s, about
+	// 60 MB/s in all.
+	fillWriteRate = 3.75e6
+	// fillFetchRate is the bytes of files a second this replica fetches of
+	// the workers' results, to write the table from them.
+	fillFetchRate = 400e6
+)
+
+// fillCost is what writing a fill's rows adds to its time, on a replica of
+// cores: it writes them wherever the query runs (here), and fetches them
+// from the workers first where it runs there (onWorkers), files about the
+// share of the bytes it reads that its rows are of the rows it reads (see
+// planEstimate.keeps). A copy, whose rows are as many as it reads, takes
+// about as long either way, writing them, and runs on workers only where
+// they are clearly faster still; an aggregate's few rows add nothing.
+func (x features) fillCost(cores int) (here, onWorkers float64) {
+	if !x.fill || !x.planned || x.planKeeps <= 0 {
+		return 0, 0
+	}
+	out := x.fillOut()
+	write := out / (fillWriteRate * float64(max(cores, 1)))
+	if x.workersWrite {
+		// Each way on workers counts its own (see onFleet, onLarge).
+		return write, 0
+	}
+	return write, write + out/fillFetchRate
+}
+
+// fillOut is the bytes of files a fill's rows take, compressed as what it
+// reads is: where DuckDB's plan does not say what share of the rows it
+// reads they are, all of them.
+func (x features) fillOut() float64 {
+	read := float64(x.bytes)
+	if x.planBytes > 0 {
+		read = float64(x.planBytes)
+	}
+	if !x.planned {
+		return read
+	}
+	return x.planKeeps * read
+}
+
+// onWorkersWrite is what tasks on cores take to write a fill's rows.
+func (x features) onWorkersWrite(cores int) float64 {
+	if !x.workersWrite {
+		return 0
+	}
+	return x.fillOut() / (fillWriteRate * float64(max(cores, 1)))
+}
+
+// defaultMinWorkerWrite is the fewest bytes of files workers write rather
+// than the coordinator: fewer take the coordinator a few seconds, and each
+// task's file would be a small one.
+const defaultMinWorkerWrite = 256 << 20
+
+// minWorkerWrite is Options.MinWorkerWrite, as it says.
+func (co *Coordinator) minWorkerWrite() float64 {
+	switch {
+	case co.opts.MinWorkerWrite < 0:
+		return 0
+	case co.opts.MinWorkerWrite == 0:
+		return defaultMinWorkerWrite
+	}
+	return float64(co.opts.MinWorkerWrite)
+}
+
+// set is the working set of a plan of features x on one machine: what
+// DuckDB's plan of the statement holds, where the session could plan it
+// (see workingSetOf), or else heldFactor times what its exchanges' stages
+// read, as selective filters leave it.
+func (x features) set() float64 {
+	if x.planned {
+		return x.planSet
+	}
+	return heldFactor * x.held
 }
 
 // planFeatures measures a plan for its estimates.
@@ -238,7 +455,6 @@ func planFeatures(stages []*Stage) features {
 	}
 	for k, cols := range read {
 		b := cols.bytes(tables[k])
-		x.unfiltered += b
 		if selective[k] {
 			b = int64(float64(b) * filterSelectivity)
 		}
@@ -254,26 +470,25 @@ func planFeatures(stages []*Stage) features {
 		}
 	}
 	x.levels, x.stages = levels(stages), len(stages)
-	x.rows, x.legacyRows = rowWork(stages, filtersSelectively), rowWork(stages, filtersByConstant)
+	x.rows = rowWork(stages, filtersSelectively)
 	return x
 }
 
 // estimate estimates the times of a plan of features x on the coordinator,
 // m, and on workers, f.
 func (x features) estimate(m machine, f fleet) estimate {
-	e := estimate{bytes: x.bytes, exchanged: x.exchanged, levels: x.levels, stages: x.stages, rows: x.rows}
+	e := estimate{bytes: x.bytes, exchanged: x.exchanged, levels: x.levels, stages: x.stages, rows: x.rows, planned: x.planned, parts: x.planParts}
 	// Short of memory on the coordinator, which a statement whose workers
 	// fail then does not fall back to, by the bytes its exchanges' stages
 	// read.
 	share := memoryShare * float64(m.memory)
+	fits := m.fitsHere()
 	e.memory = m.memory > 0 && float64(workingSetFactor*x.exchanged) > share && !m.ranHere
-	// As many workers as the first estimates gave a statement, so that one
-	// forced onto workers runs as it did.
-	e.workers = workerCount(x.unfiltered, x.legacyRows, x.levels, f)
-	e.onWorkers = math.Inf(1)
-	if e.workers > 0 {
-		e.onWorkers = onWorkers(e, e.workers, f)
-	}
+	// The ways on workers, and the one auto mode would take without what
+	// the statement took before (see plan, which corrects them).
+	e.options = x.options(f)
+	_, _, _, e.dollars = f.prices()
+	e.pick(runs{}, f)
 
 	// One machine reads cold from object storage at its threads a core: its
 	// read cache holds what it read lately, which a statement's first run
@@ -282,63 +497,81 @@ func (x features) estimate(m machine, f fleet) estimate {
 	// cache for warm put a report of 258 s at 15 s.
 	cores := float64(max(m.cores, 1))
 	threadsPerCore := float64(max(m.threads, m.cores)) / cores
-	e.oneMachine = float64(e.bytes) / (cores * coldRateAt(threadsPerCore))
+	// What it reads by DuckDB's plan, the columns its scans project, where
+	// the stages' fragments may read a view's every column: a report whose
+	// stages read 77 GB of a table of 470 columns read 9.6 GB there.
+	e.localBytes = e.bytes
+	if x.planned && x.planBytes > 0 {
+		e.localBytes = x.planBytes
+	}
+	e.oneMachine = float64(e.localBytes) / (cores * coldRateAt(threadsPerCore))
 	// What it reads, or what it computes over the rows, whichever takes
 	// longer: a report that reads 2 GB of a table but joins its 400 million
-	// rows to themselves 16 times is no 1-second statement.
-	e.oneMachine = max(e.oneMachine, e.rows/(cores*rowRate))
-	// Short of memory, it takes longer by as much as its working set,
-	// heldFactor times what its exchanges' stages read as the selective
-	// filters leave it, is over its share of memory, spilling, up to
-	// spillFactor times.
-	if set := heldFactor * x.held; m.memory > 0 && set > share && !(m.ranHere && float64(m.allocated) <= share) {
-		e.spills = true
-		e.oneMachine *= min(set/share, spillFactor)
+	// rows to themselves 16 times is no 1-second statement. By the plan,
+	// its hash tables' rows, at hashMissRate where they outgrow the caches.
+	e.oneMachine = max(e.oneMachine, e.rows/(cores*rowRate), x.planWork/cores)
+	// Short of memory, it takes longer, spilling, as much as its working
+	// set is over its share of memory (see spillOn): heldFactor times what
+	// its exchanges' stages read as the selective filters leave it, or what
+	// a statement of its shape allocated over its run here, which fits if
+	// that is within its share.
+	set := x.set()
+	e.farBeyond = m.memory > 0 && set > farBeyondRatio*memoryShare*float64(m.memory)
+	within := x.lenience()
+	switch {
+	case fits && !(x.planned && set > footprintTrust*float64(m.allocated) && set > slightSpill*memoryShare*float64(m.memory)):
+		// What a run of its shape allocated here, unless DuckDB's plan holds
+		// far more, as when its tables have grown since: a report's shape
+		// that ran here at a tenth of the data allocated 53 GB, and its plan
+		// at a hundred times held 250 GB. It held that and completed: it
+		// fits.
+		set, within = float64(m.allocated), math.Inf(1)
+	case m.ranHere:
+		// It ran here at its memory limit, holding at least that.
+		set = max(set, float64(m.allocated))
+	}
+	e.local = spillLenient(set, m.memory, within)
+	e.spills = e.local.factor > 1
+	e.oneMachine *= e.local.factor
+	// A fill's rows, written here wherever the query runs; a read's, sent
+	// to the client, from here or from the workers' merge alike.
+	here, there := x.fillCost(m.cores)
+	if !x.fill && x.planned {
+		e.stream = x.planFields / clientFieldRate
+		here, there = e.stream, e.stream
+	}
+	e.oneMachine += here
+	// A sort or window that holds near the replica's room is risky there
+	// (see riskyShare).
+	e.sorted = x.planSorted
+	e.risky = x.planned && m.memory > 0 && x.planSorted >= riskyShare*memoryShare*float64(m.memory)
+	if there > 0 {
+		for i := range e.options {
+			e.options[i].estimate += there
+			e.options[i].seconds = e.options[i].estimate
+			e.options[i].cost = e.options[i].costOn(f)
+		}
+		e.pick(runs{}, f)
 	}
 	return e
 }
 
-// workerCount is the fewest workers, of f's, whose time is within a fifth
-// of the fastest, by the plan's levels and what its stages read of tables
-// (bytes, and rows as rowWork counts them with filtersByConstant), at the
-// rates of the first scale runs. Execute runs a statement on as many.
-func workerCount(bytes int64, rows float64, levels int, f fleet) int {
-	times := make([]float64, f.most+1)
-	best := math.Inf(1)
-	for n := 1; n <= f.most; n++ {
-		cores := float64(n * max(f.cores, 1))
-		t := float64(levels)*levelCost + max(float64(bytes)/(cores*coldRate), rows/(cores*rowRate))
-		if n > f.running {
-			t += f.start.Seconds()
-		}
-		times[n] = t
-		best = min(best, t)
+// pick chooses the way on workers e's options say, corrected by what the
+// statement took before, r (see correct and pick): workers is how many, or
+// 1 and large for the large worker, and onWorkers its time by the
+// estimates; with no way on workers, workers is zero and onWorkers
+// infinite.
+func (e *estimate) pick(r runs, f fleet) {
+	e.workers, e.large, e.onWorkers, e.fleet = 0, false, math.Inf(1), ""
+	if len(e.options) == 0 {
+		return
 	}
-	for n := 1; n <= f.most; n++ {
-		if times[n] <= best*1.2 {
-			return n
-		}
+	correct(e.options, r, f)
+	best, why, ok := pick(e.options, e.dollars)
+	e.fleet = why
+	if ok {
+		e.workers, e.large, e.onWorkers, e.picked = best.workers, best.large, best.estimate, best
 	}
-	return 0
-}
-
-// onWorkers estimates the plan's time on n of f's workers: a statement's
-// own start, each stage's round of tasks and of the exchanges it writes to
-// object storage, and what its stages read cold, or the rows they go
-// through, whichever takes longer, on n workers' cores at their threads a
-// core. At ten times the data on 16 workers, reports of 2 and 3 stages took
-// 12 to 40 s, and of 23 to 26 stages 153 to 183 s, over a few gigabytes.
-func onWorkers(e estimate, n int, f fleet) float64 {
-	cores := float64(n * max(f.cores, 1))
-	threadsPerCore := float64(workerThreadsPerCore)
-	if f.threads > 0 && f.cores > 0 {
-		threadsPerCore = float64(f.threads) / float64(f.cores)
-	}
-	t := startCost + float64(e.stages)*stageCost + max(float64(e.bytes)/(cores*coldRateAt(threadsPerCore)), e.rows/(cores*rowRate))
-	if n > f.running {
-		t += f.start.Seconds()
-	}
-	return t
 }
 
 // rowWork estimates the rows a plan's stages go through: each stage's
@@ -605,11 +838,40 @@ func levels(stages []*Stage) int {
 // to learn how long it takes there, but never one that ran on one machine
 // within threshold on workers, nor on a side estimated at more than
 // exploreWithin times what it took on the other, nor on one machine where
-// it should not fit.
+// its working set should spill (see spillOn), or, after a run on workers
+// far slower than one machine's estimate, where it is far beyond one
+// machine's memory; nor does pick try the large worker where its working
+// set would spill there (see option.unproven).
+//
+// Statements running beside it on the replica (e.others) share its cores:
+// a statement takes 1 + e.others times as long there, up to shareCap + 1
+// times, which is what auto mode weighs one machine's time at, so that a
+// heavy statement runs on workers rather than take the cores of the
+// replica's other statements, as a dashboard's, and one ran only on
+// workers is not tried on the replica meanwhile. At ten times the data,
+// beside 16 users' dashboards, a report that had run in 25 s on one
+// machine, and 66 s on 16 workers alone, ran 577 s there, the dashboards'
+// median rising from 4 ms to 23 s.
 func choose(e estimate, r runs, found bool, threshold time.Duration, now time.Time) (workers, explore bool, reason string) {
+	workers, explore, reason = chooseShared(e, r, found, threshold, now, float64(1+min(max(e.others, 0), shareCap)))
+	if e.others > 0 {
+		reason += fmt.Sprintf("; %d other statements run on this replica", e.others)
+	}
+	return workers, explore, reason
+}
+
+// chooseShared is choose with one machine's time taken share times as
+// long, as other statements share its cores.
+func chooseShared(e estimate, r runs, found bool, threshold time.Duration, now time.Time, share float64) (workers, explore bool, reason string) {
 	limit := threshold.Seconds()
+	// Alone, workers must be clearly faster; beside others, no slower than
+	// the replica shared, which they leave to the others.
+	faster := speedup
+	if share > 1 {
+		faster = 1
+	}
 	worth := func(oneMachine float64) bool {
-		return e.workers > 0 && (oneMachine > limit || e.spills) && e.onWorkers < oneMachine/speedup
+		return e.workers > 0 && (oneMachine*share > limit || e.spills) && e.onWorkers < oneMachine*share/faster
 	}
 	// Measured on one side only, a statement that took under exploreUnder
 	// there is tried once a day on the other, whatever the estimates say,
@@ -622,13 +884,35 @@ func choose(e estimate, r runs, found bool, threshold time.Duration, now time.Ti
 	// on the other side, and, on one machine, where it should fit.
 	tryWorkers := func(took float64) bool { return e.onWorkers < exploreWithin*took }
 	tryOne := func(took float64) bool {
-		return e.oneMachine < exploreWithin*took && !e.memory && !e.spills && !r.heavy
+		return e.oneMachine < exploreWithin*took && !e.memory && !e.spills && !r.heavy && !e.risky
+	}
+	// A sort or window near the replica's room: workers, where they are
+	// configured, unless they take riskyWithin times one machine's time.
+	risky := func(oneMachine float64) bool {
+		return e.risky && e.workers > 0 && e.onWorkers <= riskyWithin*oneMachine*share
+	}
+	riskyReason := func(what string) string {
+		return fmt.Sprintf("%s, and its sort holds %s, near the %s one machine has for it (DuckDB's sort takes more than its limit)",
+			what, gigabytes(int64(e.sorted)), gigabytes(int64(e.local.room)))
+	}
+	// Why one machine, by the rule that decided: its time oneMachine.
+	here := func(oneMachine float64) string {
+		t := oneMachine * share
+		switch {
+		case e.workers == 0 || math.IsInf(e.onWorkers, 1):
+			return fmt.Sprintf("one machine should take %.0f s, and no way on workers would finish", t)
+		case t <= limit && !e.spills:
+			return fmt.Sprintf("one machine should take %.0f s, within the %.0f s a statement must take for workers to be worth it", t, limit)
+		case faster > 1:
+			return fmt.Sprintf("workers should take %.0f s, not %.1f times as fast as one machine's %.0f s, as a statement running alone needs", e.onWorkers, faster, t)
+		}
+		return fmt.Sprintf("workers should take %.0f s, no faster than one machine's %.0f s, shared", e.onWorkers, t)
 	}
 	switch {
 	case found && r.outOfMemory && e.workers > 0:
 		return true, false, "it ran out of memory on one machine"
 	case found && r.guarded && e.workers > 0:
-		return true, false, fmt.Sprintf("it ran on one machine for %.0f s, past three times its estimate", r.local)
+		return true, false, fmt.Sprintf("it ran on one machine for %.0f s, far past its estimate", r.local)
 	case found && r.dist > 0 && r.distWorkers > 0 && e.workers >= 2*r.distWorkers && mayExplore:
 		// Measured on far fewer workers than it would run on now, as
 		// after an earlier session's runs on a smaller fleet: a report
@@ -636,31 +920,38 @@ func choose(e estimate, r runs, found bool, threshold time.Duration, now time.Ti
 		// machine at 178 s.
 		return true, true, fmt.Sprintf("it ran in %.0f s on %d workers; trying %d once, estimated at %.0f s", r.dist, r.distWorkers, e.workers, e.onWorkers)
 	case found && r.local > 0 && r.dist > 0:
-		if r.dist < r.local {
+		switch {
+		case r.dist < r.local*share:
 			return true, false, fmt.Sprintf("it ran in %.0f s on workers and %.0f s on one machine", r.dist, r.local)
+		case e.risky && r.dist <= riskyWithin*r.local*share:
+			return true, false, riskyReason(fmt.Sprintf("it ran in %.0f s on workers and %.0f s on one machine", r.dist, r.local))
 		}
 		return false, false, fmt.Sprintf("it ran in %.0f s on one machine and %.0f s on workers", r.local, r.dist)
 	case found && r.local > 0:
 		switch {
-		case r.local < limit:
-			return false, false, fmt.Sprintf("it ran in %.0f s on one machine, under %.0f s", r.local, limit)
+		case r.local*share < limit:
+			return false, false, fmt.Sprintf("it ran in %.0f s on one machine, under %.0f s", r.local, limit/share)
 		case e.workers > 0 && mayExplore && r.local < exploreUnder.Seconds() && tryWorkers(r.local):
 			return true, true, fmt.Sprintf("it ran in %.0f s on one machine; trying workers once, estimated at %.0f s", r.local, e.onWorkers)
-		case r.local < e.oneMachine/2:
+		case share == 1 && r.local < e.oneMachine/2:
 			return false, false, fmt.Sprintf("it ran in %.0f s on one machine, well under the %.0f s estimated", r.local, e.oneMachine)
 		case worth(r.local):
 			return true, false, fmt.Sprintf("it ran in %.0f s on one machine, and workers should take %.0f s", r.local, e.onWorkers)
+		case risky(r.local):
+			return true, false, riskyReason(fmt.Sprintf("it ran in %.0f s on one machine, and workers should take %.0f s", r.local, e.onWorkers))
 		case e.workers > 0 && mayExplore && tryWorkers(r.local):
 			return true, true, fmt.Sprintf("it ran in %.0f s on one machine; trying workers, estimated at %.0f s", r.local, e.onWorkers)
 		}
 		return false, false, fmt.Sprintf("it ran in %.0f s on one machine, and workers should take %.0f s", r.local, e.onWorkers)
 	case found && r.dist > 0:
 		switch {
-		case mayExplore && r.dist < exploreUnder.Seconds() && tryOne(r.dist):
+		case share == 1 && mayExplore && r.dist < exploreUnder.Seconds() && tryOne(r.dist):
 			return false, true, fmt.Sprintf("it ran in %.0f s on workers; trying one machine once, estimated at %.0f s", r.dist, e.oneMachine)
-		case mayExplore && !r.heavy && r.dist > slowOnWorkers*e.oneMachine:
+		case share == 1 && mayExplore && !r.heavy && !e.farBeyond && r.dist > slowOnWorkers*e.oneMachine:
 			// Far slower on workers than one machine should take it, even
-			// short of memory: without this it stayed there for good.
+			// short of memory: without this it stayed there for good. Not
+			// where its working set is far beyond one machine's memory,
+			// which it would spill for far longer than its estimate says.
 			return false, true, fmt.Sprintf("it ran in %.0f s on workers, over %.0f times one machine's estimate of %.0f s; trying one machine once",
 				r.dist, slowOnWorkers, e.oneMachine)
 		case e.memory || e.spills:
@@ -670,16 +961,24 @@ func choose(e estimate, r runs, found bool, threshold time.Duration, now time.Ti
 			return true, false, fmt.Sprintf("it ran in %.0f s on workers, and one machine should run short of memory", r.dist)
 		case r.heavy:
 			return true, false, fmt.Sprintf("it ran in %.0f s on workers, whose exchanges held %.1f GB, more than one machine's memory holds", r.dist, float64(r.exchangeBytes)/1e9)
-		case r.dist <= e.onWorkers/2 || r.dist < e.oneMachine/speedup:
+		case r.dist <= e.onWorkers/2 || r.dist < e.oneMachine*share/faster:
 			return true, false, fmt.Sprintf("it ran in %.0f s on workers, and one machine should take %.0f s", r.dist, e.oneMachine)
+		case e.risky && r.dist <= riskyWithin*e.oneMachine*share:
+			return true, false, riskyReason(fmt.Sprintf("it ran in %.0f s on workers, and one machine should take %.0f s", r.dist, e.oneMachine))
 		}
-		return false, false, fmt.Sprintf("it ran in %.0f s on workers, and one machine should take %.0f s", r.dist, e.oneMachine)
+		if faster > 1 {
+			return false, false, fmt.Sprintf("it ran in %.0f s on workers, not %.1f times as fast as one machine's estimate of %.0f s, as a statement running alone needs",
+				r.dist, faster, e.oneMachine)
+		}
+		return false, false, fmt.Sprintf("it ran in %.0f s on workers, no faster than one machine's estimate of %.0f s, shared", r.dist, e.oneMachine*share)
 	case e.spills && e.workers > 0 && e.onWorkers <= spillWithin*e.oneMachine:
 		return true, false, fmt.Sprintf("one machine should take %.0f s or more, spilling, and workers %.0f s", e.oneMachine, e.onWorkers)
 	case worth(e.oneMachine):
 		return true, false, fmt.Sprintf("one machine should take %.0f s and workers %.0f s", e.oneMachine, e.onWorkers)
+	case risky(e.oneMachine):
+		return true, false, riskyReason(fmt.Sprintf("one machine should take %.0f s and workers %.0f s", e.oneMachine, e.onWorkers))
 	}
-	return false, false, fmt.Sprintf("one machine should take %.0f s and workers %.0f s", e.oneMachine, e.onWorkers)
+	return false, false, here(e.oneMachine)
 }
 
 // planKey identifies a statement in the history of its runs: its syntax

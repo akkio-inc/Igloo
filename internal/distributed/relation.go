@@ -7,6 +7,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // Relations. A candidate's FROM clause may read, besides catalog tables, a
@@ -163,8 +164,8 @@ type relUse struct {
 	// query says ref is a subquery expression's query, which every task
 	// reads in full.
 	query bool
-	// semi is as for tables.
-	semi bool
+	// semi and outer are as for tables.
+	semi, outer bool
 	// key identifies the relation across plans of the statement (see
 	// relationKey); known says its size was measured, and rows are the
 	// rows it was measured at.
@@ -354,10 +355,29 @@ func (pl *planner) describe(q node, scope cteScope) ([]Column, error) {
 	if err != nil {
 		return nil, unsupported("%v", err)
 	}
+	return pl.describeText(text)
+}
+
+// describeText binds query text in the session and returns its result
+// columns, once for the statement (see describeCache). A part described
+// is progress (see limitPlanning).
+func (pl *planner) describeText(text string) ([]Column, error) {
+	if cols, ok := pl.describes.get(text); ok {
+		pl.profile.cached++
+		return cols, nil
+	}
+	if err := pl.budget(); err != nil {
+		return nil, err
+	}
+	start := time.Now()
 	cols, err := pl.env.Describe(pl.ctx, text)
+	pl.profile.describes++
+	pl.profile.describing += time.Since(start)
 	if err != nil {
 		return nil, unsupported("describe: %v", err)
 	}
+	pl.describes.put(text, cols)
+	pl.progressed()
 	return cols, nil
 }
 
@@ -471,7 +491,9 @@ func (pl *planner) viewBytes(parts []string, depth int) (int64, bool, error) {
 	if depth > maxViewDepth {
 		return 0, false, unsupported("views nest too deep")
 	}
+	start := time.Now()
 	def, ok, err := pl.env.ViewDefinition(pl.ctx, parts)
+	pl.looked(start)
 	if err != nil || !ok {
 		return 0, false, err
 	}
@@ -495,8 +517,13 @@ func (pl *planner) viewBytes(parts []string, depth int) (int64, bool, error) {
 		}
 		t, terr := pl.table(q)
 		if IsUnsupported(terr) {
-			var b int64
-			if b, ok, terr = pl.viewBytes(q, depth+1); terr == nil && ok {
+			// A view, in turn; or neither a catalog table nor a view, which
+			// stays the error.
+			b, isView, verr := pl.viewBytes(q, depth+1)
+			switch {
+			case verr != nil:
+				terr = verr
+			case isView:
 				total += b
 				return false
 			}
@@ -509,6 +536,66 @@ func (pl *planner) viewBytes(parts []string, depth int) (int64, bool, error) {
 		return false
 	})
 	return total, err == nil, err
+}
+
+// readBytes is the size of the catalog tables q reads, through its
+// subqueries, common table expressions and views, each time it reads them:
+// what a machine that computes q alone reads.
+func (pl *planner) readBytes(q node, scope cteScope, depth int) (int64, error) {
+	if depth > maxViewDepth {
+		return 0, unsupported("common table expressions nest too deep")
+	}
+	var total int64
+	var err error
+	var visit func(v any, sc cteScope)
+	visit = func(v any, sc cteScope) {
+		walk(v, func(n node) bool {
+			if err != nil {
+				return false
+			}
+			if len(list(child(n, "cte_map"), "map")) > 0 {
+				// Its common table expressions count where they are read.
+				inner := sc.with(n)
+				for k, c := range n {
+					if k != "cte_map" {
+						visit(c, inner)
+					}
+				}
+				return false
+			}
+			if str(n["type"]) != "BASE_TABLE" {
+				return true
+			}
+			parts := tableParts(n)
+			if len(parts) == 1 {
+				if d := sc.find(parts[0]); d != nil {
+					var b int64
+					b, err = pl.readBytes(d.query(), d.scope, depth+1)
+					total += b
+					return false
+				}
+			}
+			t, terr := pl.table(parts)
+			if IsUnsupported(terr) {
+				b, ok, verr := pl.viewBytes(parts, 0)
+				if verr == nil && ok {
+					total += b
+					return false
+				}
+				if verr != nil {
+					terr = verr
+				}
+			}
+			if terr != nil {
+				err = terr
+				return false
+			}
+			total += t.Bytes
+			return false
+		})
+	}
+	visit(q, scope)
+	return total, err
 }
 
 // relation adds a relation that a FROM clause reads, ref, to sc and rd.
@@ -563,7 +650,7 @@ func (pl *planner) relation(ref, q node, qscope cteScope, def *cteDef, splittabl
 // plans it again reading every common table expression as a relation.
 func (pl *planner) inline(ref node, d *cteDef, ctes cteScope) (bool, error) {
 	q := d.query()
-	if pl.noInline || d.first != nil || str(q["type"]) != "SELECT_NODE" || pl.opaque(q) != "" || rowQuery(q) ||
+	if pl.noInline || d.first != nil || str(q["type"]) != "SELECT_NODE" || pl.opaque(q) != "" && !pl.groupsByBucket(q, d.scope) || rowQuery(q) ||
 		child(ref, "sample") != nil || child(ref, "at_clause") != nil || pl.uses(d) != 1 {
 		return false, nil
 	}
@@ -750,8 +837,12 @@ func (pl *planner) opaque(sel node) string {
 // keyed by keys (columns as the candidate names them), hashed as casts
 // say, and plans the stages that write it. A common table expression's
 // rows are written once: an exchange keyed otherwise is partitioned again
-// rather than computed again.
-func (pl *planner) relationExchange(r *relUse, keys, casts []string) (*Exchange, error) {
+// rather than computed again. buckets, if not 0, is the Iceberg buckets of
+// its one key it is written to (see Exchange.Buckets).
+func (pl *planner) relationExchange(r *relUse, keys, casts []string, buckets int) (*Exchange, error) {
+	if err := pl.budget(); err != nil {
+		return nil, err
+	}
 	xkeys := make([]string, len(keys))
 	for i, k := range keys {
 		j := slices.Index(r.item.columns, k)
@@ -760,7 +851,7 @@ func (pl *planner) relationExchange(r *relUse, keys, casts []string) (*Exchange,
 		}
 		xkeys[i] = r.columns[j].Name
 	}
-	sig := strings.Join(xkeys, "\x00") + "\x01" + strings.Join(casts, "\x00")
+	sig := strings.Join(xkeys, "\x00") + "\x01" + strings.Join(casts, "\x00") + "\x01" + strconv.Itoa(buckets)
 	if d := r.def; d != nil {
 		if x := d.outs[sig]; x != nil {
 			r.out = x
@@ -770,6 +861,7 @@ func (pl *planner) relationExchange(r *relUse, keys, casts []string) (*Exchange,
 			// Partitioned otherwise: partition it again. (Written whole, it
 			// is small, and computed again.)
 			x := pl.exchange("relation", xkeys, casts)
+			x.Buckets = buckets
 			f, err := pl.p.parse("SELECT * FROM " + quoteIdent("__igloo_r"))
 			if err != nil {
 				return nil, err
@@ -780,7 +872,26 @@ func (pl *planner) relationExchange(r *relUse, keys, casts []string) (*Exchange,
 			return x, nil
 		}
 	}
+	// A relation produced while it is being produced would be planned
+	// again and again, each time anew: a relation is never its own input.
+	self := pl.relationKey(r.q, r.scope)
+	if self != "" && pl.producing[self] {
+		return nil, unsupported("relation %s would be computed from itself", r.item.name)
+	}
+	if pl.producing == nil {
+		pl.producing = map[string]bool{}
+	}
+	if self != "" {
+		pl.producing[self] = true
+		defer delete(pl.producing, self)
+	}
+	pl.depth++
+	defer func() { pl.depth-- }()
+	if pl.depth > maxRelationDepth {
+		return nil, unsupported("relations nest more than %d deep", maxRelationDepth)
+	}
 	x := pl.exchange("relation", xkeys, casts)
+	x.Buckets = buckets
 	if err := pl.produce(r.q, r.scope, x, r.columns, nil); err != nil {
 		return nil, err
 	}
@@ -809,11 +920,14 @@ func (pl *planner) relationOut(r *relUse, x *Exchange) {
 func (pl *planner) produce(q node, scope cteScope, out *Exchange, cols []Column, wraps []*wrapper) error {
 	switch str(q["type"]) {
 	case "SET_OPERATION_NODE":
-		if str(q["setop_type"]) != "UNION" || q["setop_all"] != true {
+		if str(q["setop_type"]) != "UNION" {
 			return unsupported("%s in a relation", strings.ToLower(str(q["setop_type"])))
 		}
 		if len(list(q, "modifiers")) > 0 {
 			return unsupported("ORDER BY or LIMIT in a relation")
+		}
+		if q["setop_all"] != true {
+			return pl.produceUnion(q, scope, out, cols, wraps)
 		}
 		sc := scope.with(q)
 		for _, side := range []string{"left", "right"} {
@@ -825,14 +939,75 @@ func (pl *planner) produce(q node, scope cteScope, out *Exchange, cols []Column,
 	case "SELECT_NODE":
 		if hasClass(q["select_list"], "WINDOW") {
 			outer, sc, err := pl.overAll(q, scope)
-			if err != nil {
+			if err == nil {
+				return pl.produceSelect(outer, sc, out, cols, wraps)
+			}
+			if !partitionedWindows(q) {
 				return err
 			}
-			return pl.produceSelect(outer, sc, out, cols, wraps)
+			// Windows over partitions, which its stage computes from its
+			// inputs read by partition (see windowColumns).
 		}
 		return pl.produceSelect(q, scope, out, cols, wraps)
 	}
 	return unsupported("%s in a relation", strings.ToLower(str(q["type"])))
+}
+
+// produceUnion plans the stages that write the rows of q, a UNION of
+// distinct rows, to out: its branches write theirs, as a UNION ALL's do,
+// to an exchange partitioned by all of their columns, so that equal rows
+// meet in one partition, and a last stage writes each partition's
+// distinct rows, applying wraps, to out.
+func (pl *planner) produceUnion(q node, scope cteScope, out *Exchange, cols []Column, wraps []*wrapper) error {
+	casts := make([]string, len(cols))
+	for i, c := range cols {
+		if slices.Contains(intTypes, c.Type) {
+			casts[i] = "BIGINT"
+		}
+	}
+	rows := pl.exchange("relation", names(cols), casts)
+	sc := scope.with(q)
+	for _, side := range []string{"left", "right"} {
+		branch := child(q, side)
+		if str(branch["type"]) == "SET_OPERATION_NODE" && str(branch["setop_type"]) == "UNION" && len(list(branch, "modifiers")) == 0 {
+			// UNION or UNION ALL within: the distinct rows of all, as
+			// those of a UNION ALL.
+			branch = clone(branch).(node)
+			allBranches(branch)
+		}
+		if err := pl.produce(branch, sc, rows, cols, nil); err != nil {
+			return err
+		}
+	}
+	f, err := pl.p.parse("SELECT DISTINCT * FROM " + quoteIdent("__igloo_r"))
+	if err != nil {
+		return err
+	}
+	have := cols
+	for _, w := range wraps {
+		if f, err = pl.conform(w.apply(f, have), w.have, w.want); err != nil {
+			return err
+		}
+		have = w.want
+	}
+	if len(wraps) > 0 {
+		if err := pl.checkFragment(f); err != nil {
+			return err
+		}
+	}
+	pl.stage(&Stage{fragment: f, Columns: names(have), Inputs: []Input{{View: "__igloo_r", Exchange: rows, Partitioned: true}}, Out: out})
+	return nil
+}
+
+// allBranches makes the UNIONs in a set operation, and those within it,
+// UNION ALLs.
+func allBranches(q node) {
+	if str(q["type"]) != "SET_OPERATION_NODE" || str(q["setop_type"]) != "UNION" || len(list(q, "modifiers")) > 0 {
+		return
+	}
+	q["setop_all"] = true
+	allBranches(child(q, "left"))
+	allBranches(child(q, "right"))
 }
 
 // overAll rewrites a SELECT whose window functions are aggregates over all
@@ -993,8 +1168,9 @@ func (pl *planner) produceSelect(sel node, scope cteScope, out *Exchange, cols [
 			return unsupported("%s in a relation", strings.ToLower(t))
 		}
 	}
-	if child(sel, "qualify") != nil || hasClass(sel["select_list"], "WINDOW") {
-		return unsupported("window functions in a relation")
+	windowed := child(sel, "qualify") != nil || hasClass(sel["select_list"], "WINDOW")
+	if windowed && (len(list(sel, "modifiers")) > 0 || len(list(sel, "group_expressions")) > 0 || pl.hasAggregate(sel["select_list"])) {
+		return unsupported("window functions in a relation that groups")
 	}
 	work, err := pl.distinctAsGroups(sel)
 	if err != nil {
@@ -1004,6 +1180,14 @@ func (pl *planner) produceSelect(sel node, scope cteScope, out *Exchange, cols [
 	if err := pl.analyze(c, scope); err != nil {
 		return err
 	}
+	if windowed {
+		if err := pl.windowColumns(c); err != nil {
+			return err
+		}
+		if c.window == nil {
+			return unsupported("window functions in a relation")
+		}
+	}
 	if c.columns, err = pl.describe(work, scope); err != nil {
 		return err
 	}
@@ -1011,6 +1195,12 @@ func (pl *planner) produceSelect(sel node, scope cteScope, out *Exchange, cols [
 		return unsupported("a relation's branches have %d and %d columns", len(c.columns), len(cols))
 	}
 	if err := pl.chooseInputs(c); err != nil {
+		return err
+	}
+	if err := c.checkWindows(); err != nil {
+		return err
+	}
+	if err := c.checkSamples(); err != nil {
 		return err
 	}
 	defer unmark(c)
@@ -1066,7 +1256,7 @@ func (pl *planner) produceSelect(sel node, scope cteScope, out *Exchange, cols [
 	}
 	*last = f
 	if _, err = pl.emit(j, b, out); err == nil {
-		pl.uncertain = append(pl.uncertain, uncertainOf(c)...)
+		pl.uncertain = append(pl.uncertain, pl.uncertainOf(c)...)
 	}
 	return err
 }
@@ -1115,9 +1305,16 @@ func (w *wrapper) apply(f node, inner []Column) node {
 // a subquery or a common table expression nothing else reads, and if so
 // returns the wrapper that computes it over the relation's rows.
 func (pl *planner) projection(sel node, scope cteScope) (*wrapper, *relUse, error) {
+	// Its own expressions, not those of the relation it reads, which is
+	// produced as it is: a relation over a subquery with a scalar subquery
+	// in it (ver = (SELECT max(ver) ...)) is still a projection of it.
+	// Taken for more, its subquery was made a relation, which projected the
+	// same columns of the same subquery, and was taken for more again,
+	// without end.
+	own := []any{sel["select_list"], sel["where_clause"]}
 	if len(list(sel, "modifiers")) > 0 || len(list(sel, "group_expressions")) > 0 || child(sel, "having") != nil ||
 		child(sel, "qualify") != nil || child(sel, "sample") != nil || str(sel["aggregate_handling"]) != "STANDARD_HANDLING" ||
-		pl.hasAggregate(sel["select_list"]) || hasClass(clauses(sel), "WINDOW") || hasClass(clauses(sel), "SUBQUERY") {
+		pl.hasAggregate(sel["select_list"]) || hasClass(own, "WINDOW") || hasClass(own, "SUBQUERY") {
 		return nil, nil, nil
 	}
 	ref := child(sel, "from_table")
@@ -1249,7 +1446,7 @@ func names(cols []Column) []string {
 // savepoint is how far planning had come: a candidate that turns out not
 // to qualify takes back the stages and exchanges it planned, and puts back
 // the views it read as their queries.
-type savepoint struct{ stages, exchanges, memo, undo, expanded, uncertain int }
+type savepoint struct{ stages, exchanges, memo, undo, expanded, uncertain, buckets int }
 
 // memoEntry records an exchange remembered for a common table expression.
 type memoEntry struct {
@@ -1260,7 +1457,7 @@ type memoEntry struct {
 
 func (pl *planner) save() savepoint {
 	return savepoint{stages: len(pl.stages), exchanges: pl.exchanges, memo: len(pl.memo), undo: len(pl.undo), expanded: pl.expanded,
-		uncertain: len(pl.uncertain)}
+		uncertain: len(pl.uncertain), buckets: len(pl.bucketNotes)}
 }
 
 func (pl *planner) restore(sp savepoint) {
@@ -1280,6 +1477,7 @@ func (pl *planner) restore(sp savepoint) {
 	}
 	pl.expanded = sp.expanded
 	pl.uncertain = pl.uncertain[:sp.uncertain]
+	pl.bucketNotes = pl.bucketNotes[:sp.buckets]
 	for x := range pl.relKeys {
 		if x.ID >= sp.exchanges {
 			delete(pl.relKeys, x)

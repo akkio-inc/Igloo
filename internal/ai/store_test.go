@@ -54,8 +54,25 @@ func TestStore(t *testing.T) {
 		if err := s.UpdateIntegration(ctx, got); err != nil {
 			t.Fatal(err)
 		}
-		if again, _ := s.Integration(ctx, "main"); again.Comment != "changed" || again.Enabled {
-			t.Errorf("updated %+v", again)
+		if again, _ := s.Integration(ctx, "main"); again.Comment != "changed" || again.Enabled || again.ID == "" || again.ID != got.ID {
+			t.Errorf("updated %+v, ID before %q", again, got.ID)
+		}
+		// CREATE OR REPLACE keeps the integration's ID, as its grants;
+		// made again after a drop, it has another.
+		if err := s.CreateIntegration(ctx, in, true); err != nil {
+			t.Fatal(err)
+		}
+		if again, _ := s.Integration(ctx, "main"); again.ID != got.ID {
+			t.Errorf("replaced: ID %q, before %q", again.ID, got.ID)
+		}
+		if err := s.DropIntegration(ctx, "main"); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.CreateIntegration(ctx, in, false); err != nil {
+			t.Fatal(err)
+		}
+		if again, _ := s.Integration(ctx, "main"); again.ID == "" || again.ID == got.ID {
+			t.Errorf("made again: ID %q, before %q", again.ID, got.ID)
 		}
 		if err := s.GrantUsage(ctx, Grant{Integration: "main", Grantee: "analysts", GranteeType: "role"}); err != nil {
 			t.Fatal(err)

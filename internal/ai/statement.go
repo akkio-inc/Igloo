@@ -323,7 +323,13 @@ func (s *Statement) resolve(calls []*call, flights []*flight, batch batchRunner,
 				err = s.ctx.Err()
 			}
 			s.settle(first.b, first.model, est, used, err)
-			if err != nil && !IsRowError(err) {
+			switch {
+			case IsRowError(err):
+				// A provider refusing the input may quote the request,
+				// its keys and headers included, and the row's error is
+				// shown as a value, in a notice and in a failed statement.
+				err = &RowError{Msg: first.b.in.Scrub(err.Error())}
+			case err != nil:
 				err = s.fail(s.providerError(first.b, err))
 			}
 			for k, i := range j.idx {

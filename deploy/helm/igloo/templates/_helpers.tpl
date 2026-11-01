@@ -89,6 +89,26 @@ Images and service accounts
 {{- printf "%s:%s" .Values.catalog.image.repository (toString .Values.catalog.image.tag) -}}
 {{- end -}}
 
+{{/* The workers' service account: their own, or the igloo pods'. */}}
+{{- define "igloo.workerServiceAccountName" -}}
+{{- if .Values.workers.serviceAccount.create -}}
+{{- default (printf "%s-worker" (include "igloo.fullname" .)) .Values.workers.serviceAccount.name -}}
+{{- else if .Values.workers.serviceAccount.name -}}
+{{- .Values.workers.serviceAccount.name -}}
+{{- else -}}
+{{- include "igloo.serviceAccountName" . -}}
+{{- end -}}
+{{- end -}}
+
+{{/* on or off, for IGLOO_WORKER_WRITES: see workers.writes in values.yaml. */}}
+{{- define "igloo.workerWrites" -}}
+{{- $w := .Values.workers.writes | toString | lower -}}
+{{- $own := or .Values.workers.serviceAccount.create .Values.workers.serviceAccount.name .Values.workers.storage.s3.existingSecret .Values.workers.storage.gcs.existingSecret .Values.workers.storage.azure.existingSecret -}}
+{{- if or (eq $w "true") (eq $w "on") (and (eq $w "auto") $own) -}}on{{- else if or (eq $w "false") (eq $w "off") (eq $w "auto") -}}off{{- else -}}
+{{- fail (printf "workers.writes must be auto, true or false, got %q" $w) -}}
+{{- end -}}
+{{- end -}}
+
 {{- define "igloo.serviceAccountName" -}}
 {{- if .Values.serviceAccount.create -}}
 {{- default (include "igloo.fullname" .) .Values.serviceAccount.name -}}
@@ -174,13 +194,28 @@ key: {{ $otherKey }}
 {{- end -}}
 
 {{/*
-IGLOO_DUCKDB_MEMORY_LIMIT: duckdb.memoryLimit, or 80% of
-resources.limits.memory in MiB but always leaving at least 512Mi for the rest
-of the process, so DuckDB spills to disk before the container reaches its
-limit. (DuckDB allocates beyond its limit for per-thread state, and the Go
-runtime, mapped extensions and spill-file page cache share the container's
-memory; on a 1Gi pod with 18 cores a large aggregation peaked at about 190Mi of
-anonymous memory above DuckDB's limit.) Empty when neither is set.
+DuckDB's memory limit in MiB, of a container's memory limit in MiB (a
+float), where none is set, as Igloo gives it (memlimit.DuckDBLimit): what the
+memory leaves after an eighth of it (at least 512Mi), which Igloo keeps free
+before it lowers DuckDB's limit, and a twentieth in reserve (at least 256Mi),
+less an eighth of the limit itself for what DuckDB holds beyond it as it
+spills, but at least half of the memory.
+*/}}
+{{- define "igloo.duckdbShareMiB" -}}
+{{- $total := float64 . -}}
+{{- $high := maxf (divf $total 8.0) 512.0 -}}
+{{- $reserve := maxf (divf $total 20.0) 256.0 -}}
+{{- floor (maxf (mulf (subf (subf $total $high) $reserve) (divf 8.0 9.0)) (divf $total 2.0)) -}}
+{{- end -}}
+
+{{/*
+IGLOO_DUCKDB_MEMORY_LIMIT: duckdb.memoryLimit, or what igloo.duckdbShareMiB
+leaves of resources.limits.memory, so DuckDB spills to disk before the
+container reaches its limit. (DuckDB allocates beyond its limit for
+per-thread state, and the Go runtime, mapped extensions and spill-file page
+cache share the container's memory; on a 1Gi pod with 18 cores a large
+aggregation peaked at about 190Mi of anonymous memory above DuckDB's limit.)
+Empty when neither is set.
 */}}
 {{- define "igloo.duckdbMemoryLimit" -}}
 {{- if .Values.duckdb.memoryLimit -}}
@@ -199,9 +234,9 @@ anonymous memory above DuckDB's limit.) Empty when neither is set.
 {{- $number := float64 (regexReplaceAll $re $limit "${1}") -}}
 {{- $bytes := mulf $number (float64 (get $unitBytes (regexReplaceAll $re $limit "${2}"))) -}}
 {{- $total := divf $bytes 1048576.0 -}}
-{{- $mib := floor (min (mulf $total 0.8) (subf $total 512.0)) -}}
+{{- $mib := float64 (include "igloo.duckdbShareMiB" $total) -}}
 {{- if lt $mib 256.0 -}}
-{{- fail (printf "igloo: resources.limits.memory %q leaves DuckDB less than 256Mi after a 512Mi reserve; use at least 1Gi, or set duckdb.memoryLimit" $limit) -}}
+{{- fail (printf "igloo: resources.limits.memory %q leaves DuckDB less than 256Mi; use at least 1Gi, or set duckdb.memoryLimit" $limit) -}}
 {{- end -}}
 {{- printf "%dMiB" (int64 $mib) -}}
 {{- end -}}
@@ -415,6 +450,9 @@ the schema enforces. The message never includes the password. */ -}}
 {{- if and $v.workers.enabled (lt (int $v.workers.maxReplicas) 1) -}}
 {{- fail (printf "%sworkers.maxReplicas must be at least 1 with workers.enabled" $prefix) -}}
 {{- end -}}
+{{- if and $v.workers.large.enabled (not (include "igloo.anyWorkers" .)) -}}
+{{- fail (printf "%sworkers.large.enabled needs workers.enabled too: the large worker shares the workers' secret and settings" $prefix) -}}
+{{- end -}}
 
 {{- $missing := list -}}
 {{- if not $location -}}
@@ -435,6 +473,31 @@ the schema enforces. The message never includes the password. */ -}}
 {{- $lines := list -}}
 {{- range $missing -}}{{- $lines = append $lines (printf "  - %s" .) -}}{{- end -}}
 {{- fail (printf "\n\nigloo: missing required values:\n%s\nFor a self-contained development install: --set postgresql.enabled=true --set objectStorage.enabled=true\n" (join "\n" $lines)) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
+Refuses a read cache volume that cannot work, for the release's igloo pods
+or a pool's (called from the Deployment, in either's context): an ephemeral
+volume needs a size, and a claim, which one pod at a time can use, needs a
+Deployment of at most one pod that never runs two at once.
+*/}}
+{{- define "igloo.validateCacheVolume" -}}
+{{- $c := .Values.cacheVolume -}}
+{{- $what := "cacheVolume" -}}
+{{- with (get . "Pool") -}}{{- $what = printf "pool %q's cacheVolume" .name -}}{{- end -}}
+{{- if and (eq $c.type "ephemeral") (not $c.sizeLimit) -}}
+{{- fail (printf "igloo: %s.type ephemeral needs cacheVolume.sizeLimit, the size of each pod's volume (e.g. 100Gi)" $what) -}}
+{{- end -}}
+{{- if eq $c.type "persistentVolumeClaim" -}}
+{{- if not $c.existingClaim -}}
+{{- fail (printf "igloo: %s.type persistentVolumeClaim needs cacheVolume.existingClaim, the claim to keep the cache on" $what) -}}
+{{- end -}}
+{{- $pods := int .Values.replicaCount -}}
+{{- if .Values.scaleToZero.enabled -}}{{- $pods = int (include "igloo.scaleToZeroReplicas" .) -}}{{- end -}}
+{{- if or .Values.autoscaling.enabled (gt $pods 1) (ne (toString (dig "type" "RollingUpdate" (.Values.strategy | default dict))) "Recreate") -}}
+{{- fail (printf "igloo: %s.type persistentVolumeClaim keeps one igloo pod's cache on claim %q, which no two pods may use at once: set replicaCount (and scaleToZero.replicas) to 1, autoscaling.enabled=false and strategy.type=Recreate, or use type emptyDir or ephemeral" $what $c.existingClaim) -}}
 {{- end -}}
 {{- end -}}
 {{- end -}}

@@ -14,7 +14,8 @@ import (
 type Model struct {
 	Schema, Name string
 	Class        string
-	// Owner is the user who created it.
+	// Owner is the user who created it, or "name (dropped)" once that
+	// user was dropped (see Store.DisownModels).
 	Owner   string
 	Comment string
 	// TrainingSQL is the CREATE statement as written.
@@ -115,13 +116,58 @@ type Store interface {
 	Delete(ctx context.Context, schema, name string) (Model, error)
 	// BlobUsed reports whether a model's blob is sha.
 	BlobUsed(ctx context.Context, sha string) (bool, error)
+	// LockBlob takes the lock on blob sha, until the function it returns
+	// is called. Models trained the same way share a blob: CREATE holds
+	// the lock from writing the blob until its model is stored, and
+	// deleting a blob holds it from BlobUsed until the blob is gone, so
+	// that a blob is never deleted under a model about to use it. In the
+	// metadata database the lock holds across replicas.
+	LockBlob(ctx context.Context, sha string) (func(), error)
 	// Grants returns every grant on models.
 	Grants(ctx context.Context) ([]Grant, error)
 	// AddGrant and RevokeGrant give and take back a privilege; giving one
 	// already given changes nothing. The model must exist.
 	AddGrant(ctx context.Context, g Grant) error
 	RevokeGrant(ctx context.Context, g Grant) error
+	// ForgetGrantee removes the grants to a user or role ("user" or
+	// "role") that was dropped.
+	ForgetGrantee(ctx context.Context, granteeType, grantee string) error
+	// DisownModels gives the models of owner, a user who was dropped, to
+	// tombstone, a name no user can have, so that a user created later
+	// with the same name does not own them.
+	DisownModels(ctx context.Context, owner, tombstone string) error
+	// ForgetDropped disowns the models, and removes the grants, that users
+	// and roles dropped before DROP USER and DROP ROLE did so themselves
+	// (see DisownModels and ForgetGrantee) left behind. A model whose
+	// owner is no user, or a user created after the model (a later one of
+	// the same name), goes to Dropped(owner); a grant to a user or role
+	// that is not there, or was created after the grant, goes. principals
+	// says which users and roles there are; models and grants made since
+	// ForgetDropped began asking stay, as one created meanwhile may hold
+	// them. It returns how many models it disowned and grants it removed.
+	// Every replica runs it as it starts, and a second run changes nothing.
+	ForgetDropped(ctx context.Context, principals func(context.Context) (Principals, error)) (disowned, forgotten int, err error)
 	Close()
+}
+
+// Principals are the users and custom roles there are, each with when it
+// was created.
+type Principals struct {
+	Users, Roles map[string]time.Time
+}
+
+// Dropped is the owner a dropped user's models are given: a name no user
+// can have (see Store.DisownModels).
+func Dropped(owner string) string { return owner + droppedSuffix }
+
+const droppedSuffix = " (dropped)"
+
+// gone reports whether what name was given at time t went to none of
+// names: there is no one of that name, or the one there is was created
+// after t.
+func gone(names map[string]time.Time, name string, t time.Time) bool {
+	created, ok := names[name]
+	return !ok || created.After(t)
 }
 
 func key(schema, name string) string { return strings.ToLower(schema) + "." + strings.ToLower(name) }
@@ -132,9 +178,19 @@ type MemoryStore struct {
 	models map[string]Model
 	grants []Grant
 	epoch  int64
+	// blobLocks are LockBlob's locks, while held or waited for.
+	blobLocks map[string]*blobLock
 }
 
-func NewMemoryStore() *MemoryStore { return &MemoryStore{models: map[string]Model{}, epoch: 1} }
+type blobLock struct {
+	held chan struct{}
+	// users hold or wait for the lock.
+	users int
+}
+
+func NewMemoryStore() *MemoryStore {
+	return &MemoryStore{models: map[string]Model{}, epoch: 1, blobLocks: map[string]*blobLock{}}
+}
 
 func (s *MemoryStore) Epoch(context.Context) (int64, error) {
 	s.mu.Lock()
@@ -221,6 +277,34 @@ func (s *MemoryStore) BlobUsed(_ context.Context, sha string) (bool, error) {
 	return false, nil
 }
 
+func (s *MemoryStore) LockBlob(ctx context.Context, sha string) (func(), error) {
+	s.mu.Lock()
+	l := s.blobLocks[sha]
+	if l == nil {
+		l = &blobLock{held: make(chan struct{}, 1)}
+		s.blobLocks[sha] = l
+	}
+	l.users++
+	s.mu.Unlock()
+	done := func() {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		if l.users--; l.users == 0 {
+			delete(s.blobLocks, sha)
+		}
+	}
+	select {
+	case l.held <- struct{}{}:
+		return func() {
+			<-l.held
+			done()
+		}, nil
+	case <-ctx.Done():
+		done()
+		return nil, ctx.Err()
+	}
+}
+
 func (s *MemoryStore) Grants(context.Context) ([]Grant, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -254,6 +338,52 @@ func (s *MemoryStore) RevokeGrant(_ context.Context, g Grant) error {
 	defer s.mu.Unlock()
 	s.grants = slices.DeleteFunc(s.grants, func(o Grant) bool { return sameGrant(o, g) })
 	return nil
+}
+
+func (s *MemoryStore) ForgetGrantee(_ context.Context, granteeType, grantee string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.grants = slices.DeleteFunc(s.grants, func(g Grant) bool { return g.GranteeType == granteeType && g.Grantee == grantee })
+	return nil
+}
+
+func (s *MemoryStore) DisownModels(_ context.Context, owner, tombstone string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for k, m := range s.models {
+		if m.Owner == owner {
+			m.Owner = tombstone
+			s.models[k] = m
+		}
+	}
+	return nil
+}
+
+func (s *MemoryStore) ForgetDropped(ctx context.Context, principals func(context.Context) (Principals, error)) (int, int, error) {
+	asked := time.Now()
+	p, err := principals(ctx)
+	if err != nil {
+		return 0, 0, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	disowned := 0
+	for k, m := range s.models {
+		if m.CreatedAt.Before(asked) && !strings.HasSuffix(m.Owner, droppedSuffix) && gone(p.Users, m.Owner, m.CreatedAt) {
+			m.Owner = Dropped(m.Owner)
+			s.models[k] = m
+			disowned++
+		}
+	}
+	n := len(s.grants)
+	s.grants = slices.DeleteFunc(s.grants, func(g Grant) bool {
+		names := p.Users
+		if g.GranteeType == "role" {
+			names = p.Roles
+		}
+		return g.GrantedAt.Before(asked) && gone(names, g.Grantee, g.GrantedAt)
+	})
+	return disowned, n - len(s.grants), nil
 }
 
 func (s *MemoryStore) Close() {}

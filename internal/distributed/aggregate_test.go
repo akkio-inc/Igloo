@@ -90,7 +90,17 @@ func TestAggregationModes(t *testing.T) {
 		`SELECT l_shipmode, count(DISTINCT l_orderkey) AS o, sum(l_quantity) AS q FROM lineitem GROUP BY 1 HAVING sum(l_quantity) > 100 ORDER BY 1`,
 		`SELECT l_orderkey, sum(l_quantity) AS q FROM lineitem GROUP BY l_orderkey HAVING sum(l_quantity) > 250 ORDER BY 1`,
 		`SELECT l_orderkey % 7 AS k, count(*) AS n FROM lineitem GROUP BY k QUALIFY rank() OVER (ORDER BY n DESC) <= 3 ORDER BY k`,
+		// A ranking of many groups, whose first the partitions keep, and
+		// one beside another window, which needs every group.
+		`SELECT l_partkey % 50 AS b, l_suppkey, count(*) AS n FROM lineitem GROUP BY 1, 2
+			QUALIFY dense_rank() OVER (PARTITION BY b ORDER BY n DESC) <= 2 ORDER BY 1, 3 DESC, 2`,
+		`SELECT l_suppkey, count(*) AS n, sum(count(*)) OVER () AS total FROM lineitem GROUP BY 1
+			QUALIFY row_number() OVER (ORDER BY n DESC, l_suppkey) <= 5 ORDER BY 2 DESC, 1`,
 		`SELECT DISTINCT l_returnflag, count(*) > 0 AS any FROM lineitem GROUP BY 1 ORDER BY 1`,
+		// GROUPING() of one grouping set, which the coordinator projects
+		// whole groups of: 0.
+		`SELECT l_returnflag, l_linestatus, GROUPING(l_linestatus) AS g, GROUPING(l_returnflag, l_linestatus) AS gg, count(DISTINCT l_suppkey) AS s
+			FROM lineitem GROUP BY 1, 2 HAVING GROUPING(l_returnflag) = 0 ORDER BY 1, 2`,
 		`SELECT l_partkey, count(*) AS n, bool_or(l_quantity > 45), bit_xor(l_linenumber), any_value(l_returnflag) IS NOT NULL FROM lineitem GROUP BY 1 ORDER BY 2 DESC, 1 LIMIT 20`,
 		// Partial sums of BIGINT are HUGEINT, which Parquet would make DOUBLE.
 		`SELECT l_partkey % 5 AS k, sum(l_orderkey * 100000000000 + l_linenumber) AS big, count(DISTINCT l_suppkey) FROM lineitem GROUP BY 1 ORDER BY 1`,
@@ -229,33 +239,52 @@ func TestTPCHByGroup(t *testing.T) {
 	}
 }
 
+// valueExchanges counts the stages of p that write partial results to an
+// exchange keyed by a DISTINCT argument's values (aggByValue).
+func valueExchanges(p *Plan) int {
+	n := 0
+	for _, s := range p.Stages {
+		if s.Out != nil && s.Out.purpose == "aggregate" && slices.ContainsFunc(s.Out.Keys, func(k string) bool { return strings.HasPrefix(k, "__dk") }) {
+			n++
+		}
+	}
+	return n
+}
+
 // TestDistinctInPlace checks aggregates over DISTINCT values in a
 // partitioned join on those values: each partition holds every row of
-// each value, so the stage computes them and the coordinator adds them up,
-// with no exchange of partial results.
+// each value, so the stage computes them with no exchange of partial
+// results by value; without groups, the coordinator adds them up, and
+// with groups of the partitioned tables, which may be many, a last stage
+// adds up each group's.
 func TestDistinctInPlace(t *testing.T) {
 	h := newHarness(t, 0.02, 5, 3)
 	h.co.maxBroadcast = h.tables["orders"].Bytes - 1
 	for _, tc := range []struct {
 		query   string
 		inPlace bool
+		// exchanges is how many stages write partial results to an exchange.
+		exchanges int
 	}{
 		{`SELECT o_orderpriority, count(DISTINCT o_orderkey) AS orders, count(DISTINCT l_orderkey) AS o2, count(*) AS n, sum(l_quantity) AS q
-			FROM lineitem JOIN orders ON l_orderkey = o_orderkey GROUP BY 1 ORDER BY 1`, true},
-		{`SELECT count(DISTINCT o_orderkey), avg(DISTINCT l_orderkey), max(DISTINCT o_orderkey) FROM lineitem, orders WHERE l_orderkey = o_orderkey AND l_shipmode = 'AIR'`, true},
+			FROM lineitem JOIN orders ON l_orderkey = o_orderkey GROUP BY 1 ORDER BY 1`, true, 1},
+		{`SELECT count(DISTINCT o_orderkey), avg(DISTINCT l_orderkey), max(DISTINCT o_orderkey) FROM lineitem, orders WHERE l_orderkey = o_orderkey AND l_shipmode = 'AIR'`, true, 0},
 		{`SELECT l_shipmode, count(DISTINCT CASE WHEN o_orderkey IS NOT NULL AND l_linenumber IS NOT NULL THEN (o_orderkey, l_linenumber) END) AS lines,
-			count(DISTINCT o_orderkey) FROM lineitem JOIN orders ON o_orderkey = l_orderkey GROUP BY 1 ORDER BY 1`, true},
-		// Values the join key does not fix go through an exchange.
-		{`SELECT o_orderpriority, count(DISTINCT o_custkey) FROM lineitem JOIN orders ON l_orderkey = o_orderkey GROUP BY 1 ORDER BY 1`, false},
+			count(DISTINCT o_orderkey) FROM lineitem JOIN orders ON o_orderkey = l_orderkey GROUP BY 1 ORDER BY 1`, true, 1},
+		// Values the join key does not fix go through an exchange by value,
+		// and the groups through one by group.
+		{`SELECT o_orderpriority, count(DISTINCT o_custkey) FROM lineitem JOIN orders ON l_orderkey = o_orderkey GROUP BY 1 ORDER BY 1`, false, 2},
 	} {
 		t.Run(short(tc.query), func(t *testing.T) {
 			h.t = t
 			if !h.partitioned(tc.query) {
 				t.Fatal("did not partition the join")
 			}
-			n := h.exchanged(tc.query, "aggregate")
-			if (n == 0) != tc.inPlace {
-				t.Errorf("%d stages wrote partial results to an exchange; want in place %v", n, tc.inPlace)
+			if n := h.exchanged(tc.query, "aggregate"); n != tc.exchanges {
+				t.Errorf("%d stages wrote partial results to an exchange, want %d", n, tc.exchanges)
+			}
+			if n := valueExchanges(h.planOf(tc.query)); (n == 0) != tc.inPlace {
+				t.Errorf("%d stages wrote partial results to an exchange by value; want in place %v", n, tc.inPlace)
 			}
 		})
 	}
@@ -419,13 +448,18 @@ func TestExtensionAggregates(t *testing.T) {
 		}
 	}
 	h.co.aggregation = ""
-	for _, q := range []string{
-		`SELECT l_shipmode, rb_count_distinct(CAST(l_orderkey AS UINTEGER), l_shipdate) AS pairs FROM lineitem GROUP BY 1 ORDER BY 1`,
-		`WITH v AS (SELECT l_shipmode AS m, CAST(l_orderkey AS UINTEGER) AS id, l_shipdate AS day FROM lineitem, unnest([1, 2]))
-			SELECT m, rb_count_distinct(id, day) AS pairs, count(*) AS n FROM v GROUP BY 1 ORDER BY 1`,
-	} {
-		if _, err := h.co.Plan(context.Background(), q, harnessEnv{h}, ModeOn); err == nil || !strings.Contains(err.Error(), "rb_count_distinct(id, key)") {
-			t.Errorf("%s: planned on workers, or for another reason: %v", short(q), err)
-		}
+	q := `SELECT l_shipmode, rb_count_distinct(CAST(l_orderkey AS UINTEGER), l_shipdate) AS pairs FROM lineitem GROUP BY 1 ORDER BY 1`
+	if _, err := h.co.Plan(context.Background(), q, harnessEnv{h}, ModeOn); err == nil || !strings.Contains(err.Error(), "rb_count_distinct(id, key)") {
+		t.Errorf("%s: planned on workers, or for another reason: %v", short(q), err)
+	}
+	// Over a common table expression's rows, which workers send: the
+	// coordinator counts them.
+	h.t = t
+	q = `WITH v AS (SELECT l_shipmode AS m, CAST(l_orderkey AS UINTEGER) AS id, l_shipdate AS day FROM lineitem, unnest([1, 2]))
+		SELECT m, rb_count_distinct(id, day) AS pairs, count(*) AS n FROM v GROUP BY 1 ORDER BY 1`
+	h.check(q)
+	p := h.planOf(q)
+	if final, _ := h.co.parser.print(p.final); strings.Contains(p.describe(), "rb_count_distinct") || !strings.Contains(final, "rb_count_distinct") {
+		t.Errorf("workers count rb_count_distinct(id, key):\n%s", p.describe())
 	}
 }

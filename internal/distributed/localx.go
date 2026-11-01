@@ -213,6 +213,16 @@ func (l *localExchanges) drop(qid string) {
 	}
 }
 
+// statements counts the statements whose exchange files the worker holds.
+func (l *localExchanges) statements() int {
+	if l == nil {
+		return 0
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return len(l.queries)
+}
+
 // hold counts n bytes more, or fewer, of files fetched to the disk.
 func (l *localExchanges) hold(n int64) {
 	l.mu.Lock()
@@ -413,12 +423,12 @@ func (w *Worker) shuffleLocal(ctx context.Context, conn *duckdb.Conn, req *taskR
 	if !ok {
 		w.log.Info("writing an exchange to object storage: the worker's disk is short of room for it",
 			"query", req.Query, "task", req.Task, "expect", req.Expect)
-		return w.shuffle(ctx, conn, req.Shuffle, query, cols, req.Partitions)
+		return w.shuffle(ctx, conn, req.Shuffle, query, cols, req.Partitions, req.Slots)
 	}
 	if err := os.MkdirAll(filepath.Dir(dir), 0o700); err != nil {
 		return nil, err
 	}
-	res, err := w.writePartitions(ctx, conn, dir, query, cols, req.Partitions)
+	res, err := w.writePartitions(ctx, conn, dir, query, cols, req.Partitions, req.Slots)
 	if err == nil && ctx.Err() != nil {
 		// Canceled as it finished: the coordinator may have removed the
 		// statement's files already, and would not list these.

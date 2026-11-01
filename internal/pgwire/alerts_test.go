@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -482,6 +483,46 @@ func TestDroppedOwnersWork(t *testing.T) {
 		t.Error("a dropped owner's alert ran")
 	}
 	mustExec(t, as.admin, "DROP ALERT watch")
+}
+
+// TestRunsDueBeforeTheOwnerWasDropped checks runs of a task and an alert
+// read when they came due, before their owner was dropped and a user of
+// the same name made again: the runs resolved the owner by name, and ran
+// as the new user. Now they are skipped.
+func TestRunsDueBeforeTheOwnerWasDropped(t *testing.T) {
+	t.Parallel()
+	as := startAlertServer(t)
+	ctx := context.Background()
+	mustExec(t, as.admin, "CREATE NOTIFICATION INTEGRATION hook TYPE webhook URL '"+as.hooks.URL+"/hook'")
+	mustExec(t, as.admin, "CREATE TABLE lake.public.ticks (n INTEGER)")
+	walt := as.user(t, "walt", auth.RoleWriter, pgx.QueryExecModeSimpleProtocol)
+	mustExec(t, as.admin, "GRANT USAGE ON INTEGRATION hook TO walt")
+	mustExec(t, walt, "CREATE ALERT watch SCHEDULE '1 hour' IF (EXISTS (SELECT 1)) THEN NOTIFY hook")
+	mustExec(t, walt, "CREATE TASK tick SCHEDULE '1 hour' AS INSERT INTO lake.public.ticks VALUES (1)")
+	var due []tasks.Job
+	for kind, name := range map[string]string{tasks.KindAlert: "watch", tasks.KindTask: "tick"} {
+		j, err := as.sched.Store().Job(ctx, kind, name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		due = append(due, j)
+	}
+	_ = walt.Close(ctx)
+	mustExec(t, as.admin, "DROP USER walt")
+	as.user(t, "walt", auth.RoleWriter, pgx.QueryExecModeSimpleProtocol)
+	mustExec(t, as.admin, "GRANT USAGE ON INTEGRATION hook TO walt")
+
+	for _, j := range due {
+		if _, err := as.sched.RunNow(ctx, as.srv, j); !errors.Is(err, tasks.ErrSkipped) {
+			t.Errorf("%s %s, read before its owner was dropped: %v", j.Kind, j.Name, err)
+		}
+	}
+	if n := count(t, as.admin, "SELECT count(*) FROM lake.public.ticks"); n != 0 {
+		t.Errorf("the task ran as the new walt: %d rows", n)
+	}
+	if n := as.hooks.count(); n != 0 {
+		t.Errorf("the alert ran as the new walt: %d notifications", n)
+	}
 }
 
 // TestFailedLoginsCannotFlood checks the failed_logins alert's inputs: a

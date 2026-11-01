@@ -83,8 +83,13 @@ func showJobs(t *testing.T, conn *pgx.Conn, what string) map[string]jobRow {
 	out := map[string]jobRow{}
 	for rows.Next() {
 		var r jobRow
-		if err := rows.Scan(&r.name, &r.owner, &r.state, &r.schedule, &r.timezone, &r.nextRun, &r.lastRun,
-			&r.lastOutcome, &r.lastError, &r.definition, &r.createdAt); err != nil {
+		dest := []any{&r.name, &r.owner, &r.state, &r.schedule, &r.timezone, &r.nextRun, &r.lastRun,
+			&r.lastOutcome, &r.lastError, &r.definition, &r.createdAt}
+		// Materialized views say how they are refreshed too.
+		for range len(rows.FieldDescriptions()) - len(dest) {
+			dest = append(dest, new(any))
+		}
+		if err := rows.Scan(dest...); err != nil {
 			t.Fatal(err)
 		}
 		out[r.name] = r

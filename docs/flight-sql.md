@@ -172,8 +172,12 @@ cursor, are strings, as the PostgreSQL protocol sends them.
   `PERMISSION_DENIED` before their password is checked. The check uses the
   address the client dialed (the request's `:authority`), as the console
   uses the `Host` header, because behind Docker's or Kubernetes' port
-  forwarding Igloo cannot tell a local client by its address. Configure
-  TLS before publishing the port beyond loopback.
+  forwarding Igloo cannot tell a local client by its address alone; the
+  address need only be on this machine or a private network, as Docker's
+  bridge network is. It guards against sending a password across a network
+  by mistake, not against clients on a private network that reach the port
+  and name `localhost`. Configure TLS before publishing the port beyond
+  loopback.
 - **Authorization.** Every statement and metadata call runs as the user, in
   an embedded session of the SQL server, through the same checks as a
   statement from `psql`: built-in roles, grants, the sandbox, and

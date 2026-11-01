@@ -2,6 +2,7 @@ package pgwire
 
 import (
 	"context"
+	"database/sql"
 	"database/sql/driver"
 	"errors"
 	"fmt"
@@ -72,8 +73,11 @@ func (s *Server) distributedCommand(sess *session, query string) (wire.PreparedS
 	}
 	if m := explainDistributed.FindStringSubmatch(query); m != nil {
 		return respond(func(ctx context.Context, w wire.DataWriter, _ []wire.Parameter) error {
+			// A cancel request and the session's statement timeout end it,
+			// as they end any statement, and nothing else does.
+			ctx, done := sess.cancelable(ctx, query)
 			rows, err := s.explainDistributed(ctx, sess, m[1])
-			if err != nil {
+			if err = done(err); err != nil {
 				return err
 			}
 			for _, r := range rows {
@@ -177,17 +181,21 @@ var errWorkerMemory = pgerror.WithCode(errors.New("canceling statement: a worker
 // it began to run on workers after running out of memory here.
 type distParts struct {
 	workers, stages, exchanges int
-	key                        string
-	since                      time.Time
+	// large says the large worker ran them; placement is where auto mode,
+	// or the session's mode, ran the statement and why, for the history.
+	large     bool
+	placement string
+	key       string
+	since     time.Time
 	// release lets the workers count as idle again: the statement holds
 	// them while it runs on this replica after their tasks failed, or
 	// where auto mode chose it, for the guard (see guardLocal).
 	release func()
 	// local is how long auto mode estimated this replica would take the
 	// statement, when it chose to run it here though workers could run it,
-	// and budget, if set, how long it may take all the same (see
-	// guardLocal).
-	local, budget time.Duration
+	// alt how long it estimated the workers would, and budget, if set, how
+	// long it may take all the same (see guardAfter).
+	local, alt, budget time.Duration
 }
 
 // sessionMode is the mode user's statements run distributed in: the
@@ -205,24 +213,62 @@ func sessionMode(sess *session, user auth.User) distributed.Mode {
 // rows to w. done is false when st did not run, and should run on this
 // replica; parts is what running it took.
 func (s *Server) runDistributed(ctx context.Context, sess *session, user auth.User, st *statement, args []driver.NamedValue, w *tagWriter, mode distributed.Mode) (parts distParts, done bool, err error) {
+	r, parts, done, err := s.startDistributed(ctx, sess, user, st, mode)
+	if r == nil {
+		return parts, done, err
+	}
+	defer r.end()
+	if err := st.runFinal(ctx, sess.conn, r.ex.SQL, r.ex.Merged(), args, w); err != nil {
+		if w.Written() > 0 || ctx.Err() != nil || distributed.DataError(err) || bitmapsDidNotFit(err) {
+			// Combining the workers' bitmaps did not fit either: the
+			// session runs the statement again with the hash.
+			return r.parts, true, err
+		}
+		s.dist.Metrics().Fallback("combine_error")
+		s.log.Warn("could not combine a distributed statement's results; running it here", "user", user.Name, "err", err)
+		return distParts{release: s.dist.Keep()}, false, nil
+	}
+	return r.parts, true, nil
+}
+
+// distRun is a statement's parts as they ran on workers: ex holds their
+// results, which ex.SQL, run on this replica, combines into the
+// statement's; parts is how they ran, and end lets go of the results and
+// of the workers.
+type distRun struct {
+	ex    *distributed.Execution
+	parts distParts
+	end   func()
+}
+
+// startDistributed runs st's parts on workers if it qualifies in mode, and
+// returns their results to combine (see runDistributed). Without them,
+// done false says st runs on this replica, and parts why, for the guard;
+// done true that it must not, and err why.
+func (s *Server) startDistributed(ctx context.Context, sess *session, user auth.User, st *statement, mode distributed.Mode) (run *distRun, parts distParts, done bool, err error) {
 	if s.dist == nil || st.stmtType != duckdb.STATEMENT_TYPE_SELECT || st.kind != returnsRows || sess.inTx || mode == distributed.ModeOff {
-		return parts, false, nil
+		return nil, parts, false, nil
 	}
 	if reason := policyReason(st); reason != "" {
 		s.log.Debug("statement runs on this replica", "user", user.Name, "reason", reason)
-		return parts, false, nil
+		return nil, parts, false, nil
 	}
 	env := &sessionEnv{s: s, sess: sess, user: user, st: st}
 	plan, err := s.dist.Plan(ctx, st.query, env, mode)
 	if err != nil {
 		if ctx.Err() != nil {
-			return parts, true, ctx.Err()
+			return nil, parts, true, ctx.Err()
 		}
 		parts.key = distributed.PlanKey(err)
+		if parts.key != "" {
+			// Auto mode chose this replica.
+			parts.placement = "this replica: " + strings.TrimPrefix(err.Error(), "cannot distribute: ")
+		}
 		if est, ok := distributed.LocalEstimate(err); ok {
 			// Workers stay up while it runs here, as an idle replica would
 			// stop them, so that the guard can run it on them.
 			parts.local, parts.release = est, s.dist.Keep()
+			parts.alt, _ = distributed.WorkersEstimate(err)
 			parts.budget, _ = distributed.LocalBudget(err)
 		}
 		if !distributed.IsUnsupported(err) {
@@ -230,15 +276,30 @@ func (s *Server) runDistributed(ctx context.Context, sess *session, user auth.Us
 		} else {
 			s.log.Debug("statement runs on this replica", "user", user.Name, "reason", err)
 		}
-		return parts, false, nil
+		return nil, parts, false, nil
 	}
 	settings, err := s.distributedSettings(ctx, sess)
 	if err != nil {
 		s.log.Debug("statement runs on this replica", "user", user.Name, "reason", err)
-		return parts, false, nil
+		return nil, parts, false, nil
+	}
+	if st.writer != nil && plan.WorkersWrite() {
+		// Its tasks write the table's files (see tableWrite).
+		target, err := st.writer.begin(ctx)
+		if err != nil {
+			s.log.Warn("workers will not write a table's files; this replica writes them", "user", user.Name, "err", err)
+		} else {
+			plan.Write(target)
+		}
 	}
 	// The workers stay up while the statement runs, here too.
 	release := s.dist.Keep()
+	start := time.Now()
+	if s.streamMerged {
+		// A merge of the workers' sorted rows reaches the client as it is
+		// made (see runFinal).
+		plan.StreamMerged()
+	}
 	ex, err := s.dist.Execute(ctx, plan, settings)
 	if err != nil {
 		// Released now if the statement is done; otherwise once it has run
@@ -250,32 +311,81 @@ func (s *Server) runDistributed(ctx context.Context, sess *session, user auth.Us
 				parts.release = release
 			}
 		}()
+		if ctx.Err() == nil && !distributed.DataError(err) && !distributed.BitmapMemory(err) && !distributed.IsUnsupported(err) &&
+			!distributed.WriteDenied(err) && !distributed.WriteRefused(err) {
+			// How long it ran there before it failed, so that auto mode
+			// takes that way to take longer for a while.
+			s.dist.ObserveFailure(plan.Key, plan.Workers(), plan.Large(), time.Since(start))
+		}
 		switch {
 		case ctx.Err() != nil:
-			return parts, true, ctx.Err()
+			return nil, parts, true, ctx.Err()
 		case distributed.DataError(err):
-			return parts, true, err
+			return nil, parts, true, err
 		case distributed.BitmapMemory(err):
 			// A task's bitmaps did not fit: the session runs the statement
 			// again with DuckDB's hash (see rerunWithoutBitmaps).
-			return parts, true, err
+			return nil, parts, true, err
 		case distributed.OutOfMemory(err):
 			// Another worker, or this replica, would run out the same way.
+			// The query history records where it failed, for the replicas
+			// that read it when they start.
 			s.log.Warn("a worker ran out of memory running part of a statement; the statement fails rather than run again",
 				"user", user.Name, "err", err)
-			return parts, true, errWorkerMemory
+			return nil, distParts{workers: plan.Workers(), large: plan.Large(), placement: plan.Placement(), key: plan.Key}, true, errWorkerMemory
 		case distributed.IsUnsupported(err):
 			// The workers found what planning could not, such as data
 			// files without field IDs.
 			s.log.Debug("statement runs on this replica", "user", user.Name, "reason", err)
-			return parts, false, nil
+			return nil, parts, false, nil
+		case distributed.WriteDenied(err) && st.writer != nil:
+			// Workers may not write the table's files: they run the query, and
+			// this replica writes the table from their results.
+			s.log.Warn("workers may not write a table's files; this replica writes them", "user", user.Name, "err", err)
+			st.writer = nil
+			r, p, ran, err := s.startDistributed(ctx, sess, user, st, mode)
+			if r != nil {
+				return r, r.parts, true, nil
+			}
+			if ran {
+				return nil, p, true, err
+			}
+			if p.release != nil {
+				// This statement's own keeps the workers up.
+				p.release()
+			}
+			return nil, p, false, nil
+		case distributed.WriteRefused(err):
+			// A worker said it wrote others: nothing of it is committed, and
+			// this replica runs the statement.
+			s.log.Error("a worker said it wrote files outside the statement's directory; running the statement here", "user", user.Name, "err", err)
+			return nil, parts, false, nil
 		}
-		if plan.ShortOfMemory() {
-			// It would run out of memory here, after taking as long as it
-			// does on one machine: fail now.
+		if plan.Large() && !plan.FitsHere() {
+			// The large worker failed, and this replica would not hold the
+			// statement: the fleet runs it, as a statement forced onto the
+			// workers does.
+			s.log.Warn("the large worker could not run a statement, which this replica would not hold; running it on the workers",
+				"user", user.Name, "err", err)
+			r, p, ran, err := s.startDistributed(ctx, sess, user, st, distributed.ModeOn)
+			if r != nil {
+				r.parts.placement = "after the large worker failed: " + r.parts.placement
+				return r, r.parts, true, nil
+			}
+			if ran {
+				return nil, p, true, err
+			}
+			if p.release != nil {
+				p.release()
+			}
+		}
+		if !plan.FitsHere() {
+			// It would run out of memory here, or spill for far longer than
+			// the workers took, after taking as long as it does on one
+			// machine: fail now.
 			s.log.Warn("workers could not run a statement, which would not fit in this replica's memory; it fails",
 				"user", user.Name, "err", err)
-			return parts, true, fmt.Errorf("workers could not run the statement, and it needs more memory than this replica has: %w", err)
+			return nil, parts, true, fmt.Errorf("workers could not run the statement, and it needs more memory than this replica has: %w", err)
 		}
 		reason := "worker_error"
 		if errors.Is(err, distributed.ErrNoWorkers) {
@@ -283,74 +393,158 @@ func (s *Server) runDistributed(ctx context.Context, sess *session, user auth.Us
 		}
 		s.dist.Metrics().Fallback(reason)
 		s.log.Warn("workers could not run a statement; running it here", "user", user.Name, "err", err)
-		return parts, false, nil
+		return nil, parts, false, nil
 	}
-	defer release()
-	defer ex.Close()
-	parts = distParts{workers: ex.Workers, stages: ex.Stages, exchanges: ex.Exchanges, key: plan.Key}
-	if err := st.runFinal(ctx, sess.conn, ex.SQL, args, w); err != nil {
-		if w.Written() > 0 || ctx.Err() != nil || distributed.DataError(err) || bitmapsDidNotFit(err) {
-			// Combining the workers' bitmaps did not fit either: the
-			// session runs the statement again with the hash.
-			return parts, true, err
-		}
-		s.dist.Metrics().Fallback("combine_error")
-		s.log.Warn("could not combine a distributed statement's results; running it here", "user", user.Name, "err", err)
-		return distParts{release: s.dist.Keep()}, false, nil
-	}
-	return parts, true, nil
+	parts = distParts{workers: ex.Workers, large: ex.Large, placement: plan.Placement(), stages: ex.Stages, exchanges: ex.Exchanges, key: plan.Key}
+	return &distRun{ex: ex, parts: parts, end: func() { ex.Close(); release() }}, parts, true, nil
 }
 
-// guardFactor and guardMinimum say when a statement auto mode chose to run
-// on this replica, though workers could run it, has run long enough there
-// to run it on workers instead: past guardFactor times its estimate, and
-// guardMinimum. At ten times the data, a report estimated at 51 s took
-// 1,798 s here and 362 s on workers: guarded, it would have taken about
-// 515 s. One estimated at 13 s that took 67 s here, where workers took 55
-// s, finishes before the guard. Variables, for tests.
+// guardFactor, guardAlternative and guardMinimum say when a statement auto
+// mode chose to run on this replica, though workers could run it, has run
+// long enough there to run it on workers instead (see guardAfter).
+// Variables, for tests.
 var (
-	guardFactor  = 3.0
-	guardMinimum = 90 * time.Second
+	guardFactor      = 3.0
+	guardAlternative = 1.0
+	guardMinimum     = 15 * time.Second
+	// guardShared is guardFactor while other statements run beside it.
+	guardShared = 1.0
 )
 
+// guardUnknown is when the guard fires for a statement whose workers'
+// estimate is not known, as the guard fired before it weighed them.
+const guardUnknown = 90 * time.Second
+
+// guardAfter is how long a statement auto mode estimated at est on this
+// replica, and at alt on workers, their start included, runs here before
+// the guard runs it on workers instead: once it has run guardFactor times
+// its estimate, or, while others run beside it (others), its estimate
+// once, as it takes their cores; and once the workers, from scratch, are
+// estimated to take no longer than it has run here (guardAlternative times
+// alt), so that running it there is clearly the better bet; never before
+// guardMinimum, nor budget, what a run on workers took when auto mode tries
+// this replica after one (see distributed.LocalBudget). The guard weighs it
+// again every guardCheck, as statements come and go beside it.
+//
+// It once waited as many times longer as statements ran when one started,
+// as they shared the replica's cores: at ten times the data, beside 16
+// users' dashboards, a report estimated at 65 s here ran 577 s, the
+// dashboards' median rising from 4 ms to 23 s, and the guard never fired.
+//
+// Moving when the run here has taken what the workers would bounds the
+// loss at about twice the faster side's time, as long as their estimate
+// holds: either the statement finishes here before, or it pays its time
+// here and then theirs. A fixed floor of 90 s let a report estimated at 13
+// s here and 30 s on workers, which took 58 to 97 s here and 50 s on 16
+// workers at ten times the data, run 90 s before moving: 140 s. It now
+// moves at 39 s. A statement whose workers are estimated far slower than
+// its run here is never moved there, however long it runs, and one that
+// ran on workers after the guard moved it runs there from then on, so the
+// guard cannot send a statement back and forth.
+func guardAfter(est, alt, budget time.Duration, others int) time.Duration {
+	factor := guardFactor
+	if others > 0 {
+		factor = min(factor, guardShared)
+	}
+	after := time.Duration(factor * float64(est))
+	if alt <= 0 {
+		after = max(after, guardUnknown)
+	}
+	return max(after, time.Duration(guardAlternative*float64(alt)), guardMinimum, budget)
+}
+
+// guardCheck is how often the guard weighs a statement again.
+var guardCheck = time.Second
+
+// othersRunning counts the statements running on this replica beside
+// sess's, which share its cores: its other sessions' that are past waiting
+// for their limits.
+func (s *Server) othersRunning(sess *session) int {
+	r := s.sessions
+	r.mu.Lock()
+	all := make([]*session, 0, len(r.byPID))
+	for _, other := range r.byPID {
+		if other != sess {
+			all = append(all, other)
+		}
+	}
+	r.mu.Unlock()
+	n := 0
+	for _, other := range all {
+		other.mu.Lock()
+		if other.statement != "" && !other.queued {
+			n++
+		}
+		other.mu.Unlock()
+	}
+	return n
+}
+
 // localGuard cancels a statement's run on this replica once it has run
-// past its time (see guardFactor), unless it has sent the client output.
+// past its time (see guardAfter), unless it has sent the client output.
 type localGuard struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 	gate   rowGate
-	timer  *time.Timer
 	start  time.Time
 	fired  atomic.Bool
+	// done ends the guard's checks, once, when it stops.
+	done     chan struct{}
+	stopOnce sync.Once
 }
 
-// guardLocal arms a guard over a run on this replica of a statement auto
-// mode estimated at est here, or let take budget, which writes to tw: run
-// it under the guard's ctx, and stop the guard after.
-func guardLocal(ctx context.Context, est, budget time.Duration, tw *tagWriter) *localGuard {
-	g := &localGuard{start: time.Now()}
+// guardLocal arms a guard over a run on this replica, which writes to tw,
+// that fires after d (see guardAfter): run it under the guard's ctx, and
+// stop the guard after.
+func guardLocal(ctx context.Context, d time.Duration, tw *tagWriter) *localGuard {
+	return guardLocalBy(ctx, func() time.Duration { return d }, tw)
+}
+
+// guardLocalBy is guardLocal of a time that after says again every
+// guardCheck, as the statements beside the run come and go.
+func guardLocalBy(ctx context.Context, after func() time.Duration, tw *tagWriter) *localGuard {
+	g := &localGuard{start: time.Now(), done: make(chan struct{})}
 	g.ctx, g.cancel = context.WithCancel(ctx)
 	tw.gate = &g.gate
-	g.timer = time.AfterFunc(max(time.Duration(guardFactor*float64(est)), guardMinimum, budget), func() {
+	fire := func() bool {
 		if g.gate.fire() {
 			g.fired.Store(true)
 			g.cancel()
+			return true
 		}
-	})
+		return false
+	}
+	every := min(guardCheck, max(after()/4, 10*time.Millisecond))
+	go func() {
+		t := time.NewTicker(every)
+		defer t.Stop()
+		for {
+			select {
+			case <-g.done:
+				return
+			case <-g.ctx.Done():
+				return
+			case <-t.C:
+				if time.Since(g.start) >= after() && fire() {
+					return
+				}
+			}
+		}
+	}()
 	return g
 }
 
 // stop disarms the guard, and says whether it canceled the run and how
 // long the run had taken.
 func (g *localGuard) stop(tw *tagWriter) (fired bool, ran time.Duration) {
-	g.timer.Stop()
+	g.stopOnce.Do(func() { close(g.done) })
 	g.cancel()
 	tw.gate = nil
 	return g.fired.Load(), time.Since(g.start)
 }
 
 // afterGuard runs st on workers after its run on this replica, where auto
-// mode had chosen to run it, passed its time (see guardFactor) before it
+// mode had chosen to run it, passed its time (see guardAfter) before it
 // sent the client output: the client gets the rows as if it had run there,
 // and the history marks it so that it runs on workers next time. If
 // workers cannot run it after all, it runs here again, to the end.
@@ -358,8 +552,9 @@ func (s *Server) afterGuard(ctx context.Context, sess *session, st *statement, a
 	w *tagWriter, parts *distParts, ran time.Duration) error {
 	user := sess.currentUser()
 	s.dist.ObserveGuard(parts.key, ran)
-	s.log.Warn("a statement ran on this replica past three times its estimate; running it on workers instead",
-		"user", user.Name, "key", parts.key, "seconds", math.Round(ran.Seconds()), "estimate_seconds", math.Round(parts.local.Seconds()))
+	s.log.Warn("a statement ran on this replica far past its estimate; running it on workers instead",
+		"user", user.Name, "key", parts.key, "seconds", math.Round(ran.Seconds()), "estimate_seconds", math.Round(parts.local.Seconds()),
+		"workers_seconds", math.Round(parts.alt.Seconds()))
 	since := time.Now()
 	// As an admin's forced statement runs, starting stopped workers: auto
 	// mode chose this replica for it, and nothing else would run it.
@@ -372,6 +567,7 @@ func (s *Server) afterGuard(ctx context.Context, sess *session, st *statement, a
 		return s.runLocal(ctx, sess, st, args, w)
 	}
 	p.since = since
+	p.placement = fmt.Sprintf("moved by the guard after %.0f s on this replica, estimated at %.0f s; %s", ran.Seconds(), parts.local.Seconds(), p.placement)
 	*parts = p
 	return err
 }
@@ -420,6 +616,7 @@ func (s *Server) afterOutOfMemory(outer, ctx context.Context, sess *session, st 
 		return errStatementTimeout
 	}
 	p.since = since
+	p.placement = "moved after it ran out of memory on this replica; " + p.placement
 	*parts = p
 	return err
 }
@@ -427,32 +624,40 @@ func (s *Server) afterOutOfMemory(outer, ctx context.Context, sess *session, st 
 // policyReason says why masking and row access policies keep st on this
 // replica, or is empty. Workers read table files directly and know nothing
 // of the requesting user, so they cannot apply policies: a statement that
-// policies rewrote, that reads a protected table or that names anything
-// policies concern (a protected table, or a view or macro that reads one)
-// is not distributed. sessionEnv.Table refuses protected tables as well,
-// should a statement reach the planner without having triggered the
-// rewriter.
+// reads a protected table, directly or through a view, is not distributed.
+//
+// Which tables a statement reads is what the rewriter found resolving its
+// names (touched, applied), not what names it spells: a statement is
+// analyzed when any word of it, or of a view it reads, spells a protected
+// table's name, as a column named like one does, or one named like an ID
+// domain, whose dictionary, Igloo's own and protected, is named after it.
+// Analyzed and found to read none, it runs on workers as the text the
+// rewriter left, views it expanded included. sessionEnv.Table refuses
+// protected tables as well, should a statement reach the planner without
+// the rewriter having seen one.
 func policyReason(st *statement) string {
 	g := st.guard
-	if g != nil && g.hiddenOnly {
+	switch {
+	case g == nil && st.original != "":
+		return "masking or row access policies rewrote it"
+	case g == nil, g.hiddenOnly:
 		// Only ID domains' columns of ids left out: nothing a worker could
 		// fail to apply.
 		return ""
-	}
-	switch {
-	case st.original != "":
-		return "masking or row access policies rewrote it"
-	case g != nil && (g.touched || len(g.applied) > 0):
+	case len(g.applied) > 0:
 		return "masking or row access policies apply to what it reads"
-	case g != nil && g.nonce != "":
-		return "it names something masking or row access policies concern"
+	case g.touched:
+		return "masking or row access policies, or a clean room, concern a table it reads"
 	}
 	return ""
 }
 
 // runFinal runs the part of a distributed statement that combines its
 // parts' results, in st's place: it must have st's columns and parameters.
-func (st *statement) runFinal(ctx context.Context, conn *duckdb.Conn, query string, args []driver.NamedValue, w wire.DataWriter) error {
+// It reads merged, the workers' sorted rows merged as it reads them (see
+// distributed.MergedFunction).
+func (st *statement) runFinal(ctx context.Context, conn *duckdb.Conn, query string, merged []*distributed.MergedView, args []driver.NamedValue, w wire.DataWriter) error {
+	ctx = distributed.WithMerged(ctx, merged)
 	fin, err := prepare(ctx, conn, query, st.clientOIDs)
 	if err != nil {
 		return err
@@ -464,6 +669,23 @@ func (st *statement) runFinal(ctx context.Context, conn *duckdb.Conn, query stri
 	}
 	fin.stmtType, fin.query = st.stmtType, st.query
 	return fin.run(ctx, args, w)
+}
+
+// registerMerged registers distributed.MergedFunction on the engine's
+// database, and reports whether it did. Without it, statements read the
+// merge of workers' sorted rows from a file once it is made.
+func (s *Server) registerMerged() bool {
+	r, ok := s.engine.(interface {
+		RegisterFunctions(ctx context.Context, register func(*sql.Conn) error) error
+	})
+	if !ok {
+		return false
+	}
+	if err := r.RegisterFunctions(context.Background(), distributed.RegisterMerged); err != nil {
+		s.log.Warn("could not register the function that reads merges of workers' sorted rows; statements read them once merged", "err", err)
+		return false
+	}
+	return true
 }
 
 // distributedHarmless are settings a session may change that do not change
@@ -626,13 +848,15 @@ func (e *sessionEnv) catalogTable(ctx context.Context, parts []string) (o object
 }
 
 // Computes vouches for a statement's reads of bitmap indexes' tables when
-// Igloo wrote them, to answer from the indexes (see bitmaprewrite.go): no
-// user's statement may name those tables (indexReferences), Igloo's own
-// text reads them at the snapshots it pinned, and a row access policy of
-// Igloo's own keeps everyone else, workers among them, from reading them.
-// The coordinator computes such a read for workers.
+// Igloo wrote them, to answer from the indexes (see bitmaprewrite.go): the
+// references its rewrite wrote, in full, to the indexes the statement's
+// pins name (see ownIndexRead), which no user's text may name
+// (indexReferences) nor reach through the search path (iglooOnPath).
+// Igloo's own text reads them at the snapshots it pinned, and a row access
+// policy of Igloo's own keeps everyone else, workers among them, from
+// reading them. The coordinator computes such a read for workers.
 func (e *sessionEnv) Computes(ctx context.Context, parts []string) (bool, error) {
-	if !e.st.readsIndexes() {
+	if !e.st.readsIndexes() || !indexReference(parts, e.s.catalogName(), indexNames(e.st.indexPins)) {
 		return false, nil
 	}
 	o, ok, err := e.catalogTable(ctx, parts)
@@ -745,16 +969,55 @@ func tableColumns(ctx context.Context, sess *session, db, schema, table string) 
 }
 
 // Setting returns the session's value of a DuckDB setting.
+// Fill says the statement planned is the query a statement fills a table
+// from, which this replica writes from its rows (distributed.Fills).
+func (e *sessionEnv) Fill() bool { return e.st.fill }
+
+// FillWrites says workers could write the table the statement fills.
+func (e *sessionEnv) FillWrites() bool { return e.st.writer != nil }
+
+// Others counts the statements running on this replica beside the
+// session's, for auto mode's choice (distributed.Loads).
+func (e *sessionEnv) Others() int { return e.s.othersRunning(e.sess) }
+
 // Footprint is what the latest statement of the shape of the one planned
-// allocated over its run on this replica, which it completed (see
-// distributed.Footprints); ok is false when none has.
+// held on this replica, in a run it completed (see
+// distributed.Footprints); ok is false when none has, or the latest run
+// learned from ended before its end.
 func (e *sessionEnv) Footprint() (allocated int64, ok bool) {
 	// The session's path is read already, for the statement's shape.
-	return e.s.workload.Footprint(e.s.workloadShape(context.Background(), e.sess, e.st.prepared))
+	return e.s.workload.Completed(e.s.workloadShape(context.Background(), e.sess, e.st.prepared))
 }
 
 func (e *sessionEnv) Setting(ctx context.Context, name string) (string, error) {
 	return settingValue(ctx, e.sess.conn, name)
+}
+
+// Explain returns DuckDB's plan of query as the session would run it,
+// EXPLAIN (FORMAT JSON), its parameters bound to NULL, for auto mode's
+// estimate of what it holds (see distributed.Explainer).
+func (e *sessionEnv) Explain(ctx context.Context, query string) (string, error) {
+	ds, err := e.sess.conn.PrepareContext(ctx, "EXPLAIN (FORMAT JSON) "+query)
+	if err != nil {
+		return "", err
+	}
+	stmt := ds.(*duckdb.Stmt)
+	defer stmt.Close() //nolint:errcheck
+	args := make([]driver.NamedValue, stmt.NumInput())
+	for i := range args {
+		args[i] = driver.NamedValue{Ordinal: i + 1}
+	}
+	rows, err := stmt.QueryContext(ctx, args)
+	if err != nil {
+		return "", err
+	}
+	defer rows.Close() //nolint:errcheck
+	dest := make([]driver.Value, len(rows.Columns()))
+	if err := rows.Next(dest); err != nil || len(dest) < 2 {
+		return "", errors.Join(errors.New("EXPLAIN returned no plan"), err)
+	}
+	plan, _ := dest[1].(string)
+	return plan, nil
 }
 
 // Aggregates returns the names of the session's aggregate functions, those

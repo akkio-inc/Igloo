@@ -135,8 +135,8 @@ func newFixture(t *testing.T) *fixture {
 	server, err := NewServer(ServerOptions{
 		Store: store, Key: key, Files: iceio.LocalFS{}, Warehouse: warehouse, Catalog: "lake", Audit: history,
 		Tables: TableSource{source: src},
-		Protection: func(_ context.Context, schema, table string) []string {
-			return policies[strings.ToLower(schema+"."+table)]
+		Protection: func(_ context.Context, schema, table string) ([]string, error) {
+			return policies[strings.ToLower(schema+"."+table)], nil
 		},
 	})
 	if err != nil {
@@ -494,9 +494,38 @@ func TestRecipient(t *testing.T) {
 			t.Errorf("%q signed in as %q", header, name)
 		}
 	}
-	if !Secure(httptest.NewRequest("GET", "http://localhost:8444/clean-rooms", nil)) ||
-		Secure(httptest.NewRequest("GET", "http://data.example.com/clean-rooms", nil)) {
-		t.Error("Secure: only TLS or localhost")
+
+	// A client across the internet that names localhost is refused, with
+	// a recipient's token (see TestSecure).
+	forged := httptest.NewRequest("GET", "http://localhost:8444"+Prefix+"/shares", nil)
+	forged.RemoteAddr = "198.51.100.23:50123"
+	forged.Header.Set("Authorization", "Bearer "+f.token)
+	w := httptest.NewRecorder()
+	f.server.ServeHTTP(w, forged)
+	if w.Code != http.StatusForbidden {
+		t.Errorf("a forged Host from across the internet: %d %s", w.Code, w.Body)
+	}
+}
+
+// Without TLS, only requests to localhost from this machine or a private
+// network, as through Docker's published ports, may carry a token or
+// data: the Host header alone, which a client may set to anything, used
+// to let a request in from across the internet.
+func TestSecure(t *testing.T) {
+	for _, tc := range []struct {
+		url, peer string
+		want      bool
+	}{
+		{"http://localhost:8444/clean-rooms", "127.0.0.1:50123", true},
+		{"http://localhost:8444/clean-rooms", "172.18.0.1:50123", true},
+		{"http://localhost:8444/clean-rooms", "198.51.100.23:50123", false},
+		{"http://data.example.com/clean-rooms", "127.0.0.1:50123", false},
+	} {
+		r := httptest.NewRequest("GET", tc.url, nil)
+		r.RemoteAddr = tc.peer
+		if got := Secure(r); got != tc.want {
+			t.Errorf("%s from %s: Secure is %v", tc.url, tc.peer, got)
+		}
 	}
 }
 

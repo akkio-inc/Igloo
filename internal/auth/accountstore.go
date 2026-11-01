@@ -3,6 +3,7 @@ package auth
 import (
 	"context"
 	"errors"
+	"hash/fnv"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -64,11 +65,11 @@ func (s *PostgresStore) updateUser(ctx context.Context, sql, name string, args .
 	return err
 }
 
-const identityColumns = `issuer, subject, user_name, email, groups, created_at, coalesce(last_sign_in, created_at)`
+const identityColumns = `issuer, subject, user_name, email, groups, account_id, created_at, coalesce(last_sign_in, created_at)`
 
 func scanIdentity(row pgx.Row) (Identity, error) {
 	var id Identity
-	err := row.Scan(&id.Issuer, &id.Subject, &id.User, &id.Email, &id.Groups, &id.CreatedAt, &id.LastSignIn)
+	err := row.Scan(&id.Issuer, &id.Subject, &id.User, &id.Email, &id.Groups, &id.AccountID, &id.CreatedAt, &id.LastSignIn)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return Identity{}, ErrIdentityNotFound
 	}
@@ -81,7 +82,7 @@ func (s *PostgresStore) IdentityBySubject(ctx context.Context, issuer, subject s
 }
 
 func (s *PostgresStore) IdentityOf(ctx context.Context, user string) (Identity, error) {
-	return scanIdentity(s.pool.QueryRow(ctx, `SELECT `+identityColumns+` FROM igloo_auth.identities
+	return scanIdentity(s.db(ctx).QueryRow(ctx, `SELECT `+identityColumns+` FROM igloo_auth.identities
 		WHERE user_name = $1`, user))
 }
 
@@ -97,8 +98,8 @@ func (s *PostgresStore) LinkIdentity(ctx context.Context, id Identity) error {
 	if id.Groups == nil {
 		id.Groups = []string{}
 	}
-	_, err := s.pool.Exec(ctx, `INSERT INTO igloo_auth.identities (issuer, subject, user_name, email, groups, last_sign_in)
-		VALUES ($1, $2, $3, $4, $5, now())`, id.Issuer, id.Subject, id.User, id.Email, id.Groups)
+	_, err := s.pool.Exec(ctx, `INSERT INTO igloo_auth.identities (issuer, subject, user_name, email, groups, account_id, last_sign_in)
+		VALUES ($1, $2, $3, $4, $5, $6, now())`, id.Issuer, id.Subject, id.User, id.Email, id.Groups, id.AccountID)
 	var pgErr *pgconn.PgError
 	if errors.As(err, &pgErr) {
 		switch pgErr.Code {
@@ -115,8 +116,8 @@ func (s *PostgresStore) UpdateIdentity(ctx context.Context, id Identity) error {
 	if id.Groups == nil {
 		id.Groups = []string{}
 	}
-	tag, err := s.pool.Exec(ctx, `UPDATE igloo_auth.identities SET email = $3, groups = $4, last_sign_in = now()
-		WHERE issuer = $1 AND subject = $2`, id.Issuer, id.Subject, id.Email, id.Groups)
+	tag, err := s.pool.Exec(ctx, `UPDATE igloo_auth.identities SET email = $3, groups = $4, account_id = $5, last_sign_in = now()
+		WHERE issuer = $1 AND subject = $2`, id.Issuer, id.Subject, id.Email, id.Groups, id.AccountID)
 	if err == nil && tag.RowsAffected() == 0 {
 		return ErrIdentityNotFound
 	}
@@ -136,7 +137,7 @@ func (s *PostgresStore) UnlinkIdentity(ctx context.Context, user string) error {
 }
 
 func (s *PostgresStore) GroupRoles(ctx context.Context) ([]GroupRole, error) {
-	rows, err := s.pool.Query(ctx, `SELECT group_name, role, granted_by, granted_at FROM igloo_auth.sso_group_roles
+	rows, err := s.db(ctx).Query(ctx, `SELECT group_name, role, granted_by, granted_at FROM igloo_auth.sso_group_roles
 		ORDER BY group_name, role`)
 	if err != nil {
 		return nil, err
@@ -175,7 +176,7 @@ func (s *PostgresStore) SyncRoles(ctx context.Context, user string, roles []stri
 	if roles == nil {
 		roles = []string{}
 	}
-	return pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+	return pgx.BeginFunc(ctx, s.db(ctx), func(tx pgx.Tx) error {
 		if err := lockNames(ctx, tx); err != nil {
 			return err
 		}
@@ -189,6 +190,42 @@ func (s *PostgresStore) SyncRoles(ctx context.Context, user string, roles []stri
 			ON CONFLICT (role, member) DO NOTHING`, user, SSOGrantor, roles)
 		return err
 	})
+}
+
+// LockRoles implements SSOStore with a transaction advisory lock keyed on
+// user.
+func (s *PostgresStore) LockRoles(ctx context.Context, user string, fn func(context.Context) error) error {
+	return pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+		h := fnv.New64a()
+		_, _ = h.Write([]byte("igloo roles " + user))
+		if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock($1)", int64(h.Sum64())); err != nil {
+			return err
+		}
+		return fn(context.WithValue(ctx, rolesTx{s}, tx))
+	})
+}
+
+// rolesTx is the key of the transaction LockRoles runs fn in, in fn's
+// context.
+type rolesTx struct{ s *PostgresStore }
+
+// querier is what the store queries: its pool, or a transaction.
+type querier interface {
+	Begin(ctx context.Context) (pgx.Tx, error)
+	Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
+	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+}
+
+// db is the transaction of LockRoles that ctx runs in, if any, or else the
+// pool. The calls that work out and write a user's roles use it: Get,
+// IdentityOf, UserSCIMGroups, SCIMGroupNames, GroupRoles, SyncRoles and
+// SetRole.
+func (s *PostgresStore) db(ctx context.Context) querier {
+	if tx, ok := ctx.Value(rolesTx{s}).(pgx.Tx); ok {
+		return tx
+	}
+	return s.pool
 }
 
 var (

@@ -107,6 +107,28 @@ through their own grants and policies, as in any query. Snowflake's
 `GRANT CREATE SNOWFLAKE.ML.<class> ON SCHEMA` is refused: grant `CREATE`
 on the schema.
 
+When a user is dropped, their models are marked as a dropped user's:
+`SHOW` gives their owner as `ana (dropped)`, as for their
+[alerts](alerts.md#alerts) and tasks. A user created later with the same
+name, by an admin or by signing in with
+[single sign-on](sso.md#who-is-who), does not own them; admins may use,
+grant and drop them, or `CREATE OR REPLACE` them as their own, and an
+erasure request cannot train them again until one does. Dropping a user
+or a role also takes back the models granted to it, so that a user or
+role created later with the same name does not get them. Grants to
+others stay.
+
+Earlier versions did neither. What users and roles dropped then left
+behind is dealt with as each replica starts: a model whose owner is no
+user, or a user created after the model was last trained (so an earlier
+user of that name was dropped), is marked as a dropped user's; and a
+model grant to a user or role that does not exist, or that was created
+after the grant, is taken back. A model trained again after the new user
+was created, by them with `CREATE OR REPLACE` or by an erasure request,
+counts as theirs. Granting a model again to the new user or role changed
+nothing then, as the old grant was still there, so it is taken back with
+the old grant: grant it once more.
+
 ## FORECAST
 
 ```sql
@@ -435,9 +457,12 @@ rows, which must hold the target.
   shares. Models train on the rest, as BigQuery's do.
 - **Large inputs.** Igloo's classes train on at most 10 million rows and
   200 million values (rows times columns). Above that they train on a
-  sample of about as many rows, chosen by a hash of each row's values, so
-  the same rows give the same sample and the same model. The model's
-  metrics record `input_rows` and `sampled_rows`.
+  sample of a little fewer rows. Each row is kept or not by a hash of its
+  values, its place among the rows equal to it, and `seed`: rows that
+  repeat are sampled like any others, each copy on its own, and the same
+  rows and seed give the same sample and the same model. A sample that
+  comes out empty fails `CREATE`. The model's metrics record `input_rows`
+  and `sampled_rows`.
 - **`seed`** (default 0) seeds sampling and training: models are the same
   for the same rows and seed.
 - Unknown `CONFIG_OBJECT` keys are refused, so that a misspelled option
@@ -882,9 +907,12 @@ by their schema there.
   already have, and every process keeps the models it has used in memory.
   Users other than admins cannot read the warehouse's files from SQL.
   Without a warehouse, blobs are in memory.
-- Dropping or replacing a model deletes its blob once no model uses it. A
-  statement prepared before a model was replaced fails with a message to
-  run it again.
+- Dropping or replacing a model deletes its blob once no model uses it.
+  Models trained the same way share a blob: a `CREATE` that writes one
+  holds it, on every replica, until its model is stored, so dropping
+  another model with that blob meanwhile does not delete it. A statement
+  prepared before a model was replaced fails with a message to run it
+  again.
 - **Personal data.** A model keeps no training rows, but it keeps what it
   learned from them: the categories it splits on or encodes, and a time
   series model's series values and its series' last steps (a foundation

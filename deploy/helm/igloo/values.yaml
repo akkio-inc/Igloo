@@ -89,8 +89,8 @@ storage:
     existingSecret: ""
 
 duckdb:
-  # -> IGLOO_DUCKDB_MEMORY_LIMIT, e.g. "6GB". Empty: 80% of
-  # resources.limits.memory, leaving at least 512Mi for the rest of the
+  # -> IGLOO_DUCKDB_MEMORY_LIMIT, e.g. "6GB". Empty: about 73% of
+  # resources.limits.memory, as Igloo leaves room for the rest of the
   # process, so queries spill to disk before the container is OOM-killed.
   memoryLimit: ""
   # -> IGLOO_DUCKDB_THREADS. null: two per core of the node (four on workers),
@@ -106,6 +106,35 @@ duckdb:
     # "" (node disk: kubelet's directory, local NVMe on nodes set up for it;
     # see README) or "Memory".
     medium: ""
+
+# The read cache (docs/operations.md#read-cache): blocks of the table files
+# igloo pods read from object storage, kept on local disk for later
+# statements, and read ahead into by prefetch. A volume at
+# /var/lib/igloo/cache (IGLOO_CACHE_DIR), whose file system must keep
+# extended attributes, as ext4, XFS and btrfs do: a node's disk, or a block
+# storage class (gp3, pd-balanced, managed-csi), not a file share (EFS,
+# Filestore, Azure Files). Erasure requests have every running igloo pod
+# empty it (docs/privacy.md).
+cacheVolume:
+  # emptyDir: on the node's disk, gone with the pod. ephemeral: a volume of
+  # its own per pod, of storageClass, made and deleted with the pod.
+  # persistentVolumeClaim: existingClaim, which keeps the cache across
+  # restarts and scaling to zero, for one igloo pod (replicaCount 1, no
+  # autoscaling, strategy.type Recreate); a pod that starts empties it if an
+  # erasure request deleted files meanwhile.
+  type: emptyDir
+  # The emptyDir's sizeLimit, or the ephemeral volume's size; the cache
+  # takes up to 90% of it -> IGLOO_CACHE_SIZE. On an emptyDir, which shares
+  # the node's disk, never more than half of the disk's free space, so it
+  # cannot fill a small node disk; an ephemeral volume or a claim is the
+  # cache's own, which it fills to IGLOO_CACHE_SIZE (IGLOO_CACHE_DEDICATED).
+  # Empty: no limit on the emptyDir, and a cache of up to 100 GiB. Required
+  # with ephemeral.
+  sizeLimit: 50Gi
+  # ephemeral: the volume's storage class; empty for the cluster's default.
+  storageClass: ""
+  # persistentVolumeClaim: the claim, ReadWriteOnce, made beforehand.
+  existingClaim: ""
 
 # kubernetes.io/tls Secret (tls.crt, tls.key) -> IGLOO_TLS_CERT_FILE and
 # IGLOO_TLS_KEY_FILE. Igloo reads it at start; restart pods after rotating it.
@@ -291,6 +320,10 @@ sso:
   # Accept the provider's access tokens for this audience as SQL passwords,
   # inside TLS -> IGLOO_OIDC_ACCESS_TOKEN_AUDIENCE. Empty: off.
   accessTokenAudience: ""
+  # Claim holding the account's immutable ID in access tokens whose subject
+  # is not the ID token's: uid for Okta, oid for Entra ID ->
+  # IGLOO_OIDC_ACCESS_TOKEN_ID_CLAIM.
+  accessTokenIdClaim: ""
 
 # Longest lifetime of an access token (CREATE TOKEN ... EXPIRES) ->
 # IGLOO_TOKEN_MAX_LIFETIME.
@@ -319,6 +352,13 @@ scaleToZero:
   # closes its connection -> IGLOO_GATEWAY_RESUME_TIMEOUT. Allow for the
   # cluster autoscaler adding a node.
   resumeTimeout: 5m
+  # How long a client has, from connecting, to send its first bytes; the
+  # gateway starts igloo for no connection before then, and closes one that
+  # sends nothing -> IGLOO_GATEWAY_FIRST_BYTE_TIMEOUT.
+  firstByteTimeout: 30s
+  # Connections that may wait at once for their first bytes or for igloo to
+  # start; further ones are closed -> IGLOO_GATEWAY_MAX_WAITING.
+  maxWaiting: 200
   # Igloo pods the gateway starts -> IGLOO_GATEWAY_K8S_REPLICAS. null:
   # replicaCount, or autoscaling.minReplicas with autoscaling.enabled.
   replicas: null
@@ -353,6 +393,7 @@ pricePerHour: 0
 #       requests: { cpu: "8", memory: 32Gi }
 #       limits: { memory: 32Gi }
 #     duckdb: {}              # memoryLimit, threads, maxTempSize, spillVolume
+#     cacheVolume: {}         # a claim of its own, with type persistentVolumeClaim
 #     scaleToZero: { enabled: true, suspendAfter: 15m }
 #     service: { type: LoadBalancer, loadBalancerSourceRanges: ["203.0.113.0/24"] }
 #     nodeSelector: {}
@@ -384,6 +425,33 @@ workers:
   # lets workers reach each other's task port, and the spill volume is split:
   # 60% for spill, 30% for exchanges, rather than 90% for spill).
   exchanges: object
+  # Whether workers write a table's files for statements that fill it from a
+  # query, under a directory of the statement's, which igloo pods commit after
+  # checking each file -> IGLOO_WORKER_WRITES (docs/distributed-execution.md):
+  # true, false, or auto: when workers have an identity of their own
+  # (serviceAccount.create or .name, or storage.*.existingSecret below), so
+  # that they are not holding the igloo pods' right to write the whole warehouse.
+  writes: auto
+  # The workers' own service account, so that their cloud identity can be
+  # narrower than the igloo pods': read the warehouse, write _igloo_shuffle/
+  # and, unless igloo pods can make credentials for a statement's directory
+  # (storage.s3.stsRoleArn on S3), directories named igloo-write-* under
+  # tables' locations. The OpenTofu modules make such an identity. With neither
+  # create nor name, workers use the igloo pods' account.
+  serviceAccount:
+    create: false
+    # Defaults to <fullname>-worker.
+    name: ""
+    annotations: {}
+  # Static keys for workers in place of storage.*.existingSecret, for the same
+  # reason (same keys in each Secret as there).
+  storage:
+    s3:
+      existingSecret: ""
+    gcs:
+      existingSecret: ""
+    azure:
+      existingSecret: ""
   # Secret with key "secret" (at least 32 characters) -> IGLOO_WORKER_SECRET,
   # which igloo and workers authenticate each other with. Generated and kept
   # across upgrades when empty.
@@ -409,8 +477,62 @@ workers:
   # Empty: prefer one worker per node.
   affinity: {}
   # A worker told to stop (scale-down, a node drained, as before a Spot node
-  # is reclaimed) finishes its running tasks for up to 30s; keep this above.
-  terminationGracePeriodSeconds: 45
+  # is reclaimed) takes no more tasks, finishes those running and serves the
+  # exchange files on its disk until the statements reading them end, for
+  # up to 110s, what a Spot node's two-minute notice leaves; keep this above.
+  # A worker with nothing running or held stops at once.
+  terminationGracePeriodSeconds: 125
+  # What one worker's machine costs an hour, e.g. 0.31 for a Spot node, for
+  # auto mode's cost estimates -> IGLOO_WORKER_PRICE_PER_HOUR. 0: unknown,
+  # when the list price of instanceType stands for it (on Spot with spot),
+  # from igloo's built-in table of common machines, in region.
+  pricePerHour: 0
+  # The workers' machine, e.g. m7gd.4xlarge, Standard_D16pds_v6 or
+  # n4-standard-16 -> IGLOO_WORKER_INSTANCE_TYPE; spot -> IGLOO_WORKER_SPOT;
+  # region, e.g. us-east-1 -> IGLOO_CLOUD_REGION. The OpenTofu modules set
+  # them.
+  instanceType: ""
+  spot: false
+  region: ""
+  # One large worker ("scale up"): a second worker Deployment,
+  # <fullname>-workers-large, of one pod on a large machine (512 GiB class),
+  # which auto mode may run a whole statement on when its estimate (fits in
+  # memory, no spill, price) is about as fast as the fastest option and
+  # cheaper. It starts at zero pods; igloo starts it when it picks it and
+  # stops it when idle, as the other workers. Needs workers.enabled, and
+  # shares the workers' secret, exchanges and timeouts; everything below is
+  # its own, not taken from the workers'. Give it a node pool of its own
+  # with a minimum size of zero (nodeSelector, tolerations).
+  large:
+    enabled: false
+    # -> IGLOO_LARGE_WORKER_PRICE_PER_HOUR, as workers.pricePerHour, and
+    # -> IGLOO_LARGE_WORKER_INSTANCE_TYPE, IGLOO_LARGE_WORKER_SPOT, as
+    # workers.instanceType and workers.spot.
+    pricePerHour: 0
+    instanceType: ""
+    spot: false
+    duckdb:
+      # Empty: about 73% of resources.limits.memory, as for workers; igloo pods
+      # also get it as IGLOO_LARGE_WORKER_MEMORY, for estimates while the
+      # large worker is stopped.
+      memoryLimit: ""
+      threads: null
+      spillVolume:
+        sizeLimit: 1000Gi
+        medium: ""
+    cacheVolume:
+      sizeLimit: 500Gi
+    # requests.cpu -> IGLOO_LARGE_WORKER_CORES on igloo pods. The default
+    # fits a 64-core, 512 GiB machine.
+    resources:
+      requests: { cpu: "60", memory: 448Gi }
+      limits: { memory: 448Gi }
+    podLabels: {}
+    podAnnotations: {}
+    nodeSelector: {}
+    tolerations: []
+    affinity: {}
+    terminationGracePeriodSeconds: 125
 
 # Prometheus metrics are served on port 8080 at /metrics, through the
 # <fullname>-metrics ClusterIP Service (never through the SQL Service), and the

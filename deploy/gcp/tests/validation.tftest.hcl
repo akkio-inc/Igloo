@@ -209,3 +209,20 @@ run "rejects_bad_local_ssd_machine_family" {
   }
   expect_failures = [var.local_ssd_machine_family]
 }
+
+run "rejects_large_worker_without_workers" {
+  command = plan
+  variables {
+    large_worker_enabled = true
+  }
+  expect_failures = [var.large_worker_enabled]
+}
+
+run "rejects_worker_spill_outside_gi" {
+  command = plan
+  variables {
+    workers_enabled    = true
+    workers_spill_size = "1Ti"
+  }
+  expect_failures = [var.workers_spill_size]
+}

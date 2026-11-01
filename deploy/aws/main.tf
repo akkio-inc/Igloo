@@ -43,6 +43,7 @@ locals {
   # explicitly so the IAM trust policies below can name them.
   igloo_service_account   = "igloo"
   catalog_service_account = "igloo-catalog"
+  worker_service_account  = "igloo-worker"
   release_name            = "igloo"
   sql_service_name        = local.release_name
 
@@ -185,7 +186,8 @@ module "eks" {
     coredns    = {}
   }
 
-  eks_managed_node_groups = {
+  # The default node group, plus the worker node groups of workers.tf.
+  eks_managed_node_groups = merge({
     default = {
       ami_type       = local.node_group.ami_type
       instance_types = local.node_group.instance_types
@@ -222,7 +224,49 @@ module "eks" {
         }
       }
     }
-  }
+    }, {
+    for key, g in local.worker_node_groups : key => {
+      ami_type       = g.ami_type
+      instance_types = g.instance_types
+      capacity_type  = g.capacity_type
+
+      # From zero: the cluster autoscaler adds nodes for waiting worker pods.
+      min_size     = g.min_size
+      max_size     = g.max_size
+      desired_size = 0
+
+      # Only worker pods (or only the large worker) run here.
+      labels = g.labels
+      taints = {
+        worker = { key = g.taint_key, value = "true", effect = "NO_SCHEDULE" }
+      }
+
+      cloudinit_pre_nodeadm = g.local_storage == "RAID0" ? [{
+        content_type = "application/node.eks.aws"
+        content      = <<-EOT
+          ---
+          apiVersion: node.eks.aws/v1alpha1
+          kind: NodeConfig
+          spec:
+            instance:
+              localStorage:
+                strategy: RAID0
+        EOT
+      }] : null
+
+      block_device_mappings = {
+        xvda = {
+          device_name = "/dev/xvda"
+          ebs = {
+            volume_size           = var.workers_disk_size_gib
+            volume_type           = "gp3"
+            encrypted             = true
+            delete_on_termination = true
+          }
+        }
+      }
+    }
+  })
 
   tags = local.tags
 }
