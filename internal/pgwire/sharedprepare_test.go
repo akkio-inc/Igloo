@@ -90,6 +90,31 @@ func TestSharedPrepares(t *testing.T) {
 	}
 }
 
+// TestQueriesWithoutPoliciesHoldNoExclusiveLock checks that with no policies a
+// query is prepared and run while another session holds the catalog lock
+// shared: taking it exclusively for policies there are none of would wait for
+// that session, as every prepare in a dashboard's burst waited for the others.
+func TestQueriesWithoutPoliciesHoldNoExclusiveLock(t *testing.T) {
+	t.Parallel()
+	vc := newViewCatalog(t)
+	r := vc.replica(t)
+	admin := r.admin(t, pgx.QueryExecModeSimpleProtocol)
+	mustExec(t, admin, "CREATE SCHEMA IF NOT EXISTS lake.public")
+	mustExec(t, admin, "CREATE TABLE lake.public.visits AS SELECT i AS id FROM range(10) r(i)")
+	release := r.eng.CatalogShare()
+	defer release()
+	done := make(chan []string, 1)
+	go func() { done <- rawTexts(t, admin, "SELECT count(*) FROM lake.public.visits") }()
+	select {
+	case got := <-done:
+		if !slices.Equal(got, []string{"10"}) {
+			t.Errorf("got %q", got)
+		}
+	case <-time.After(30 * time.Second):
+		t.Error("the query waited for a shared hold of the catalog lock")
+	}
+}
+
 // TestSharedHoldRefusesWalks checks the guard shared prepares rely on, in
 // DuckDB itself: while the catalog lock is held shared, a listing of the
 // catalog's tables, a missing table's suggestion of similar names and a
