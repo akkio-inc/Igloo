@@ -722,12 +722,20 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   later for what its tasks finished meanwhile, the table's next write removes
   what a stopped process left, and erasure requests treat what is
   left as the table's orphan files. A worker refused the write leaves it to
-  the replica. Tables partitioned by bucket stay with the replica. A task
+  the replica. Tables partitioned by bucket or by a decimal stay with the replica. A task
   bounds its row groups by its share of the worker's memory: rows of 10.8 KB,
   which row groups of 122,880 rows took a worker of 1 GB out of memory with, now
   take about a third of it. Auto mode takes rows too wide for a task to the replica, and a
   fill that runs out of memory on workers runs there, or with the replica writing,
-  rather than fail.
+  rather than fail. What is committed is the replica's own copy of each file, in
+  a directory no worker's grant names, read and checked there, with a footer that
+  can say no more than it holds; what a task's statement left unfinished in the
+  store's multipart uploads is aborted when it ends, and an erasure request does
+  not complete while any could hold its rows. Workers also write `INSERT ... BY
+  NAME` and of some of a table's columns, partitioned views' refreshes, and tables
+  with NOT NULL or nested columns.
+- A statement whose last runs keep it on the replica no longer plans for workers
+  again, so that planning it does not take longer than it does.
 - DuckDB's memory limit, where `IGLOO_DUCKDB_MEMORY_LIMIT` does not set it,
   is what Igloo's memory leaves after the eighth it keeps free before it
   lowers DuckDB's limit, its reserve and an eighth of the limit itself,
