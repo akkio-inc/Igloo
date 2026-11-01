@@ -454,6 +454,7 @@ type Server struct {
 	idComplete idComplete
 	// scanner and prefetcher read ahead for statements, or are nil.
 	scanner    *distributed.Scanner
+	scanNames  scanNames
 	prefetcher *prefetch.Prefetcher
 	// bitmaps and bitmapMinRows choose the statements that count distinct
 	// IDs in roaring bitmaps, and bitmapReruns counts those run again with

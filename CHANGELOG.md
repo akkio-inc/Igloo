@@ -1912,6 +1912,9 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   shape of its own, and does not wait behind the replica's limit: 32 of a
   dashboard's 96 queries were such, and the shape they shared with the ones
   that ran said those used next to nothing.
+- Reading ahead for a statement lists a table or view's name once, not each
+  time: listing takes the catalog lock exclusively, several times a statement,
+  which held up every prepare beside it.
 - A statement reads ahead only the files no statement has lately for the same
   columns: a dashboard's 96 queries, in cache, each parsed the footers of every
   file they read and asked for each of their blocks.

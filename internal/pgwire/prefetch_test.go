@@ -118,6 +118,51 @@ func TestPrefetchStatements(t *testing.T) {
 	}
 }
 
+// TestReadAheadLeavesTheCatalogLock checks that a statement whose names have
+// been listed reads ahead, and runs, while another session holds the catalog
+// lock shared: listing them again takes it exclusively, which waited for that
+// session and held up the prepares behind it.
+func TestReadAheadLeavesTheCatalogLock(t *testing.T) {
+	t.Parallel()
+	vc := newViewCatalog(t)
+	ctx := context.Background()
+	cat, err := catalog.Open(ctx, vc.cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	scanner, err := distributed.NewScanner(distributed.NewIceberg(cat))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = scanner.Close() })
+	pf, err := prefetch.New(prefetch.Options{Dir: t.TempDir(), Open: func(_ context.Context, path string) (prefetch.Object, error) {
+		f, err := os.Open(strings.TrimPrefix(path, "file://"))
+		return localObject{f}, err
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(pf.Close)
+	r := vc.replica(t, func(o *Options) { o.Scanner, o.Prefetcher = scanner, pf })
+	admin := r.admin(t, pgx.QueryExecModeSimpleProtocol)
+	mustExec(t, admin, "CREATE SCHEMA IF NOT EXISTS lake.public")
+	mustExec(t, admin, "CREATE TABLE lake.public.seen AS SELECT i AS id FROM range(10) r(i)")
+	const q = "SELECT count(*) FROM lake.public.seen"
+	rawTexts(t, admin, q)
+	release := r.eng.CatalogShare()
+	defer release()
+	done := make(chan []string, 1)
+	go func() { done <- rawTexts(t, admin, q) }()
+	select {
+	case got := <-done:
+		if len(got) != 1 || got[0] != "10" {
+			t.Errorf("got %q", got)
+		}
+	case <-time.After(30 * time.Second):
+		t.Error("the statement waited for a shared hold of the catalog lock")
+	}
+}
+
 // TestPrefetchWhereItRuns reads ahead on this replica only for statements
 // that run here: workers read ahead for the tasks of one they run, and the
 // coordinator reading the same blocks too would double the requests and
