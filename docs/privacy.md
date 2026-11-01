@@ -768,10 +768,19 @@ that stopped leaves, or a worker that wrote on past that, is deleted at the
 table's next write or by the request, which waits for those that hold matching rows until they are old
 enough to tell from a write in progress, and verifies they are gone before
 it completes. A fill during which a request deleted files does not commit
-what its tasks wrote. As with parts of multipart uploads a stopped process
-abandoned, on S3, which no one can list or read and which the bucket's
-lifecycle rule removes (the OpenTofu module for AWS sets one), a request sees
-no file there; give your bucket such a rule.
+what its tasks wrote.
+
+What a process that stopped had uploaded of a file is in no listing of files,
+but it can be recovered: on S3 and GCS whoever may write can list the parts of a
+multipart upload and complete it, and on Azure can commit a blob's staged blocks.
+A statement's end aborts those under its directories. A request aborts those
+that began by five minutes after the latest deletion under its tables' locations,
+under no table's location and among exchanges, and does not complete while it
+finds one or cannot look: `s3:ListBucketMultipartUploads` on AWS, and a GCS HMAC
+key that may list them. The buckets of the OpenTofu modules for AWS and Google
+Cloud, and the one of the single-VM deployment, also abort them after a day; give your
+bucket such a rule. A DFS write on an Azure filesystem leaves a file of no length,
+which is a file like the others to all of this.
 
 A worker cannot reach the metadata database, so coordinators keep it up
 with requests:

@@ -360,6 +360,10 @@ type Verification struct {
 	// Orphans are unreferenced files with matching rows that are too new
 	// to delete: they may belong to a write in progress.
 	Orphans int64 `json:"orphans"`
+	// Uploads are unfinished uploads that could hold its rows: a stopped
+	// write's, under its tables, under no table's location, or among exchanges
+	// (see uploads.go).
+	Uploads int64 `json:"uploads,omitempty"`
 	// Staging are tables being made for its tables since it last looked,
 	// which it erases from too.
 	Staging int64 `json:"staging,omitempty"`

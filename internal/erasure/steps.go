@@ -1534,6 +1534,9 @@ func (s *Service) purge(ctx context.Context, r *Request) error {
 	if err := s.delete(ctx, r, tables, keep(gone, kept)); err != nil {
 		return err
 	}
+	if err := s.abortUploads(ctx, r, tables); err != nil {
+		return err
+	}
 	for _, l := range tables {
 		l.t.done(StepPurge, s.now())
 	}
@@ -2391,6 +2394,9 @@ func (s *Service) verify(ctx context.Context, r *Request) (string, error) {
 	}
 	u.leave(refs, append(slices.Clone(kept), more...))
 	v.Orphans += int64(len(u.all()))
+	if v.Uploads, err = s.uploadsRemaining(ctx, r, tables); err != nil {
+		return "", err
+	}
 	for _, f := range files {
 		if f.Deleted.IsZero() {
 			continue
@@ -2454,7 +2460,7 @@ func (s *Service) verify(ctx context.Context, r *Request) (string, error) {
 		next = StepViews
 	case v.IDSets > 0:
 		next = StepExpire
-	case v.Storage > 0 || v.Orphans > 0:
+	case v.Storage > 0 || v.Orphans > 0 || v.Uploads > 0:
 		next = StepPurge
 	case v.Sharing > 0:
 		next = StepSharing
@@ -2572,7 +2578,7 @@ func (v *Verification) String() string {
 	}{
 		{v.Rows, "rows"}, {v.Files, "files"}, {v.Bounds, "manifest bounds"}, {v.Statistics, "Parquet statistics"},
 		{v.Staging, "tables being made"},
-		{v.Storage, "deleted files in storage"}, {v.Orphans, "recent orphan files"}, {v.Sharing, "sharing copies"},
+		{v.Storage, "deleted files in storage"}, {v.Orphans, "recent orphan files"}, {v.Uploads, "unfinished uploads"}, {v.Sharing, "sharing copies"},
 		{v.History, "history records"}, {v.Derived, "derived entries"}, {v.Models, "models or their old blobs"},
 		{v.IDSets, "sets of ids"}, {v.Views, "materialized views or dynamic tables"}, {int64(v.Workers), "workers that have not purged"},
 	} {

@@ -604,6 +604,7 @@ func (s *Server) clearNoted(ctx context.Context, schema, name string, tbl *table
 				if err := s.deleteRefreshFiles(ctx, tbl, dir); err != nil {
 					return err
 				}
+				s.abortUploads(ctx, tbl, dir)
 			}
 		}
 	}

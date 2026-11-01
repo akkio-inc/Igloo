@@ -56,8 +56,10 @@ resource "aws_s3_bucket_lifecycle_configuration" "warehouse" {
 
     filter {}
 
+    # What a stopped write had uploaded can be recovered, and so holds its rows:
+    # Igloo aborts what it can see to, and this the rest.
     abort_incomplete_multipart_upload {
-      days_after_initiation = 7
+      days_after_initiation = 1
     }
   }
 

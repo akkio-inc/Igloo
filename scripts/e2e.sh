@@ -1715,6 +1715,30 @@ if [ "$got|$requests" = "crm.audience:1,crm.people:2,crm.people_copy:2|0" ]; the
 else
   fail "dry run: got [$got|$requests]"
 fi
+# What a stopped write had uploaded is in no listing of files, and can be
+# recovered: an upload under a tagged table holds the person's rows, one under a
+# table the request does not erase from holds another table's.
+s3_curl() {
+  docker run --rm --network "$network" curlimages/curl:8.22.0 -sS --aws-sigv4 "aws:amz:$(grep '^S3_REGION=' "$env_file" | cut -d= -f2):s3" \
+    --user "$s3_access_key:$s3_secret_key" "$@"
+}
+# stopped_upload KEY uploads a part of the person's rows to KEY, and stops.
+stopped_upload() {
+  local id
+  id="$(s3_curl -X POST "http://storage:9000/$bucket/$1?uploads" | sed -n 's|.*<UploadId>\(.*\)</UploadId>.*|\1|p')"
+  s3_curl -X PUT --data-binary "$erase_email" --url-query partNumber=1 --url-query "uploadId=$id" -o /dev/null "http://storage:9000/$bucket/$1"
+}
+table_dir() { psql_admin -c "SELECT file_path FROM iceberg_metadata(lake.crm.$1) LIMIT 1" | sed -e 's|/data/.*||' -e 's|^s3://[^/]*/||'; }
+people_dir="$(table_dir people)"
+psql_admin -c "CREATE TABLE crm.not_tagged (id INTEGER)" -c "INSERT INTO crm.not_tagged VALUES (1)" >/dev/null
+other_dir="$(table_dir not_tagged)"
+stopped_upload "$people_dir/data/igloo-write-00112233445566ff/q/s0-0/a0/f/part_0.parquet"
+stopped_upload "$other_dir/data/igloo-write-00112233445566ff/q/s0-0/a0/f/part_0.parquet"
+if [ "$(s3_curl "http://storage:9000/$bucket?uploads&prefix=$people_dir/" | grep -c '<UploadId>')" = 1 ]; then
+  pass "an upload that stopped is there for the request to find"
+else
+  fail "no upload to find: $(s3_curl "http://storage:9000/$bucket?uploads&prefix=$people_dir/" | head -c 400)"
+fi
 request="$(psql_as pat pat-password-1 -c "ERASE SUBJECT WHERE person.email = '  $lower_email' OR person.device_id = '$lower_device'" | cut -d'|' -f1)"
 status=""
 deadline=$((SECONDS + 240))
@@ -1728,6 +1752,10 @@ if [ "$status" = completed ]; then
 else
   fail "the erasure request: $(psql_admin -c "SELECT status, step, error FROM igloo.erasure_requests WHERE request_id = '$request'")"
 fi
+got="$(s3_curl "http://storage:9000/$bucket?uploads&prefix=$people_dir/")"
+if grep -q '<UploadId>' <<<"$got"; then fail "the request left an upload that holds the person's rows: $got"; else pass "it aborted the upload that held the person's rows"; fi
+got="$(s3_curl "http://storage:9000/$bucket?uploads&prefix=$other_dir/")"
+if grep -q '<UploadId>' <<<"$got"; then pass "and left another table's"; else fail "the request aborted another table's upload"; fi
 expect "its verification finds nothing" "0|0|0|0|0|0|0|0|1" pat pat-password-1 \
   "SELECT v->>'rows', v->>'files', v->>'bounds', v->>'statistics', v->>'storage', v->>'orphans', v->>'sharing', v->>'history', v->>'caches'
    FROM (SELECT verification::JSON AS v FROM igloo.erasure_requests WHERE request_id = '$request')"

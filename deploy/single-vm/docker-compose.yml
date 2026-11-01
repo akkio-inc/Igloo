@@ -261,6 +261,11 @@ services:
         else
           curl -fsS -X PUT $$auth "$$url" && echo "created bucket $$S3_BUCKET"
         fi
+        # What a stopped write had uploaded can be recovered, and so holds its
+        # rows: Igloo aborts what it can see to, and this the rest.
+        rule='<LifecycleConfiguration><Rule><ID>abort-incomplete-multipart-uploads</ID><Filter><Prefix></Prefix></Filter><Status>Enabled</Status><AbortIncompleteMultipartUpload><DaysAfterInitiation>1</DaysAfterInitiation></AbortIncompleteMultipartUpload></Rule></LifecycleConfiguration>'
+        curl -fsS -X PUT $$auth -H 'Content-Type: application/xml' --data-binary "$$rule" "$$url?lifecycle" \
+          && echo "set the bucket's lifecycle rule" || echo "could not set the bucket's lifecycle rule; see docs/privacy.md"
     environment:
       S3_BUCKET: ${S3_BUCKET}
       S3_REGION: ${S3_REGION}

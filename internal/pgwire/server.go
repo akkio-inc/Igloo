@@ -55,6 +55,7 @@ import (
 	"github.com/akkio-inc/igloo/internal/sqllex"
 	"github.com/akkio-inc/igloo/internal/tasks"
 	"github.com/akkio-inc/igloo/internal/tsforecast"
+	"github.com/akkio-inc/igloo/internal/uploads"
 	"github.com/akkio-inc/igloo/internal/workload"
 )
 
@@ -264,6 +265,9 @@ type Options struct {
 	// reportFallback, when set, hears of each recognized statement that
 	// failed, which then ran as written (for tests).
 	reportFallback func(recognized string, err error)
+	// UploadKeys are what it takes to see the store's unfinished uploads, which
+	// a statement's end aborts under its directories.
+	UploadKeys uploads.Keys
 	// AllowedLocations are where users other than admins may read files
 	// from while tables have policies (IGLOO_ALLOWED_LOCATIONS), and
 	// Warehouse is the warehouse's location, whose files they may not.
@@ -567,6 +571,8 @@ type Server struct {
 	lateWritesStop chan struct{}
 	lateWritesWait func()
 	stopLateWrites sync.Once
+	// uploadKeys is Options.UploadKeys.
+	uploadKeys uploads.Keys
 	// beforeWriteCommit, if set, runs before files workers wrote under dir
 	// are committed, and fails the commit with its error (see tableWrite).
 	beforeWriteCommit func(ctx context.Context, dir string) error
@@ -786,6 +792,7 @@ func New(engine Engine, opts Options, log *slog.Logger) (*Server, error) {
 	s.idFillRewriteRows = cmp.Or(opts.idFillRewriteRows, idFillRewriteRows)
 	s.reportOutcomes, s.reportFallback = opts.reportOutcomes, opts.reportFallback
 	s.reportRewriteAnyPath = opts.reportRewriteAnyPath
+	s.uploadKeys = opts.UploadKeys
 	if s.idDomains == nil {
 		s.idDomains = iddomain.NewMemoryStore()
 	}

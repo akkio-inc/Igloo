@@ -42,6 +42,14 @@ locals {
         Resource = aws_s3_bucket.warehouse.arn
       },
       {
+        # Unfinished uploads, which erasure requests abort (no prefix condition
+        # applies to this action).
+        Sid      = "ListUnfinishedUploads"
+        Effect   = "Allow"
+        Action   = "s3:ListBucketMultipartUploads"
+        Resource = aws_s3_bucket.warehouse.arn
+      },
+      {
         Sid    = "ReadWriteWarehouseObjects"
         Effect = "Allow"
         # PutObject also covers CreateMultipartUpload, UploadPart and

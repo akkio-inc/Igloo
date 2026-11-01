@@ -29,6 +29,17 @@ resource "google_storage_bucket" "warehouse" {
     enabled = var.bucket_versioning
   }
 
+  # What a stopped write had uploaded can be recovered, and so holds its rows:
+  # Igloo aborts what it can see to, and this the rest.
+  lifecycle_rule {
+    condition {
+      age = 1
+    }
+    action {
+      type = "AbortIncompleteMultipartUpload"
+    }
+  }
+
   dynamic "lifecycle_rule" {
     for_each = var.bucket_versioning ? [1] : []
     content {

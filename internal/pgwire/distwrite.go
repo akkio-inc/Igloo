@@ -19,6 +19,7 @@ import (
 	"github.com/akkio-inc/igloo/internal/catalog"
 	"github.com/akkio-inc/igloo/internal/ddl"
 	"github.com/akkio-inc/igloo/internal/distributed"
+	"github.com/akkio-inc/igloo/internal/uploads"
 )
 
 // Workers writing a fill's rows (see distributed's writes.go, and fillOn).
@@ -306,6 +307,7 @@ func (w *tableWrite) end(ctx context.Context) {
 				return false
 			}
 		}
+		s.abortUploads(bg, tbl, dir)
 		return true
 	}
 	dirs := []string{dir}
@@ -325,6 +327,25 @@ func (w *tableWrite) end(ctx context.Context) {
 		}
 		s.forgetRefreshFiles(bg, schema, note)
 	}()
+}
+
+// abortUploads ends what tasks had uploaded under dir and not finished, as a
+// worker killed in its COPY leaves, which no listing of files shows: a directory
+// of no use to anyone, and files of the table's rows that could still be made.
+func (s *Server) abortUploads(ctx context.Context, tbl *table.Table, dir string) {
+	fsys, err := tbl.FS(ctx)
+	if err == nil {
+		var store uploads.Store
+		if store, err = uploads.For(fsys, dir, s.uploadKeys); err == nil {
+			var n int
+			if n, err = uploads.AbortUnder(ctx, store, dir+"/", time.Time{}); n > 0 {
+				s.log.Info("aborted uploads a statement's tasks did not finish", "dir", dir, "uploads", n)
+			}
+		}
+	}
+	if err != nil {
+		s.log.Warn("could not abort uploads a statement's tasks did not finish; the bucket's lifecycle rule or an erasure request does", "dir", dir, "err", err)
+	}
 }
 
 // sealCopies is how many files a statement copies at a time.

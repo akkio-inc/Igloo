@@ -608,6 +608,24 @@ else
   fail "after a worker died writing: [$got], want [$wide_want]; $(tail -3 "$work/written_killed")"
 fi
 compose up -d --wait worker >/dev/null 2>&1 || compose up -d --wait --scale worker="$workers" >/dev/null
+# What the killed worker had uploaded goes with the statement, though no listing
+# of files shows it, and tasks' last writes a minute after that.
+s3_uploads() {
+  docker run --rm --network "$network" curlimages/curl:8.22.0 -sS \
+    --aws-sigv4 "aws:amz:$(grep '^S3_REGION=' "$env_file" | cut -d= -f2):s3" \
+    --user "$(grep '^S3_ACCESS_KEY_ID=' "$env_file" | cut -d= -f2):$(grep '^S3_SECRET_ACCESS_KEY=' "$env_file" | cut -d= -f2)" \
+    "http://storage:9000/$(grep '^S3_BUCKET=' "$env_file" | cut -d= -f2)?uploads&prefix=warehouse/"
+}
+deadline=$((SECONDS + 90))
+until ! s3_uploads | grep -q '<Key>[^<]*igloo-write-' || [ "$SECONDS" -ge "$deadline" ]; do
+  sleep 3
+done
+got="$(s3_uploads)"
+if grep -q '<Key>[^<]*igloo-write-' <<<"$got"; then
+  fail "uploads of a statement that ended: $(head -c 500 <<<"$got")"
+else
+  pass "what the worker had uploaded went with the statement"
+fi
 
 echo "after table maintenance"
 # Compaction rewrites the small files loaded above, and gives every table
