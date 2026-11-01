@@ -535,6 +535,16 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
 
 ### Distributed execution
 
+- Bucketed tables stay in place beside what is not bucketed. A join of a table
+  bucketed by the join column to another table, or to a relation workers
+  compute, shuffles the other side into the table's buckets, by the key's
+  Iceberg bucket, and leaves the bucketed table's rows where they are, where
+  both were exchanged. A subquery read once that keeps the key as it is, by
+  filtering and projecting a bucketed table, joining bucketed tables on the
+  key, or grouping one with the key among its groups, is read by bucket where
+  it stands. A key computed from the column, or counts that do not divide,
+  are exchanged as before. `EXPLAIN DISTRIBUTED` says what is written to
+  buckets. See [bucketed tables](docs/distributed-execution.md#bucketed-tables).
 - A `SELECT ... ORDER BY` larger than memory on one machine sorts in runs and
   merges them as the client reads them: its rows go to files in the spill
   directory, each file is sorted within memory, and the merge streams them.

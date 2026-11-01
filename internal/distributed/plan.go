@@ -350,10 +350,14 @@ type planner struct {
 	ins int
 	// inlined are the entries of common table expressions read as their
 	// queries in their one reader's place (inline); inlines counts those
-	// reads, and noInline turns them off.
-	inlined  map[uintptr]bool
-	inlines  int
-	noInline bool
+	// reads, and noInline turns them off. grouped counts the subqueries
+	// planned to group where their tables' buckets are read, and noGrouped
+	// turns that off (see groupsByBucket).
+	inlined   map[uintptr]bool
+	inlines   int
+	noInline  bool
+	grouped   int
+	noGrouped bool
 	// fused numbers the views of stages fusePartitions took out.
 	fused int
 	// reasons say why candidates were not distributed, for logs.
@@ -713,6 +717,9 @@ type candidate struct {
 	// tooDeep is a table that must be partitioned but lies in a subquery,
 	// which then becomes a relation.
 	tooDeep *tableUse
+	// noThrough says no table in a subquery is read by bucket: the
+	// candidate's inputs did not all meet by bucket with one that was.
+	noThrough bool
 	// columns are its result columns.
 	columns []Column
 	// ctes are the common table expressions its FROM sees, its own among
@@ -740,7 +747,7 @@ func (pl *planner) job(sel node, top bool, ctes cteScope) (node, error) {
 		return nil, err
 	}
 	sp := pl.save()
-	inlines := pl.inlines
+	inlines, grouped := pl.inlines, pl.grouped
 	c := &candidate{sel: sel, top: top}
 	j, b, err := pl.build(c, top, ctes)
 	if pl.ctx.Err() != nil {
@@ -754,6 +761,14 @@ func (pl *planner) job(sel node, top bool, ctes cteScope) (node, error) {
 	}
 	if err == nil {
 		pl.uncertain = append(pl.uncertain, pl.uncertainOf(c)...)
+	}
+	if err != nil && IsUnsupported(err) && pl.grouped > grouped && !pl.noGrouped {
+		// Its subqueries that group could not be read by bucket: they are
+		// relations.
+		pl.restore(sp)
+		pl.noGrouped = true
+		defer func() { pl.noGrouped = false }()
+		return pl.job(sel, top, ctes)
 	}
 	if err != nil && IsUnsupported(err) && pl.inlines > inlines && !pl.noInline {
 		// Some parts need a common table expression's rows in an exchange:
@@ -934,6 +949,10 @@ type tableUse struct {
 	// the other side partitioned alike (see outer.go). outerSub says it is
 	// in a subquery that is such a side, which is then a relation.
 	outer, outerSub bool
+	// grouped says it is in a subquery that groups by its bucket column:
+	// read by bucket beside what the subquery joins, or a relation, but
+	// never divided by shares (see groupsByBucket).
+	grouped bool
 }
 
 // hasColumn reports whether some item of sc has a column called name
@@ -1331,6 +1350,9 @@ func (pl *planner) from(ref node, splittable bool, ctes cteScope, sc *scope, rd 
 			renameColumns(item, list(ref, "column_name_alias"))
 			sc.items = append(sc.items, item)
 			return pl.filterSubqueries(sub, ctes, rd)
+		}
+		if !pl.forced[identity(ref)] && pl.groupsByBucket(sub, ctes) {
+			return pl.groupedFrom(ref, sub, item, splittable, ctes, sc, rd)
 		}
 		if str(sub["type"]) != "SELECT_NODE" || pl.opaque(sub) != "" || pl.forced[identity(ref)] {
 			// A relation workers compute.
@@ -2009,6 +2031,11 @@ func (pl *planner) chooseSplit(c *candidate) error {
 			largest = u
 		}
 	}
+	if (c.split == nil || largest.table.Bytes > c.split.table.Bytes) && largest != nil && largest.grouped {
+		// Read by bucket, or the subquery around it is a relation.
+		c.split = nil
+		return pl.chooseKeyed(c)
+	}
 	if c.split == nil {
 		return unsupported("no table whose rows can be divided among workers")
 	}
@@ -2224,17 +2251,18 @@ func (pl *planner) emit(j *job, b *jobBuild, out *Exchange) (*Stage, error) {
 			// A stage per partitioned table, writing its rows to an exchange
 			// keyed by its side of the join key.
 			x = pl.exchange("join", k.keys, k.casts)
+			x.Buckets = k.into
 			pl.stage(&Stage{fragment: k.stage, Inputs: []Input{{View: k.view, Table: k.use.table, Split: true}}, Out: x})
 		} else {
 			var err error
-			if x, err = pl.relationExchange(k.rel, k.keys, k.casts); err != nil {
+			if x, err = pl.relationExchange(k.rel, k.keys, k.casts, k.into); err != nil {
 				return nil, err
 			}
 		}
 		last.Inputs = append(last.Inputs, Input{View: k.view, Exchange: x, Partitioned: true})
 	}
 	for _, w := range j.whole {
-		x, err := pl.relationExchange(w.rel, nil, nil)
+		x, err := pl.relationExchange(w.rel, nil, nil, 0)
 		if err != nil {
 			return nil, err
 		}
@@ -2565,7 +2593,7 @@ func passesKey(s *Stage, x *Exchange) bool {
 		keyed = in
 		ix := in.Exchange
 		if len(ix.Keys) != len(x.Keys) || len(ix.Casts) != len(ix.Keys) || !strings.EqualFold(ix.Keys[i], parts[len(parts)-1]) ||
-			ix.Casts[i] != "" || x.Casts[i] != "" {
+			ix.Casts[i] != "" || x.Casts[i] != "" || ix.Buckets != x.Buckets {
 			return false
 		}
 	}

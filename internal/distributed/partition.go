@@ -42,6 +42,13 @@ type keyed struct {
 	// by its bucketing bucket, of its key column (see bucket.go).
 	bucketed bool
 	bucket   int
+	// into, for an input read beside tables read by bucket, is the buckets
+	// its exchange writes its rows to, the smallest count of theirs.
+	into int
+	// through, for a table in a subquery read by bucket, says how the
+	// subquery passes its columns on: item is the subquery's, and keys are
+	// its columns (see bucket.go).
+	through *through
 	// nullable says it supplies NULLs to an outer join (see outer.go): its
 	// key keeps no group or partition whole, and the statement's filters on
 	// it alone do not apply before the join.
@@ -66,7 +73,7 @@ func (k *keyed) ref() node {
 // columnType returns the type of a key column of the input.
 func (k *keyed) columnType(name string) string {
 	if k.use != nil {
-		return columnType(k.use.table, name)
+		return columnType(k.use.table, k.tableColumn(name))
 	}
 	if i := slices.Index(k.item.columns, name); i >= 0 {
 		return k.rel.columns[i].Type
@@ -79,7 +86,15 @@ func (k *keyed) columnType(name string) string {
 // until the rest fit every worker; all of them must be joined, directly
 // and by inner joins or WHERE, on equal columns, which become their keys.
 func (pl *planner) chooseKeyed(c *candidate) error {
+	notes := len(pl.bucketNotes)
 	err := pl.keyInputs(c)
+	if slices.ContainsFunc(c.keyed, func(k *keyed) bool { return k.through != nil && !k.bucketed }) {
+		// A subquery's table that is not to be read by bucket after all: the
+		// subquery is then a relation, as below.
+		pl.bucketNotes = pl.bucketNotes[:notes]
+		c.noThrough = true
+		err = pl.keyInputs(c)
+	}
 	if u := c.tooDeep; u != nil && IsUnsupported(err) {
 		// A large table inside a subquery that passes rows through: the
 		// subquery it is in is a relation, written by its own stages. That
@@ -388,7 +403,12 @@ func (pl *planner) keyInputs(c *candidate) error {
 		if rest <= pl.opts.maxBroadcast && (len(c.keyed) > 0 || u.table.Bytes < pl.opts.minBytes) && !windowed(u) {
 			break
 		}
-		if !(u.splittable || u.semi || u.outer) || !inScope(u.scope) {
+		th := pl.throughOf(c, u)
+		sc, item := u.scope, u.item
+		if th != nil {
+			sc, item = c.scope, th.item
+		}
+		if !(u.splittable || u.semi || u.outer || th != nil) || !inScope(sc) {
 			if (u.splittable || u.outerSub) && u.scope != nil && u.scope.ref != nil {
 				c.tooDeep = u
 			}
@@ -397,7 +417,7 @@ func (pl *planner) keyInputs(c *candidate) error {
 		if len(list(u.ref, "column_name_alias")) > 0 {
 			return unsupported("%s with renamed columns", u.table)
 		}
-		c.keyed = append(c.keyed, &keyed{use: u, item: u.item})
+		c.keyed = append(c.keyed, &keyed{use: u, item: item, through: th})
 		rest -= u.table.Bytes
 	}
 	if err := pl.outerPairs(c); err != nil {

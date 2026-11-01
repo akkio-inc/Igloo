@@ -927,6 +927,10 @@ func minSlots(ws []*worker) int {
 	return max(n, 1)
 }
 
+// SetMaxBroadcast overrides what every worker may read in full, for tests of
+// packages that plan statements of small tables as of large ones.
+func (co *Coordinator) SetMaxBroadcast(n int64) { co.maxBroadcast = n }
+
 // Keep keeps the workers from stopping as idle until release is called:
 // the server holds them while a statement that ran tasks runs, on the
 // coordinator too, and while one auto mode chose to run there runs, for

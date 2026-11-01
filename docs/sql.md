@@ -167,7 +167,8 @@ column)`, keeps the rows of each bucket of the column's hash in files of
 their own, as Iceberg's spec has every engine write them. Workers then join
 two such tables on their bucketed columns, group by the column or count its
 distinct values bucket by bucket, each reading the same buckets of every
-table, without exchanging rows first (see [bucketed
+table, without exchanging rows first, and write what they join such a table
+to on that column into its buckets, leaving the table in place (see [bucketed
 tables](distributed-execution.md#bucketed-tables)):
 
 ```sql

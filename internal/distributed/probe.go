@@ -576,7 +576,7 @@ func (co *Coordinator) runProbing(ctx context.Context, plan *Plan, run *executio
 		if x == nil || exchanges[id] == nil {
 			continue
 		}
-		if readWhole[id] || slices.Equal(exchanges[id].Keys, w.Keys) && slices.Equal(exchanges[id].Casts, w.Casts) {
+		if readWhole[id] || slices.Equal(exchanges[id].Keys, w.Keys) && slices.Equal(exchanges[id].Casts, w.Casts) && exchanges[id].Buckets == w.Buckets {
 			again.exchanges[id] = x
 			reused[id] = true
 		}

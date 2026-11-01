@@ -409,12 +409,37 @@ when every file of the tables was written under a partition spec that
 buckets so, and the buckets are at least as many as the workers: a part
 reads them in as many tasks, two for each slot of the workers at most,
 balanced by their files' bytes. Rows whose column is `NULL` are read by one
-task. `EXPLAIN DISTRIBUTED` says, in `buckets` rows, which tables a part
-reads by bucket with no exchange, and why bucketed tables were exchanged
-all the same:
+task.
+
+The other side of a join need not be bucketed:
+
+- A table not bucketed by the join column, or a relation workers compute (a
+  common table expression several parts read, a subquery that aggregates), is
+  **shuffled into the bucketed table's buckets**: its stage writes each row
+  to the partition of its key's Iceberg bucket, and the bucketed table stays
+  where it is. Its rows cross once, and the bucketed table's not at all.
+- A subquery read once that **keeps the key as it is**, over tables bucketed
+  by it, is read where it stands, with no exchange of its own: one that
+  filters and projects such a table, joins such tables on the key, or groups
+  one with the key among its groups. A `SELECT` renaming the key counts as
+  keeping it.
+
+Both apply to a key of one column, the column itself on the table's side, of
+an integer type, `VARCHAR` without a collation, `DATE`, `TIMESTAMP`,
+`TIMESTAMPTZ` or `DECIMAL`. A key computed from the column (`upper(person)`,
+`id + 1`), a `UUID` (whose bucket DuckDB's function does not compute as
+Iceberg's spec does, so that a table another engine wrote would not meet it), a
+join on two columns, bucket counts that do not divide or columns of types
+that hash apart are exchanged as before, by the hash of the key.
+
+`EXPLAIN DISTRIBUTED` says, in `buckets` rows, which tables a part reads by
+bucket with no exchange, what is written to their buckets, and why bucketed
+tables were exchanged all the same; a stage that writes to buckets says so
+(`to exchange 1 (relation) by bucket[32]`):
 
 ```
 buckets | no exchange: public.orders by bucket[32](customer_id) and public.visits by bucket[64](customer_id), read by bucket, 32 groups of buckets a stage
+buckets | no exchange: public.visits by bucket[64](customer_id), read by bucket, 64 groups of buckets a stage; active written to those buckets
 buckets | exchanged although public.orders by bucket[32](customer_id), public.events by bucket[48](customer_id): public.events's 48 buckets are not a multiple of 32
 ```
 

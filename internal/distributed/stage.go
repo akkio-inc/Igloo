@@ -104,6 +104,11 @@ type Exchange struct {
 	// expression of the key, upper(%s), whose value is hashed (see
 	// keyExpression).
 	Casts []string
+	// Buckets, if not 0, says its rows go to the partitions the files of a
+	// table bucketed by its one key into so many buckets are read by, beside
+	// which a stage reads them (see bucket.go): by the key's Iceberg bucket
+	// rather than its hash.
+	Buckets int
 	// purpose says what the exchange is for, in logs and tests.
 	purpose string
 }
@@ -126,6 +131,9 @@ func (s *Stage) String() string {
 	}
 	if s.Out != nil {
 		fmt.Fprintf(&b, " to exchange %d (%s)", s.Out.ID, s.Out.purpose)
+		if s.Out.Buckets > 0 {
+			fmt.Fprintf(&b, " by bucket[%d]", s.Out.Buckets)
+		}
 	} else {
 		b.WriteString(" to the coordinator")
 	}
@@ -183,6 +191,10 @@ func exchangeSQL(s *Stage, parts int) string {
 			keys[i] = hashKey(k, s.Out.Casts[i])
 		}
 		b = fmt.Sprintf("CAST(hash(%s) %% %d AS INTEGER)", strings.Join(keys, ", "), parts)
+		if s.Out.Buckets > 0 {
+			// NULL keys are where a bucketed table's are (see bucketGroups).
+			b = fmt.Sprintf("CAST(COALESCE(iceberg_bucket(%d, %s), 0) %% %d AS INTEGER)", s.Out.Buckets, keys[0], parts)
+		}
 	}
 	return "SELECT *, " + b + " AS __b FROM (" + inner + ") AS __igloo_x"
 }
@@ -466,11 +478,8 @@ func (e *execution) stage(ctx context.Context, s *Stage) error {
 		tasks = len(shares)
 	}
 	var groups [][]int
-	if s.partitioned() {
-		groups = e.groups(s)
-		tasks = len(groups)
-	}
-	// Tables read by bucket: each task reads the files of some buckets.
+	// Tables read by bucket: each task reads the files of some buckets, and
+	// the partitions of the exchanges written to those buckets.
 	var buckets [][]int
 	var bucketFiles map[string][][]File
 	if n := s.bucketCount(); n > 0 {
@@ -479,6 +488,12 @@ func (e *execution) stage(ctx context.Context, s *Stage) error {
 			return err
 		}
 		tasks = len(buckets)
+		if s.partitioned() {
+			groups = buckets
+		}
+	} else if s.partitioned() {
+		groups = e.groups(s)
+		tasks = len(groups)
 	}
 	e.co.log.Debug("running a stage", "query", e.qid, "stage", s.String(), "tasks", tasks, "partitions", e.parts)
 

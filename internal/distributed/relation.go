@@ -650,7 +650,7 @@ func (pl *planner) relation(ref, q node, qscope cteScope, def *cteDef, splittabl
 // plans it again reading every common table expression as a relation.
 func (pl *planner) inline(ref node, d *cteDef, ctes cteScope) (bool, error) {
 	q := d.query()
-	if pl.noInline || d.first != nil || str(q["type"]) != "SELECT_NODE" || pl.opaque(q) != "" || rowQuery(q) ||
+	if pl.noInline || d.first != nil || str(q["type"]) != "SELECT_NODE" || pl.opaque(q) != "" && !pl.groupsByBucket(q, d.scope) || rowQuery(q) ||
 		child(ref, "sample") != nil || child(ref, "at_clause") != nil || pl.uses(d) != 1 {
 		return false, nil
 	}
@@ -837,8 +837,9 @@ func (pl *planner) opaque(sel node) string {
 // keyed by keys (columns as the candidate names them), hashed as casts
 // say, and plans the stages that write it. A common table expression's
 // rows are written once: an exchange keyed otherwise is partitioned again
-// rather than computed again.
-func (pl *planner) relationExchange(r *relUse, keys, casts []string) (*Exchange, error) {
+// rather than computed again. buckets, if not 0, is the Iceberg buckets of
+// its one key it is written to (see Exchange.Buckets).
+func (pl *planner) relationExchange(r *relUse, keys, casts []string, buckets int) (*Exchange, error) {
 	if err := pl.budget(); err != nil {
 		return nil, err
 	}
@@ -850,7 +851,7 @@ func (pl *planner) relationExchange(r *relUse, keys, casts []string) (*Exchange,
 		}
 		xkeys[i] = r.columns[j].Name
 	}
-	sig := strings.Join(xkeys, "\x00") + "\x01" + strings.Join(casts, "\x00")
+	sig := strings.Join(xkeys, "\x00") + "\x01" + strings.Join(casts, "\x00") + "\x01" + strconv.Itoa(buckets)
 	if d := r.def; d != nil {
 		if x := d.outs[sig]; x != nil {
 			r.out = x
@@ -860,6 +861,7 @@ func (pl *planner) relationExchange(r *relUse, keys, casts []string) (*Exchange,
 			// Partitioned otherwise: partition it again. (Written whole, it
 			// is small, and computed again.)
 			x := pl.exchange("relation", xkeys, casts)
+			x.Buckets = buckets
 			f, err := pl.p.parse("SELECT * FROM " + quoteIdent("__igloo_r"))
 			if err != nil {
 				return nil, err
@@ -889,6 +891,7 @@ func (pl *planner) relationExchange(r *relUse, keys, casts []string) (*Exchange,
 		return nil, unsupported("relations nest more than %d deep", maxRelationDepth)
 	}
 	x := pl.exchange("relation", xkeys, casts)
+	x.Buckets = buckets
 	if err := pl.produce(r.q, r.scope, x, r.columns, nil); err != nil {
 		return nil, err
 	}

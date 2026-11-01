@@ -24,6 +24,25 @@ import (
 // N, as the transform takes the hash modulo the count. The tables'
 // key columns must hash alike: integers of any width (Iceberg hashes int
 // and long alike), or the same type otherwise.
+//
+// An input joined to such a table on its bucket column that is not itself
+// bucketed so, a relation workers compute or another table, is shuffled into
+// the table's buckets: its stage writes each row to the partition of the
+// key's Iceberg bucket, with iceberg_bucket, the function DuckDB writes
+// bucketed tables with, and the table's rows stay where they are, each task
+// reading the files of some buckets and the partitions those buckets are
+// written to. Only one key, the column itself on the table's side, and
+// types Iceberg hashes by value alone qualify (bucketHashes): a key
+// computed from the column, or counts that do not divide, are exchanged as
+// before.
+//
+// A subquery that keeps its rows' keys as they are makes rows that a bucket
+// of its table holds whole, by filtering and projecting one such table, by
+// joining such tables on the key, or by grouping one with the key among the
+// groups: it is read where it stands, its tables by bucket, rather than
+// written to an exchange (through). Only one read once, in place of its
+// name: a common table expression that several parts read is computed once
+// and written to their buckets, which scans its table once.
 
 // Bucketing is a bucket transform of a table's partition spec.
 type Bucketing struct {
@@ -167,39 +186,37 @@ func (pl *planner) bucketKeyed(c *candidate) {
 	if len(c.keyed) == 0 {
 		return
 	}
-	var names, why []string
+	var names, others, why []string
 	var types []string
 	smallest := 0
 	ok := true
 	for _, k := range c.keyed {
-		if k.use == nil {
-			ok = false
-			why = append(why, k.String()+" is a relation workers compute")
-			continue
-		}
-		t := k.use.table
 		if len(k.keys) != 1 {
 			ok = false
-			why = append(why, fmt.Sprintf("%s is keyed by %d columns", t, len(k.keys)))
+			why = append(why, fmt.Sprintf("%s is keyed by %d columns", k, len(k.keys)))
 			continue
 		}
 		if keyExpression(k.casts[0]) {
 			// Keyed by an expression of the column, which its buckets
 			// do not hold apart.
 			ok = false
-			why = append(why, fmt.Sprintf("%s is keyed by %s", t, fmt.Sprintf(k.casts[0], k.keys[0])))
+			why = append(why, fmt.Sprintf("%s is keyed by %s", k, fmt.Sprintf(k.casts[0], k.keys[0])))
 			continue
 		}
-		i := bucketOf(t, k.keys[0])
-		if i < 0 {
+		i := -1
+		if k.use != nil {
+			i = bucketOf(k.use.table, k.tableColumn(k.keys[0]))
+		}
+		if i < 0 && k.through != nil {
 			ok = false
-			if len(t.Buckets) > 0 {
-				why = append(why, fmt.Sprintf("%s is bucketed by %s, not by %s", t, t.Buckets[0], k.keys[0]))
-			} else {
-				why = append(why, fmt.Sprintf("%s is not bucketed by %s", t, k.keys[0]))
-			}
 			continue
 		}
+		if i < 0 {
+			others = append(others, k.String())
+			types = append(types, k.columnType(k.keys[0]))
+			continue
+		}
+		t := k.use.table
 		b := t.Buckets[i]
 		names = append(names, fmt.Sprintf("%s by %s", t, b))
 		types = append(types, columnType(t, b.Column))
@@ -208,10 +225,10 @@ func (pl *planner) bucketKeyed(c *candidate) {
 		}
 	}
 	for _, k := range c.keyed {
-		if k.use == nil || len(k.keys) != 1 {
+		if k.use == nil || len(k.keys) != 1 || smallest == 0 {
 			continue
 		}
-		if i := bucketOf(k.use.table, k.keys[0]); i >= 0 && k.use.table.Buckets[i].N%smallest != 0 {
+		if i := bucketOf(k.use.table, k.tableColumn(k.keys[0])); i >= 0 && k.use.table.Buckets[i].N%smallest != 0 {
 			ok = false
 			why = append(why, fmt.Sprintf("%s's %d buckets are not a multiple of %d", k.use.table, k.use.table.Buckets[i].N, smallest))
 		}
@@ -224,9 +241,13 @@ func (pl *planner) bucketKeyed(c *candidate) {
 	for _, t := range types[min(1, len(types)):] {
 		if t != types[0] && !(slices.Contains(intTypes, t) && slices.Contains(intTypes, types[0])) {
 			ok = false
-			why = append(why, "the bucketed columns are of types that hash apart ("+strings.Join(types, ", ")+")")
+			why = append(why, "the key columns are of types that hash apart ("+strings.Join(types, ", ")+")")
 			break
 		}
+	}
+	if len(others) > 0 && len(types) > 0 && !bucketHashes(types[0]) {
+		ok = false
+		why = append(why, fmt.Sprintf("%s cannot be written to buckets of %s", strings.Join(others, ", "), types[0]))
 	}
 	if len(names) == 0 {
 		return
@@ -236,9 +257,26 @@ func (pl *planner) bucketKeyed(c *candidate) {
 		return
 	}
 	for _, k := range c.keyed {
-		k.bucketed, k.bucket = true, bucketOf(k.use.table, k.keys[0])
+		if k.use != nil && bucketOf(k.use.table, k.tableColumn(k.keys[0])) >= 0 {
+			k.bucketed, k.bucket = true, bucketOf(k.use.table, k.tableColumn(k.keys[0]))
+		} else {
+			k.into = smallest
+		}
 	}
-	pl.bucketNotes = append(pl.bucketNotes, fmt.Sprintf("no exchange: %s, read by bucket, %d groups of buckets a stage", strings.Join(names, " and "), smallest))
+	note := fmt.Sprintf("no exchange: %s, read by bucket, %d groups of buckets a stage", strings.Join(names, " and "), smallest)
+	if len(others) > 0 {
+		note += fmt.Sprintf("; %s written to those buckets", strings.Join(others, ", "))
+	}
+	pl.bucketNotes = append(pl.bucketNotes, note)
+}
+
+// bucketHashes reports whether iceberg_bucket hashes values of a key's type
+// as Iceberg's spec has every engine that writes a table hash a column of
+// the type: integers of any width, cast to BIGINT, and others its spec's
+// values show it does (see TestIcebergBucketHash). A UUID it hashes
+// otherwise: a table another engine wrote has its keys in other buckets.
+func bucketHashes(t string) bool {
+	return slices.Contains(intTypes, t) || t == "VARCHAR" || t == "DATE" || t == "TIMESTAMP" || t == "TIMESTAMP WITH TIME ZONE" || strings.HasPrefix(t, "DECIMAL(")
 }
 
 // bucketSplit reads a candidate's divided table by bucket instead of by
@@ -378,6 +416,189 @@ func distinctsFix(pl *planner, c *candidate, col itemColumn) bool {
 	return found && all
 }
 
+// through is how a subquery passes on the columns of a table it reads.
+type through struct {
+	// item is the subquery's, in the candidate's FROM clause.
+	item *fromItem
+	// columns maps its columns that are the table's unchanged, by its names,
+	// to the table's.
+	columns map[string]string
+}
+
+// tableColumn returns the table's column that a key column of a table read
+// by a keyed input is, or "" when a subquery computes it.
+func (k *keyed) tableColumn(name string) string {
+	if k.through != nil {
+		return k.through.columns[name]
+	}
+	return name
+}
+
+// throughOf returns how the subqueries around a bucketed table pass on its
+// columns to an item of the candidate's FROM clause, if they each read it
+// alone, or the innermost joins it, and may be read by bucket (see the top of
+// this file); nil otherwise.
+func (pl *planner) throughOf(c *candidate, u *tableUse) *through {
+	if c.noThrough || len(u.table.Buckets) == 0 || u.scope == nil || u.scope.ref == nil || !(u.splittable || u.outerSub || u.semi || u.grouped) {
+		return nil
+	}
+	if collation, err := pl.collation(); err != nil || collation != "" {
+		// Text equal under a collation buckets apart (see hashCast).
+		return nil
+	}
+	names := map[string]string{}
+	for _, col := range u.item.columns {
+		names[col] = col
+	}
+	item := u.item
+	for sc := u.scope; ; sc = sc.outer {
+		if sc == nil || sc.ref == nil || sc.item == nil || sc.item.columns == nil {
+			return nil
+		}
+		var passed []string
+		switch {
+		case len(sc.items) == 1 && sc.items[0] == item:
+			passed = passedColumns(subqueryNode(sc.ref), item)
+		case sc == u.scope && u.splittable:
+			passed = joinedColumns(subqueryNode(sc.ref), item, sc)
+		}
+		if passed == nil || len(passed) != len(sc.item.columns) {
+			return nil
+		}
+		next := map[string]string{}
+		for i, col := range sc.item.columns {
+			if t, ok := names[passed[i]]; ok && passed[i] != "" {
+				next[col] = t
+			}
+		}
+		names, item = next, sc.item
+		if sc.outer == c.scope {
+			return &through{item: item, columns: names}
+		}
+	}
+}
+
+// passedColumns returns what each column of sel, in order, is of its one
+// FROM item: the item's column, or "" for a value computed; nil when that
+// is not known.
+func passedColumns(sel node, item *fromItem) []string {
+	var out []string
+	for _, it := range list(sel, "select_list") {
+		e := it.(node)
+		switch str(e["class"]) {
+		case "COLUMN_REF":
+			parts := columnNames(e)
+			if len(parts) > 2 || len(parts) == 2 && !strings.EqualFold(parts[0], item.name) {
+				return nil
+			}
+			out = append(out, strings.ToLower(parts[len(parts)-1]))
+		case "STAR":
+			rel := str(e["relation_name"])
+			if e["columns"] == true || len(list(e, "exclude_list")) > 0 || len(list(e, "replace_list")) > 0 ||
+				len(list(e, "rename_list")) > 0 || child(e, "expr") != nil || rel != "" && !strings.EqualFold(rel, item.name) {
+				return nil
+			}
+			out = append(out, item.columns...)
+		default:
+			out = append(out, "")
+		}
+	}
+	return out
+}
+
+// joinedColumns returns what each column of sel, in order, is of item, one of
+// the items its FROM clause sc joins: the item's column, or that of another
+// item it is joined on, the same value, or "" for anything else; nil when
+// that is not known.
+func joinedColumns(sel node, item *fromItem, sc *scope) []string {
+	classes := joinKeys(sc)
+	var out []string
+	for _, it := range list(sel, "select_list") {
+		e := it.(node)
+		switch str(e["class"]) {
+		case "STAR":
+			return nil
+		case "COLUMN_REF":
+			from := resolveColumn(e, sc)
+			name := strings.ToLower(lastName(e))
+			col := ""
+			if from == item {
+				col = name
+			} else if from != nil {
+				for _, class := range classes {
+					if !slices.Contains(class, itemColumn{from, name}) {
+						continue
+					}
+					if i := slices.IndexFunc(class, func(ic itemColumn) bool { return ic.item == item }); i >= 0 {
+						col = class[i].name
+					}
+				}
+			}
+			out = append(out, col)
+		default:
+			out = append(out, "")
+		}
+	}
+	return out
+}
+
+// groupsByBucket reports whether q groups the rows of one bucketed table,
+// in as many buckets as workers, so that a bucket of the table holds its
+// groups whole if its bucket column is among them: planned to read the
+// table by bucket where q stands, if a key of the statement is that column
+// (groupedFrom), else q is a relation.
+func (pl *planner) groupsByBucket(q node, ctes cteScope) bool {
+	if pl.noGrouped || str(q["type"]) != "SELECT_NODE" || len(list(q, "group_expressions")) == 0 || len(list(q, "group_sets")) > 1 ||
+		len(list(child(q, "cte_map"), "map")) > 0 || child(q, "sample") != nil || child(q, "qualify") != nil || len(list(q, "modifiers")) > 0 ||
+		str(q["aggregate_handling"]) != "STANDARD_HANDLING" || hasClass(q["select_list"], "WINDOW") {
+		return false
+	}
+	from := child(q, "from_table")
+	if str(from["type"]) != "BASE_TABLE" || child(from, "sample") != nil || child(from, "at_clause") != nil || len(list(from, "column_name_alias")) > 0 {
+		return false
+	}
+	parts := tableParts(from)
+	if len(parts) == 1 && ctes.find(parts[0]) != nil {
+		return false
+	}
+	t, err := pl.table(parts)
+	if err != nil {
+		return false
+	}
+	return slices.ContainsFunc(t.Buckets, func(b Bucketing) bool { return b.N >= max(pl.opts.workers, 1) })
+}
+
+// groupedFrom adds a subquery groupsByBucket accepted, ref of query sub, to
+// sc and rd: its table may be read by bucket, and never by shares; its
+// subquery expressions as any.
+func (pl *planner) groupedFrom(ref, sub node, item *fromItem, splittable bool, ctes cteScope, sc *scope, rd *reads) error {
+	cols, err := pl.relationColumns(sub, ctes, nil)
+	if err != nil {
+		return err
+	}
+	inner := &scope{ref: ref, outer: sc, splittable: splittable}
+	uses := len(rd.uses)
+	if err := pl.from(child(sub, "from_table"), false, ctes, inner, rd); err != nil {
+		return err
+	}
+	for _, u := range rd.uses[uses:] {
+		u.grouped = true
+	}
+	for _, part := range []string{"select_list", "where_clause", "having"} {
+		if err := pl.filterSubqueries(sub[part], ctes, rd); err != nil {
+			return err
+		}
+	}
+	for _, col := range cols {
+		item.columns = append(item.columns, strings.ToLower(col.Name))
+	}
+	renameColumns(item, list(ref, "column_name_alias"))
+	sc.items = append(sc.items, item)
+	inner.item = item
+	pl.grouped++
+	return nil
+}
+
 // --- running ------------------------------------------------------------
 
 // bucketCount is how many buckets a stage that reads tables by bucket
@@ -395,15 +616,32 @@ func (s *Stage) bucketCount() int {
 	return n
 }
 
-// bucketGroups returns the buckets, of n, each task of a stage reads, and
-// the files of each input read by bucket, by bucket of n: as many tasks as
-// the workers run at once, twice over, or one a bucket if there are fewer,
-// balanced by the bytes of their files. Rows whose key is NULL are in
-// bucket 0's.
-func (e *execution) bucketGroups(s *Stage, n int) ([][]int, map[string][][]File, error) {
+// bucketGroups returns the buckets, of count, each task of a stage reads,
+// and the files of each input read by bucket, by bucket of count: as many
+// tasks as the workers run at once, twice over, or one a bucket if there are
+// fewer, balanced by the bytes of their files. Rows whose key is NULL are in
+// bucket 0's. A stage that also reads exchanges written to those buckets
+// reads partition p of them with the buckets that come to p modulo the
+// partitions: where the partitions are fewer than the buckets, what it
+// groups, and what the groups list, are those partitions.
+func (e *execution) bucketGroups(s *Stage, count int) ([][]int, map[string][][]File, error) {
+	n := count
+	if s.partitioned() {
+		n = min(count, e.parts)
+	}
 	files := map[string][][]File{}
 	bytes := make([]int64, n)
 	for _, in := range s.Inputs {
+		if in.Exchange != nil && in.Partitioned {
+			if in.Exchange.Buckets != count {
+				return nil, nil, fmt.Errorf("stage %d reads tables by %d buckets beside exchange %d, written to %d", s.ID, count, in.Exchange.ID, in.Exchange.Buckets)
+			}
+			for p, b := range e.exchanges[in.Exchange.ID].partBytes {
+				if p < n {
+					bytes[p] += b
+				}
+			}
+		}
 		if in.Table == nil || !in.Bucketed {
 			continue
 		}
@@ -412,7 +650,7 @@ func (e *execution) bucketGroups(s *Stage, n int) ([][]int, map[string][][]File,
 			if in.Bucket >= len(f.Buckets) {
 				return nil, nil, fmt.Errorf("stage %d reads %s by bucket, whose file %s has no bucket", s.ID, in.Table, f.Path)
 			}
-			b := max(f.Buckets[in.Bucket], 0) % n
+			b := max(f.Buckets[in.Bucket], 0) % count % n
 			byBucket[b] = append(byBucket[b], f)
 			bytes[b] += f.Size
 		}
