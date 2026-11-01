@@ -78,6 +78,7 @@ func (e *Engine) setupWorker(ctx context.Context, cfg config.Config, log *slog.L
 			return fmt.Errorf("configure object storage: %w", err)
 		}
 	}
+	e.startAzureTokens(ctx, cfg, log)
 	if err := e.setupCache(exec, cfg, log); err != nil {
 		return err
 	}

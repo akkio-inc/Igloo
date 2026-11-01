@@ -58,6 +58,9 @@ type Engine struct {
 	// local is DuckDB's own database, where Igloo keeps its copies of the
 	// catalog's views: DuckDB cannot keep views in an Iceberg catalog.
 	local string
+	// stopAzureTokens stops renewing DuckDB's Azure token, where it has one (see
+	// startAzureTokens).
+	stopAzureTokens func()
 	// connectStmts run on every new connection so unqualified names
 	// resolve to the catalog's default schema, and to the views kept for
 	// it in the local database.
@@ -668,6 +671,9 @@ func (e *Engine) Close() error {
 		e.bg = nil
 	}
 	e.bgMu.Unlock()
+	if e.stopAzureTokens != nil {
+		e.stopAzureTokens()
+	}
 	if e.prefetcher != nil {
 		e.prefetcher.Close()
 	}
@@ -762,6 +768,7 @@ func (e *Engine) setup(ctx context.Context, cfg config.Config, log *slog.Logger,
 			return fmt.Errorf("configure object storage: %w", err)
 		}
 	}
+	e.startAzureTokens(ctx, cfg, log)
 	if err := e.setupCache(exec, cfg, log); err != nil {
 		return err
 	}
