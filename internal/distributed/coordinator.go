@@ -411,6 +411,8 @@ type decision struct {
 // leaves the history and the log alone. sizes are relations' sizes
 // measured before (see Execute).
 func (co *Coordinator) plan(ctx context.Context, query string, env Env, mode Mode, dry bool, sizes map[string]knownSize) (*Plan, *decision, error) {
+	// Both plans describe the statement's parts once (see describeCache).
+	ctx = withDescribes(ctx)
 	plan, d, err := co.planOn(ctx, query, env, mode, dry, sizes, nil)
 	if err != nil || !d.onWorkers || !d.e.large {
 		return plan, d, err
@@ -479,32 +481,30 @@ func (co *Coordinator) planOn(ctx context.Context, query string, env Env, mode M
 		}
 		return nil, nil, unsupported("%v", err)
 	}
-	// Auto mode plans within a share of what the statement is expected to
-	// take on one machine (see budget.go); forced runs, EXPLAIN DISTRIBUTED
-	// and a plan again with relations' sizes within planBudget.
+	// Auto mode stops planning a statement planning does not get on with
+	// (see budget.go); forced runs, EXPLAIN DISTRIBUTED and a plan again
+	// with relations' sizes plan for as long as planning takes.
 	shape := ""
 	if mode == ModeAuto && !dry && sizes == nil && onLarge == nil {
 		shape = planKey(stmt, nil)
 	}
+	ctx = withDescribes(ctx)
 	values, err := co.computedValues(ctx, env, stmt)
 	if err != nil {
 		return nil, nil, err
 	}
 	opts.values = valueNames(values)
 	pl := newPlanner(ctx, env, co.parser, co.aggregates(ctx, env), opts)
-	budget := planBudget
+	pl.describes = describesOf(ctx)
+	var limits planLimits
 	if shape != "" {
-		if seconds, ok := co.expectedLocal(pl, stmt, shape); ok {
-			budget = autoBudget(seconds)
-		}
-		if co.shapes.gaveUpLately(shape, budget, time.Now()) {
-			return nil, nil, unsupported("planning a statement of its shape ran past a budget of %s or more lately", budget)
-		}
+		limits = autoLimits(co.expectedLocal(pl, stmt, shape))
 	}
-	pctx, cancel := budgetContext(ctx, budget)
-	defer cancel()
-	pl.ctx, pl.limit = pctx, budget
+	pctx, stop := limitPlanning(ctx, pl, limits)
+	defer stop()
+	pl.ctx = pctx
 	plan, err := pl.plan(stmt)
+	co.logPlanning(pl, plan, err, limits)
 	if err != nil && ctx.Err() != nil {
 		// Canceled or past its deadline while it planned, as when the
 		// session could not describe a part in time: the statement ends,
@@ -512,11 +512,8 @@ func (co *Coordinator) planOn(ctx context.Context, query string, env Env, mode M
 		return nil, nil, context.Cause(ctx)
 	}
 	if err != nil && pctx.Err() != nil {
-		co.log.Warn("planning a statement took longer than its budget; it runs on one machine", "budget", budget, "err", err)
-		if shape != "" {
-			co.shapes.gaveUpOn(shape, budget, time.Now())
-		}
-		err = unsupported("planning took longer than its budget of %s", budget)
+		why, _ := pl.stalled.Load().(string)
+		err = unsupported("%s", why)
 	}
 	if err != nil {
 		var u *errUnsupported

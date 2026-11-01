@@ -7,6 +7,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // Relations. A candidate's FROM clause may read, besides catalog tables, a
@@ -354,10 +355,29 @@ func (pl *planner) describe(q node, scope cteScope) ([]Column, error) {
 	if err != nil {
 		return nil, unsupported("%v", err)
 	}
+	return pl.describeText(text)
+}
+
+// describeText binds query text in the session and returns its result
+// columns, once for the statement (see describeCache). A part described
+// is progress (see limitPlanning).
+func (pl *planner) describeText(text string) ([]Column, error) {
+	if cols, ok := pl.describes.get(text); ok {
+		pl.profile.cached++
+		return cols, nil
+	}
+	if err := pl.budget(); err != nil {
+		return nil, err
+	}
+	start := time.Now()
 	cols, err := pl.env.Describe(pl.ctx, text)
+	pl.profile.describes++
+	pl.profile.describing += time.Since(start)
 	if err != nil {
 		return nil, unsupported("describe: %v", err)
 	}
+	pl.describes.put(text, cols)
+	pl.progressed()
 	return cols, nil
 }
 
@@ -471,7 +491,9 @@ func (pl *planner) viewBytes(parts []string, depth int) (int64, bool, error) {
 	if depth > maxViewDepth {
 		return 0, false, unsupported("views nest too deep")
 	}
+	start := time.Now()
 	def, ok, err := pl.env.ViewDefinition(pl.ctx, parts)
+	pl.looked(start)
 	if err != nil || !ok {
 		return 0, false, err
 	}

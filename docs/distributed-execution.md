@@ -672,17 +672,22 @@ distributed, but only on workers already running and on no more of them
 than the automatic decision would use; it never starts a worker. So no user can
 start a fleet of machines, or keep one busy, by repeating a query.
 
-Planning a statement for workers takes at most 10 seconds, besides the
-session's `statement_timeout`, which ends `EXPLAIN DISTRIBUTED` as it ends
-any statement: a statement that cannot be planned in that time runs on one
-machine, as does a part whose relations workers compute nest more than 64
-deep, or one that would compute a relation from itself. In auto mode the
-budget is a quarter of the time the statement is expected to take on one
-machine (what it took before, else the estimate), between half a second
-and 10 seconds, so that a statement that falls back waits little for it;
-a statement whose shape ran past a budget at least as large in the last
-hour goes to one machine without planning. `distributed_execution = on` and
-`EXPLAIN DISTRIBUTED` keep 10 seconds.
+Planning a statement for workers ends with the session's
+`statement_timeout` and a cancel request, which end `EXPLAIN DISTRIBUTED`
+as they end any statement; a part whose relations workers compute nest
+more than 64 deep, or one that would compute a relation from itself, runs
+on one machine. In auto mode planning stops once it stalls: a statement
+runs on one machine once planning has planned no stage and described no
+new part for a tenth of the time the statement is expected to take there
+(what it took before, else the estimate), between half a second and a
+minute, or once planning has taken that time in all. A report expected
+to take minutes plans as long as it progresses; a cheap statement whose
+planning stalls waits half a second for it. `distributed_execution = on`
+and `EXPLAIN DISTRIBUTED` plan for as long as planning takes. Planning
+describes each part of the statement in the session once, keeps the SQL
+it printed of each part, and logs `planned a statement` with its time,
+stages, descriptions and other lookups in the session when it takes a
+second or more.
 
 ## Same results as one machine
 

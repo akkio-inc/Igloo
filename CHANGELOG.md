@@ -2153,14 +2153,28 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   made a relation of the columns read, whose producing took it for more
   than a projection of the subquery, as the scalar subquery deep in its
   `FROM` counted against it, and made the subquery a relation again, and
-  again, in auto mode too, until the statement timed out. Planning now has
-  a budget of 10 seconds, past which the statement runs on one machine, as
-  does a part whose relations nest more than 64 deep or would compute a
-  relation from itself; and `EXPLAIN DISTRIBUTED` ends on the session's
-  `statement_timeout` and on a cancel request. In auto mode the budget is
-  a quarter of the statement's expected time on one machine, between half
-  a second and 10 seconds, so that a statement that falls back waits
-  little for it.
+  again, in auto mode too, until the statement timed out. A part whose
+  relations nest more than 64 deep or would compute a relation from itself
+  now runs on one machine, and `EXPLAIN DISTRIBUTED` ends on the session's
+  `statement_timeout` and on a cancel request.
+- A long report in auto mode is no longer sent to one machine because its
+  planning took more than 10 seconds: a report of many stages, whose
+  parts each took a while to describe in the session, ran on one machine
+  for many times as long as on workers. Auto mode now stops planning only
+  once it stalls, having planned no stage and described no new part for
+  a tenth of the statement's expected time on one machine (between half a
+  second and a minute), or after that whole time, so that a cheap
+  statement whose planning stalls still waits half a second for it; and it
+  no longer skips planning statements of a shape that ran past its limit
+  lately. `distributed_execution = on` and `EXPLAIN DISTRIBUTED` plan for
+  as long as planning takes, within the statement's timeout. Planning is
+  quicker too: it describes each part of a statement in the session once,
+  for both its plans and its plan again with measured sizes, looks each
+  table up once per plan, and keeps the SQL it printed of each part, which
+  took most of the time of planning a long chain of common table
+  expressions. It logs `planned a statement` with its time, stages, and
+  descriptions and other lookups in the session, and their times, when it
+  takes a second or more.
 - Workers write to exchanges only the columns of a table or view that the
   statement reads when a view joined to it has a star of its own, as
   every stored view has where it reads its tables through

@@ -8,6 +8,7 @@ import (
 	"maps"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/akkio-inc/igloo/internal/ai"
@@ -310,8 +311,16 @@ type planner struct {
 	// relations nest no deeper than maxRelationDepth (see relationExchange).
 	producing map[string]bool
 	depth     int
-	// limit is the planning budget ctx ends at (see budget.go).
-	limit time.Duration
+	// started is when planning began, progress when it last planned a
+	// stage or described a part (Unix nanoseconds), and stalled why its
+	// limits ended it (see limitPlanning).
+	started  time.Time
+	progress atomic.Int64
+	stalled  atomic.Value
+	// describes are the session's descriptions of parts, by their text,
+	// for the statement (see describe), and profile what planning spent.
+	describes *describeCache
+	profile   planProfile
 
 	stages []*Stage
 	// exchanges counts the exchanges planned.
@@ -460,7 +469,7 @@ func (pl *planner) pinReads(final node) (map[string]string, error) {
 		if cte {
 			// A common table expression, unless it is named like a table
 			// the jobs read, which the name might mean here instead.
-			t, ok, terr := pl.env.Table(pl.ctx, parts)
+			t, ok, terr := pl.lookupTable(parts)
 			switch {
 			case terr != nil:
 				err = terr
@@ -469,7 +478,9 @@ func (pl *planner) pinReads(final node) (map[string]string, error) {
 			}
 			return err == nil
 		}
+		start := time.Now()
 		view, verr := pl.env.View(pl.ctx, parts)
+		pl.looked(start)
 		if verr != nil {
 			err = verr
 			return false
@@ -490,7 +501,7 @@ func (pl *planner) pinReads(final node) (map[string]string, error) {
 			}
 			return false
 		}
-		t, ok, terr := pl.env.Table(pl.ctx, parts)
+		t, ok, terr := pl.lookupTable(parts)
 		if terr != nil {
 			err = terr
 			return false
@@ -1337,24 +1348,19 @@ const maxViewDepth = 16
 // nest a dozen deep at most.
 const maxRelationDepth = 64
 
-// planBudget is how long planning a statement may take, besides its own
-// statement timeout: a statement the planner cannot plan within it runs on
-// one machine, as auto mode must never be slower than one machine for want
-// of a plan. A report of seventeen common table expressions plans in under
-// two seconds. Auto mode budgets less for statements expected to take less
-// on one machine (see budget.go). A variable for tests.
-var planBudget = 10 * time.Second
+// errPlanBudget ends a planner's context once auto mode's limits of
+// planning a statement passed (see limitPlanning).
+var errPlanBudget = errors.New("planning ran past its limits")
 
-// errPlanBudget ends a planner's context once planBudget has passed.
-var errPlanBudget = errors.New("planning took longer than its budget")
-
-// budget fails once the planner's context ended, which planBudget ends:
-// the planner checks it as it recurses, besides the calls into the
-// session that read the context.
+// budget fails once the planner's context ended, which auto mode's limits
+// end (see limitPlanning), as do the statement's timeout and a cancel
+// request: the planner checks it as it recurses, besides the calls into
+// the session that read the context.
 func (pl *planner) budget() error {
 	if err := pl.ctx.Err(); err != nil {
 		if errors.Is(context.Cause(pl.ctx), errPlanBudget) {
-			return unsupported("planning took longer than its budget of %s", pl.limit)
+			why, _ := pl.stalled.Load().(string)
+			return unsupported("%s", why)
 		}
 		return err
 	}
@@ -1373,7 +1379,9 @@ func (pl *planner) expandView(ref node, parts []string) (node, bool, error) {
 	if child(ref, "sample") != nil || child(ref, "at_clause") != nil {
 		return nil, false, nil
 	}
+	start := time.Now()
 	def, ok, err := pl.env.ViewDefinition(pl.ctx, parts)
+	pl.looked(start)
 	if err != nil || !ok {
 		return nil, false, err
 	}
@@ -1473,11 +1481,7 @@ func (pl *planner) describeFrom(ref node) ([]Column, error) {
 	if err != nil {
 		return nil, unsupported("%v", err)
 	}
-	cols, err := pl.env.Describe(pl.ctx, text)
-	if err != nil {
-		return nil, unsupported("describe: %v", err)
-	}
-	return cols, nil
+	return pl.describeText(text)
 }
 
 // rowFunctions are the table functions whose rows depend on their
@@ -1904,18 +1908,30 @@ func outputColumns(sel node, sc *scope) []string {
 	return cols
 }
 
+// lookupTable resolves a table name as the session does (see Env.Table),
+// once per planner.
+func (pl *planner) lookupTable(parts []string) (*Table, bool, error) {
+	key := strings.ToLower(strings.Join(parts, "\x00"))
+	if r, ok := pl.tables[key]; ok {
+		return r.t, r.ok, nil
+	}
+	start := time.Now()
+	t, found, err := pl.env.Table(pl.ctx, parts)
+	pl.looked(start)
+	if err != nil {
+		return nil, false, err
+	}
+	pl.tables[key] = tableResult{t: t, ok: found}
+	return t, found, nil
+}
+
 // table resolves a table name to a catalog table that workers can read.
 func (pl *planner) table(parts []string) (*Table, error) {
-	key := strings.ToLower(strings.Join(parts, "\x00"))
-	r, ok := pl.tables[key]
-	if !ok {
-		t, found, err := pl.env.Table(pl.ctx, parts)
-		if err != nil {
-			return nil, err
-		}
-		r = tableResult{t: t, ok: found}
-		pl.tables[key] = r
+	t, found, err := pl.lookupTable(parts)
+	if err != nil {
+		return nil, err
 	}
+	r := tableResult{t: t, ok: found}
 	if !r.ok {
 		return nil, unsupported("%s is not a catalog table", strings.Join(parts, "."))
 	}
@@ -2597,6 +2613,7 @@ func isView(n node, name string) bool {
 func (pl *planner) stage(s *Stage) *Stage {
 	s.ID = len(pl.stages)
 	pl.stages = append(pl.stages, s)
+	pl.progressed()
 	return s
 }
 
@@ -2706,7 +2723,7 @@ func (pl *planner) checkTimeColumns(stmt node) error {
 			if len(parts) == 1 && slices.Contains(ctes, strings.ToLower(parts[0])) {
 				return false
 			}
-			t, ok, terr := pl.env.Table(pl.ctx, parts)
+			t, ok, terr := pl.lookupTable(parts)
 			switch {
 			case terr != nil:
 				err = terr
@@ -2771,7 +2788,9 @@ func (pl *planner) checkFunctions(fragment node) error {
 				err = unsupported("rb_count_distinct(id, key), which has no partials")
 				return false
 			}
+			start := time.Now()
 			user, uerr := pl.env.UserFunction(pl.ctx, name)
+			pl.looked(start)
 			switch {
 			case uerr != nil:
 				err = uerr

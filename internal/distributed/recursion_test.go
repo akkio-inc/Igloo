@@ -85,33 +85,29 @@ func TestHouseholdReportPlans(t *testing.T) {
 	}
 }
 
-// TestPlanningGivesUp checks that planning a statement the planner cannot
-// plan within its budget, or whose relations nest too deep, gives up, and
-// the statement runs on one machine with its rows, in about the budget:
-// a chain of common table expressions, each grouping the last, nests a
-// relation in each.
+// TestPlanningGivesUp checks that planning a forced statement ends with the
+// statement's own deadline, and that planning one whose relations nest
+// too deep gives up on them: a chain of common table expressions, each
+// grouping the last, nests a relation in each.
 func TestPlanningGivesUp(t *testing.T) {
 	h := householdHarness(t)
-	defer func(b time.Duration) { planBudget = b }(planBudget)
 	ctx := context.Background()
 
-	// Out of time.
-	planBudget = time.Millisecond
+	// The statement's timeout, which ends planning as it ends the run.
+	short, cancel := context.WithTimeout(ctx, 300*time.Millisecond)
+	defer cancel()
 	start := time.Now()
-	_, err := h.co.Plan(ctx, householdReport, harnessEnv{h}, ModeOn)
-	if !IsUnsupported(err) || !strings.Contains(err.Error(), "planning took longer") {
-		t.Errorf("planned past its budget: %v", err)
+	_, err := h.co.Plan(short, householdReport, slowEnv{harnessEnv: harnessEnv{h}, delay: time.Second}, ModeOn)
+	if err == nil || IsUnsupported(err) {
+		t.Errorf("planned past the statement's deadline: %v", err)
 	}
 	if took := time.Since(start); took > 5*time.Second {
 		t.Errorf("gave up after %s", took)
 	}
-	if h.check(householdReport) {
-		t.Error("ran on workers past its budget")
-	}
 
 	// Too deep: relations nest past maxRelationDepth, each produced for
 	// the next, which planning stops at rather than recurse on.
-	planBudget = 20 * time.Second
+	const limit = 20 * time.Second
 	var b strings.Builder
 	b.WriteString("WITH c0 AS (SELECT hh_id % 5000 AS k, count(*) AS n FROM households GROUP BY 1)")
 	const chain = maxRelationDepth + 6
@@ -122,7 +118,7 @@ func TestPlanningGivesUp(t *testing.T) {
 	q := b.String()
 	start = time.Now()
 	p, err := h.co.Plan(ctx, q, harnessEnv{h}, ModeOn)
-	if took := time.Since(start); took > planBudget+5*time.Second {
+	if took := time.Since(start); took > limit+5*time.Second {
 		t.Errorf("planning the chain took %s", took)
 	}
 	switch {

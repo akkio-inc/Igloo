@@ -2,61 +2,139 @@ package distributed
 
 import (
 	"context"
+	"log/slog"
+	"math"
+	"slices"
 	"strings"
 	"sync"
 	"time"
 )
 
-// Planning budgets in auto mode. Planning a statement for workers costs
-// time that a statement auto mode runs on one machine pays for nothing: a
-// report of a few seconds on one machine could wait out a budget of 10 s
-// before it fell back. So auto mode plans a statement within a quarter of
-// the time it is expected to take on one machine, no less than
-// autoBudgetFloor and no more than planBudget: what it took here before,
-// by the history of the plan it got last, or else what one machine reads
-// of its tables cold, as auto mode's estimate of one machine reads them.
-// TPC-H's queries plan in under 10 ms at test scale, and reports of a
-// dozen common table expressions in 70 to 300 ms. A statement planned past
-// its budget is remembered, by its shape, so that its next runs within an
-// hour, budgeted no more, go to one machine without planning. Forced runs
-// on workers and EXPLAIN DISTRIBUTED keep planBudget.
+// Planning limits. Planning a statement for workers costs time that a
+// statement auto mode then runs on one machine pays for nothing, so auto
+// mode stops planning a statement that planning does not get on with: once
+// it has made no progress, planning no stage and describing no part it had
+// not described, for a tenth of the time the statement is expected to take
+// on one machine (at least autoStallFloor, at most maxAutoStall), or once
+// planning has taken that long in all, as long as one machine would take
+// it. A report expected to take minutes plans as long as it gets on: a
+// report of many stages, whose parts each take a while to describe in the
+// session, took longer to plan than a cap of 10 s, which sent it to one
+// machine for many times as long as workers take. A cheap statement whose
+// planning stalls gives up within half a second. The
+// expected time is what the statement took here before, by the history of
+// the plan its shape got last, or else what one machine reads of its
+// tables cold, as auto mode's estimate of one machine reads them. Forced
+// runs on workers and EXPLAIN DISTRIBUTED plan for as long as planning
+// takes, within the statement's timeout; the planner's guards (a relation
+// is never its own input, and relations nest at most maxRelationDepth
+// deep) end plans that would recurse.
 
-// autoBudgetFloor is the least auto mode plans a statement for, and
-// autoBudgetShare the share of its expected time on one machine it may
-// spend planning.
+// autoStallShare is the share of a statement's expected time on one machine
+// auto mode waits for planning to progress; autoStallFloor and
+// maxAutoStall bound the wait, and unknownStall is it when the expected
+// time is not known.
 const (
-	autoBudgetFloor = 500 * time.Millisecond
-	autoBudgetShare = 0.25
+	autoStallShare = 0.1
+	autoStallFloor = 500 * time.Millisecond
+	maxAutoStall   = time.Minute
+	unknownStall   = 10 * time.Second
 )
 
-// gaveUpFor is how long a shape whose planning ran past its budget goes to
-// one machine without planning.
-const gaveUpFor = time.Hour
+// planLimits are when planning stops: when it has made no progress for
+// stall, or it has taken total in all; zero means never.
+type planLimits struct {
+	stall, total time.Duration
+}
 
-// autoBudget is the planning budget of a statement expected to take
-// seconds on one machine (see the top of this file).
-func autoBudget(seconds float64) time.Duration {
-	b := time.Duration(autoBudgetShare * seconds * float64(time.Second))
-	return min(max(b, autoBudgetFloor), planBudget)
+// autoLimits are auto mode's limits of planning a statement expected to
+// take seconds on one machine, if known (see the top of this file).
+func autoLimits(seconds float64, known bool) planLimits {
+	if !known {
+		return planLimits{stall: unknownStall}
+	}
+	expected := time.Duration(seconds * float64(time.Second))
+	stall := time.Duration(autoStallShare * float64(expected))
+	return planLimits{stall: min(max(stall, autoStallFloor), maxAutoStall), total: max(expected, autoStallFloor)}
+}
+
+// describeCache holds the session's descriptions of a statement's parts,
+// by their text. The planner describes a part again as it tries one plan
+// after another, and plans a statement more than once (again for the large
+// worker, and with relations' sizes once measured), and each description
+// binds the part in the session, which loads its tables from the catalog
+// and their metadata from object storage. A nil cache holds nothing.
+type describeCache struct {
+	mu   sync.Mutex
+	cols map[string][]Column
+}
+
+func (c *describeCache) get(text string) ([]Column, bool) {
+	if c == nil {
+		return nil, false
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	cols, ok := c.cols[text]
+	return slices.Clone(cols), ok
+}
+
+func (c *describeCache) put(text string, cols []Column) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.cols[text] = slices.Clone(cols)
+}
+
+// describesKey keys a statement's describeCache in its planning context.
+type describesKey struct{}
+
+// withDescribes returns ctx with a describeCache for the statement, unless
+// it has one, which the plans of the statement under ctx share.
+func withDescribes(ctx context.Context) context.Context {
+	if ctx.Value(describesKey{}) != nil {
+		return ctx
+	}
+	return context.WithValue(ctx, describesKey{}, &describeCache{cols: map[string][]Column{}})
+}
+
+// describesOf returns ctx's describeCache, or nil.
+func describesOf(ctx context.Context) *describeCache {
+	c, _ := ctx.Value(describesKey{}).(*describeCache)
+	return c
+}
+
+// planProfile is what planning a statement spent, for the log: how many
+// parts it described in the session, how long that took, and how many
+// descriptions it had already; and how many names and functions it looked
+// up in the session (tables, views, their definitions), and how long that
+// took.
+type planProfile struct {
+	describes, cached, lookups int
+	describing, looking        time.Duration
+}
+
+// progressed records that planning progressed: it planned a stage or
+// described a part (see limitPlanning).
+func (pl *planner) progressed() { pl.progress.Store(time.Now().UnixNano()) }
+
+// looked records a lookup in the session begun at start.
+func (pl *planner) looked(start time.Time) {
+	pl.profile.lookups++
+	pl.profile.looking += time.Since(start)
 }
 
 // planShapes remembers, by statement shape (planKey without its tables'
 // sizes), the plan key a statement got last, whose history says how long
-// it took on one machine, and the shapes whose planning ran past their
-// budget.
+// it took on one machine.
 type planShapes struct {
-	mu     sync.Mutex
-	keys   map[string]string
-	gaveUp map[string]gaveUp
+	mu   sync.Mutex
+	keys map[string]string
 }
 
-// gaveUp is when planning a shape ran past budget.
-type gaveUp struct {
-	budget time.Duration
-	at     time.Time
-}
-
-// maxShapes bounds the shapes planShapes keeps of each kind.
+// maxShapes bounds the shapes planShapes keeps.
 const maxShapes = 4096
 
 func (s *planShapes) key(shape string) (string, bool) {
@@ -73,25 +151,6 @@ func (s *planShapes) planned(shape, key string) {
 		s.keys = map[string]string{}
 	}
 	s.keys[shape] = key
-	delete(s.gaveUp, shape)
-}
-
-func (s *planShapes) gaveUpOn(shape string, budget time.Duration, now time.Time) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.gaveUp == nil || len(s.gaveUp) >= maxShapes {
-		s.gaveUp = map[string]gaveUp{}
-	}
-	s.gaveUp[shape] = gaveUp{budget: budget, at: now}
-}
-
-// gaveUpLately reports whether planning shape ran past a budget of at
-// least budget within gaveUpFor before now.
-func (s *planShapes) gaveUpLately(shape string, budget time.Duration, now time.Time) bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	g, ok := s.gaveUp[shape]
-	return ok && now.Sub(g.at) < gaveUpFor && budget <= g.budget
 }
 
 // expectedLocal is how many seconds the statement of shape is expected to
@@ -151,8 +210,71 @@ func (pl *planner) statementReads(stmt node) (int64, bool) {
 	return total, ok && pl.ctx.Err() == nil
 }
 
-// budgetContext is the context planning runs in: ctx, ended once budget
-// has passed (errPlanBudget).
-func budgetContext(ctx context.Context, budget time.Duration) (context.Context, context.CancelFunc) {
-	return context.WithTimeoutCause(ctx, budget, errPlanBudget)
+// logPlanning logs what planning a statement spent, at INFO when it took a
+// second or more or ran past its limits: how long, the stages it planned,
+// the parts it described in the session and how long that took, those it
+// had described already, and its other lookups in the session and how long
+// they took; the rest is the planner's own work.
+func (co *Coordinator) logPlanning(pl *planner, plan *Plan, err error, limits planLimits) {
+	took := time.Since(pl.started)
+	why, _ := pl.stalled.Load().(string)
+	level := slog.LevelDebug
+	if took >= time.Second || why != "" {
+		level = slog.LevelInfo
+	}
+	stages := len(pl.stages)
+	if plan != nil {
+		stages = len(plan.Stages)
+	}
+	co.log.Log(context.Background(), level, "planned a statement", "seconds", math.Round(took.Seconds()*1000)/1000, "stages", stages,
+		"describes", pl.profile.describes, "describes_cached", pl.profile.cached,
+		"describe_seconds", math.Round(pl.profile.describing.Seconds()*1000)/1000,
+		"lookups", pl.profile.lookups, "lookup_seconds", math.Round(pl.profile.looking.Seconds()*1000)/1000,
+		"stall_limit", limits.stall, "limit", limits.total, "gave_up", why, "err", err)
+}
+
+// limitPlanning returns the context planner pl plans in: ctx, ended
+// (errPlanBudget) once pl has made no progress for limits.stall, or
+// planned for limits.total, when they are set; pl.stalled then says which.
+// stop ends the watch.
+func limitPlanning(ctx context.Context, pl *planner, limits planLimits) (context.Context, func()) {
+	pl.started = time.Now()
+	pl.progress.Store(pl.started.UnixNano())
+	if limits.stall <= 0 && limits.total <= 0 {
+		return ctx, func() {}
+	}
+	pctx, cancel := context.WithCancelCause(ctx)
+	done := make(chan struct{})
+	tick := 50 * time.Millisecond
+	if limits.stall > 0 {
+		tick = min(tick, limits.stall/4)
+	}
+	go func() {
+		t := time.NewTicker(tick)
+		defer t.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-pctx.Done():
+				return
+			case now := <-t.C:
+				idle := now.Sub(time.Unix(0, pl.progress.Load()))
+				switch {
+				case limits.stall > 0 && idle >= limits.stall:
+					pl.stalled.Store("planning planned no stage and described no part for " + limits.stall.String())
+				case limits.total > 0 && now.Sub(pl.started) >= limits.total:
+					pl.stalled.Store("planning took " + limits.total.String() + ", as long as one machine should take the statement")
+				default:
+					continue
+				}
+				cancel(errPlanBudget)
+				return
+			}
+		}
+	}()
+	return pctx, func() {
+		close(done)
+		cancel(nil)
+	}
 }
