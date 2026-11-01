@@ -1906,6 +1906,9 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   large dashboard's statements learned under a twentieth of what they
   allocated, started beside the heavy ones next time and spilled. Runs
   cancelled after ten seconds or more count as needing all the memory.
+- A statement's thread sleeps while DuckDB's workers hold all its tasks,
+  rather than ask for one again and again without a pause, a core for every
+  statement waiting on its workers.
 - A `FLATTEN` of a column takes the form DuckDB's estimates point to, then
   whichever form its shape's latest runs took the less CPU time in at best (see
   [Snowflake SQL](docs/snowflake-sql.md)): two dashboard queries over tens

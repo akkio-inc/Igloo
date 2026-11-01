@@ -88,6 +88,9 @@ func (s *Stmt) executeBoundStreaming(ctx context.Context) (*mapping.Result, erro
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
+	if failed, msg := runPending(pendingRes); failed {
+		return nil, streamError(ctx, msg)
+	}
 	var res mapping.Result
 	if mapping.ExecutePending(pendingRes, &res) == mapping.StateError {
 		err := streamError(ctx, mapping.ResultError(&res))
