@@ -166,6 +166,10 @@ compact large tables within `IGLOO_MAINTENANCE_MEMORY`:
   Arrow side's already did, instead of Arrow's default allocator, so a
   caller that counts memory through the context sees them.
 
+- `io/gocloud/blob.go`, `WalkDir`: the root of a walk is a directory if anything
+  is under it, though a blob of its name opens: on an Azure account with a
+  hierarchical namespace, a directory is that too, and the walk listed one file.
+
 Drop this copy and the `replace` directive once an iceberg-go release reads
 DuckDB-written tables, lets callers choose these Parquet writer defaults,
 no longer needs an MPL-licensed dependency and can rewrite manifests.

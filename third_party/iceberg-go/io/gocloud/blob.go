@@ -24,8 +24,11 @@ import (
 	"io"
 	"io/fs"
 	"net/url"
+	"path"
 	"path/filepath"
+	"slices"
 	"strings"
+	"time"
 
 	icebergio "github.com/apache/iceberg-go/io"
 	"gocloud.dev/blob"
@@ -219,10 +222,87 @@ func (bfs *blobFileIO) WalkDir(root string, fn fs.WalkDirFunc) error {
 
 	parsed.Path = ""
 
-	return fs.WalkDir(bfs.Bucket, walkPath, func(path string, d fs.DirEntry, err error) error {
+	return fs.WalkDir(walkFS{Bucket: bfs.Bucket, root: walkPath, ctx: bfs.ctx}, walkPath, func(path string, d fs.DirEntry, err error) error {
 		return fn(parsed.JoinPath(path).String(), d, err)
 	})
 }
+
+// walkFS is a bucket walked by its listings, in which what has something under it is
+// a directory, whatever a blob of its name says: on an Azure account with a
+// hierarchical namespace a directory also opens as a blob of no length, and fs.WalkDir
+// would take it for one file, and list nothing under it.
+type walkFS struct {
+	*blob.Bucket
+	root string
+	ctx  context.Context
+}
+
+// Stat implements fs.StatFS.
+func (w walkFS) Stat(name string) (fs.FileInfo, error) {
+	if name == w.root && name != "." {
+		it := w.Bucket.List(&blob.ListOptions{Prefix: name + "/"})
+		if _, err := it.Next(w.ctx); err == nil {
+			return walkEntry{name: path.Base(name), dir: true}, nil
+		}
+	}
+	f, err := w.Bucket.Open(name)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close() //nolint:errcheck
+
+	return f.Stat()
+}
+
+// ReadDir implements fs.ReadDirFS.
+func (w walkFS) ReadDir(name string) ([]fs.DirEntry, error) {
+	prefix := name + "/"
+	if name == "." {
+		prefix = ""
+	}
+	it := w.Bucket.List(&blob.ListOptions{Prefix: prefix, Delimiter: "/"})
+	var out []fs.DirEntry
+	for {
+		o, err := it.Next(w.ctx)
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			return out, err
+		}
+		out = append(out, walkEntry{name: path.Base(strings.TrimSuffix(o.Key, "/")), dir: o.IsDir, size: o.Size, modTime: o.ModTime})
+	}
+	slices.SortFunc(out, func(a, b fs.DirEntry) int { return strings.Compare(a.Name(), b.Name()) })
+
+	return out, nil
+}
+
+// walkEntry is what a listing says of a file or directory.
+type walkEntry struct {
+	name    string
+	dir     bool
+	size    int64
+	modTime time.Time
+}
+
+func (e walkEntry) Name() string { return e.name }
+func (e walkEntry) Size() int64  { return e.size }
+func (e walkEntry) IsDir() bool  { return e.dir }
+func (e walkEntry) Sys() any     { return nil }
+
+func (e walkEntry) Type() fs.FileMode { return e.Mode().Type() }
+
+func (e walkEntry) Mode() fs.FileMode {
+	if e.dir {
+		return fs.ModeDir | 0o555
+	}
+
+	return 0o444
+}
+
+func (e walkEntry) ModTime() time.Time { return e.modTime }
+
+func (e walkEntry) Info() (fs.FileInfo, error) { return e, nil }
 
 func (bfs *blobFileIO) DeleteFiles(ctx context.Context, paths []string) ([]string, error) {
 	if len(paths) == 0 {
