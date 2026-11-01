@@ -392,6 +392,16 @@ func TestHeavyHistory(t *testing.T) {
 	if !h.heavy("report") {
 		t.Error("1000 s is not heavy beside statements of 80 s")
 	}
+	// What ran long ago says nothing of it.
+	at := time.Now()
+	h.now = func() time.Time { return at }
+	at = at.Add(heavyRecent + time.Minute)
+	for range heavyRuns {
+		h.observe("big", 300*time.Second, false)
+	}
+	if !h.heavy("big") {
+		t.Error("300 s is not heavy once the statements of 80 s have stopped")
+	}
 	// Small statements say nothing of it.
 	h = newHeavyHistory()
 	h.cpu = line

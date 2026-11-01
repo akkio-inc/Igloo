@@ -72,6 +72,10 @@ const (
 	// heavyAtOnce is how many times over the line one run in the first DuckDB
 	// makes a shape heavy with no other.
 	heavyAtOnce = 5
+	// heavyRecent is how lately a shape has run for what it uses to count for
+	// what is heavy beside it: this afternoon's reports are not heavy by this
+	// morning's dashboards.
+	heavyRecent = 10 * time.Minute
 	// heavyProbeEvery is how often a shape known to be heavy runs in the first
 	// DuckDB again, where it soon moves if it is still heavy, as it has only the
 	// second DuckDB's measures, which count its waiting for the cores.
@@ -97,6 +101,7 @@ type heavyHistory struct {
 	cpu    time.Duration
 	factor time.Duration
 	after  time.Duration
+	now    func() time.Time
 }
 
 // shapeRuns is a shape's latest runs.
@@ -106,6 +111,8 @@ type shapeRuns struct {
 	heavy bool
 	// probe counts down to its next run in the first DuckDB.
 	probe int
+	// last is when it last ended.
+	last time.Time
 	// moved says its last run started again in the background: the next starts
 	// there, as a run that gets far in the first takes the memory of its caches,
 	// and one that fails there says nothing else.
@@ -121,16 +128,17 @@ func (r *shapeRuns) sorted() []time.Duration {
 
 func newHeavyHistory() *heavyHistory {
 	return &heavyHistory{shapes: map[string]*shapeRuns{}, cpu: heavySeconds * time.Second * time.Duration(runtime.GOMAXPROCS(0)),
-		factor: heavyFactor, after: heavySeconds * time.Second}
+		factor: heavyFactor, after: heavySeconds * time.Second, now: time.Now}
 }
 
 // line is how much CPU makes shape heavy: at least h.cpu, and heavyFactor times
 // what the other statements of some size use, as many of them as use less
-// as use more, once there are a few. h.mu is held.
+// as use more, once there are a few that ran lately. h.mu is held.
 func (h *heavyHistory) line(shape string) time.Duration {
 	var others []time.Duration
+	lately := h.now().Add(-heavyRecent)
 	for name, r := range h.shapes {
-		if name == shape || r.runs == 0 {
+		if name == shape || r.runs == 0 || r.last.Before(lately) {
 			continue
 		}
 		if low := r.sorted()[0]; low >= h.cpu/10 {
@@ -163,6 +171,7 @@ func (h *heavyHistory) observe(shape string, cpu time.Duration, inBackground boo
 	}
 	r.cpu[r.runs%heavyRuns] = cpu
 	r.runs++
+	r.last = h.now()
 	line := h.line(shape)
 	was := r.heavy
 	switch {
