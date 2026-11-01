@@ -114,6 +114,18 @@ type Options struct {
 	// MemoryBytes is the coordinator's DuckDB memory limit, for estimating
 	// whether a statement fits it (see choose); zero for unknown.
 	MemoryBytes int64
+	// NoWorkerWrites keeps workers from writing tables' files: the
+	// coordinator writes every table (IGLOO_WORKER_WRITES=off).
+	NoWorkerWrites bool
+	// MinWorkerWrite is the fewest bytes of files, as a statement's plan
+	// estimates, that workers write rather than the coordinator; zero is
+	// defaultMinWorkerWrite, less than zero none.
+	MinWorkerWrite int64
+	// WriteCredentials, if set, makes credentials that reach the files under
+	// dir, an attempt of a task's directory, and nothing else, for the attempt
+	// that writes them; it fails where it cannot, when workers use their own
+	// identity.
+	WriteCredentials func(ctx context.Context, dir string) (*WriteCredentials, error)
 	// Threshold is how long a statement must take on one machine before
 	// auto mode runs it on workers, unless it would run short of memory.
 	// Zero means DefaultThreshold.
@@ -165,6 +177,9 @@ type Coordinator struct {
 	// erased is the latest deletion of erasure requests it knows of, in
 	// Unix nanoseconds, which statements' tasks carry (see erasure.go).
 	erased atomic.Int64
+	// writeDeniedUntil is when workers may be asked to write tables' files
+	// again after one was refused (see noteWriteDenied), in Unix nanoseconds.
+	writeDeniedUntil atomic.Int64
 	// maxBroadcast, if set, overrides what every worker may read in full,
 	// for tests.
 	maxBroadcast int64
@@ -362,6 +377,9 @@ func (co *Coordinator) Plan(ctx context.Context, query string, env Env, mode Mod
 		return nil, u
 	}
 	plan.placement = d.placement()
+	if plan.writes {
+		plan.placement += "; its tasks write the table's files"
+	}
 	return plan, nil
 }
 
@@ -405,6 +423,8 @@ type decision struct {
 	tookOnWorkers float64
 	// forced says the session's mode, not auto mode, decided.
 	forced bool
+	// writes says the plan's tasks write the table it fills.
+	writes bool
 }
 
 // plan plans query as Plan does, and says where it runs: on workers unless
@@ -470,6 +490,8 @@ func (co *Coordinator) planOn(ctx context.Context, query string, env Env, mode M
 	}
 	opts.aggregation = co.aggregation
 	opts.bitmaps = co.bitmapsOn(ctx, env)
+	fills, fill := env.(Fills)
+	opts.writes = fill && fills.Fill() && fills.FillWrites() && co.workersMayWrite()
 	opts.sizes, opts.taskMemory, opts.workers = sizes, taskMemory(ws), len(ws)
 	if sizes == nil {
 		// Relations measured large lately are planned as such at once.
@@ -553,6 +575,7 @@ func (co *Coordinator) planOn(ctx context.Context, query string, env Env, mode M
 	}
 	if onLarge != nil {
 		// Decided already, by the plan for the fleet.
+		plan.writes = onLarge.writes && slices.ContainsFunc(plan.Stages, func(s *Stage) bool { return s.writeSQL != "" })
 		plan.workers, plan.large, plan.shortOfMemory, plan.farBeyond = 1, true, onLarge.e.memory, onLarge.e.farBeyond
 		return plan, &decision{onWorkers: true, reason: onLarge.reason, e: onLarge.e, ws: ws, tookOnWorkers: onLarge.tookOnWorkers}, nil
 	}
@@ -583,9 +606,12 @@ func (co *Coordinator) planOn(ctx context.Context, query string, env Env, mode M
 		x.planBytes, x.planWork, x.planKeeps = p.bytes, p.work, p.keeps
 		x.planFields, x.planSorted, x.planJoins = p.fields, p.sorted*co.memory.scale(), p.joins
 	}
-	if fe, ok := env.(Fills); ok {
-		x.fill = fe.Fill()
-	}
+	x.fill = fill && fills.Fill()
+	// Workers write the rows where their tasks hold them and there are
+	// enough to be worth their files.
+	x.workersWrite = opts.writes && slices.ContainsFunc(plan.Stages, func(s *Stage) bool { return s.writeSQL != "" }) &&
+		(opts.force || x.fillOut() >= co.minWorkerWrite())
+	plan.writes = x.workersWrite
 	e := x.estimate(m, f)
 	e.others = others
 	if found {
@@ -609,7 +635,7 @@ func (co *Coordinator) planOn(ctx context.Context, query string, env Env, mode M
 	}
 	plan.workers, plan.large = e.workers, e.large
 	plan.shortOfMemory, plan.farBeyond = e.memory || found && r.outOfMemory, e.farBeyond
-	d := &decision{onWorkers: true, reason: "distributed_execution is " + string(mode), e: e, ws: ws, forced: mode != ModeAuto}
+	d := &decision{onWorkers: true, reason: "distributed_execution is " + string(mode), e: e, ws: ws, forced: mode != ModeAuto, writes: plan.writes}
 	if mode != ModeAuto {
 		return plan, d, nil
 	}
@@ -820,6 +846,13 @@ type Execution struct {
 	exchanges string
 	// merged are the merges SQL reads as views (see Merged).
 	merged []*MergedView
+	// wrote says the tasks wrote the statement's rows, written the files of
+	// their winning attempts (see writes.go); erased is the latest deletion
+	// of erasure requests known when it began.
+	wrote   bool
+	written []WrittenFile
+	erased  int64
+	co      *Coordinator
 }
 
 // MergedView is sorted rows merged as they are read (see mergeOrdered),
@@ -954,7 +987,7 @@ func (co *Coordinator) Execute(ctx context.Context, plan *Plan, settings []Setti
 	// Its tasks carry the latest deletion of erasure requests known before
 	// it reads the tables' snapshots (see erasure.go).
 	erased := co.erased.Load()
-	ex := &Execution{dir: filepath.Join(co.dir, newID())}
+	ex := &Execution{dir: filepath.Join(co.dir, newID()), erased: erased, co: co}
 	if err := os.MkdirAll(ex.dir, 0o700); err != nil {
 		return nil, err
 	}
@@ -1007,6 +1040,13 @@ func (co *Coordinator) Execute(ctx context.Context, plan *Plan, settings []Setti
 	ws = leastBusy(ws, want)
 	p.touch()
 	limit := co.spoolLimit()
+	target := plan.target
+	if target != nil {
+		// Before the query runs, as a write refused would show only after.
+		if err := co.probeWrite(ctx, ws, target, qid, erased); err != nil {
+			return nil, err
+		}
+	}
 
 	snapshots, files, err := co.preflight(ctx, plan)
 	if err != nil {
@@ -1058,7 +1098,7 @@ func (co *Coordinator) Execute(ctx context.Context, plan *Plan, settings []Setti
 			r := &execution{
 				co: co, qid: id, dir: ex.dir, ws: ws, files: files, settings: settings, variables: vars, force: planned.force,
 				sp: &spool{limit: limit}, parts: parts, smaller: smaller, slots: slots, roots: spreadRoots(co.opts.Warehouse, id), local: local, erased: erased,
-				exchanges: map[int]*exchangeRun{}, results: map[int]*jobResult{}, used: map[string]bool{},
+				exchanges: map[int]*exchangeRun{}, results: map[int]*jobResult{}, used: map[string]bool{}, target: target,
 			}
 			// The exchanges are read only by the stages: once they have run,
 			// the statement's rows need not wait for their removal.
@@ -1131,6 +1171,9 @@ func (co *Coordinator) Execute(ctx context.Context, plan *Plan, settings []Setti
 				continue
 			}
 		}
+		if WriteDenied(err) {
+			co.noteWriteDenied(err)
+		}
 		switch {
 		case ctx.Err() != nil:
 			co.opts.Metrics.query("canceled", start)
@@ -1145,36 +1188,41 @@ func (co *Coordinator) Execute(ctx context.Context, plan *Plan, settings []Setti
 		return nil, err
 	}
 
-	final := clone(plan.final).(node)
-	co.mergeOrdered(ctx, final, plan.Stages, run, settings, ex.dir, qid, stream)
-	for _, s := range plan.Stages {
-		if s.Out != nil {
-			continue
+	ex.wrote = target != nil && slices.ContainsFunc(plan.Stages, func(s *Stage) bool { return s.writeSQL != "" })
+	if ex.wrote {
+		ex.written = run.written
+	} else {
+		final := clone(plan.final).(node)
+		co.mergeOrdered(ctx, final, plan.Stages, run, settings, ex.dir, qid, stream)
+		for _, s := range plan.Stages {
+			if s.Out != nil {
+				continue
+			}
+			if m := run.results[s.ID].merged; m != nil {
+				ex.merged = append(ex.merged, m)
+			}
+			ref, err := co.partials(run.results[s.ID])
+			if err != nil {
+				return nil, err
+			}
+			replaced := false
+			rewrite(final, func(n node) (node, bool) {
+				if str(n["type"]) == "BASE_TABLE" && str(n["table_name"]) == s.placeholder {
+					replaced = true
+					return clone(ref).(node), true
+				}
+				return nil, false
+			})
+			if !replaced {
+				return nil, fmt.Errorf("stage %d has no place in the statement", s.ID)
+			}
 		}
-		if m := run.results[s.ID].merged; m != nil {
-			ex.merged = append(ex.merged, m)
-		}
-		ref, err := co.partials(run.results[s.ID])
-		if err != nil {
+		if err := co.pin(final, plan.pins, snapshots); err != nil {
 			return nil, err
 		}
-		replaced := false
-		rewrite(final, func(n node) (node, bool) {
-			if str(n["type"]) == "BASE_TABLE" && str(n["table_name"]) == s.placeholder {
-				replaced = true
-				return clone(ref).(node), true
-			}
-			return nil, false
-		})
-		if !replaced {
-			return nil, fmt.Errorf("stage %d has no place in the statement", s.ID)
+		if ex.SQL, err = co.parser.print(final); err != nil {
+			return nil, err
 		}
-	}
-	if err := co.pin(final, plan.pins, snapshots); err != nil {
-		return nil, err
-	}
-	if ex.SQL, err = co.parser.print(final); err != nil {
-		return nil, err
 	}
 	for _, x := range run.overfull() {
 		co.log.Warn("an exchange has more files than its tasks times its partitions", "query", qid, "exchange", x)
@@ -1450,6 +1498,12 @@ func (co *Coordinator) dispatch(ctx context.Context, task *taskRequest, ws []*wo
 		if t.Local != "" {
 			t.Local += "/a" + strconv.Itoa(runs)
 		}
+		if t.Write != nil {
+			wr := *t.Write
+			wr.Dir += "/a" + strconv.Itoa(runs)
+			wr.Credentials = co.writeCredentials(ctx, wr.Dir)
+			t.Write = &wr
+		}
 		t.Worker = w.addr
 		body, err := json.Marshal(&t)
 		if err != nil {
@@ -1458,6 +1512,9 @@ func (co *Coordinator) dispatch(ctx context.Context, task *taskRequest, ws []*wo
 		head, err := co.fetch(ctx, w, body, path, sp)
 		if err == nil {
 			co.opts.Metrics.task("ok")
+			if t.Write != nil {
+				head.attempt = t.Write.Dir
+			}
 			return w, head, nil
 		}
 		if ctx.Err() != nil {
@@ -1637,6 +1694,9 @@ func (co *Coordinator) fetchTask(ctx context.Context, w *worker, body []byte, pa
 		}
 		if res.Error.CacheRace {
 			return nil, &cacheRaceError{msg: fmt.Sprintf("a task on %s: %s", w.addr, res.Error.Message)}
+		}
+		if res.Error.WriteDenied {
+			return nil, fmt.Errorf("%w: a task on %s: %s", ErrWriteDenied, w.addr, res.Error.Message)
 		}
 		if res.Error.Erased != 0 {
 			// The statement began before an erasure request this worker

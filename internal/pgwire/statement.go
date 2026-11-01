@@ -114,8 +114,10 @@ type statement struct {
 	// (see beginAI).
 	ai bool
 	// fill says the statement is the query a statement fills a table
-	// from, prepared for the planner (see fillSource).
-	fill bool
+	// from, prepared for the planner (see fillSource); writer, if set, is
+	// how workers would write its rows (see tableWrite).
+	fill   bool
+	writer *tableWrite
 	// filled is where the query of a fill of a table ran, on workers or
 	// here, as for a read of it (see fillOn): for the query history, and
 	// for auto mode's history of the query.

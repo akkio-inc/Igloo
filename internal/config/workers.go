@@ -46,6 +46,10 @@ type Workers struct {
 	// them to the disk's free space.
 	Exchanges   string
 	ExchangeMax int64
+	// NoWrites keeps workers from writing tables' files, which they do for a
+	// statement that fills a table from a query, under a directory of the
+	// statement's (IGLOO_WORKER_WRITES, on): this replica then writes them.
+	NoWrites bool
 
 	K8sNamespace   string
 	K8sDeployment  string
@@ -237,6 +241,13 @@ func loadWorkers(lookup func(string) (string, bool), errs *[]error) Workers {
 			addErr("%s must be a positive duration such as 10m, got %q", key, v)
 		}
 		return d
+	}
+	switch v := strings.ToLower(get("IGLOO_WORKER_WRITES", "on")); v {
+	case "on", "true":
+	case "off", "false":
+		w.NoWrites = true
+	default:
+		addErr("IGLOO_WORKER_WRITES must be on or off, got %q", v)
 	}
 	switch v := strings.ToLower(get("IGLOO_WORKER_SPOT_NOTICE", "on")); v {
 	case "on", "true":

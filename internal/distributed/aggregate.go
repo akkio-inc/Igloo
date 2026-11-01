@@ -1980,9 +1980,10 @@ func (pl *planner) rowsJob(c *candidate) (*jobBuild, error) {
 	// more memory besides than its limit allows.
 	sorts := c.top && order != nil && limit == nil && distinct == nil
 	hop := distinct == nil && limit == nil && !qualifies && !filtersRelation && !selective && !feeds
-	if hop && !sorts {
+	if hop && !sorts && !pl.opts.writes {
 		// Every matching row would cross to the coordinator and wait on its
 		// disk before the first reached the client: a hop, not a saving.
+		// Workers that write a table's files send it none.
 		return nil, unsupported("rows of %s without DISTINCT, aggregates or ORDER BY ... LIMIT", c.largest())
 	}
 	if limit != nil {
@@ -2146,7 +2147,7 @@ func (pl *planner) rowsJob(c *candidate) (*jobBuild, error) {
 			}
 		}
 	}
-	if hop && !pl.mergeable(b.merge, columns[:n], c.columns) {
+	if hop && sorts && !pl.mergeable(b.merge, columns[:n], c.columns) {
 		// Sorted only on the coordinator, after every row crossed to it.
 		return nil, unsupported("rows of %s ordered by what the coordinator cannot merge", c.largest())
 	}

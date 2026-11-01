@@ -25,6 +25,7 @@ import (
 	"github.com/akkio-inc/igloo/internal/engine"
 	"github.com/akkio-inc/igloo/internal/erasure"
 	"github.com/akkio-inc/igloo/internal/gateway"
+	"github.com/akkio-inc/igloo/internal/icebergrest"
 	"github.com/akkio-inc/igloo/internal/memlimit"
 	"github.com/akkio-inc/igloo/internal/prefetch"
 	"github.com/akkio-inc/igloo/internal/spot"
@@ -234,6 +235,10 @@ func newCoordinator(ctx context.Context, cfg config.Config, source distributed.S
 	if err != nil {
 		return nil, err
 	}
+	credentials, err := workerWriteCredentials(ctx, cfg, log)
+	if err != nil {
+		return nil, err
+	}
 	co, err := distributed.NewCoordinator(distributed.Options{
 		Source: source, Secret: cfg.Workers.Secret, Version: version, TempDir: cfg.DuckDB.TempDir,
 		Warehouse: cfg.Storage.Root(), Threads: threads, Metrics: distributed.NewMetrics(reg),
@@ -247,6 +252,7 @@ func newCoordinator(ctx context.Context, cfg config.Config, source distributed.S
 		WorkerPrice: cfg.Workers.Price, Price: cfg.PricePerHour, Large: large, LargeCores: l.Cores, LargeMemory: l.Memory, LargePrice: l.Price,
 		WorkerInstanceType: cfg.Workers.InstanceType, WorkerSpot: cfg.Workers.Spot, Region: cfg.Workers.Region,
 		LargeInstanceType: l.InstanceType, LargeSpot: l.Spot,
+		NoWorkerWrites: cfg.Workers.NoWrites, WriteCredentials: credentials,
 	}, log)
 	if err != nil {
 		return nil, fmt.Errorf("distributed execution: %w", err)
@@ -254,6 +260,38 @@ func newCoordinator(ctx context.Context, cfg config.Config, source distributed.S
 	log.Info("distributed execution is on", "workers", cfg.Workers.Addresses, "compute", cfg.Workers.Compute, "max_workers", cfg.Workers.Max,
 		"large_worker", l.Address)
 	return co, nil
+}
+
+// workerWriteCredentials returns what makes the credentials a task's attempt
+// writes a table's files with, limited to its directory, with no right to
+// delete, for an hour: nil where none can be made (GCS and Azure, and S3 without
+// IGLOO_S3_STS_ROLE_ARN), and workers write with their own identity, as far
+// as the deployment grants it; or none, and this replica writes the tables
+// (see distributed.ErrWriteDenied).
+func workerWriteCredentials(ctx context.Context, cfg config.Config, log *slog.Logger) (func(context.Context, string) (*distributed.WriteCredentials, error), error) {
+	if cfg.Workers.NoWrites {
+		log.Info("workers write no tables' files (IGLOO_WORKER_WRITES=off)")
+		return nil, nil
+	}
+	v, err := icebergrest.NewS3Vendor(ctx, cfg.Storage, log)
+	if err != nil {
+		return nil, fmt.Errorf("distributed execution: credentials for workers' writes: %w", err)
+	}
+	if v == nil {
+		log.Info("workers write tables' files with their own identity, which needs write access to directories named " + distributed.WriteDirMark +
+			"* under tables' locations and no more: without it, this replica writes them (docs/distributed-execution.md)")
+		return nil, nil
+	}
+	s3 := cfg.Storage.S3
+	return func(ctx context.Context, dir string) (*distributed.WriteCredentials, error) {
+		c, err := v.Vend(ctx, dir, icebergrest.AddFiles, "worker-write")
+		if err != nil {
+			return nil, err
+		}
+		return &distributed.WriteCredentials{KeyID: c.Config["s3.access-key-id"], Secret: c.Config["s3.secret-access-key"],
+			SessionToken: c.Config["s3.session-token"], Region: s3.Region, Endpoint: s3.Endpoint, URLStyle: s3.URLStyle, UseSSL: s3.UseSSL,
+			Expires: c.Expires}, nil
+	}, nil
 }
 
 // footprints learns what statements held at once, by their shapes: the

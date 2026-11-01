@@ -267,7 +267,7 @@ func (x features) onFleet(n int, f fleet) option {
 	cores := float64(n * max(f.cores, 1))
 	rate := coldRateAt(threadsPerCore(f.threads, f.cores)) * workerReadShare
 	work := max(float64(x.bytes)/(cores*rate), x.rows/(cores*rowRate))
-	o.estimate = startCost + float64(max(x.levels, 1))*levelCost + work*o.spill.factor
+	o.estimate = startCost + float64(max(x.levels, 1))*levelCost + work*o.spill.factor + x.onWorkersWrite(n*max(f.cores, 1))
 	if n > f.running {
 		o.estimate += f.start.Seconds()
 		o.started = n - f.running
@@ -285,7 +285,7 @@ func (x features) onLarge(l largeWorker) option {
 	cores := float64(max(l.cores, 1))
 	rate := coldRateAt(threadsPerCore(l.threads, l.cores))
 	work := max(float64(x.bytes)/(cores*rate), x.rows/(cores*rowRate))
-	o.estimate = startCost + float64(max(x.levels, 1))*largeStageCost + work*o.spill.factor
+	o.estimate = startCost + float64(max(x.levels, 1))*largeStageCost + work*o.spill.factor + x.onWorkersWrite(l.cores)
 	if !l.running {
 		o.estimate += l.start.Seconds()
 		o.started = 1

@@ -82,6 +82,10 @@ type taskRequest struct {
 	// of memory and more partitions would not fit their writers (see
 	// retryShape).
 	Slots int `json:"slots,omitempty"`
+	// Write, if set, makes the task write its rows as files of a table,
+	// instead of sending them back; the response lists the files (see
+	// writes.go).
+	Write *writeRequest `json:"write,omitempty"`
 }
 
 // purgeRequest has a worker purge what erasure requests deleted through
@@ -173,9 +177,13 @@ type taskResult struct {
 	// Columns are the result's columns, with their DuckDB types.
 	Columns []Column `json:"columns,omitempty"`
 	Rows    int64    `json:"rows"`
-	// Files are a shuffle task's output files.
+	// Files are a shuffle task's output files, or the files of a table a
+	// task wrote.
 	Files []shuffleFile `json:"files,omitempty"`
 	Error *taskErr      `json:"error,omitempty"`
+	// attempt is the directory the attempt that answered was given to
+	// write under, as the coordinator knows it (see checkWritten).
+	attempt string
 }
 
 // shuffleFile is a file of rows a shuffle task wrote for one partition.
@@ -217,6 +225,9 @@ type taskErr struct {
 	// what erasure requests deleted through Erased, later than the
 	// statement began (see erasure.go).
 	Erased int64 `json:"erased,omitempty"`
+	// WriteDenied says object storage refused the task's write of a table's
+	// files (see writeDenied).
+	WriteDenied bool `json:"write_denied,omitempty"`
 }
 
 func (e *taskErr) Error() string { return e.Message }

@@ -17,6 +17,9 @@
 #   - an audience report in Snowflake's dialect (cohorts, FLATTEN of array
 #     columns through views, distinct people per signal, ranking) returns
 #     the same rows with and without workers,
+#   - workers write tables' files with credentials limited to a task's
+#     directory: same rows, partitioned tables too, with a worker killed in
+#     the middle,
 #   - tables that maintenance compacted still run distributed,
 #   - statements over tables with policies stay on one replica,
 #   - workers accept no one without the worker secret.
@@ -516,6 +519,59 @@ else
 fi
 compose up -d --wait worker >/dev/null 2>&1 || compose up -d --wait --scale worker="$workers" >/dev/null
 set_exchanges object
+
+echo "workers write tables"
+# files_of TABLE: the table's data files.
+files_of() { psql_admin -c "SELECT file_path FROM iceberg_metadata('lake.public.$1') WHERE status <> 'DELETED'"; }
+# wrote_by_workers NAME TABLE QUERY: TABLE holds what QUERY returns on one
+# machine, in files of statements' directories.
+wrote_by_workers() {
+  local got want
+  got="$(psql_admin -c "SET distributed_execution = 'off'" -c "SELECT count(*), count(DISTINCT l_orderkey), sum(l_extendedprice) FROM $2" | grep -v '^SET$')"
+  want="$(psql_admin -c "SET distributed_execution = 'off'" -c "SELECT count(*), count(DISTINCT l_orderkey), sum(l_extendedprice) FROM ($3)" | grep -v '^SET$')"
+  if [ -n "$want" ] && [ "$got" = "$want" ]; then pass "$1: the same rows"; else fail "$1: [$got], want [$want]"; fi
+  if [ -n "$(files_of "$2")" ] && [ -z "$(files_of "$2" | grep -v '/igloo-write-')" ]; then
+    pass "$1: its files are of a statement's directory"
+  else
+    fail "$1: its files: $(files_of "$2" | head -3)"
+  fi
+}
+copy_of="SELECT l_orderkey, l_partkey, l_extendedprice, l_shipdate, l_returnflag, l_comment FROM lineitem"
+psql_admin -c "SET distributed_execution = 'on'" -c "CREATE TABLE written_copy AS $copy_of" >/dev/null
+wrote_by_workers "CREATE TABLE ... AS" written_copy "$copy_of"
+psql_admin -c "SET distributed_execution = 'off'" -c "CREATE TABLE written_parts AS $copy_of LIMIT 0" \
+  -c "ALTER TABLE written_parts SET PARTITIONED BY (l_returnflag, month(l_shipdate))" >/dev/null
+psql_admin -c "SET distributed_execution = 'on'" -c "INSERT INTO written_parts $copy_of" >/dev/null
+wrote_by_workers "a partitioned table" written_parts "$copy_of"
+# Read whole first: grep -q closing the pipe early would fail compose, and with
+# it the pipeline.
+igloo_log="$(compose logs --no-color igloo)"
+if grep -q "workers may not write\|could not make credentials limited" <<<"$igloo_log"; then
+  fail "workers were refused the write: $(grep "workers may not write\|could not make credentials limited" <<<"$igloo_log" | head -2)"
+else
+  pass "with credentials limited to a task's directory"
+fi
+# The credentials reach that directory alone: outside it, the same session
+# policy is refused, which S3Vendor checks against this store first.
+expect_refused="$(compose logs --no-color igloo | grep -c 'does not limit STS credentials' || true)"
+if [ "$expect_refused" = 0 ]; then pass "the store limits them to their policy"; else fail "the store ignores session policies"; fi
+# A worker dies while it writes: the statement finishes with each row once.
+slow_copy="SELECT l_orderkey, l_extendedprice, repeat(l_comment, 40) AS c FROM lineitem"
+start=$SECONDS
+psql_admin -c "SET distributed_execution = 'on'" -c "CREATE TABLE written_killed AS $slow_copy" >"$work/written_killed" 2>&1 &
+query=$!
+sleep 1
+victim="$(docker ps -q --filter "label=com.docker.compose.project=$project" --filter "label=com.docker.compose.service=worker" | head -1)"
+docker kill "$victim" >/dev/null
+wait "$query" || true
+got="$(psql_admin -c "SET distributed_execution = 'off'" -c "SELECT count(*), count(DISTINCT c), sum(l_extendedprice) FROM written_killed" 2>&1 | grep -v '^SET$' || true)"
+want="$(psql_admin -c "SET distributed_execution = 'off'" -c "SELECT count(*), count(DISTINCT c), sum(l_extendedprice) FROM ($slow_copy)" | grep -v '^SET$')"
+if [ -n "$want" ] && [ "$got" = "$want" ]; then
+  pass "a worker killed while writing: each row once, in $((SECONDS - start))s"
+else
+  fail "after a worker died writing: [$got], want [$want]; $(tail -3 "$work/written_killed")"
+fi
+compose up -d --wait worker >/dev/null 2>&1 || compose up -d --wait --scale worker="$workers" >/dev/null
 
 echo "after table maintenance"
 # Compaction rewrites the small files loaded above, and gives every table

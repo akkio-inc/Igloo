@@ -203,6 +203,9 @@ func (r *refresher) rebuild(ctx context.Context) (int64, error) {
 	f := &stagedFill{s: r.s, sess: r.sess, ctx: ctx}
 	defer f.close()
 	src := r.s.fillSource(ctx, r.sess, &statement{access: r.access, guard: r.guard}, r.query)
+	if src != nil {
+		src.writer = r.rebuildWriter(ctx, src)
+	}
 	rows, parts, _, err := r.s.fillOn(f, src, func(ctx context.Context) (int64, error) { return write(ctx, r.query) }, write)
 	if err == nil && parts.key != "" {
 		r.s.dist.ObserveOn(parts.key, parts.workers, parts.large, time.Since(cmp.Or(parts.since, start)))
@@ -211,6 +214,21 @@ func (r *refresher) rebuild(ctx context.Context) (int64, error) {
 		r.placement = parts.placement
 	}
 	return rows, err
+}
+
+// rebuildWriter returns how workers would write the view's rows, in place
+// of the table's files, or nil: where the refresh could not overwrite them
+// itself (see overwritePlan), as a partitioned view's.
+func (r *refresher) rebuildWriter(ctx context.Context, src *statement) *tableWrite {
+	o, err := r.overwritePlan(ctx)
+	if err != nil {
+		return nil
+	}
+	w := r.s.tableWriter(ctx, r.sess, r.schema, r.table, src, nil)
+	if w != nil {
+		w.overwrite = o
+	}
+	return w
 }
 
 // onWorkers says, for a refresh's detail, where its query ran when it ran

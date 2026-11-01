@@ -71,6 +71,11 @@ type Stage struct {
 	// that ended sent as many, the others are stopped, and the coordinator
 	// reads what those sent.
 	enough int64
+	// writeSQL, for a stage whose rows are the result of a statement that
+	// fills a table, row by row (see markWrites), is the query that gives a
+	// task's rows of the result: its tasks write them, where the statement
+	// has a target (see writes.go).
+	writeSQL string
 }
 
 // Input is a relation a stage's fragment reads under a view name: a
@@ -237,6 +242,10 @@ type execution struct {
 	// variables are the values the coordinator computed, which tasks set
 	// before they run (see values.go).
 	variables []variable
+	// target, if set, says the tasks of a stage that can write the
+	// statement's rows do, and written lists what they wrote (see writes.go).
+	target  *WriteTarget
+	written []WrittenFile
 	// local says workers write exchanges to their own disks (see localFor).
 	local bool
 	// erased is the latest deletion of erasure requests the coordinator
@@ -523,8 +532,10 @@ func (e *execution) stage(ctx context.Context, s *Stage) error {
 		}
 	}
 
+	// A stage that writes the statement's rows sends none.
+	writes := e.target != nil && s.writeSQL != ""
 	var res *jobResult
-	if s.Out == nil {
+	if s.Out == nil && !writes {
 		res = &jobResult{files: make([]string, tasks), workers: map[string]bool{}}
 	}
 	var mu sync.Mutex
@@ -576,7 +587,10 @@ func (e *execution) stage(ctx context.Context, s *Stage) error {
 			}
 		}
 		out := ""
-		if s.Out == nil {
+		if writes {
+			task.SQL = writeSQL(s, e.target)
+			task.Write = writeRequestFor(e.target, e.target.Dir+"/"+e.qid+"/s"+strconv.Itoa(s.ID)+"-"+strconv.Itoa(i))
+		} else if s.Out == nil {
 			task.SQL, task.Columns = s.SQL, s.Columns
 			out = filepath.Join(e.dir, fmt.Sprintf("%d-%d.parquet", s.ID, i))
 		} else {
@@ -597,7 +611,7 @@ func (e *execution) stage(ctx context.Context, s *Stage) error {
 		}
 		g.Go(func() error {
 			var sp *spool
-			if s.Out == nil {
+			if s.Out == nil && !writes {
 				sp = e.sp
 			}
 			first := i % len(e.ws)
@@ -628,6 +642,9 @@ func (e *execution) stage(ctx context.Context, s *Stage) error {
 			e.mu.Unlock()
 			if s.Out != nil {
 				return e.received(s, task, head, w)
+			}
+			if writes {
+				return e.writtenBy(task, head, w)
 			}
 			mu.Lock()
 			defer mu.Unlock()

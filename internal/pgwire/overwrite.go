@@ -10,6 +10,7 @@ import (
 	"io"
 	iofs "io/fs"
 	mrand "math/rand/v2"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -19,6 +20,7 @@ import (
 
 	"github.com/akkio-inc/igloo/internal/catalog"
 	"github.com/akkio-inc/igloo/internal/ddl"
+	"github.com/akkio-inc/igloo/internal/distributed"
 )
 
 // Full refreshes by overwrite. A full refresh replaced the rows of the
@@ -200,29 +202,39 @@ func (o *overwritePlan) run(ctx context.Context, query string) (rows int64, err 
 			return -1, err
 		}
 	}
-	if err := o.commit(ctx, paths); err != nil {
-		// A commit whose answer was lost, or that a cancel cut short, may
-		// have been made: its files stay if the table holds them, or if
-		// that cannot be told.
-		bg := context.WithoutCancel(ctx)
-		tbl, lerr := s.ddl.LoadTable(bg, r.schema, r.table)
-		held := false
-		if lerr == nil {
-			held, lerr = holdsFiles(bg, tbl, dir)
-		}
-		switch {
-		case lerr != nil:
-			leave = true
-			return -1, err
-		case !held:
-			return -1, err
-		}
-		s.log.Warn("a refresh's commit was made, though it failed", "view", r.job.Name, "err", err)
+	if leave, err = o.commitAt(ctx, dir, paths, nil); err != nil {
+		return -1, err
 	}
 	committed = true
 	s.ddl.TableChanged(r.schema, r.table)
 	s.indexesChanged(r.schema, r.table)
 	return rows, nil
+}
+
+// commitAt commits the files at paths, of directory dir, as commit does,
+// after check, if set, of what their footers say. A commit whose answer was
+// lost, or that a cancel cut short, may have been made: its files stay if
+// the table holds them; leave says that cannot be told.
+func (o *overwritePlan) commitAt(ctx context.Context, dir string, paths []string, check func([]iceberg.DataFile, iceberg.PartitionSpec) error) (leave bool, err error) {
+	r, s := o.r, o.r.s
+	err = o.commit(ctx, paths, check)
+	if err == nil {
+		return false, nil
+	}
+	bg := context.WithoutCancel(ctx)
+	tbl, lerr := s.ddl.LoadTable(bg, r.schema, r.table)
+	held := false
+	if lerr == nil {
+		held, lerr = holdsFiles(bg, tbl, dir)
+	}
+	switch {
+	case lerr != nil:
+		return true, err
+	case !held:
+		return false, err
+	}
+	s.log.Warn("a refresh's commit was made, though it failed", "view", r.job.Name, "err", err)
+	return false, nil
 }
 
 // copy writes query's rows with COPY into dir, as Parquet with the table's
@@ -300,8 +312,9 @@ const maxOverwriteAttempts = 10
 
 // commit puts the files at paths in the table in place of every data and
 // delete file of its current snapshot, in one snapshot. On a conflict it
-// does so again on the new current snapshot.
-func (o *overwritePlan) commit(ctx context.Context, paths []string) error {
+// does so again on the new current snapshot. check, if set, checks what
+// the files' footers say before anything is committed.
+func (o *overwritePlan) commit(ctx context.Context, paths []string, check func([]iceberg.DataFile, iceberg.PartitionSpec) error) error {
 	r, tbl := o.r, o.tbl
 	schemaID := tbl.Schema().ID
 	var added []iceberg.DataFile
@@ -311,6 +324,11 @@ func (o *overwritePlan) commit(ctx context.Context, paths []string) error {
 			var err error
 			if added, err = tx.DataFiles(ctx, paths); err != nil {
 				return fmt.Errorf("read the files the refresh wrote: %w", err)
+			}
+			if check != nil {
+				if err := check(added, tbl.Spec()); err != nil {
+					return err
+				}
 			}
 		}
 		data, deletes, err := currentFiles(ctx, tbl)
@@ -403,24 +421,42 @@ func (s *Server) clearRefreshFiles(ctx context.Context, schema, name string, all
 				return err
 			}
 		}
-		if tbl != nil {
-			held, err := holdsFiles(ctx, tbl, n.Name)
-			if err != nil {
-				return err
-			}
-			if !held {
-				if err := s.deleteRefreshFiles(ctx, tbl, n.Name); err != nil {
-					return err
-				}
-			}
-		}
-		// A table that is gone took its location's files with it, or
-		// left them to the orphan cleanup with the rest of them.
-		if err := s.ddl.ForgetPending(ctx, schema, n.Key); err != nil {
+		if err := s.clearNoted(ctx, schema, name, tbl, n); err != nil {
 			return err
 		}
-		s.log.Info("cleared the files a stopped refresh left", "table", schema+"."+name, "dir", n.Name, "since", n.At)
 	}
+	return nil
+}
+
+// clearNotedFiles is clearNoted of schema.name as it loads now.
+func (s *Server) clearNotedFiles(ctx context.Context, schema, name string, n catalog.Pending) error {
+	tbl, err := s.ddl.LoadTable(ctx, schema, name)
+	if err != nil && !errors.Is(err, ddl.ErrNotFound) {
+		return err
+	}
+	return s.clearNoted(ctx, schema, name, tbl, n)
+}
+
+// clearNoted deletes the files note n says a stopped write left under tbl,
+// schema.name, nil if gone, unless a snapshot holds them, and forgets it.
+func (s *Server) clearNoted(ctx context.Context, schema, name string, tbl *table.Table, n catalog.Pending) error {
+	if tbl != nil {
+		held, err := holdsFiles(ctx, tbl, n.Name)
+		if err != nil {
+			return err
+		}
+		if !held {
+			if err := s.deleteRefreshFiles(ctx, tbl, n.Name); err != nil {
+				return err
+			}
+		}
+	}
+	// A table that is gone took its location's files with it, or
+	// left them to the orphan cleanup with the rest of them.
+	if err := s.ddl.ForgetPending(ctx, schema, n.Key); err != nil {
+		return err
+	}
+	s.log.Info("cleared the files a stopped write left", "table", schema+"."+name, "dir", n.Name, "since", n.At)
 	return nil
 }
 
@@ -452,15 +488,24 @@ func (s *Server) forgetRefreshFiles(ctx context.Context, schema string, note cat
 // deleteRefreshFiles deletes the files in dir, a refresh's directory under
 // tbl's location.
 func (s *Server) deleteRefreshFiles(ctx context.Context, tbl *table.Table, dir string) error {
-	if !strings.Contains(dir, "/"+overwriteDir) {
-		return fmt.Errorf("%s is not a refresh's directory", dir)
+	return s.deleteFilesExcept(ctx, tbl, dir, nil)
+}
+
+// deleteFilesExcept deletes the files in dir, a refresh's or a statement's
+// directory under tbl's location, but those at keep, which a commit holds:
+// if it does not find them all there, it does not know what the files it
+// finds are called, and deletes none.
+func (s *Server) deleteFilesExcept(ctx context.Context, tbl *table.Table, dir string, keep []string) error {
+	if !strings.Contains(dir, "/"+overwriteDir) && !strings.Contains(dir, "/"+distributed.WriteDirMark) {
+		return fmt.Errorf("%s is not a refresh's directory, nor a statement's", dir)
 	}
 	conn, err := s.engine.Connect(ctx)
 	if err != nil {
 		return err
 	}
 	defer conn.Close() //nolint:errcheck
-	res, err := conn.QueryContext(ctx, "SELECT file FROM glob("+quoteLiteral(dir+"/*")+")", nil)
+	// Tasks write in directories of their own under it.
+	res, err := conn.QueryContext(ctx, "SELECT file FROM glob("+quoteLiteral(dir+"/**")+")", nil)
 	if err != nil {
 		return err
 	}
@@ -479,6 +524,17 @@ func (s *Server) deleteRefreshFiles(ctx context.Context, tbl *table.Table, dir s
 		files = append(files, f)
 	}
 	_ = res.Close()
+	listed := make(map[string]bool, len(files))
+	for _, f := range files {
+		listed[f] = true
+	}
+	for _, k := range keep {
+		if !listed[k] {
+			return fmt.Errorf("a committed file, %s, is not among the files listed under %s", k, dir)
+		}
+		delete(listed, k)
+	}
+	files = slices.DeleteFunc(files, func(f string) bool { return !listed[f] })
 	if len(files) == 0 {
 		return nil
 	}

@@ -199,6 +199,10 @@ type Plan struct {
 	// values.go).
 	values   []*value
 	valueEnv ValueEnv
+	// writes says its tasks can write the table it fills (WorkersWrite), and
+	// target is how, once the caller said (Write).
+	writes bool
+	target *WriteTarget
 	// versions are the snapshots the statement reads tables at, AT
 	// (VERSION => n), by key: Execute runs it on workers only if each is
 	// the snapshot it loads (see pinVersion).
@@ -294,6 +298,11 @@ type planOptions struct {
 	// workers are the workers the statement may run on, for weighing
 	// what every task reads whole.
 	workers int
+	// writes says the statement fills a table whose files workers may write
+	// (see writes.go): every row of a table may go to workers, which then
+	// need not cross to the coordinator (see rowsJob), and the stage whose
+	// rows are the result is made ready to write them (markWrites).
+	writes bool
 	// bitmaps says count(DISTINCT) of 32-bit unsigned IDs combines roaring
 	// bitmaps (combineBitmap): the rb extension is loaded, as on every
 	// machine, and the session turned them on (see bitmapsOn).
@@ -434,6 +443,9 @@ func (pl *planner) plan(stmt node) (*Plan, error) {
 		if s.SQL, err = pl.p.print(s.fragment); err != nil {
 			return nil, unsupported("%v", err)
 		}
+	}
+	if pl.opts.writes {
+		pl.markWrites(out)
 	}
 	pins, err := pl.pinReads(out)
 	if err != nil {

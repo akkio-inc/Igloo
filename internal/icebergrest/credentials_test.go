@@ -161,6 +161,26 @@ func TestS3VendorRefusesStoresThatIgnoreThePolicy(t *testing.T) {
 	}
 }
 
+// TestStatementDirectoryPolicy checks the credentials workers write a
+// statement's files with: a table's directory of the statement's alone, no
+// right to delete, as AddFiles is for other engines.
+func TestStatementDirectoryPolicy(t *testing.T) {
+	prefix := "warehouse/ns/t/data/igloo-write-0123456789abcdef"
+	if got, err := (&S3Vendor{bucket: "b", root: "warehouse"}).tablePrefix("s3://b/" + prefix); err != nil || got != prefix {
+		t.Fatalf("prefix %q, %v", got, err)
+	}
+	policy, err := sessionPolicy("aws", "b", prefix, AddFiles, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(policy, "DeleteObject") {
+		t.Errorf("may delete: %s", policy)
+	}
+	if !strings.Contains(policy, `"arn:aws:s3:::b/`+prefix+`/*"`) || !strings.Contains(policy, `"`+prefix+`/*"`) || strings.Count(policy, "warehouse/") != 2 {
+		t.Errorf("reaches more than the directory: %s", policy)
+	}
+}
+
 func TestS3VendorOnAWS(t *testing.T) {
 	v, f, _ := newTestVendor(t, "", "arn:aws-us-gov:iam::123456789012:role/igloo-engines")
 	creds, err := v.Vend(context.Background(), "s3://bucket/wh/t", WriteFiles, "a_very_long_user_name_that_goes_on_and_on_and_on_beyond_limits")

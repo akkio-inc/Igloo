@@ -538,6 +538,13 @@ func (w *Worker) serveTask(rw http.ResponseWriter, r *http.Request) {
 			w.fail(rw, http.StatusUnprocessableEntity, te)
 			return
 		}
+		if req.Write != nil && writeDenied(err) {
+			log.Warn("object storage refused a task's write of a table's files", "err", err)
+			te.WriteDenied = true
+			w.opts.Metrics.task("error", start)
+			w.fail(rw, http.StatusUnprocessableEntity, te)
+			return
+		}
 		if te.Bitmap {
 			log.Warn("task's bitmaps did not fit in memory", "err", err)
 			w.opts.Metrics.task("bitmap_memory", start)
@@ -571,7 +578,7 @@ func (w *Worker) serveTask(rw http.ResponseWriter, r *http.Request) {
 		w.fail(rw, http.StatusUnprocessableEntity, te)
 		return
 	}
-	if req.Shuffle != "" {
+	if req.Shuffle != "" || req.Write != nil {
 		// The rows are in object storage; the response lists the files.
 		head, _ := json.Marshal(res)
 		rw.Header().Set("Content-Type", "application/json")
@@ -763,6 +770,10 @@ func (w *Worker) run(ctx context.Context, req *taskRequest) (string, *taskResult
 	cols, err := describe(ctx, conn, query)
 	if err != nil {
 		return "", nil, err
+	}
+	if req.Write != nil {
+		res, err := w.writeFiles(ctx, conn, req, query, cols)
+		return "", res, err
 	}
 	if req.Shuffle != "" && req.Local != "" {
 		res, err := w.shuffleLocal(ctx, conn, req, query, cols)

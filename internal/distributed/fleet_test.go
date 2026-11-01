@@ -830,6 +830,21 @@ func TestFillCost(t *testing.T) {
 	if workers, reason := decide(aggregate); !workers {
 		t.Errorf("an aggregate fill: here (%s)", reason)
 	}
+	// Workers that write the copy themselves share the writing, and fetch
+	// nothing.
+	written := copyOf
+	written.workersWrite = true
+	if workers, reason := decide(written); !workers {
+		t.Errorf("a copy workers write: here (%s)", reason)
+	}
+	here := copyOf.estimate(scaleCoordinator, benchWorkers)
+	there := written.estimate(scaleCoordinator, benchWorkers)
+	if there.onWorkers >= here.onWorkers/2 {
+		t.Errorf("workers write it in %.0f s, and %.0f s when this replica does", there.onWorkers, here.onWorkers)
+	}
+	if there.oneMachine != here.oneMachine {
+		t.Errorf("one machine writes it in %.0f s or %.0f s", there.oneMachine, here.oneMachine)
+	}
 }
 
 // TestOrderWithoutLimit checks a read whose result is its every row,

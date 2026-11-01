@@ -579,6 +579,22 @@ func TestStatementReservations(t *testing.T) {
 	}
 }
 
+func TestWorkerWrites(t *testing.T) {
+	for v, want := range map[string]bool{"": false, "on": false, "off": true, "false": true} {
+		m := map[string]string{"IGLOO_ADMIN_PASSWORD": "password"}
+		if v != "" {
+			m["IGLOO_WORKER_WRITES"] = v
+		}
+		cfg, err := Load(env(m))
+		if err != nil || cfg.Workers.NoWrites != want {
+			t.Errorf("IGLOO_WORKER_WRITES=%q: %v %v, want %v", v, cfg.Workers.NoWrites, err, want)
+		}
+	}
+	if _, err := Load(env(map[string]string{"IGLOO_ADMIN_PASSWORD": "password", "IGLOO_WORKER_WRITES": "sometimes"})); err == nil {
+		t.Error("IGLOO_WORKER_WRITES=sometimes should be refused")
+	}
+}
+
 func TestWorkerSpotNotice(t *testing.T) {
 	for v, want := range map[string]bool{"": true, "on": true, "off": false, "false": false} {
 		m := map[string]string{"IGLOO_ADMIN_PASSWORD": "password"}

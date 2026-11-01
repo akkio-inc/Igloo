@@ -52,6 +52,14 @@ func (s *Server) clearLeftovers(ctx context.Context, sess *session, schema, name
 	staging := strings.ToLower(name) + policy.StagingMark
 	var done []string
 	released := false
+	// The files workers wrote for a staging table, before the table goes.
+	for _, n := range notes {
+		if n.Dead(now) && n.Kind == catalog.PendingFiles && strings.HasPrefix(strings.ToLower(n.Target), staging) {
+			if err := s.clearNotedFiles(ctx, schema, n.Target, n); err != nil {
+				s.log.Warn("could not delete files a stopped CREATE TABLE ... AS left", "table", schema+"."+n.Target, "err", err)
+			}
+		}
+	}
 	for _, n := range notes {
 		if !n.Dead(now) {
 			continue

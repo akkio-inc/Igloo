@@ -21,14 +21,12 @@ import (
 // its query where auto mode would run the query as a read: on workers by
 // the same estimates, history, grants and policies, the coordinator then
 // writing the table from their results, INSERT INTO the table the SQL that
-// combines them, as a read sends the client what it combines. Workers
-// write no table's files; the table is written here, as before, so a fill
-// whose rows are as many as it reads, a copy, gains little on workers, and
-// auto mode, which weighs only the query, runs it there only when they are
-// clearly faster. A count(DISTINCT) of a billion IDs into a table, whose
-// thousand rows the replica writes in a moment, held the replica's memory
-// at its limit while it ran here and was canceled; on workers, the replica
-// holds only its thousand rows.
+// combines them, as a read sends the client what it combines; or where its
+// tasks hold its rows, as a copy's do, they write the table's files, which
+// this replica commits (see tableWrite). A count(DISTINCT) of a billion IDs
+// into a table, whose thousand rows the replica writes in a moment, held the
+// replica's memory at its limit while it ran here and was canceled; on
+// workers, the replica holds only its thousand rows.
 //
 // The fill runs on workers only as a read of its query by its user would:
 // not where masking or row access policies apply to, or concern, what the
@@ -160,12 +158,33 @@ func (s *Server) fillOn(f *stagedFill, src *statement, here func(context.Context
 func (s *Server) fillOnWorkers(ctx context.Context, sess *session, src *statement, mode distributed.Mode,
 	from func(ctx context.Context, source string) (int64, error)) (rows int64, parts distParts, done bool, err error) {
 	user := sess.currentUser()
+	writer := src.writer
+	if writer != nil {
+		// What its tasks wrote, and no commit holds, goes.
+		defer writer.end(ctx)
+	}
 	r, parts, done, err := s.startDistributed(ctx, sess, user, src, mode)
 	if r == nil {
 		return 0, parts, done, err
 	}
 	defer r.end()
-	rows, err = s.fillFrom(ctx, sess, src, r, from)
+	if r.ex.Wrote() {
+		// An erasure request deleted files since the statement began: what
+		// its tasks read of them is not to be committed. Here, it reads the
+		// tables as they are now.
+		if r.ex.ErasedSince() {
+			s.log.Info("an erasure request deleted files during a fill; its query runs again here", "user", user.Name)
+			return 0, distParts{release: s.dist.Keep()}, false, nil
+		}
+		rows, err = writer.commit(ctx, r.ex.Written())
+		if err != nil && writer.left {
+			// Whether a commit holds its rows cannot be told: written again
+			// here, they could be there twice.
+			return 0, r.parts, true, err
+		}
+	} else {
+		rows, err = s.fillFrom(ctx, sess, src, r, from)
+	}
 	if err == nil {
 		return rows, r.parts, true, nil
 	}
@@ -212,48 +231,57 @@ func (s *Server) fillFrom(ctx context.Context, sess *session, src *statement, r 
 	return rows, err
 }
 
+// insertParsed reads an INSERT of a query's rows, with a list of columns or
+// without.
+func insertParsed(text string) (parsedInsert, bool) {
+	if p, ok := parseInsert(text); ok {
+		return p, true
+	}
+	sc := &scanner{s: text}
+	if !sc.keywords("INSERT", "INTO") {
+		return parsedInsert{}, false
+	}
+	sc.skip()
+	start := sc.i
+	if _, named := sc.name(); !named {
+		return parsedInsert{}, false
+	}
+	p := parsedInsert{target: text[start:sc.i]}
+	sc.skip()
+	p.source = strings.TrimRight(sc.rest(), "; \t\r\n")
+	for _, t := range topWords(p.source) {
+		if t.word == "RETURNING" || t.word == "CONFLICT" {
+			return parsedInsert{}, false
+		}
+	}
+	return p, true
+}
+
 // insertFill is the query an INSERT writes rows from, source, and
 // head, st's text before it, which writes the target from another query
 // of its columns: for an INSERT INTO a table of no member columns (see
 // idassign.go) of a query's rows, VALUES not included, outside a
 // transaction block.
-func insertFill(sess *session, st *statement, args int) (head, source string, ok bool) {
+func insertFill(sess *session, st *statement, args int) (head, source string, p parsedInsert, ok bool) {
 	if st.stmtType != duckdb.STATEMENT_TYPE_INSERT || st.ids != nil || sess.inTx || args > 0 || st.kind != command {
-		return "", "", false
+		return "", "", p, false
 	}
-	p, ok := parseInsert(st.query)
-	if !ok {
-		// Without a column list: the query follows the table's name.
-		sc := &scanner{s: st.query}
-		if !sc.keywords("INSERT", "INTO") {
-			return "", "", false
-		}
-		if _, named := sc.name(); !named {
-			return "", "", false
-		}
-		sc.skip()
-		p.source = strings.TrimRight(sc.rest(), "; \t\r\n")
-		for _, t := range topWords(p.source) {
-			if t.word == "RETURNING" || t.word == "CONFLICT" {
-				return "", "", false
-			}
-		}
-	}
-	if p.source == "" {
-		return "", "", false
+	p, ok = insertParsed(st.query)
+	if !ok || p.source == "" {
+		return "", "", p, false
 	}
 	switch (&scanner{s: p.source}).word() {
 	case "SELECT", "WITH", "FROM":
 	default:
 		if p.source[0] != '(' {
-			return "", "", false
+			return "", "", p, false
 		}
 	}
 	text := strings.TrimRight(st.query, "; \t\r\n")
 	if !strings.HasSuffix(text, p.source) {
-		return "", "", false
+		return "", "", p, false
 	}
-	return text[:len(text)-len(p.source)], p.source, true
+	return text[:len(text)-len(p.source)], p.source, p, true
 }
 
 // runInsertFill runs an INSERT INTO ... SELECT of st as a fill (see
@@ -262,7 +290,7 @@ func insertFill(sess *session, st *statement, args int) (head, source string, ok
 // as a read: it then runs as usual.
 func (s *Server) runInsertFill(ctx context.Context, sess *session, st *statement, args int, w wire.DataWriter,
 	run func(ctx context.Context) error) (done bool, err error) {
-	head, source, ok := insertFill(sess, st, args)
+	head, source, p, ok := insertFill(sess, st, args)
 	if !ok {
 		return false, nil
 	}
@@ -270,6 +298,7 @@ func (s *Server) runInsertFill(ctx context.Context, sess *session, st *statement
 	if src == nil {
 		return false, nil
 	}
+	src.writer = s.insertWriter(ctx, sess, p, src)
 	f := &stagedFill{s: s, sess: sess, ctx: ctx}
 	defer f.close()
 	ranHere := false

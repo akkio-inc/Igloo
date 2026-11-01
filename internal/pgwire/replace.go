@@ -414,7 +414,11 @@ func (s *Server) runStagedCreate(ctx context.Context, sess *session, st *stateme
 			parts distParts
 			again bool
 		)
-		rows, parts, again, err = s.fillOn(f, s.fillSource(f.ctx, sess, st, c.query), here, from)
+		src := s.fillSource(f.ctx, sess, st, c.query)
+		if src != nil {
+			src.writer = s.tableWriter(f.ctx, sess, c.target.Schema, c.staging[len(c.staging)-1], src, nil)
+		}
+		rows, parts, again, err = s.fillOn(f, src, here, from)
 		st.filled = &parts
 		if err != nil && (again || errors.Is(err, errWorkerMemory) && f.ctx.Err() == nil) {
 			// DuckDB's estimate was short, the memory watch stopped the

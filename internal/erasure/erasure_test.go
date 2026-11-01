@@ -436,6 +436,22 @@ func TestErasure(t *testing.T) {
 	}
 	newOrphan := filepath.Join(people.Location(), "data", "in-progress.parquet")
 	eng.exec(t, fmt.Sprintf("COPY (SELECT 10 AS id, '%s' AS device_id) TO '%s' (FORMAT parquet)", storedDevice, newOrphan))
+	// What a worker wrote for a statement that stopped, in directories of the
+	// statement, its task and its attempt: old, and recent.
+	leftover := func(name, column, value string) string {
+		t.Helper()
+		p := filepath.Join(people.Location(), "data", "igloo-write-"+name, "q1", "s1-0", "a0", "__igloo_p0=123", "part_0.parquet")
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		eng.exec(t, fmt.Sprintf("COPY (SELECT 11 AS id, '%s' AS %s) TO '%s' (FORMAT parquet)", value, column, p))
+		return p
+	}
+	oldWrite := leftover("0123456789abcdef", "email", storedEmail)
+	if err := os.Chtimes(oldWrite, time.Now().Add(-4*24*time.Hour), time.Now().Add(-4*24*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	newWrite := leftover("fedcba9876543210", "device_id", storedDevice)
 
 	policies := policy.NewMemoryStore()
 	err = policies.Update(ctx, func(c *policy.Catalog) error {
@@ -541,6 +557,12 @@ func TestErasure(t *testing.T) {
 	if _, err := os.Stat(oldOrphan); !os.IsNotExist(err) {
 		t.Errorf("the old orphan is still there: %v", err)
 	}
+	if _, err := os.Stat(oldWrite); !os.IsNotExist(err) {
+		t.Errorf("the old leftover of a stopped write is still there: %v", err)
+	}
+	if _, err := os.Stat(newWrite); err != nil {
+		t.Errorf("the recent leftover of a stopped write, which may be a write in progress, went: %v", err)
+	}
 	later := got.WaitUntil.Add(time.Minute)
 	svc.now = func() time.Time { return later }
 	if got = run(); got.Status != StatusCompleted {
@@ -607,7 +629,7 @@ func TestErasure(t *testing.T) {
 	if found := search(t, eng, dir, []string{"dora@other.com", sha256Hex("ann@other.com")}); len(found) < 2 {
 		t.Errorf("the search does not find rows that stay: %v", found)
 	}
-	for _, p := range []string{copyPath, newOrphan} {
+	for _, p := range []string{copyPath, newOrphan, newWrite} {
 		if _, err := os.Stat(p); !os.IsNotExist(err) {
 			t.Errorf("%s is still there: %v", p, err)
 		}

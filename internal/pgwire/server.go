@@ -545,6 +545,12 @@ type Server struct {
 	// failFill, if set, runs before a fill's query runs on this replica
 	// (see fillOn), and fails it with its error.
 	failFill func(ctx context.Context, query string) error
+	// writesRunning holds the notes' keys of this replica's statements whose
+	// workers write a table's files (see tableWrite).
+	writesRunning sync.Map
+	// beforeWriteCommit, if set, runs before files workers wrote under dir
+	// are committed, and fails the commit with its error (see tableWrite).
+	beforeWriteCommit func(ctx context.Context, dir string) error
 	// rewriteHook, if set, is the last of Igloo's rewrites of a statement
 	// before it is checked and prepared (see rewrite); tests use it to
 	// write what only Igloo may, such as the columns of ID domains' ids.

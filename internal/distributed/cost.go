@@ -290,6 +290,9 @@ type features struct {
 	// (see fillCost).
 	fill      bool
 	planKeeps float64
+	// workersWrite says tasks write the rows, on as many cores as they run
+	// on, and none cross to this replica (see writes.go).
+	workersWrite bool
 	// planFields are the fields of its result's rows, which a read sends
 	// the client (see clientFieldRate), and planSorted what its largest
 	// sort or window holds, by the plan (see riskyShare); planJoins the
@@ -337,6 +340,9 @@ const (
 // same query.
 type Fills interface {
 	Fill() bool
+	// FillWrites says workers could write the table's files, if they may
+	// and its tasks hold its rows (see writes.go).
+	FillWrites() bool
 }
 
 const (
@@ -361,13 +367,51 @@ func (x features) fillCost(cores int) (here, onWorkers float64) {
 	if !x.fill || !x.planned || x.planKeeps <= 0 {
 		return 0, 0
 	}
+	out := x.fillOut()
+	write := out / (fillWriteRate * float64(max(cores, 1)))
+	if x.workersWrite {
+		// Each way on workers counts its own (see onFleet, onLarge).
+		return write, 0
+	}
+	return write, write + out/fillFetchRate
+}
+
+// fillOut is the bytes of files a fill's rows take, compressed as what it
+// reads is: where DuckDB's plan does not say what share of the rows it
+// reads they are, all of them.
+func (x features) fillOut() float64 {
 	read := float64(x.bytes)
 	if x.planBytes > 0 {
 		read = float64(x.planBytes)
 	}
-	out := x.planKeeps * read
-	write := out / (fillWriteRate * float64(max(cores, 1)))
-	return write, write + out/fillFetchRate
+	if !x.planned {
+		return read
+	}
+	return x.planKeeps * read
+}
+
+// onWorkersWrite is what tasks on cores take to write a fill's rows.
+func (x features) onWorkersWrite(cores int) float64 {
+	if !x.workersWrite {
+		return 0
+	}
+	return x.fillOut() / (fillWriteRate * float64(max(cores, 1)))
+}
+
+// defaultMinWorkerWrite is the fewest bytes of files workers write rather
+// than the coordinator: fewer take the coordinator a few seconds, and each
+// task's file would be a small one.
+const defaultMinWorkerWrite = 256 << 20
+
+// minWorkerWrite is Options.MinWorkerWrite, as it says.
+func (co *Coordinator) minWorkerWrite() float64 {
+	switch {
+	case co.opts.MinWorkerWrite < 0:
+		return 0
+	case co.opts.MinWorkerWrite == 0:
+		return defaultMinWorkerWrite
+	}
+	return float64(co.opts.MinWorkerWrite)
 }
 
 // set is the working set of a plan of features x on one machine: what

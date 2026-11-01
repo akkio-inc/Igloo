@@ -283,6 +283,15 @@ func (s *Server) startDistributed(ctx context.Context, sess *session, user auth.
 		s.log.Debug("statement runs on this replica", "user", user.Name, "reason", err)
 		return nil, parts, false, nil
 	}
+	if st.writer != nil && plan.WorkersWrite() {
+		// Its tasks write the table's files (see tableWrite).
+		target, err := st.writer.begin(ctx)
+		if err != nil {
+			s.log.Warn("workers will not write a table's files; this replica writes them", "user", user.Name, "err", err)
+		} else {
+			plan.Write(target)
+		}
+	}
 	// The workers stay up while the statement runs, here too.
 	release := s.dist.Keep()
 	start := time.Now()
@@ -302,7 +311,8 @@ func (s *Server) startDistributed(ctx context.Context, sess *session, user auth.
 				parts.release = release
 			}
 		}()
-		if ctx.Err() == nil && !distributed.DataError(err) && !distributed.BitmapMemory(err) && !distributed.IsUnsupported(err) {
+		if ctx.Err() == nil && !distributed.DataError(err) && !distributed.BitmapMemory(err) && !distributed.IsUnsupported(err) &&
+			!distributed.WriteDenied(err) && !distributed.WriteRefused(err) {
 			// How long it ran there before it failed, so that auto mode
 			// takes that way to take longer for a while.
 			s.dist.ObserveFailure(plan.Key, plan.Workers(), plan.Large(), time.Since(start))
@@ -327,6 +337,28 @@ func (s *Server) startDistributed(ctx context.Context, sess *session, user auth.
 			// The workers found what planning could not, such as data
 			// files without field IDs.
 			s.log.Debug("statement runs on this replica", "user", user.Name, "reason", err)
+			return nil, parts, false, nil
+		case distributed.WriteDenied(err) && st.writer != nil:
+			// Workers may not write the table's files: they run the query, and
+			// this replica writes the table from their results.
+			s.log.Warn("workers may not write a table's files; this replica writes them", "user", user.Name, "err", err)
+			st.writer = nil
+			r, p, ran, err := s.startDistributed(ctx, sess, user, st, mode)
+			if r != nil {
+				return r, r.parts, true, nil
+			}
+			if ran {
+				return nil, p, true, err
+			}
+			if p.release != nil {
+				// This statement's own keeps the workers up.
+				p.release()
+			}
+			return nil, p, false, nil
+		case distributed.WriteRefused(err):
+			// A worker said it wrote others: nothing of it is committed, and
+			// this replica runs the statement.
+			s.log.Error("a worker said it wrote files outside the statement's directory; running the statement here", "user", user.Name, "err", err)
 			return nil, parts, false, nil
 		}
 		if plan.Large() && !plan.FitsHere() {
@@ -940,6 +972,9 @@ func tableColumns(ctx context.Context, sess *session, db, schema, table string) 
 // Fill says the statement planned is the query a statement fills a table
 // from, which this replica writes from its rows (distributed.Fills).
 func (e *sessionEnv) Fill() bool { return e.st.fill }
+
+// FillWrites says workers could write the table the statement fills.
+func (e *sessionEnv) FillWrites() bool { return e.st.writer != nil }
 
 // Others counts the statements running on this replica beside the
 // session's, for auto mode's choice (distributed.Loads).
