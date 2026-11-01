@@ -196,7 +196,7 @@ func startWriteServer(t *testing.T, configure ...func(*Options)) *writeEnv {
 // coordinate leaves them.
 func startWriteServerWith(t *testing.T, coordinate func(*distributed.Options), configure ...func(*Options)) *writeEnv {
 	t.Helper()
-	return startWriteServerOn(t, writeWorkers{cores: 8, memory: 1 << 30, claim: 300 << 20}, coordinate, configure...)
+	return startWriteServerOn(t, writeWorkers{cores: 8, memory: 4 << 30, claim: 300 << 20}, coordinate, configure...)
 }
 
 // writeWorkers says what workers a writeEnv has: of cores, taking their memory
