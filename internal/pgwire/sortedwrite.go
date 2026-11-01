@@ -196,6 +196,9 @@ func (s *Server) runSortedInsert(ctx context.Context, sess *session, st *stateme
 		return false, nil
 	}
 	sw := s.sortedWriteOf(ctx, sess, p.head(), p.source)
+	if sw != nil {
+		s.noWorkerWrite(p.target, "its rows are written in order, a range at a time")
+	}
 	if sw == nil {
 		return false, nil
 	}

@@ -389,6 +389,7 @@ func (s *Server) runStagedCreate(ctx context.Context, sess *session, st *stateme
 	plain := "INSERT INTO " + quoteName(c.staging) + "\n" + c.query
 	if text, ok := s.joinedInsert(parsedInsert{target: quoteName(c.staging), columns: visible,
 		source: strings.TrimRight(c.query, "; \t\r\n")}, idMembersOf(ids)); ok {
+		s.noWorkerWrite(c.target.String(), "it fills an ID domain's ids, joined here")
 		rows, err = f.fill(text)
 		if err != nil && joinFailed(err) {
 			s.log.Debug("a new member table is filled without its ids", "table", c.target.String(), "err", err)
@@ -396,6 +397,7 @@ func (s *Server) runStagedCreate(ctx context.Context, sess *session, st *stateme
 		}
 	} else if sw := s.sortedWriteOf(ctx, sess, "INSERT INTO "+quoteName(c.staging), c.query); sw != nil {
 		// Too many rows in order to sort at once: a range at a time.
+		s.noWorkerWrite(c.target.String(), "its rows are written in order, a range at a time")
 		var done bool
 		if rows, done, err = s.runSortedWrite(ctx, sess, sw); !done && err == nil {
 			rows, err = f.fill(plain)
@@ -403,6 +405,7 @@ func (s *Server) runStagedCreate(ctx context.Context, sess *session, st *stateme
 	} else if ap := s.aggPassesOf(ctx, sess, c.query, 0); ap != nil {
 		// An aggregate whose states would not fit in memory: its groups a
 		// share at a time (see aggpasses.go).
+		s.noWorkerWrite(c.target.String(), "its groups are written in passes")
 		rows, err = s.fillInPasses(f, c.staging, ap)
 	} else {
 		// Its query on workers where auto mode runs it there as a read,

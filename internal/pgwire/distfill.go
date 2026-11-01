@@ -42,6 +42,9 @@ import (
 // prepare as a query of rows without parameters.
 func (s *Server) fillSource(ctx context.Context, sess *session, st *statement, query string) *statement {
 	if s.dist == nil || st == nil || sess.inTx || sessionMode(sess, sess.currentUser()) == distributed.ModeOff {
+		if s.dist != nil && sess.inTx {
+			s.noWorkerWrite("a fill", "it is in a transaction block")
+		}
 		return nil
 	}
 	var src *statement
@@ -292,6 +295,9 @@ func (s *Server) runInsertFill(ctx context.Context, sess *session, st *statement
 	run func(ctx context.Context) error) (done bool, err error) {
 	head, source, p, ok := insertFill(sess, st, args)
 	if !ok {
+		if st.stmtType == duckdb.STATEMENT_TYPE_INSERT && (st.ids != nil || sess.inTx) {
+			s.noWorkerWrite("an INSERT", "it fills an ID domain's ids, or is in a transaction block")
+		}
 		return false, nil
 	}
 	src := s.fillSource(ctx, sess, st, source)
