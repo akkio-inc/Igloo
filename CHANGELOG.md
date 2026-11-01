@@ -1540,6 +1540,11 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   `history.expire.max-snapshot-age-ms` of Java's `Long.MAX_VALUE`
   ("forever") as forever; it overflowed into a negative age that dropped
   every branch and tag.
+- Erasure requests erase from the tables being made to replace their tagged
+  tables (`name__igloo_new_...`), which a stopped `CREATE OR REPLACE TABLE`
+  left, committed rows and files of workers alike, and which no request
+  found: tags stay with names. A verification looks again, and a request
+  does not complete while such a fill that began before its deletes runs.
 - Erasure requests train models again. A model records the tables its
   training read, through views and other models' predictions too; a
   request on any of them, once the rows are gone, trains it again from its

@@ -1,6 +1,7 @@
 package catalog
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"os"
@@ -97,6 +98,15 @@ func (p Pending) Mine() bool { return p.Host == pendingHost && p.Process == *pen
 // process, PendingStale ago.
 func (p Pending) Dead(now time.Time) bool {
 	return p.Host == pendingHost && p.Process != *pendingProcess.Load() || now.Sub(p.At) >= PendingStale
+}
+
+// PendingNotes returns the notes of tables being made in schema.
+func (c *Client) PendingNotes(ctx context.Context, schema string) ([]Pending, error) {
+	props, err := c.LoadNamespaceProperties(ctx, strings.Split(schema, "."))
+	if err != nil {
+		return nil, err
+	}
+	return PendingNotes(props), nil
 }
 
 // PendingNotes returns the notes among a namespace's properties.

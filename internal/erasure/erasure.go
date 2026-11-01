@@ -301,6 +301,9 @@ type Table struct {
 	// a location no table has any more, go as any such files do (see
 	// unowned).
 	Gone bool `json:"gone,omitempty"`
+	// StagingOf is the tagged table it is being made to replace, if it is a
+	// table being made (see stagingTables).
+	StagingOf string `json:"staging_of,omitempty"`
 }
 
 // Column is a column that holds identifiers.
@@ -357,6 +360,9 @@ type Verification struct {
 	// Orphans are unreferenced files with matching rows that are too new
 	// to delete: they may belong to a write in progress.
 	Orphans int64 `json:"orphans"`
+	// Staging are tables being made for its tables since it last looked,
+	// which it erases from too.
+	Staging int64 `json:"staging,omitempty"`
 	// Sharing are Delta Sharing copies with matching rows.
 	Sharing int64 `json:"sharing"`
 	// History are history records that still hold an identifier.

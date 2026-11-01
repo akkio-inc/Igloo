@@ -15,6 +15,7 @@ import (
 	"github.com/akkio-inc/igloo/internal/catalog"
 	"github.com/akkio-inc/igloo/internal/clone"
 	"github.com/akkio-inc/igloo/internal/erasure"
+	"github.com/akkio-inc/igloo/internal/policy"
 	"github.com/akkio-inc/igloo/internal/tasks"
 )
 
@@ -300,5 +301,98 @@ func TestErasureClearsRefreshFiles(t *testing.T) {
 				t.Errorf("the view holds %d of the person's rows", n)
 			}
 		})
+	}
+}
+
+// TestErasureErasesFromStagingTables: the table a stopped CREATE OR REPLACE
+// TABLE was filling holds the person's rows under a name no tag is on. A
+// request erases from it, and completes with none left; while a fill that may
+// have read them is running, it waits for that.
+func TestErasureErasesFromStagingTables(t *testing.T) {
+	t.Parallel()
+	vc := newViewCatalog(t)
+	sched := tasks.NewScheduler(tasks.NewMemoryStore(), tasks.Options{})
+	r := vc.replica(t, func(o *Options) { o.Tasks = sched })
+	admin := r.admin(t, pgx.QueryExecModeSimpleProtocol)
+	ctx := context.Background()
+	const (
+		person  = "u3@example.com"
+		stopped = "visits" + policy.StagingMark + "0123456789abcdef"
+		filling = "visits" + policy.StagingMark + "fedcba9876543210"
+	)
+	for _, q := range []string{
+		"CREATE TABLE lake.public.visits AS SELECT 'u' || (i % 20) || '@example.com' AS email, i AS spend FROM range(200) AS r(i)",
+		"CREATE TAG pii",
+		"ALTER TABLE lake.public.visits ALTER COLUMN email SET TAG pii = 'email'",
+		"CREATE TABLE lake.public." + stopped + " AS SELECT * FROM lake.public.visits",
+	} {
+		mustExec(t, admin, q)
+	}
+	dead := catalog.NewPending(catalog.PendingFill, stopped, "visits")
+	dead.Host, dead.At = "a-host-gone-since", time.Now().Add(-2*catalog.PendingStale)
+	running := catalog.NewPending(catalog.PendingFill, filling, "visits")
+	for _, n := range []catalog.Pending{dead, running} {
+		if err := r.objects.NotePending(ctx, "public", n); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cat, err := catalog.Open(ctx, vc.cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := erasure.NewMemoryStore()
+	svc := erasure.New(erasure.Options{Store: store, Catalog: cat, Policies: r.srv.gov.store.Load, Engine: r.eng, Jobs: sched, Making: cat.PendingNotes,
+		Key: []byte("an erasure key of thirty-two bytes"), CatalogName: "lake", Schema: "public", Warehouse: vc.cfg.Storage.Location + "/",
+		Purger: erasure.NewPurger(store, r.eng, erasure.MemoryCache+"replica", "replica", slog.New(slog.DiscardHandler))})
+	req, err := svc.Submit(ctx, "privacy", []erasure.Wanted{{Tag: "pii", Value: "email", Identifiers: []string{person}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	run := func(until string) *erasure.Request {
+		t.Helper()
+		var got *erasure.Request
+		for range 10 {
+			_ = svc.Run(ctx, req.ID)
+			if got, err = store.Get(ctx, req.ID); err != nil {
+				t.Fatal(err)
+			}
+			if got.Status == until {
+				return got
+			}
+		}
+		t.Fatalf("request: status %s at %s: %s", got.Status, got.Step, got.Error)
+		return nil
+	}
+	got := run(erasure.StatusWaiting)
+	if got.Step != erasure.StepVerify || !strings.Contains(got.Error, filling) {
+		t.Errorf("waiting at %s: %s", got.Step, got.Error)
+	}
+	if err := r.objects.ForgetPending(ctx, "public", running.Key); err != nil {
+		t.Fatal(err)
+	}
+	got = run(erasure.StatusCompleted)
+	if i := slices.IndexFunc(got.Tables, func(t erasure.Table) bool { return strings.HasSuffix(t.Name, stopped) }); i < 0 || got.Tables[i].RowsDeleted == 0 {
+		t.Errorf("the stopped fill's table in the request: %+v", got.Tables)
+	}
+	for _, table := range []string{"visits", stopped} {
+		if n := count(t, admin, "SELECT count(*) FROM lake.public."+table+" WHERE email = '"+person+"'"); n != 0 {
+			t.Errorf("%s still holds %d of the person's rows", table, n)
+		}
+		tbl, err := r.objects.LoadTable(ctx, "public", table)
+		if err != nil {
+			t.Fatal(err)
+		}
+		files, _ := filepath.Glob(filepath.Join(strings.TrimPrefix(tbl.Location(), "file://"), "data", "*.parquet"))
+		if len(files) == 0 {
+			t.Errorf("%s has no data files: the test shows nothing", table)
+		}
+		for _, f := range files {
+			if strings.HasSuffix(f, "-deletes.parquet") {
+				continue
+			}
+			if count(t, admin, "SELECT count(*) FROM read_parquet("+quoteLiteral(f)+") WHERE email = '"+person+"'") != 0 {
+				t.Errorf("%s holds the person's rows in %s", table, f)
+			}
+		}
 	}
 }

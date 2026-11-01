@@ -23,6 +23,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 
 	"github.com/akkio-inc/igloo/internal/audit"
+	"github.com/akkio-inc/igloo/internal/catalog"
 	"github.com/akkio-inc/igloo/internal/deletefiles"
 	"github.com/akkio-inc/igloo/internal/iddomain"
 	"github.com/akkio-inc/igloo/internal/policy"
@@ -101,6 +102,10 @@ type Options struct {
 	// warehouse's files under none (see unowned). It must fail if one
 	// cannot be loaded. Without it, the tables' locations stand in.
 	Locations func(ctx context.Context) ([]string, error)
+	// Making, if set, returns the notes of the tables being made in a schema
+	// (see catalog.Pending): a request does not complete while one for its
+	// tables is being filled (see fillsUnderWay).
+	Making func(ctx context.Context, schema string) ([]catalog.Pending, error)
 	// Jobs runs requests. Without it they run only when Run is called.
 	Jobs *tasks.Scheduler
 	// History are the stores whose records requests redact; nil ones are

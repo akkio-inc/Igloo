@@ -423,7 +423,7 @@ func serve() error {
 		eraser, err = newEraser(cfg, erasure.Options{
 			Store: erasureStore, Catalog: cat, Policies: policies.Load, Engine: eng, Jobs: jobs, Purger: purger,
 			Locks: cloneStore, Failed: notifier.ErasureFailed, Blocked: notifier.ErasureBlocked, Metrics: erasure.NewMetrics(reg), Log: log,
-			Locations: cat.Locations, Memory: rewriteMemory(cfg, memory), IDDomains: domains, IDSets: idSetsFor(cfg, bitmapIDs),
+			Locations: cat.Locations, Making: cat.PendingNotes, Memory: rewriteMemory(cfg, memory), IDDomains: domains, IDSets: idSetsFor(cfg, bitmapIDs),
 			// What AI functions derived from the tables, cached, the models
 			// trained from them, and the views refreshed from them.
 			Derived: []erasure.Derived{aiRuntime.Store()}, Models: retrainer, Views: views,
