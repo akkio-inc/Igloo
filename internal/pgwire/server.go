@@ -529,6 +529,10 @@ type Server struct {
 	// beforeFill, if set, runs as a staged CREATE TABLE ... AS starts to
 	// fill its table, with the context that ends the fill (for tests).
 	beforeFill func(context.Context)
+	// afterOverwrite, if set, runs once a refresh's overwrite is committed,
+	// before it writes the view's state; an error fails the refresh (for
+	// tests).
+	afterOverwrite func(ctx context.Context) error
 	// beforeOverwrite, if set, runs once a full refresh wrote its files
 	// into dir, before it commits them, with the refresh's context; an
 	// error fails the refresh (for tests).

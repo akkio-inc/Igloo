@@ -767,6 +767,104 @@ func TestFullRefreshByInsertInterrupted(t *testing.T) {
 	}
 }
 
+// TestRefreshOfWholeAggregateOverwrites checks the rewrite of an aggregating
+// view's whole table, which an incremental refresh does when the view's rows
+// do not show their groups, or it has one row of no group: by overwrite, no
+// delete files; and that a change is never counted twice in the state, whichever
+// of the view and the state a failure leaves committed: the view's commit
+// failing leaves all as it was, and the next refresh goes on from there; one
+// after it makes the next refresh a full one.
+func TestRefreshOfWholeAggregateOverwrites(t *testing.T) {
+	t.Parallel()
+	for _, c := range []struct{ name, query string }{
+		{"one row", "SELECT count(*) AS n, sum(x) AS s FROM src"},
+		{"rows not showing their groups", "SELECT sum(x) AS s FROM src GROUP BY g"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
+			env := startRefreshServer(t)
+			env.srv.refreshFraction = 1000
+			admin := env.admin
+			for _, q := range []string{
+				"CREATE TABLE src AS SELECT i AS id, i % 7 AS g, i * 2 AS x FROM range(1000) AS r(i)",
+				"CREATE MATERIALIZED VIEW v AS " + c.query,
+				"REFRESH MATERIALIZED VIEW v",
+			} {
+				mustExec(t, admin, q)
+			}
+			next := 1000
+			change := func() {
+				t.Helper()
+				mustExec(t, admin, fmt.Sprintf("INSERT INTO src VALUES (%d, %d, 5)", next, next%7))
+				next++
+			}
+			check := func(step, action string) {
+				t.Helper()
+				if got, want := sortedTexts(t, admin, "SELECT * FROM v"), sortedTexts(t, admin, c.query); !slices.Equal(got, want) {
+					t.Errorf("%s: v holds %q, want %q", step, got, want)
+				}
+				if got, detail, _, _ := viewRefresh(t, admin, "public.v"); got != action {
+					t.Errorf("%s: %s, %s, want %s", step, got, detail, action)
+				}
+				if _, deletes := liveFiles(t, admin, "v"); len(deletes) > 0 {
+					t.Errorf("%s: %d delete files", step, len(deletes))
+				}
+			}
+			check("first", "FULL")
+
+			change()
+			mustExec(t, admin, "REFRESH MATERIALIZED VIEW v")
+			check("incremental", "INCREMENTAL")
+
+			// The view's commit fails: all as it was, and the change is
+			// read by the next refresh, once.
+			change()
+			env.srv.beforeOverwrite = func(context.Context, string) error { return errors.New("an injected failure") }
+			if _, err := admin.Exec(context.Background(), "REFRESH MATERIALIZED VIEW v"); err == nil {
+				t.Error("the refresh went through")
+			}
+			env.srv.beforeOverwrite = nil
+			mustExec(t, admin, "REFRESH MATERIALIZED VIEW v")
+			check("after a failure before the view's commit", "INCREMENTAL")
+
+			// A stop between the view's commit and the state's: the view
+			// holds the change, the state does not. The next refresh is full,
+			// and the one after goes on from its state.
+			change()
+			env.srv.afterOverwrite = func(context.Context) error { return errors.New("an injected failure") }
+			if _, err := admin.Exec(context.Background(), "REFRESH MATERIALIZED VIEW v"); err == nil {
+				t.Error("the refresh went through")
+			}
+			env.srv.afterOverwrite = nil
+			if got, want := sortedTexts(t, admin, "SELECT * FROM v"), sortedTexts(t, admin, c.query); !slices.Equal(got, want) {
+				t.Errorf("after a failure between the commits: v holds %q, want %q", got, want)
+			}
+			change()
+			mustExec(t, admin, "REFRESH MATERIALIZED VIEW v")
+			check("after a failure between the commits", "FULL")
+			change()
+			mustExec(t, admin, "REFRESH MATERIALIZED VIEW v")
+			check("after the full refresh", "INCREMENTAL")
+
+			// A stop between the state's commit and the record of it: the
+			// same, as the job says what the last refresh it knows of left.
+			store := env.tasks.Store()
+			job, err := store.Job(context.Background(), tasks.KindMaterializedView, "public.v")
+			if err != nil {
+				t.Fatal(err)
+			}
+			change()
+			mustExec(t, admin, "REFRESH MATERIALIZED VIEW v")
+			check("before the record is lost", "INCREMENTAL")
+			if err := store.SetRefresh(context.Background(), tasks.KindMaterializedView, "public.v", job.Refresh); err != nil {
+				t.Fatal(err)
+			}
+			mustExec(t, admin, "REFRESH MATERIALIZED VIEW v")
+			check("after the record was lost", "FULL")
+		})
+	}
+}
+
 // TestFullRefreshOfOtherEnginesTypes checks the same of a view's table another
 // engine replaced with columns of a fixed-length or nanosecond type, which
 // DuckDB describes as other types than COPY could write them in.

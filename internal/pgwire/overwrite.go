@@ -74,10 +74,17 @@ type overwritePlan struct {
 	ids          []int
 }
 
-// replaceRows makes the view's table hold query's rows, and runs also,
-// statements that write the view's state, before it: by overwrite if it
-// can, or else as one transaction that deletes the table's rows, inserts
-// query's and runs also. It returns the rows written.
+// replaceRows makes the view's table hold query's rows, and then runs also,
+// statements that write the view's state: by overwrite if it can, or else as
+// one transaction that deletes the table's rows, inserts query's and runs
+// also. It returns the rows written.
+//
+// An overwrite cannot commit with the state's statements, which DuckDB
+// commits. A stop or a failure between the two leaves the view's table at
+// another snapshot than the job records, which makes the next refresh a full
+// one (see baseline), so no change is counted twice in the state, whichever
+// has been committed: the state is only ever gone on from when both match
+// what the last refresh recorded. query may read the state as it was.
 func (r *refresher) replaceRows(ctx context.Context, query string, also ...string) (int64, error) {
 	o, err := r.overwritePlan(ctx)
 	if errors.Is(err, errNoOverwrite) {
@@ -86,12 +93,21 @@ func (r *refresher) replaceRows(ctx context.Context, query string, also ...strin
 	if err != nil {
 		return -1, err
 	}
+	rows, err := o.run(ctx, query)
+	if err != nil {
+		return -1, err
+	}
+	if r.s.afterOverwrite != nil {
+		if err := r.s.afterOverwrite(ctx); err != nil {
+			return -1, err
+		}
+	}
 	if len(also) > 0 {
 		if _, err := r.write(ctx, also...); err != nil {
 			return -1, err
 		}
 	}
-	return o.run(ctx, query)
+	return rows, nil
 }
 
 // overwritePlan returns how to overwrite the view's table, or

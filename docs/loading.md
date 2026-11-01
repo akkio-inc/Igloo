@@ -378,7 +378,11 @@ new delete files name.
   included. A refresh aggregates the changed rows, merges them into the
   state, and writes the groups that changed; rows deleted are subtracted
   from counts and sums. Expressions of aggregates and of the `GROUP BY`
-  columns, and `HAVING`, work: they are computed from the state.
+  columns, and `HAVING`, work: they are computed from the state. A view
+  whose rows do not show their groups, or of one row of no group, is written
+  whole, as a full refresh writes it. The view's commit and the state's are
+  two: a refresh stopped between them makes the next refresh a full one, so
+  no change is counted twice.
 - **Exact, always.** Every table a refresh reads, it reads at the
   snapshot it records, so the next refresh starts where it ended, and the
   result equals a full refresh's to the bit. So sums and averages of

@@ -2445,7 +2445,11 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   not complete while any from before it may remain. Partitioned views and
   views with columns of nested, fixed-length or nanosecond types go the same
   way, their files written by DuckDB's `INSERT`, whose commit the catalog
-  proxy keeps from the catalog.
+  proxy keeps from the catalog. An incremental refresh that writes an
+  aggregating view whole, of one row of no group or whose rows do not show
+  their groups, overwrites it too, where it deleted every row: a refresh
+  stopped between the view's commit and its state's is followed by a full
+  one, so no change is counted twice.
 - A `CREATE TABLE ... AS` of an aggregate that the memory watch stops while
   it fills its table runs the fill again, its groups a share at a time, as
   it does when DuckDB runs out of memory: the benchmark's copy of a
