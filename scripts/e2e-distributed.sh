@@ -538,7 +538,7 @@ wrote_by_workers() {
   got="$(psql_admin -c "SET distributed_execution = 'off'" -c "SELECT count(*), count(DISTINCT l_orderkey), sum(l_extendedprice) FROM $2" | grep -v '^SET$')"
   want="$(psql_admin -c "SET distributed_execution = 'off'" -c "SELECT count(*), count(DISTINCT l_orderkey), sum(l_extendedprice) FROM ($3)" | grep -v '^SET$')"
   if [ -n "$want" ] && [ "$got" = "$want" ]; then pass "$1: the same rows"; else fail "$1: [$got], want [$want]"; fi
-  if [ -n "$(files_of "$2")" ] && [ -z "$(files_of "$2" | grep -v '/igloo-write-')" ]; then
+  if [ -n "$(files_of "$2")" ] && [ -z "$(files_of "$2" | grep -v '/igloo-sealed-')" ]; then
     pass "$1: its files are of a statement's directory"
   else
     fail "$1: its files: $(files_of "$2" | head -3)"
@@ -577,7 +577,7 @@ wide_rows() {
 }
 psql_admin -c "SET distributed_execution = 'on'" -c "CREATE TABLE written_wide AS $slow_copy" >/dev/null 2>&1 || true
 wide_rows "wide rows, forced onto workers of 1 GB" written_wide
-if [ -n "$(files_of written_wide)" ] && [ -z "$(files_of written_wide | grep -v '/igloo-write-')" ]; then
+if [ -n "$(files_of written_wide)" ] && [ -z "$(files_of written_wide | grep -v '/igloo-sealed-')" ]; then
   pass "and workers wrote them"
 else
   fail "wide rows: its files: $(files_of written_wide | head -3)"
@@ -588,7 +588,7 @@ psql_admin -c "SET distributed_execution = 'off'" -c "CREATE TABLE written_wide_
   -c "ALTER TABLE written_wide_parts SET PARTITIONED BY (truncate(10000, l_orderkey))" >/dev/null
 psql_admin -c "SET distributed_execution = 'on'" -c "INSERT INTO written_wide_parts $slow_copy" >/dev/null 2>&1 || true
 wide_rows "wide rows in partitions, forced onto workers" written_wide_parts
-if [ -z "$(files_of written_wide_parts | grep -v '/igloo-write-')" ]; then
+if [ -z "$(files_of written_wide_parts | grep -v '/igloo-sealed-')" ]; then
   pass "and workers wrote them"
 else
   fail "wide rows in partitions: its files: $(files_of written_wide_parts | head -3)"

@@ -38,7 +38,8 @@ import (
 //     files count only if the coordinator hears from that attempt. The
 //     coordinator refuses files outside it (checkWritten), and reads each
 //     file's footer itself before it commits: what is committed is what it
-//     read, not what a worker said (see pgwire's tableWrite).
+//     read, not what a worker said (see pgwire's tableWrite). It reads and
+//     commits its own copy of each, under SealedDirMark.
 //   - Where the coordinator can have credentials made for it
 //     (Options.WriteCredentials: on S3, STS with a session policy), each
 //     attempt carries credentials that reach its directory and nothing else,
@@ -56,6 +57,12 @@ import (
 // WriteDirMark starts the names of statements' directories of table files
 // workers write.
 const WriteDirMark = "igloo-write-"
+
+// SealedDirMark starts the names of the directories the coordinator copies those
+// files to, and commits them from. No worker's grant names it, as it may name
+// WriteDirMark, so that what is committed is out of its reach, whatever it can
+// still do to its own attempt's files with credentials that cannot be revoked.
+const SealedDirMark = "igloo-sealed-"
 
 // WriteColumn is a column of a table's files: its field ID, by name.
 type WriteColumn struct {

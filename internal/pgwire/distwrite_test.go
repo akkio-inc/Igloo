@@ -302,7 +302,7 @@ func written(t *testing.T, dir string) []string {
 			}
 			return err
 		}
-		if !d.IsDir() && strings.Contains(p, "/"+distributed.WriteDirMark) {
+		if !d.IsDir() && (strings.Contains(p, "/"+distributed.WriteDirMark) || strings.Contains(p, "/"+distributed.SealedDirMark)) {
 			out = append(out, p)
 		}
 		return nil
@@ -324,8 +324,8 @@ func (e *writeEnv) checkWrote(t *testing.T, table string) {
 		t.Errorf("%s has %d data files and %d delete files", table, len(data), len(deletes))
 	}
 	for _, f := range data {
-		if !strings.Contains(f, "/"+distributed.WriteDirMark) {
-			t.Errorf("%s's file %s is not of a statement's directory", table, f)
+		if !strings.Contains(f, "/"+distributed.SealedDirMark) {
+			t.Errorf("%s's file %s is not a copy of a statement's", table, f)
 		}
 	}
 	left := written(t, e.location(t, table))
@@ -502,7 +502,7 @@ func TestWorkersWritePartitions(t *testing.T) {
 				t.Errorf("rows differ:\n%.300s\nwant\n%.300s", got, want)
 			}
 			data, _ := liveFiles(t, admin, table)
-			inDir := func(f string) bool { return strings.Contains(f, "/"+distributed.WriteDirMark) }
+			inDir := func(f string) bool { return strings.Contains(f, "/"+distributed.SealedDirMark) }
 			if c.workers {
 				if !slices.ContainsFunc(data, inDir) {
 					t.Fatalf("workers did not write it: %d files", len(data))
@@ -510,7 +510,7 @@ func TestWorkersWritePartitions(t *testing.T) {
 				env.checkWrote(t, table)
 				for _, f := range data {
 					// No value of the table in a path.
-					if _, rest, _ := strings.Cut(f, "/"+distributed.WriteDirMark); strings.ContainsAny(rest, "% ") || strings.Contains(rest, "name-") {
+					if _, rest, _ := strings.Cut(f, "/"+distributed.SealedDirMark); strings.ContainsAny(rest, "% ") || strings.Contains(rest, "name-") {
 						t.Errorf("path %s", f)
 					}
 				}
@@ -666,7 +666,7 @@ func TestWorkersWriteRefused(t *testing.T) {
 			if slices.ContainsFunc(data, func(f string) bool { return slices.Contains(foreign, f) }) {
 				t.Errorf("the other table's file is in this one: %q", data)
 			}
-			if slices.ContainsFunc(data, func(f string) bool { return strings.Contains(f, "/"+distributed.WriteDirMark) }) {
+			if slices.ContainsFunc(data, func(f string) bool { return strings.Contains(f, "/"+distributed.SealedDirMark) }) {
 				t.Errorf("a suspect worker's statement committed files of workers: %q", data)
 			}
 			if got := env.local(t, "SELECT count(*) FROM w_secret"); got != "10" {
@@ -867,11 +867,7 @@ func TestWorkersWriteLeftovers(t *testing.T) {
 	data, _ := liveFiles(t, admin, "w_left")
 	dir := leave("w_left", "w_left", "0123456789abcdef")
 	// The note of files a statement committed and stopped before it forgot it.
-	held := filepath.Dir(data[0])
-	for !strings.HasPrefix(filepath.Base(filepath.Dir(held)), distributed.WriteDirMark) && held != "/" {
-		held = filepath.Dir(held)
-	}
-	held = filepath.Dir(held)
+	held := filepath.Join(filepath.Dir(filepath.Dir(data[0])), distributed.WriteDirMark+strings.TrimPrefix(filepath.Base(filepath.Dir(data[0])), distributed.SealedDirMark))
 	if err := env.srv.ddl.NotePending(ctx, "public", catalog.NewPending(catalog.PendingFiles, held, "w_left")); err != nil {
 		t.Fatal(err)
 	}
@@ -939,7 +935,7 @@ func TestWorkersWriteDenied(t *testing.T) {
 		t.Errorf("%s, want %s", got, want)
 	}
 	data, _ := liveFiles(t, admin, "w_denied")
-	if slices.ContainsFunc(data, func(f string) bool { return strings.Contains(f, "/"+distributed.WriteDirMark) }) {
+	if slices.ContainsFunc(data, func(f string) bool { return strings.Contains(f, "/"+distributed.SealedDirMark) }) {
 		t.Errorf("workers wrote it: %q", data)
 	}
 	if left := written(t, env.location(t, "w_denied")); len(left) != 0 {
@@ -1021,7 +1017,7 @@ func TestWorkersDoNotWrite(t *testing.T) {
 	env := startWriteServer(t)
 	env.force(t)
 	admin := env.admin
-	inDir := func(f string) bool { return strings.Contains(f, "/"+distributed.WriteDirMark) }
+	inDir := func(f string) bool { return strings.Contains(f, "/"+distributed.SealedDirMark) }
 	mustExec(t, admin, "CREATE TABLE w_tx (id BIGINT, x BIGINT)")
 	mustExec(t, admin, "BEGIN")
 	mustExec(t, admin, "INSERT INTO w_tx SELECT id, x FROM src")
@@ -1077,7 +1073,7 @@ func TestWorkersWriteErasedAtCommit(t *testing.T) {
 	env := startWriteServer(t)
 	env.force(t)
 	admin := env.admin
-	inDir := func(f string) bool { return strings.Contains(f, "/"+distributed.WriteDirMark) }
+	inDir := func(f string) bool { return strings.Contains(f, "/"+distributed.SealedDirMark) }
 	ledger := &lateLedger{}
 	ctx, stop := context.WithCancel(context.Background())
 	watched := make(chan struct{})
@@ -1138,7 +1134,7 @@ func TestWorkersWriteErased(t *testing.T) {
 		t.Errorf("%s, want %s", got, want)
 	}
 	data, _ := liveFiles(t, admin, "w_erased")
-	if slices.ContainsFunc(data, func(f string) bool { return strings.Contains(f, "/"+distributed.WriteDirMark) }) {
+	if slices.ContainsFunc(data, func(f string) bool { return strings.Contains(f, "/"+distributed.SealedDirMark) }) {
 		t.Errorf("files tasks wrote were committed: %q", data)
 	}
 	if left := written(t, env.location(t, "w_erased")); len(left) != 0 {
@@ -1278,7 +1274,7 @@ func TestWorkersWriteLate(t *testing.T) {
 				t.Errorf("what a task wrote late is still there: %v", err)
 			}
 			data, _ := liveFiles(t, admin, "w_late")
-			if c.commit && !slices.ContainsFunc(data, func(f string) bool { return strings.HasPrefix(f, *dir.Load()+"/") }) {
+			if c.commit && !slices.ContainsFunc(data, func(f string) bool { return strings.HasPrefix(f, sealedDir(*dir.Load())+"/") }) {
 				t.Errorf("the committed files went: %q", data)
 			}
 			for _, f := range data {
@@ -1302,6 +1298,51 @@ func TestLateWritesStop(t *testing.T) {
 	}
 }
 
+// TestWorkersWriteSealed checks that a commit holds copies of what tasks wrote, out
+// of their directories, and that overwriting what a task wrote, as its credentials
+// allow for a while yet, changes nothing of the table, nor does anything that
+// leaves the copies out.
+func TestWorkersWriteSealed(t *testing.T) {
+	t.Parallel()
+	env := startWriteServer(t)
+	env.force(t)
+	admin := env.admin
+	var wrote []string
+	for _, f := range env.faults {
+		f.set(func(f *writeFault) {
+			f.answer = func(_, head map[string]any) faultAction {
+				files, _ := head["files"].([]any)
+				for _, x := range files {
+					p, _ := x.(map[string]any)["path"].(string)
+					wrote = append(wrote, p)
+				}
+				return faultNone
+			}
+		})
+	}
+	mustExec(t, admin, "CREATE TABLE w_sealed (id BIGINT, x BIGINT)")
+	mustExec(t, admin, "INSERT INTO w_sealed SELECT id, x FROM src")
+	if len(wrote) == 0 {
+		t.Fatal("no task wrote")
+	}
+	env.checkWrote(t, "w_sealed")
+	for _, p := range wrote {
+		if _, err := os.Stat(p); !errors.Is(err, fs.ErrNotExist) {
+			t.Errorf("what a task wrote is still there: %s, %v", p, err)
+		}
+		// Written again by a worker with its attempt's credentials.
+		if err := os.MkdirAll(filepath.Dir(p), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte("tampered"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got, want := env.local(t, "SELECT count(*), sum(x) FROM w_sealed"), env.local(t, "SELECT count(*), sum(x) FROM src"); got != want {
+		t.Errorf("%s, want %s", got, want)
+	}
+}
+
 // TestForgedNoteDeletesNothing: a note of what a stopped write left, as whoever
 // reaches the catalog itself can write one, deletes files only in a directory
 // of the table it names, as Igloo makes them. Any other is left, and the note
@@ -1320,7 +1361,8 @@ func TestForgedNoteDeletesNothing(t *testing.T) {
 		t.Fatal("workers wrote none of the victim's files: the test shows nothing")
 	}
 	base := strings.TrimSuffix(strings.TrimPrefix(loc, "file://"), "/") + "/data/"
-	own := regexp.MustCompile(".*/" + distributed.WriteDirMark + "[0-9a-f]+").FindString(before[0])
+	// The victim's own statement's directory, as its note named it.
+	own := strings.Replace(regexp.MustCompile(".*/"+distributed.SealedDirMark+"[0-9a-f]+").FindString(before[0]), distributed.SealedDirMark, distributed.WriteDirMark, 1)
 	for _, dir := range []string{base + distributed.WriteDirMark + "*", own} {
 		note := catalog.Pending{Key: "igloo.pending.forged", Kind: catalog.PendingFiles, Name: dir, Target: "w_mine", Host: "gone", Process: "gone",
 			At: time.Now().Add(-2 * catalog.PendingStale)}
@@ -1414,7 +1456,7 @@ func TestWorkersOutOfMemoryOnWrite(t *testing.T) {
 	env := startWriteServerOn(t, writeWorkers{cores: 2, memory: 0, limit: "64MB"}, nil)
 	env.force(t)
 	admin := env.admin
-	inDir := func(f string) bool { return strings.Contains(f, "/"+distributed.WriteDirMark) }
+	inDir := func(f string) bool { return strings.Contains(f, "/"+distributed.SealedDirMark) }
 	leftAlone := func(t *testing.T, table string) {
 		t.Helper()
 		env.checkWide(t, table)
@@ -1460,7 +1502,7 @@ func TestWorkersShortOfMemoryWriting(t *testing.T) {
 		}
 	}
 	shortAnswers := func(env *writeEnv) int64 { return env.faults[0].short.Load() + env.faults[1].short.Load() }
-	inDir := func(f string) bool { return strings.Contains(f, "/"+distributed.WriteDirMark) }
+	inDir := func(f string) bool { return strings.Contains(f, "/"+distributed.SealedDirMark) }
 	t.Run("room here", func(t *testing.T) {
 		t.Parallel()
 		env := startWriteServer(t)

@@ -136,6 +136,20 @@ func (bfs *blobFileIO) Remove(name string) error {
 	return bfs.Delete(bfs.ctx, name)
 }
 
+// Copy copies the file at src to dst, in the store, in the same bucket.
+func (bfs *blobFileIO) Copy(ctx context.Context, src, dst string) error {
+	srcKey, err := bfs.preprocess(src)
+	if err != nil {
+		return &fs.PathError{Op: "copy", Path: src, Err: err}
+	}
+	dstKey, err := bfs.preprocess(dst)
+	if err != nil {
+		return &fs.PathError{Op: "copy", Path: dst, Err: err}
+	}
+
+	return bfs.Bucket.Copy(ctx, dstKey, srcKey, nil)
+}
+
 func (bfs *blobFileIO) Create(name string) (icebergio.FileWriter, error) {
 	return bfs.NewWriter(bfs.ctx, name, true, nil)
 }

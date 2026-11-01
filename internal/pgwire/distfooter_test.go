@@ -195,7 +195,7 @@ func TestWorkersWriteCraftedFooter(t *testing.T) {
 	t.Parallel()
 	env := startWriteServer(t)
 	env.force(t)
-	inDir := func(f string) bool { return strings.Contains(f, "/"+distributed.WriteDirMark) }
+	inDir := func(f string) bool { return strings.Contains(f, "/"+distributed.SealedDirMark) }
 	for i, crafted := range [][]byte{
 		craftedParquet(craftedFooter(5000, math.MaxInt32, nil)),
 		craftedParquet(craftedFooter(5_000_000, 1, nil)),

@@ -590,13 +590,20 @@ func (s *Server) clearNoted(ctx context.Context, schema, name string, tbl *table
 		return s.ddl.ForgetPending(ctx, schema, n.Key)
 	}
 	if tbl != nil {
-		held, err := holdsFiles(ctx, tbl, n.Name)
-		if err != nil {
-			return err
+		dirs := []string{n.Name}
+		if _, name := splitDir(n.Name); strings.HasPrefix(name, distributed.WriteDirMark) {
+			// A statement's note also stands for the copies it commits.
+			dirs = append(dirs, sealedDir(n.Name))
 		}
-		if !held {
-			if err := s.deleteRefreshFiles(ctx, tbl, n.Name); err != nil {
+		for _, dir := range dirs {
+			held, err := holdsFiles(ctx, tbl, dir)
+			if err != nil {
 				return err
+			}
+			if !held {
+				if err := s.deleteRefreshFiles(ctx, tbl, dir); err != nil {
+					return err
+				}
 			}
 		}
 	}
@@ -634,17 +641,9 @@ func (s *Server) forgetRefreshFiles(ctx context.Context, schema string, note cat
 	}
 }
 
-// deleteRefreshFiles deletes the files in dir, a refresh's directory under
-// tbl's location.
+// deleteRefreshFiles deletes the files in dir, a refresh's or a statement's
+// directory under the table's data.
 func (s *Server) deleteRefreshFiles(ctx context.Context, tbl *table.Table, dir string) error {
-	return s.deleteFilesExcept(ctx, tbl, dir, nil)
-}
-
-// deleteFilesExcept deletes the files in dir, a refresh's or a statement's
-// directory under tbl's location, but those at keep, which a commit holds:
-// if it does not find them all there, it does not know what the files it
-// finds are called, and deletes none.
-func (s *Server) deleteFilesExcept(ctx context.Context, tbl *table.Table, dir string, keep []string) error {
 	if parent, name := splitDir(dir); !writeDirName.MatchString(name) || !strings.HasSuffix(parent, "/data") {
 		return fmt.Errorf("%s is not a refresh's directory, nor a statement's", dir)
 	}
@@ -673,17 +672,6 @@ func (s *Server) deleteFilesExcept(ctx context.Context, tbl *table.Table, dir st
 		files = append(files, f)
 	}
 	_ = res.Close()
-	listed := make(map[string]bool, len(files))
-	for _, f := range files {
-		listed[f] = true
-	}
-	for _, k := range keep {
-		if !listed[k] {
-			return fmt.Errorf("a committed file, %s, is not among the files listed under %s", k, dir)
-		}
-		delete(listed, k)
-	}
-	files = slices.DeleteFunc(files, func(f string) bool { return !listed[f] })
 	if len(files) == 0 {
 		return nil
 	}
@@ -700,7 +688,7 @@ func (s *Server) deleteFilesExcept(ctx context.Context, tbl *table.Table, dir st
 }
 
 // writeDirName is the name of a refresh's directory, or a statement's.
-var writeDirName = regexp.MustCompile("^(" + overwriteDir + "|" + distributed.WriteDirMark + ")[0-9a-f]+$")
+var writeDirName = regexp.MustCompile("^(" + overwriteDir + "|" + distributed.WriteDirMark + "|" + distributed.SealedDirMark + ")[0-9a-f]+$")
 
 // ownDirectory reports whether dir is a refresh's directory or a statement's
 // of the table at location: directly in its data, as Igloo makes them.

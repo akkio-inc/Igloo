@@ -389,7 +389,11 @@ statement's rows are in the table when that commit is, or not at all.
 
 - **Where.** Under one directory of the statement's under the table's
   location, `data/igloo-write-<random>/`, and in it one for its query, for
-  each task and for each attempt of a task. Committed files stay there.
+  each task and for each attempt of a task. The coordinator copies the files of
+  the attempts it heard from, within the store, to `data/igloo-sealed-<random>/`,
+  reads them there and commits those. So a commit takes one copy a file, at most
+  32 at a time, and for that while the table's new files take twice their space.
+  S3's copy stops at 5 GB a file, past which the replica writes the table.
 - **Retries.** A worker that dies or does not answer has its task run again
   elsewhere, in a directory of its own. Only files of the attempt the
   coordinator heard from are committed, so rows are not lost or written twice.
@@ -1032,9 +1036,10 @@ give the workers more memory.
   Any mismatch commits nothing of the statement, which then runs on the
   replica, and logs an error. A compromised worker can put wrong rows in a
   table it is writing, as it can return wrong rows to any read, and until its
-  credentials expire it can overwrite the files of its own attempt, committed
-  ones too; but it cannot get a file outside its directory committed, nor
-  write outside it with those credentials.
+  credentials expire it can overwrite the files of its own attempt. Nothing
+  reads those by then: what is checked and committed is the coordinator's
+  copy, in a directory no worker's grant names. It cannot get a file outside
+  its directory committed, nor write outside it with those credentials.
 - **Pools are kept apart by secret and network.** Each compute pool's
   workers have a secret of their own (the Helm chart generates one per
   pool), so one pool's igloo pods cannot use another's workers; the

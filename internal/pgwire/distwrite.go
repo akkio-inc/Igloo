@@ -14,6 +14,7 @@ import (
 
 	"github.com/apache/iceberg-go"
 	"github.com/apache/iceberg-go/table"
+	"golang.org/x/sync/errgroup"
 
 	"github.com/akkio-inc/igloo/internal/catalog"
 	"github.com/akkio-inc/igloo/internal/ddl"
@@ -56,11 +57,11 @@ type tableWrite struct {
 	columns    []distributed.WriteColumn
 	partitions []string
 	// dir is the statement's directory while a run of it writes there, and
-	// note its note in the catalog; committed says a commit holds kept, its
-	// files, and left that whether one does cannot be told.
-	dir             string
+	// note its note in the catalog; sealed is where the files to commit were
+	// copied to, of which the note speaks too; committed says a commit holds
+	// them, and left that whether one does cannot be told.
+	dir, sealed     string
 	note            catalog.Pending
-	kept            []string
 	committed, left bool
 }
 
@@ -275,56 +276,93 @@ func (w *tableWrite) begin(ctx context.Context) (*distributed.WriteTarget, error
 	return t, nil
 }
 
-// end deletes what the statement's tasks wrote and no commit holds: all of
-// it, unless the statement committed, and then what lost attempts wrote, the
-// probe's file and files of no rows. Tasks the statement no longer waits for
-// may still finish a file, so it looks again a while later (lateWritesAfter),
-// and only then forgets the note; a process that stops before that leaves the
-// note for the table's next write. It leaves both where a commit may hold the
-// files and that cannot be told, for the table's next write to tell.
+// end deletes what the statement's tasks wrote, which no commit holds, and the
+// copies of it if the statement did not commit them. Tasks the statement no
+// longer waits for may still finish a file, so it looks again a while later
+// (lateWritesAfter), and only then forgets the note; a process that stops before
+// that leaves the note for the table's next write. It leaves both where a commit
+// may hold the files and that cannot be told, for the table's next write to tell.
 func (w *tableWrite) end(ctx context.Context) {
 	if w.dir == "" {
 		return
 	}
-	s, schema, name, tbl, dir, note, committed := w.s, w.schema, w.name, w.tbl, w.dir, w.note, w.committed
-	w.dir = ""
+	s, schema, name, tbl, dir, sealed, note, committed := w.s, w.schema, w.name, w.tbl, w.dir, w.sealed, w.note, w.committed
+	w.dir, w.sealed = "", ""
 	if w.left {
 		s.writesRunning.Delete(note.Key)
 		return
 	}
 	bg := context.WithoutCancel(ctx)
-	var keep []string
-	if committed {
-		keep = w.kept
-	}
 	failed := func(err error) {
-		// What a commit holds stays, and the note says what to look at. Files
-		// no snapshot holds are orphans to the table's cleanup and to erasure.
+		// The note says what to look at. Files no snapshot holds are orphans to
+		// the table's cleanup and to erasure.
 		s.log.Warn("could not delete the files a write did not commit; the table's next write or its orphan cleanup deletes them",
 			"table", schema+"."+name, "dir", dir, "err", err)
 	}
-	if err := s.deleteFilesExcept(bg, tbl, dir, keep); err != nil {
-		failed(err)
-		if !committed {
-			s.writesRunning.Delete(note.Key)
-			return
+	remove := func(dirs ...string) bool {
+		for _, d := range dirs {
+			if err := s.deleteRefreshFiles(bg, tbl, d); err != nil {
+				failed(err)
+				return false
+			}
 		}
+		return true
+	}
+	dirs := []string{dir}
+	if sealed != "" && !committed {
+		dirs = append(dirs, sealed)
+	}
+	if !remove(dirs...) {
+		s.writesRunning.Delete(note.Key)
+		return
 	}
 	s.lateWrites.Add(1)
 	go func() {
 		defer s.lateWrites.Done()
 		defer s.writesRunning.Delete(note.Key)
-		if !s.waitLateWrites() {
+		if !s.waitLateWrites() || !remove(dir) {
 			return
-		}
-		if err := s.deleteFilesExcept(bg, tbl, dir, keep); err != nil {
-			failed(err)
-			if !committed {
-				return
-			}
 		}
 		s.forgetRefreshFiles(bg, schema, note)
 	}()
+}
+
+// sealCopies is how many files a statement copies at a time.
+const sealCopies = 32
+
+// sealedDir is the directory the coordinator copies the files of a statement's
+// directory to.
+func sealedDir(dir string) string {
+	parent, name := splitDir(dir)
+	return parent + "/" + distributed.SealedDirMark + strings.TrimPrefix(name, distributed.WriteDirMark)
+}
+
+// seal copies files out of their tasks' directories, in the store, and returns
+// them as copied: what a worker can still do with its credentials to the files
+// it wrote, for up to an hour on S3, does not reach what is read and committed
+// from here on. A copy takes what the file holds at that moment, so that nothing
+// has to be held against what a worker said of it.
+func (w *tableWrite) seal(ctx context.Context, files []distributed.WrittenFile) ([]distributed.WrittenFile, error) {
+	fsys, err := w.tbl.FS(ctx)
+	if err != nil {
+		return nil, err
+	}
+	store, ok := fsys.(interface {
+		Copy(ctx context.Context, src, dst string) error
+	})
+	if !ok {
+		return nil, fmt.Errorf("the store of %s.%s cannot copy a file", w.schema, w.name)
+	}
+	w.sealed = sealedDir(w.dir)
+	out := make([]distributed.WrittenFile, len(files))
+	g, ctx := errgroup.WithContext(ctx)
+	g.SetLimit(sealCopies)
+	for i, f := range files {
+		out[i] = f
+		out[i].Path = w.sealed + "/part_" + strconv.Itoa(i) + ".parquet"
+		g.Go(func() error { return store.Copy(ctx, f.Path, out[i].Path) })
+	}
+	return out, g.Wait()
 }
 
 // lateWritesAfter is how long after a statement ended it looks for what its
@@ -405,7 +443,15 @@ func (w *tableWrite) commit(ctx context.Context, files []distributed.WrittenFile
 			kept = append(kept, f)
 		}
 	}
-	w.kept = paths
+	if len(paths) > 0 {
+		var err error
+		if kept, err = w.seal(ctx, kept); err != nil {
+			return 0, fmt.Errorf("copy the files workers wrote: %w", err)
+		}
+		for i, f := range kept {
+			paths[i] = f.Path
+		}
+	}
 	check := func(added []iceberg.DataFile, spec iceberg.PartitionSpec) error {
 		if err := checkAdded(kept, added, spec); err != nil {
 			return err
@@ -417,7 +463,7 @@ func (w *tableWrite) commit(ctx context.Context, files []distributed.WrittenFile
 	}
 	var err error
 	if w.overwrite != nil {
-		w.left, err = w.overwrite.commitAt(ctx, w.dir, paths, nil, check)
+		w.left, err = w.overwrite.commitAt(ctx, w.sealed, paths, nil, check)
 		w.committed = err == nil
 	} else if len(paths) > 0 {
 		err = w.add(ctx, paths, check)
@@ -477,7 +523,7 @@ func (w *tableWrite) add(ctx context.Context, paths []string, check func([]icebe
 			held := false
 			if lerr == nil {
 				w.tbl = latest
-				held, lerr = holdsFiles(bg, latest, w.dir)
+				held, lerr = holdsFiles(bg, latest, w.sealed)
 			}
 			switch {
 			case lerr != nil:

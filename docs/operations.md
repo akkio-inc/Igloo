@@ -534,7 +534,7 @@ nothing.
 
 A full refresh of a materialized view or dynamic table writes the view's
 rows into a directory of their own under its table's data
-(`igloo-refresh-...`, or `igloo-write-...` where [workers write them](distributed-execution.md#workers-writing-tables)), noted the same way, and commits them in place of the
+(`igloo-refresh-...`, or `igloo-write-...` where [workers write them](distributed-execution.md#workers-writing-tables), with `igloo-sealed-...` the copies it commits), noted the same way, and commits them in place of the
 table's files. One that fails or is canceled deletes its files; one an
 Igloo stopped before the commit leaves them, in no snapshot, and the view's
 next refresh deletes them, as does an erasure request's replacement of the
