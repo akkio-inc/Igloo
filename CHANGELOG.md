@@ -2147,6 +2147,18 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
 
 ### Fixed
 
+- The coordinator merges workers' sorted rows on several cores and copies
+  them into DuckDB a column at a time: rows of a table sorted on workers
+  took longer to reach the client than one machine's own sort of them.
+  Each worker's file is decoded in a goroutine of its own, groups of
+  up to eight files are merged at once and the groups' rows merged in turn
+  (by a tournament of losers, with comparisons typed per column), ahead
+  of DuckDB reading them; numbers, dates, times, timestamps and decimals
+  are copied into DuckDB's vectors in bulk, text of up to twelve bytes
+  written into them, and longer text assigned in one call a chunk. On 4
+  million synthetic rows from 32 files, merged rows read through DuckDB
+  take about as long as DuckDB's sort of the same rows, three times faster
+  than before.
 - A worker told to stop, by a Spot Instance's interruption notice or by
   SIGTERM, keeps serving the exchange files on its disk until the
   statements that read them end, or its deadline passes (ten seconds

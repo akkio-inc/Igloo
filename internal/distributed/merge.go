@@ -2,7 +2,7 @@ package distributed
 
 import (
 	"bytes"
-	"container/heap"
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -16,6 +16,7 @@ import (
 
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
+	"github.com/apache/arrow-go/v18/arrow/decimal128"
 	"github.com/apache/arrow-go/v18/arrow/memory"
 	"github.com/apache/arrow-go/v18/parquet"
 	"github.com/apache/arrow-go/v18/parquet/compress"
@@ -221,37 +222,93 @@ func resolveMerge(keys []mergeKey, cols []Column, settings []setting) ([]resolve
 // orders them: the coordinator sorts instead.
 var errNotMergeable = errors.New("rows not mergeable")
 
+// mergeBatch is how many rows a batch of merged rows holds, mergeRowGroup
+// the most rows of a row group of a merged file, and mergeReadBuffer what
+// the merge reads of each file at a time: it reads every task's file of a
+// stage at once, hundreds of them, and a row group's column chunks read
+// whole held megabytes each. mergeAhead is how many batches the merge
+// makes, and each file decodes, ahead of their reader.
+const (
+	mergeBatch      = 8192
+	mergeRowGroup   = 122_880
+	mergeReadBuffer = 1 << 20
+	mergeAhead      = 2
+)
+
+// mergeGroup is the most files one goroutine merges: more are merged in
+// groups of at most that many, at once, and the groups' merged rows merged
+// in turn, so that the comparisons run on several cores; a variable for
+// tests.
+var mergeGroup = 8
+
+// batchSource is what a cursor reads batches from: a file's record reader,
+// or the merge of a group of files.
+type batchSource interface {
+	Next() bool
+	RecordBatch() arrow.RecordBatch
+	Err() error
+	Release()
+}
+
 // mergeCursor is a file being merged: its current batch, retained, its
-// current row, and the batch's key columns.
+// current row, and the batch's key columns. A goroutine of its own decodes
+// its batches ahead (see start), so that the files' decoding runs on as
+// many cores as there are files, beside the merge.
 type mergeCursor struct {
-	rr   pqarrow.RecordReader
+	rr   batchSource
 	pf   *file.Reader
 	rec  arrow.RecordBatch
 	row  int
-	keys []arrow.Array
+	keys []keyColumn
+
+	batches  chan arrow.RecordBatch
+	done     chan struct{}
+	finished chan struct{}
+	// err is the decoding's, set before batches closes.
+	err error
 }
 
-// load reads the cursor's next batch that has rows; false at the end of
-// the file.
+// start decodes the file's batches that have rows, mergeAhead ahead.
+func (c *mergeCursor) start() {
+	c.batches = make(chan arrow.RecordBatch, mergeAhead)
+	c.done = make(chan struct{})
+	c.finished = make(chan struct{})
+	go func() {
+		defer close(c.finished)
+		defer close(c.batches)
+		for c.rr.Next() {
+			rec := c.rr.RecordBatch()
+			if rec.NumRows() == 0 {
+				continue
+			}
+			rec.Retain()
+			select {
+			case c.batches <- rec:
+			case <-c.done:
+				rec.Release()
+				return
+			}
+		}
+		c.err = c.rr.Err()
+	}()
+}
+
+// load takes the cursor's next batch; false at the end of the file.
 func (c *mergeCursor) load(keys []resolvedKey) (bool, error) {
-	for c.rr.Next() {
-		rec := c.rr.RecordBatch()
-		if rec.NumRows() == 0 {
-			continue
-		}
-		rec.Retain()
-		c.rec, c.row = rec, 0
-		c.keys = c.keys[:0]
-		for _, k := range keys {
-			c.keys = append(c.keys, rec.Column(k.col))
-		}
-		return true, nil
+	rec, ok := <-c.batches
+	if !ok {
+		return false, c.err
 	}
-	return false, c.rr.Err()
+	c.rec, c.row = rec, 0
+	c.keys = c.keys[:0]
+	for _, k := range keys {
+		c.keys = append(c.keys, newKeyColumn(rec.Column(k.col)))
+	}
+	return true, nil
 }
 
 // advance moves the cursor to its next row. Past its batch's last row, it
-// releases that batch and reads the next; ok is false at the end of the
+// releases that batch and takes the next; ok is false at the end of the
 // file.
 func (c *mergeCursor) advance(keys []resolvedKey) (ok bool, err error) {
 	c.row++
@@ -263,7 +320,15 @@ func (c *mergeCursor) advance(keys []resolvedKey) (ok bool, err error) {
 	return c.load(keys)
 }
 
+// close stops the decoding and closes the file.
 func (c *mergeCursor) close() {
+	if c.done != nil {
+		close(c.done)
+		for rec := range c.batches {
+			rec.Release()
+		}
+		<-c.finished
+	}
 	if c.rec != nil {
 		c.rec.Release()
 	}
@@ -275,30 +340,156 @@ func (c *mergeCursor) close() {
 	}
 }
 
-// mergeHeap orders cursors by their current rows.
-type mergeHeap struct {
-	cs   []*mergeCursor
-	keys []resolvedKey
-	err  error
+// keyColumn is a key column of a cursor's batch, which compares its values
+// with those of the same column of another cursor's batch, by their type
+// as DuckDB orders it (see newKeyColumn).
+type keyColumn interface {
+	// compare compares non-NULL value i with o's value j.
+	compare(i int, o keyColumn, j int) int
+	null(i int) bool
 }
 
-func (h *mergeHeap) Len() int      { return len(h.cs) }
-func (h *mergeHeap) Swap(i, j int) { h.cs[i], h.cs[j] = h.cs[j], h.cs[i] }
-func (h *mergeHeap) Less(i, j int) bool {
-	return h.compare(h.cs[i], h.cs[j]) < 0
-}
-func (h *mergeHeap) Push(x any) { h.cs = append(h.cs, x.(*mergeCursor)) }
-func (h *mergeHeap) Pop() any {
-	c := h.cs[len(h.cs)-1]
-	h.cs = h.cs[:len(h.cs)-1]
-	return c
+// nullable answers whether a value is NULL, cheaply where none is.
+type nullable struct {
+	a     arrow.Array
+	nulls bool
 }
 
-// compare orders the current rows of a and b by the keys.
-func (h *mergeHeap) compare(a, b *mergeCursor) int {
-	for i, k := range h.keys {
+func (n nullable) null(i int) bool { return n.nulls && n.a.IsNull(i) }
+
+// orderedKey is a key of numbers, or of dates, times or timestamps by
+// their ticks.
+type orderedKey[T cmp.Ordered] struct {
+	nullable
+	v []T
+}
+
+func (k orderedKey[T]) compare(i int, o keyColumn, j int) int {
+	return cmp.Compare(k.v[i], o.(orderedKey[T]).v[j])
+}
+
+// floatKey is a key of floating-point numbers, NaN after every other
+// number, as DuckDB orders them.
+type floatKey[T float32 | float64] struct {
+	nullable
+	v []T
+}
+
+func (k floatKey[T]) compare(i int, o keyColumn, j int) int {
+	return cmpFloat(float64(k.v[i]), float64(o.(floatKey[T]).v[j]))
+}
+
+// stringKey is a key of text, by its bytes.
+type stringKey struct {
+	nullable
+	a *array.String
+}
+
+func (k stringKey) compare(i int, o keyColumn, j int) int {
+	return strings.Compare(k.a.Value(i), o.(stringKey).a.Value(j))
+}
+
+type largeStringKey struct {
+	nullable
+	a *array.LargeString
+}
+
+func (k largeStringKey) compare(i int, o keyColumn, j int) int {
+	return strings.Compare(k.a.Value(i), o.(largeStringKey).a.Value(j))
+}
+
+// bytesKey is a key of BLOBs, by their bytes.
+type bytesKey struct {
+	nullable
+	value func(int) []byte
+}
+
+func (k bytesKey) compare(i int, o keyColumn, j int) int {
+	return bytes.Compare(k.value(i), o.(bytesKey).value(j))
+}
+
+type decimalKey struct {
+	nullable
+	v []decimal128.Num
+}
+
+func (k decimalKey) compare(i int, o keyColumn, j int) int {
+	return k.v[i].Cmp(o.(decimalKey).v[j])
+}
+
+type boolKey struct {
+	nullable
+	a *array.Boolean
+}
+
+func (k boolKey) compare(i int, o keyColumn, j int) int {
+	x, y := k.a.Value(i), o.(boolKey).a.Value(j)
+	switch {
+	case x == y:
+		return 0
+	case !x:
+		return -1
+	}
+	return 1
+}
+
+// newKeyColumn returns a key column of a, an array of a type mergeableArrow
+// reports.
+func newKeyColumn(a arrow.Array) keyColumn {
+	n := nullable{a: a, nulls: a.NullN() > 0}
+	switch a := a.(type) {
+	case *array.Int8:
+		return orderedKey[int8]{n, a.Int8Values()}
+	case *array.Int16:
+		return orderedKey[int16]{n, a.Int16Values()}
+	case *array.Int32:
+		return orderedKey[int32]{n, a.Int32Values()}
+	case *array.Int64:
+		return orderedKey[int64]{n, a.Int64Values()}
+	case *array.Uint8:
+		return orderedKey[uint8]{n, a.Uint8Values()}
+	case *array.Uint16:
+		return orderedKey[uint16]{n, a.Uint16Values()}
+	case *array.Uint32:
+		return orderedKey[uint32]{n, a.Uint32Values()}
+	case *array.Uint64:
+		return orderedKey[uint64]{n, a.Uint64Values()}
+	case *array.Float32:
+		return floatKey[float32]{n, a.Float32Values()}
+	case *array.Float64:
+		return floatKey[float64]{n, a.Float64Values()}
+	case *array.String:
+		return stringKey{n, a}
+	case *array.LargeString:
+		return largeStringKey{n, a}
+	case *array.Binary:
+		return bytesKey{n, a.Value}
+	case *array.LargeBinary:
+		return bytesKey{n, a.Value}
+	case *array.Date32:
+		return orderedKey[arrow.Date32]{n, a.Date32Values()}
+	case *array.Date64:
+		return orderedKey[arrow.Date64]{n, a.Date64Values()}
+	case *array.Timestamp:
+		return orderedKey[arrow.Timestamp]{n, a.TimestampValues()}
+	case *array.Time32:
+		return orderedKey[arrow.Time32]{n, a.Time32Values()}
+	case *array.Time64:
+		return orderedKey[arrow.Time64]{n, a.Time64Values()}
+	case *array.Decimal128:
+		return decimalKey{n, a.Values()}
+	case *array.Boolean:
+		return boolKey{n, a}
+	}
+	panic(fmt.Sprintf("merge by a column of %s", a.DataType()))
+}
+
+// rowOrder orders the current rows of cursors a and b by keys, a tie by
+// the cursors' order, so that the merge is the same every time.
+func rowOrder(keys []resolvedKey, a, b *mergeCursor, ai, bi int) int {
+	for i, k := range keys {
 		x, y := a.keys[i], b.keys[i]
-		xn, yn := x.IsNull(a.row), y.IsNull(b.row)
+		xn, yn := x.null(a.row), y.null(b.row)
 		switch {
 		case xn && yn:
 			continue
@@ -308,85 +499,14 @@ func (h *mergeHeap) compare(a, b *mergeCursor) int {
 			}
 			return 1
 		}
-		c, err := compareValues(x, a.row, y, b.row)
-		if err != nil && h.err == nil {
-			h.err = err
-		}
-		if c != 0 {
+		if c := x.compare(a.row, y, b.row); c != 0 {
 			if k.desc {
 				return -c
 			}
 			return c
 		}
 	}
-	return 0
-}
-
-// compareValues compares non-null values of arrays of one type as DuckDB
-// orders them.
-func compareValues(x arrow.Array, i int, y arrow.Array, j int) (int, error) {
-	switch a := x.(type) {
-	case *array.Int8:
-		return cmpOrdered(a.Value(i), y.(*array.Int8).Value(j)), nil
-	case *array.Int16:
-		return cmpOrdered(a.Value(i), y.(*array.Int16).Value(j)), nil
-	case *array.Int32:
-		return cmpOrdered(a.Value(i), y.(*array.Int32).Value(j)), nil
-	case *array.Int64:
-		return cmpOrdered(a.Value(i), y.(*array.Int64).Value(j)), nil
-	case *array.Uint8:
-		return cmpOrdered(a.Value(i), y.(*array.Uint8).Value(j)), nil
-	case *array.Uint16:
-		return cmpOrdered(a.Value(i), y.(*array.Uint16).Value(j)), nil
-	case *array.Uint32:
-		return cmpOrdered(a.Value(i), y.(*array.Uint32).Value(j)), nil
-	case *array.Uint64:
-		return cmpOrdered(a.Value(i), y.(*array.Uint64).Value(j)), nil
-	case *array.Float32:
-		return cmpFloat(float64(a.Value(i)), float64(y.(*array.Float32).Value(j))), nil
-	case *array.Float64:
-		return cmpFloat(a.Value(i), y.(*array.Float64).Value(j)), nil
-	case *array.String:
-		return strings.Compare(a.Value(i), y.(*array.String).Value(j)), nil
-	case *array.LargeString:
-		return strings.Compare(a.Value(i), y.(*array.LargeString).Value(j)), nil
-	case *array.Binary:
-		return bytes.Compare(a.Value(i), y.(*array.Binary).Value(j)), nil
-	case *array.LargeBinary:
-		return bytes.Compare(a.Value(i), y.(*array.LargeBinary).Value(j)), nil
-	case *array.Date32:
-		return cmpOrdered(a.Value(i), y.(*array.Date32).Value(j)), nil
-	case *array.Date64:
-		return cmpOrdered(a.Value(i), y.(*array.Date64).Value(j)), nil
-	case *array.Timestamp:
-		return cmpOrdered(a.Value(i), y.(*array.Timestamp).Value(j)), nil
-	case *array.Time32:
-		return cmpOrdered(a.Value(i), y.(*array.Time32).Value(j)), nil
-	case *array.Time64:
-		return cmpOrdered(a.Value(i), y.(*array.Time64).Value(j)), nil
-	case *array.Decimal128:
-		return a.Value(i).Cmp(y.(*array.Decimal128).Value(j)), nil
-	case *array.Boolean:
-		av, bv := a.Value(i), y.(*array.Boolean).Value(j)
-		switch {
-		case av == bv:
-			return 0, nil
-		case !av:
-			return -1, nil
-		}
-		return 1, nil
-	}
-	return 0, fmt.Errorf("%w: a column of %s", errNotMergeable, x.DataType())
-}
-
-func cmpOrdered[T int8 | int16 | int32 | int64 | uint8 | uint16 | uint32 | uint64 | arrow.Date32 | arrow.Date64 | arrow.Timestamp | arrow.Time32 | arrow.Time64](a, b T) int {
-	switch {
-	case a < b:
-		return -1
-	case a > b:
-		return 1
-	}
-	return 0
+	return cmp.Compare(ai, bi)
 }
 
 // cmpFloat orders floating-point numbers as DuckDB does: NaN after every
@@ -408,7 +528,7 @@ func cmpFloat(a, b float64) int {
 	return 0
 }
 
-// mergeableArrow reports whether compareValues compares values of dt.
+// mergeableArrow reports whether keyColumn compares values of dt.
 func mergeableArrow(dt arrow.DataType) bool {
 	switch dt.ID() {
 	case arrow.INT8, arrow.INT16, arrow.INT32, arrow.INT64, arrow.UINT8, arrow.UINT16, arrow.UINT32, arrow.UINT64,
@@ -419,31 +539,89 @@ func mergeableArrow(dt arrow.DataType) bool {
 	return false
 }
 
-// mergeBatch is how many rows a batch of merged rows holds, mergeRowGroup
-// the most rows of a row group of a merged file, and mergeReadBuffer what
-// the merge reads of each file at a time: it reads every task's file of a
-// stage at once, hundreds of them, and a row group's column chunks read
-// whole held megabytes each.
-const (
-	mergeBatch      = 8192
-	mergeRowGroup   = 122_880
-	mergeReadBuffer = 1 << 20
-)
+// loserTree picks the cursor whose current row comes first, in about
+// log2(cursors) comparisons a row: each inner node holds the cursor that
+// lost the match there, and winner the one that won them all. An ended
+// cursor loses every match.
+type loserTree struct {
+	cs     []*mergeCursor
+	ended  []bool
+	keys   []resolvedKey
+	size   int
+	losers []int
+	winner int
+}
+
+func newLoserTree(cs []*mergeCursor, ended []bool, keys []resolvedKey) *loserTree {
+	t := &loserTree{cs: cs, ended: ended, keys: keys, size: 1}
+	for t.size < len(cs) {
+		t.size *= 2
+	}
+	t.losers = make([]int, t.size)
+	// Play each match bottom up: winners[node] is who won below it.
+	winners := make([]int, 2*t.size)
+	for i := range t.size {
+		winners[t.size+i] = i
+	}
+	for node := t.size - 1; node >= 1; node-- {
+		a, b := winners[2*node], winners[2*node+1]
+		if t.beats(a, b) {
+			winners[node], t.losers[node] = a, b
+		} else {
+			winners[node], t.losers[node] = b, a
+		}
+	}
+	t.winner = winners[1]
+	return t
+}
+
+// beats reports whether cursor a's row comes before cursor b's: a leaf
+// past the cursors, or an ended cursor, comes after every other.
+func (t *loserTree) beats(a, b int) bool {
+	aOut := a >= len(t.cs) || t.ended[a]
+	bOut := b >= len(t.cs) || t.ended[b]
+	switch {
+	case aOut:
+		return false
+	case bOut:
+		return true
+	}
+	return rowOrder(t.keys, t.cs[a], t.cs[b], a, b) < 0
+}
+
+// replay plays the matches again from the winner's leaf up, once the
+// winner has moved to its next row or ended.
+func (t *loserTree) replay() {
+	w := t.winner
+	for node := (t.size + w) / 2; node >= 1; node /= 2 {
+		if l := t.losers[node]; t.beats(l, w) {
+			t.losers[node], w = w, l
+		}
+	}
+	t.winner = w
+}
+
+// done reports whether every cursor ended.
+func (t *loserTree) done() bool { return t.winner >= len(t.cs) || t.ended[t.winner] }
 
 // mergeReader is an array.RecordReader of the rows of files, each sorted by
-// keys, merged in order by them, in batches of mergeBatch rows. It reads
-// each file a batch at a time, so that it holds a batch a file and the
-// batch it makes, whatever the files hold; the first batch comes once each
-// file's first is read. Its columns are copied value by value into the
-// batch it makes where their types allow (see appender), and otherwise
-// sliced from the files' batches and concatenated.
+// keys, merged in order by them, in batches of mergeBatch rows. Each file
+// decodes its batches in a goroutine of its own, and the merge runs in
+// another, mergeAhead batches ahead of the reader, so that the reader, as
+// DuckDB, copies one batch while the next is merged and the files' next
+// decoded. It holds a few batches a file and the batches it makes, whatever
+// the files hold; the first batch comes once each file's first is decoded.
+// Its columns are copied value by value into the batch it makes where their
+// types allow (see appender), and otherwise sliced from the files' batches
+// and concatenated.
 type mergeReader struct {
 	ctx     context.Context
 	refs    atomic.Int64
 	schema  *arrow.Schema
 	keys    []resolvedKey
 	cursors []*mergeCursor
-	h       *mergeHeap
+	ended   []bool
+	tree    *loserTree
 	// b and appends copy rows value by value; without them, runs are the
 	// batch's runs of consecutive rows of the files' batches, each holding
 	// its batch.
@@ -452,6 +630,15 @@ type mergeReader struct {
 	runs    []mergeRun
 	rec     arrow.RecordBatch
 	err     error
+
+	// batches are the merge's, made in a goroutine once Next is first
+	// called, ahead of them; its error is set before batches closes.
+	ahead    int
+	started  bool
+	batches  chan arrow.RecordBatch
+	done     chan struct{}
+	finished chan struct{}
+	aheadErr error
 }
 
 // mergeRun is consecutive rows, from start to end, of a file's batch.
@@ -460,18 +647,47 @@ type mergeRun struct {
 	start, end int
 }
 
+// mergeReaderAhead is how many batches the merge a statement reads makes
+// ahead of it: DuckDB fills its stream's buffer from the merge in bursts,
+// between which the session reads the buffer, and a merge that waits for
+// each burst leaves the two taking turns rather than running at once.
+const mergeReaderAhead = 16
+
 // newMergeReader opens files, each sorted by keys, to merge them. It fails
 // with errNotMergeable where the columns cannot be compared, before it
 // reads a row. ctx ends the merge.
-func newMergeReader(ctx context.Context, files []string, keys []resolvedKey) (_ *mergeReader, err error) {
+func newMergeReader(ctx context.Context, files []string, keys []resolvedKey) (*mergeReader, error) {
+	return openMerge(ctx, files, keys, mergeReaderAhead)
+}
+
+// openMerge opens files to merge, as newMergeReader does, making batches
+// ahead of its reader.
+func openMerge(ctx context.Context, files []string, keys []resolvedKey, ahead int) (_ *mergeReader, err error) {
 	mem := memory.DefaultAllocator
-	r := &mergeReader{ctx: ctx, keys: keys}
+	r := &mergeReader{ctx: ctx, keys: keys, ahead: ahead}
 	r.refs.Store(1)
 	defer func() {
 		if err != nil {
 			r.Release()
 		}
 	}()
+	if len(files) > mergeGroup {
+		// Groups of files merged at once, each into a cursor of this merge.
+		groups := (len(files) + mergeGroup - 1) / mergeGroup
+		for g := range groups {
+			sub, err := openMerge(ctx, files[g*len(files)/groups:(g+1)*len(files)/groups], keys, mergeAhead)
+			if err != nil {
+				return nil, err
+			}
+			r.cursors = append(r.cursors, &mergeCursor{rr: sub})
+			if r.schema == nil {
+				r.schema = sub.schema
+			} else if !r.schema.Equal(sub.schema) {
+				return nil, fmt.Errorf("%w: files of different columns", errNotMergeable)
+			}
+		}
+		return r, r.begin(mem)
+	}
 	props := parquet.NewReaderProperties(mem)
 	props.BufferedStreamEnabled, props.BufferSize = true, mergeReadBuffer
 	for _, path := range files {
@@ -501,34 +717,42 @@ func newMergeReader(ctx context.Context, files []string, keys []resolvedKey) (_ 
 	if r.schema == nil {
 		return nil, fmt.Errorf("%w: no files", errNotMergeable)
 	}
+	return r, r.begin(mem)
+}
+
+// begin checks the merge's keys, starts its cursors, takes their first
+// batches and readies what makes its batches.
+func (r *mergeReader) begin(mem memory.Allocator) error {
+	keys := r.keys
 	for _, k := range keys {
 		if k.col >= len(r.schema.Fields()) || !mergeableArrow(r.schema.Field(k.col).Type) {
-			return nil, fmt.Errorf("%w: column %d", errNotMergeable, k.col)
+			return fmt.Errorf("%w: column %d", errNotMergeable, k.col)
 		}
 	}
-	r.h = &mergeHeap{keys: keys}
 	for _, c := range r.cursors {
+		c.start()
+	}
+	r.ended = make([]bool, len(r.cursors))
+	for i, c := range r.cursors {
 		ok, err := c.load(keys)
 		if err != nil {
-			return nil, err
+			return err
 		}
-		if ok {
-			r.h.cs = append(r.h.cs, c)
-		}
+		r.ended[i] = !ok
 	}
-	heap.Init(r.h)
+	r.tree = newLoserTree(r.cursors, r.ended, keys)
 	b := array.NewRecordBuilder(mem, r.schema)
 	for i := range r.schema.Fields() {
 		f, ok := appender(b.Field(i))
 		if !ok {
 			b.Release()
 			r.appends = nil
-			return r, nil
+			return nil
 		}
 		r.appends = append(r.appends, f)
 	}
 	r.b = b
-	return r, nil
+	return nil
 }
 
 func (r *mergeReader) Retain()                        { r.refs.Add(1) }
@@ -537,10 +761,18 @@ func (r *mergeReader) RecordBatch() arrow.RecordBatch { return r.rec }
 func (r *mergeReader) Record() arrow.RecordBatch      { return r.rec }
 func (r *mergeReader) Err() error                     { return r.err }
 
-// Release closes the files once the last reference is released.
+// Release stops the merge and closes the files once the last reference is
+// released.
 func (r *mergeReader) Release() {
 	if r.refs.Add(-1) != 0 {
 		return
+	}
+	if r.started {
+		close(r.done)
+		for rec := range r.batches {
+			rec.Release()
+		}
+		<-r.finished
 	}
 	if r.rec != nil {
 		r.rec.Release()
@@ -556,24 +788,67 @@ func (r *mergeReader) Release() {
 	r.cursors = nil
 }
 
-// Next makes the next batch of merged rows.
+// Next takes the next batch of merged rows.
 func (r *mergeReader) Next() bool {
 	if r.rec != nil {
 		r.rec.Release()
 		r.rec = nil
 	}
-	if r.err != nil || r.h == nil || r.h.Len() == 0 {
+	if r.err != nil || r.tree == nil {
 		return false
 	}
-	if r.err = r.ctx.Err(); r.err != nil {
+	if !r.started {
+		r.start()
+	}
+	rec, ok := <-r.batches
+	if !ok {
+		r.err = r.aheadErr
 		return false
+	}
+	r.rec = rec
+	return true
+}
+
+// start merges batches in a goroutine, mergeAhead ahead of Next.
+func (r *mergeReader) start() {
+	r.started = true
+	r.batches = make(chan arrow.RecordBatch, r.ahead)
+	r.done = make(chan struct{})
+	r.finished = make(chan struct{})
+	go func() {
+		defer close(r.finished)
+		defer close(r.batches)
+		for {
+			rec, err := r.merge()
+			if err != nil || rec == nil {
+				r.aheadErr = err
+				return
+			}
+			select {
+			case r.batches <- rec:
+			case <-r.done:
+				rec.Release()
+				return
+			}
+		}
+	}()
+}
+
+// merge makes the next batch of merged rows, nil after the last.
+func (r *mergeReader) merge() (arrow.RecordBatch, error) {
+	if r.tree.done() {
+		return nil, nil
+	}
+	if err := r.ctx.Err(); err != nil {
+		return nil, err
 	}
 	if r.b != nil {
 		r.b.Reserve(mergeBatch)
 	}
 	n := 0
-	for n < mergeBatch && r.h.Len() > 0 {
-		c := r.h.cs[0]
+	for n < mergeBatch && !r.tree.done() {
+		w := r.tree.winner
+		c := r.cursors[w]
 		if r.b != nil {
 			for i, f := range r.appends {
 				f(c.rec.Column(i), c.row)
@@ -587,26 +862,17 @@ func (r *mergeReader) Next() bool {
 		n++
 		ok, err := c.advance(r.keys)
 		if err != nil {
-			r.err = err
-			return false
+			return nil, err
 		}
-		if ok {
-			heap.Fix(r.h, 0)
-		} else {
-			heap.Pop(r.h)
-		}
-		if r.h.err != nil {
-			r.err = r.h.err
-			return false
-		}
+		r.ended[w] = !ok
+		r.tree.replay()
 	}
 	if r.b != nil {
-		r.rec = r.b.NewRecordBatch()
-		return true
+		return r.b.NewRecordBatch(), nil
 	}
-	r.rec, r.err = r.concatRuns(n)
+	rec, err := r.concatRuns(n)
 	r.dropRuns()
-	return r.err == nil
+	return rec, err
 }
 
 // concatRuns makes a batch of the n rows of the runs.

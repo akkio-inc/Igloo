@@ -5,10 +5,11 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"time"
+	"unsafe"
 
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
+	"github.com/apache/arrow-go/v18/arrow/decimal128"
 	"github.com/duckdb/duckdb-go/v2"
 )
 
@@ -52,41 +53,45 @@ func RegisterMerged(conn *sql.Conn) error {
 }
 
 // mergedSource is MergedFunction's rows: those of a merge's reader, copied
-// a DuckDB chunk at a time, read by one thread in order.
+// into DuckDB's chunks a column at a time, read by one thread in order.
 type mergedSource struct {
-	r    array.RecordReader
-	cols []duckdb.ColumnInfo
-	sets []columnSetter
+	r      array.RecordReader
+	cols   []duckdb.ColumnInfo
+	copies []columnCopy
 	// rec is the reader's batch being copied, from its row next.
 	rec  arrow.RecordBatch
 	next int
+	// out are the chunk's columns, ok those the statement reads.
+	out []duckdb.ChunkColumn
+	ok  []bool
 }
 
-// columnSetter writes value i of a into a chunk's column col at row.
-type columnSetter func(chunk *duckdb.DataChunk, col, row int, a arrow.Array, i int) error
+// columnCopy copies n values of a, from its row from, into column dst
+// from its row at, NULLs as NULLs.
+type columnCopy func(dst duckdb.ChunkColumn, at int, a arrow.Array, from, n int)
 
 // mergedColumns checks that MergedFunction can return columns of schema,
-// and returns them with what writes their values.
-func mergedColumns(schema *arrow.Schema) ([]duckdb.ColumnInfo, []columnSetter, error) {
+// and returns them with what copies their values.
+func mergedColumns(schema *arrow.Schema) ([]duckdb.ColumnInfo, []columnCopy, error) {
 	var cols []duckdb.ColumnInfo
-	var sets []columnSetter
+	var copies []columnCopy
 	for _, f := range schema.Fields() {
-		info, set, err := columnOf(f.Type)
+		info, copyCol, err := columnOf(f.Type)
 		if err != nil {
 			return nil, nil, fmt.Errorf("%w: column %s of %s", errNotMergeable, f.Name, f.Type)
 		}
 		cols = append(cols, duckdb.ColumnInfo{Name: f.Name, T: info})
-		sets = append(sets, set)
+		copies = append(copies, copyCol)
 	}
-	return cols, sets, nil
+	return cols, copies, nil
 }
 
 func newMergedSource(r array.RecordReader) (*mergedSource, error) {
-	cols, sets, err := mergedColumns(r.Schema())
+	cols, copies, err := mergedColumns(r.Schema())
 	if err != nil {
 		return nil, err
 	}
-	return &mergedSource{r: r, cols: cols, sets: sets}, nil
+	return &mergedSource{r: r, cols: cols, copies: copies, out: make([]duckdb.ChunkColumn, len(cols)), ok: make([]bool, len(cols))}, nil
 }
 
 func (s *mergedSource) ColumnInfos() []duckdb.ColumnInfo     { return s.cols }
@@ -95,6 +100,13 @@ func (s *mergedSource) Init()                                {}
 
 // FillChunk copies the next rows of the merge, as many as a chunk holds.
 func (s *mergedSource) FillChunk(chunk duckdb.DataChunk) error {
+	for c := range s.copies {
+		col, ok, err := chunk.ChunkColumn(c)
+		if err != nil {
+			return err
+		}
+		s.out[c], s.ok[c] = col, ok
+	}
 	capacity := duckdb.GetDataChunkCapacity()
 	n := 0
 	for n < capacity {
@@ -108,12 +120,9 @@ func (s *mergedSource) FillChunk(chunk duckdb.DataChunk) error {
 			s.rec, s.next = s.r.RecordBatch(), 0
 		}
 		take := min(capacity-n, int(s.rec.NumRows())-s.next)
-		for c, set := range s.sets {
-			a := s.rec.Column(c)
-			for k := range take {
-				if err := set(&chunk, c, n+k, a, s.next+k); err != nil {
-					return err
-				}
+		for c, copyCol := range s.copies {
+			if s.ok[c] {
+				copyCol(s.out[c], n, s.rec.Column(c), s.next, take)
 			}
 		}
 		n += take
@@ -123,46 +132,38 @@ func (s *mergedSource) FillChunk(chunk duckdb.DataChunk) error {
 }
 
 // columnOf returns the DuckDB type of an Arrow type MergedFunction returns,
-// and what writes its values.
-func columnOf(dt arrow.DataType) (duckdb.TypeInfo, columnSetter, error) {
-	typed := func(t duckdb.Type, set columnSetter) (duckdb.TypeInfo, columnSetter, error) {
+// and what copies its values.
+func columnOf(dt arrow.DataType) (duckdb.TypeInfo, columnCopy, error) {
+	typed := func(t duckdb.Type, copyCol columnCopy) (duckdb.TypeInfo, columnCopy, error) {
 		info, err := duckdb.NewTypeInfo(t)
-		return info, set, err
+		return info, copyCol, err
 	}
 	switch dt := dt.(type) {
 	case *arrow.Int8Type:
-		return typed(duckdb.TYPE_TINYINT, setOf((*array.Int8).Value))
+		return typed(duckdb.TYPE_TINYINT, copyFixed((*array.Int8).Int8Values))
 	case *arrow.Int16Type:
-		return typed(duckdb.TYPE_SMALLINT, setOf((*array.Int16).Value))
+		return typed(duckdb.TYPE_SMALLINT, copyFixed((*array.Int16).Int16Values))
 	case *arrow.Int32Type:
-		return typed(duckdb.TYPE_INTEGER, setOf((*array.Int32).Value))
+		return typed(duckdb.TYPE_INTEGER, copyFixed((*array.Int32).Int32Values))
 	case *arrow.Int64Type:
-		return typed(duckdb.TYPE_BIGINT, setOf((*array.Int64).Value))
+		return typed(duckdb.TYPE_BIGINT, copyFixed((*array.Int64).Int64Values))
 	case *arrow.Uint8Type:
-		return typed(duckdb.TYPE_UTINYINT, setOf((*array.Uint8).Value))
+		return typed(duckdb.TYPE_UTINYINT, copyFixed((*array.Uint8).Uint8Values))
 	case *arrow.Uint16Type:
-		return typed(duckdb.TYPE_USMALLINT, setOf((*array.Uint16).Value))
+		return typed(duckdb.TYPE_USMALLINT, copyFixed((*array.Uint16).Uint16Values))
 	case *arrow.Uint32Type:
-		return typed(duckdb.TYPE_UINTEGER, setOf((*array.Uint32).Value))
+		return typed(duckdb.TYPE_UINTEGER, copyFixed((*array.Uint32).Uint32Values))
 	case *arrow.Uint64Type:
-		return typed(duckdb.TYPE_UBIGINT, setOf((*array.Uint64).Value))
+		return typed(duckdb.TYPE_UBIGINT, copyFixed((*array.Uint64).Uint64Values))
 	case *arrow.Float32Type:
-		return typed(duckdb.TYPE_FLOAT, setOf((*array.Float32).Value))
+		return typed(duckdb.TYPE_FLOAT, copyFixed((*array.Float32).Float32Values))
 	case *arrow.Float64Type:
-		return typed(duckdb.TYPE_DOUBLE, setOf((*array.Float64).Value))
-	case *arrow.BooleanType:
-		return typed(duckdb.TYPE_BOOLEAN, setOf((*array.Boolean).Value))
-	case *arrow.StringType:
-		return typed(duckdb.TYPE_VARCHAR, setOf((*array.String).Value))
-	case *arrow.LargeStringType:
-		return typed(duckdb.TYPE_VARCHAR, setOf((*array.LargeString).Value))
-	case *arrow.BinaryType:
-		return typed(duckdb.TYPE_BLOB, setOf((*array.Binary).Value))
-	case *arrow.LargeBinaryType:
-		return typed(duckdb.TYPE_BLOB, setOf((*array.LargeBinary).Value))
+		return typed(duckdb.TYPE_DOUBLE, copyFixed((*array.Float64).Float64Values))
 	case *arrow.Date32Type:
-		return typed(duckdb.TYPE_DATE, setOf(func(a *array.Date32, i int) time.Time { return a.Value(i).ToTime() }))
+		// Days since 1970, as DuckDB's DATE.
+		return typed(duckdb.TYPE_DATE, copyFixed((*array.Date32).Date32Values))
 	case *arrow.TimestampType:
+		// Ticks of the unit since 1970, as DuckDB's timestamps of the unit.
 		t := map[arrow.TimeUnit]duckdb.Type{arrow.Second: duckdb.TYPE_TIMESTAMP_S, arrow.Millisecond: duckdb.TYPE_TIMESTAMP_MS,
 			arrow.Microsecond: duckdb.TYPE_TIMESTAMP, arrow.Nanosecond: duckdb.TYPE_TIMESTAMP_NS}[dt.Unit]
 		if dt.TimeZone != "" {
@@ -171,37 +172,107 @@ func columnOf(dt arrow.DataType) (duckdb.TypeInfo, columnSetter, error) {
 			}
 			t = duckdb.TYPE_TIMESTAMP_TZ
 		}
-		unit := dt.Unit
-		return typed(t, setOf(func(a *array.Timestamp, i int) time.Time { return a.Value(i).ToTime(unit) }))
+		return typed(t, copyFixed((*array.Timestamp).TimestampValues))
 	case *arrow.Time64Type:
-		perTick := time.Microsecond
-		if dt.Unit == arrow.Nanosecond {
-			perTick = time.Nanosecond
+		// Microseconds since midnight, as DuckDB's TIME.
+		if dt.Unit == arrow.Microsecond {
+			return typed(duckdb.TYPE_TIME, copyFixed((*array.Time64).Time64Values))
 		}
-		midnight := time.Date(1970, time.January, 1, 0, 0, 0, 0, time.UTC)
-		return typed(duckdb.TYPE_TIME, setOf(func(a *array.Time64, i int) time.Time {
-			return midnight.Add(time.Duration(a.Value(i)) * perTick)
+		return typed(duckdb.TYPE_TIME, copyConverted((*array.Time64).Time64Values, func(v arrow.Time64) int64 { return int64(v) / 1000 }))
+	case *arrow.BooleanType:
+		return typed(duckdb.TYPE_BOOLEAN, copyBool)
+	case *arrow.StringType:
+		return typed(duckdb.TYPE_VARCHAR, copyStrings(func(a *array.String, i int) []byte {
+			s := a.Value(i)
+			return unsafe.Slice(unsafe.StringData(s), len(s))
 		}))
+	case *arrow.LargeStringType:
+		return typed(duckdb.TYPE_VARCHAR, copyStrings(func(a *array.LargeString, i int) []byte {
+			s := a.Value(i)
+			return unsafe.Slice(unsafe.StringData(s), len(s))
+		}))
+	case *arrow.BinaryType:
+		return typed(duckdb.TYPE_BLOB, copyStrings((*array.Binary).Value))
+	case *arrow.LargeBinaryType:
+		return typed(duckdb.TYPE_BLOB, copyStrings((*array.LargeBinary).Value))
 	case *arrow.Decimal128Type:
 		if dt.Precision < 1 || dt.Precision > 38 || dt.Scale < 0 || dt.Scale > dt.Precision {
 			break
 		}
 		info, err := duckdb.NewDecimalInfo(uint8(dt.Precision), uint8(dt.Scale))
-		if dt.Precision <= 18 {
-			return info, setOf(func(a *array.Decimal128, i int) int64 { return int64(a.Value(i).LowBits()) }), err
+		values := (*array.Decimal128).Values
+		// DuckDB keeps a decimal as the smallest integer its width fits.
+		switch {
+		case dt.Precision <= 4:
+			return info, copyConverted(values, func(v decimal128.Num) int16 { return int16(v.LowBits()) }), err
+		case dt.Precision <= 9:
+			return info, copyConverted(values, func(v decimal128.Num) int32 { return int32(v.LowBits()) }), err
+		case dt.Precision <= 18:
+			return info, copyConverted(values, func(v decimal128.Num) int64 { return int64(v.LowBits()) }), err
 		}
-		return info, setOf(func(a *array.Decimal128, i int) any { return a.Value(i).BigInt() }), err
+		// A HUGEINT: the low 64 bits, then the high, as decimal128.Num.
+		return info, copyFixed(values), err
 	}
 	return nil, nil, fmt.Errorf("type %s", dt)
 }
 
-// setOf is a columnSetter of arrays of type A, read by value, NULLs as
-// NULLs.
-func setOf[A arrow.Array, T any](value func(A, int) T) columnSetter {
-	return func(chunk *duckdb.DataChunk, col, row int, a arrow.Array, i int) error {
-		if a.IsNull(i) {
-			return chunk.SetValue(col, row, nil)
+// setNulls makes the values at of dst NULL where a, from its row from, is.
+func setNulls(dst duckdb.ChunkColumn, at int, a arrow.Array, from, n int) {
+	if a.NullN() == 0 {
+		return
+	}
+	for k := range n {
+		if a.IsNull(from + k) {
+			dst.SetNull(at + k)
 		}
-		return duckdb.SetChunkValue(*chunk, col, row, value(a.(A), i))
+	}
+}
+
+// copyFixed copies values of a type whose memory is DuckDB's, in bulk.
+func copyFixed[A arrow.Array, T any](values func(A) []T) columnCopy {
+	return func(dst duckdb.ChunkColumn, at int, a arrow.Array, from, n int) {
+		out := unsafe.Slice((*T)(dst.Data()), at+n)[at:]
+		copy(out, values(a.(A))[from:from+n])
+		setNulls(dst, at, a, from, n)
+	}
+}
+
+// copyConverted copies values converted one by one to DuckDB's type U.
+func copyConverted[A arrow.Array, T, U any](values func(A) []T, convert func(T) U) columnCopy {
+	return func(dst duckdb.ChunkColumn, at int, a arrow.Array, from, n int) {
+		out := unsafe.Slice((*U)(dst.Data()), at+n)[at:]
+		for k, v := range values(a.(A))[from : from+n] {
+			out[k] = convert(v)
+		}
+		setNulls(dst, at, a, from, n)
+	}
+}
+
+// copyBool copies booleans, which Arrow keeps a bit each and DuckDB a
+// byte.
+func copyBool(dst duckdb.ChunkColumn, at int, a arrow.Array, from, n int) {
+	b := a.(*array.Boolean)
+	out := unsafe.Slice((*bool)(dst.Data()), at+n)[at:]
+	for k := range n {
+		out[k] = b.Value(from + k)
+	}
+	setNulls(dst, at, a, from, n)
+}
+
+// copyStrings copies text or bytes: short values into the vector, longer
+// ones gathered for one call into DuckDB, which copies each.
+func copyStrings[A arrow.Array](value func(A, int) []byte) columnCopy {
+	var w *duckdb.Strings
+	return func(dst duckdb.ChunkColumn, at int, a arrow.Array, from, n int) {
+		arr := a.(A)
+		w = dst.Strings(w)
+		for k := range n {
+			if a.IsNull(from + k) {
+				dst.SetNull(at + k)
+				continue
+			}
+			w.Add(at+k, value(arr, from+k))
+		}
+		w.Flush()
 	}
 }
