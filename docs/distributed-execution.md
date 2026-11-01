@@ -1436,7 +1436,7 @@ On the Igloo server:
 | `IGLOO_WORKERS` | | Workers' addresses, `host[:port]` comma separated (port 7433 by default). A host may resolve to several workers, as a Kubernetes headless Service does. Empty turns distributed execution off. |
 | `IGLOO_WORKER_SECRET` | (required with workers) | At least 32 characters, the same on the server and the workers |
 | `IGLOO_WORKER_COMPUTE` | | How to start and stop workers: `kubernetes`, `ec2`, `command`, or empty when they always run |
-| `IGLOO_WORKER_MAX` | `4` | The most workers Igloo starts |
+| `IGLOO_WORKER_MAX` | `16` | The most workers Igloo starts, as it weighs how many a statement should run on |
 | `IGLOO_WORKER_IDLE_AFTER` | `auto` | Stop workers after this long without tasks; `auto` for three times what their last start took, from 2 to 10 minutes |
 | `IGLOO_WORKER_WARM` | `1` | While some workers work, how many idle ones past them stay up; the others stop alone, on Kubernetes and EC2 (see [idle workers](#idle-workers)); `off` stops workers only all together |
 | `IGLOO_WORKER_START_TIMEOUT` | `3m` | How long a statement waits for workers to start before it runs on the server instead |

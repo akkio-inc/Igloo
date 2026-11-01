@@ -734,6 +734,10 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   not complete while any could hold its rows. Workers also write `INSERT ... BY
   NAME` and of some of a table's columns, partitioned views' refreshes, and tables
   with NOT NULL or nested columns.
+- Igloo starts up to 16 workers by default, where it was 4 (`IGLOO_WORKER_MAX`,
+  `workers.maxReplicas`, `workers_max`): a report at ten times the data took 200 s
+  on 4 and 112 s on 8 at about the same cost. Auto mode weighs how many a statement
+  should run on, and idle workers stop on their own.
 - A statement whose last runs keep it on the replica no longer plans for workers
   again, so that planning it does not take longer than it does.
 - DuckDB's memory limit, where `IGLOO_DUCKDB_MEMORY_LIMIT` does not set it,

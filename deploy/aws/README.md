@@ -236,7 +236,7 @@ changes nothing. With it on, the module adds:
 
 | Node group | Capacity | Size | Runs |
 |---|---|---|---|
-| `workers-spot` (unless `workers_spot = false`) | Spot, any of `workers_instance_types` (`m7gd.4xlarge`, `m6gd.4xlarge`: 16 Graviton vCPUs, 64 GiB, 950 GB NVMe) | 0 to `workers_max` (4) | worker pods |
+| `workers-spot` (unless `workers_spot = false`) | Spot, any of `workers_instance_types` (`m7gd.4xlarge`, `m6gd.4xlarge`: 16 Graviton vCPUs, 64 GiB, 950 GB NVMe) | 0 to `workers_max` (16) | worker pods |
 | `workers-ondemand` | On-demand, the first type | 0 to `workers_max` | worker pods, when Spot has no capacity |
 | `large-worker-ondemand` (with `large_worker_enabled`) | On-demand, `r7gd.16xlarge` (64 vCPUs, 512 GiB, 2 x 1900 GB NVMe) | 0 to 1 | the large worker |
 | `large-worker-spot` (with `large_worker_spot` too) | Spot | 0 to 1 | the large worker, when Spot has capacity |
@@ -247,6 +247,12 @@ worker's, `large-worker`) and a `NoSchedule` taint, `igloo.dev/workers`
 worker pods select the label and tolerate the taint, which both groups of a
 kind share. Igloo pods, Lakekeeper and system pods stay on the default node
 group, on-demand unless `node_use_spot`: igloo pods hold client sessions.
+Sixteen workers take 256 vCPUs at once where a statement is worth it, and nothing
+when idle: check your account's quotas for Standard Spot and On-Demand instances (in
+Service Quotas, `L-34B43A08` and `L-1216C47A`), or lower `workers_max`. A node
+AWS refuses leaves its worker unstarted, and the statement runs on fewer, or on
+an igloo pod when `workers.startTimeout` runs out.
+
 One worker fills a node: its pod requests 90% of the first type's vCPUs and
 85% of its memory (`workers_cpu`, `workers_memory` override that), and its
 spill and read cache volumes take 55% and 25% of the instance store, which
@@ -311,7 +317,7 @@ and Spot runs 50 to 70% below on-demand, varying by zone and hour. Left at
 | `expose_sql`, `sql_allowed_cidrs`, `sql_load_balancer_internal` | `false`, none, `false` | SQL access from outside the cluster |
 | `cluster_endpoint_public_access_cidrs`, `cluster_admin_arns` | `["0.0.0.0/0"]`, none | Kubernetes API access |
 | `allowed_locations`, `igloo_additional_policy_arns` | none | Let users `COPY` from or to other buckets: list the `s3://` prefixes and attach an IAM policy granting the igloo role access to them |
-| `workers_enabled`, `workers_spot`, `workers_instance_types`, `workers_max` | `false`, `true`, `["m7gd.4xlarge", "m6gd.4xlarge"]`, 4 | [Distributed-execution workers](#distributed-execution-workers): Spot with an on-demand fallback |
+| `workers_enabled`, `workers_spot`, `workers_instance_types`, `workers_max` | `false`, `true`, `["m7gd.4xlarge", "m6gd.4xlarge"]`, 16 | [Distributed-execution workers](#distributed-execution-workers): Spot with an on-demand fallback |
 | `workers_cpu`, `workers_memory`, `workers_disk_size_gib`, `workers_price_per_hour` | 90% of vCPUs, 85% of memory, 100, 0 | Worker pod size, node root volume, price for auto mode |
 | `large_worker_enabled`, `large_worker_spot`, `large_worker_instance_types`, `large_worker_price_per_hour` | `false`, `false`, `["r7gd.16xlarge"]`, 0 | One large worker, on-demand by default |
 | `cluster_autoscaler_chart_version` | `9.59.0` | Cluster autoscaler 1.35, for `kubernetes_version` 1.35; keep the two minor versions together |

@@ -300,7 +300,7 @@ variable "workers_machine_family" {
 variable "workers_max" {
   description = "The most worker pods Igloo starts (the chart's workers.maxReplicas)."
   type        = number
-  default     = 4
+  default     = 16
 
   validation {
     condition     = var.workers_max >= 1 && var.workers_max <= 100 && floor(var.workers_max) == var.workers_max

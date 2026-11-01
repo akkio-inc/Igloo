@@ -172,7 +172,7 @@ psql "host=sql.example.com port=5432 user=igloo dbname=igloo sslmode=verify-full
 | `bucket_soft_delete_days` | `7` | Deleted objects stay recoverable this long |
 | `deletion_protection` | `true` | Protect the cluster and database from deletion |
 | `control_plane_authorized_cidrs` | `[]` | CIDRs allowed on the control plane's public IP endpoint (none needed; see below) |
-| `workers_enabled`, `workers_spot`, `workers_machine_family`, `workers_max` | `false`, `true`, `n4`, `4` | [Distributed-execution workers](#distributed-execution-workers): Spot first, on-demand when Spot has no capacity |
+| `workers_enabled`, `workers_spot`, `workers_machine_family`, `workers_max` | `false`, `true`, `n4`, `16` | [Distributed-execution workers](#distributed-execution-workers): Spot first, on-demand when Spot has no capacity |
 | `workers_cpu`, `workers_memory`, `workers_spill_size`, `workers_cache_size`, `workers_price_per_hour` | `14`, `54Gi`, `80Gi`, `28Gi`, `0` | Worker pod size, volumes and price |
 | `large_worker_enabled`, `large_worker_spot`, `large_worker_machine_type`, `large_worker_price_per_hour` | `false`, `false`, `n4-highmem-64`, `0` | One large worker, on-demand by default |
 
@@ -272,6 +272,11 @@ Google preempts a Spot node, its worker gets about 25 seconds to finish its
 tasks, and what it has not finished runs again on other workers. Worker
 nodes go away once Igloo stops idle workers; with a machine series named,
 Autopilot bills them per node.
+
+Sixteen workers take 256 vCPUs at once where a statement is worth it, and nothing
+when idle: check the region's `N4_CPUS` and `CPUS` quotas, `PREEMPTIBLE_CPUS` for
+Spot, or lower `workers_max`. A node Google refuses leaves its worker unstarted, and
+the statement runs on fewer, or on an igloo pod when `workers.startTimeout` runs out.
 
 Each worker requests 14 vCPUs and 54 GiB (`workers_cpu`, `workers_memory`),
 which Autopilot runs on a 16-vCPU machine of the series, and ephemeral

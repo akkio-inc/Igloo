@@ -228,7 +228,7 @@ func loadWorkers(lookup func(string) (string, bool), errs *[]error) Workers {
 		w.Large.Memory = n
 	}
 
-	v := get("IGLOO_WORKER_MAX", "4")
+	v := get("IGLOO_WORKER_MAX", "16")
 	n, err := strconv.Atoi(v)
 	if err != nil || n < 1 {
 		addErr("IGLOO_WORKER_MAX must be a positive integer, got %q", v)

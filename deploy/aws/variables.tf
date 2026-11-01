@@ -517,7 +517,7 @@ variable "workers_instance_types" {
 variable "workers_max" {
   description = "The most worker pods, and so worker nodes, Igloo starts (the chart's workers.maxReplicas)."
   type        = number
-  default     = 4
+  default     = 16
 
   validation {
     condition     = var.workers_max >= 1 && var.workers_max <= 100 && floor(var.workers_max) == var.workers_max

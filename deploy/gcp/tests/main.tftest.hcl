@@ -464,7 +464,7 @@ run "workers_on_spot_with_on_demand_fallback" {
   assert {
     condition = (
       yamldecode(helm_release.igloo[0].values[0]).workers.enabled == true &&
-      yamldecode(helm_release.igloo[0].values[0]).workers.maxReplicas == 4 &&
+      yamldecode(helm_release.igloo[0].values[0]).workers.maxReplicas == 16 &&
       yamldecode(helm_release.igloo[0].values[0]).workers.pricePerHour == 0.25 &&
       yamldecode(helm_release.igloo[0].values[0]).workers.instanceType == "n4-standard-16" &&
       yamldecode(helm_release.igloo[0].values[0]).workers.spot == true &&

@@ -482,7 +482,7 @@ run "workers_on_spot_with_on_demand_fallback" {
       keys(output.worker_node_groups) == ["workers-ondemand", "workers-spot"] &&
       output.worker_node_groups["workers-spot"].capacity_type == "SPOT" &&
       output.worker_node_groups["workers-ondemand"].capacity_type == "ON_DEMAND" &&
-      alltrue([for g in output.worker_node_groups : g.min_size == 0 && g.max_size == 4 && g.instance_types == tolist(["m7gd.4xlarge", "m6gd.4xlarge"])])
+      alltrue([for g in output.worker_node_groups : g.min_size == 0 && g.max_size == 16 && g.instance_types == tolist(["m7gd.4xlarge", "m6gd.4xlarge"])])
     )
     error_message = "Workers must get a Spot node group and an on-demand one to fall back to, both from zero to workers_max nodes."
   }
@@ -504,7 +504,7 @@ run "workers_on_spot_with_on_demand_fallback" {
   assert {
     condition = (
       yamldecode(helm_release.igloo[0].values[0]).workers.enabled == true &&
-      yamldecode(helm_release.igloo[0].values[0]).workers.maxReplicas == 4 &&
+      yamldecode(helm_release.igloo[0].values[0]).workers.maxReplicas == 16 &&
       yamldecode(helm_release.igloo[0].values[0]).workers.pricePerHour == 0.35 &&
       yamldecode(helm_release.igloo[0].values[0]).workers.instanceType == "m7gd.4xlarge" &&
       yamldecode(helm_release.igloo[0].values[0]).workers.spot == true &&
@@ -536,8 +536,8 @@ run "workers_on_spot_with_on_demand_fallback" {
   assert {
     condition = (
       yamldecode(helm_release.cluster_autoscaler[0].values[0]).autoscalingGroups == [
-        { name = "eks-workers-ondemand-4567", minSize = 0, maxSize = 4 },
-        { name = "eks-workers-spot-0123", minSize = 0, maxSize = 4 },
+        { name = "eks-workers-ondemand-4567", minSize = 0, maxSize = 16 },
+        { name = "eks-workers-spot-0123", minSize = 0, maxSize = 16 },
       ] &&
       helm_release.cluster_autoscaler[0].namespace == "kube-system" &&
       helm_release.cluster_autoscaler[0].version == "9.59.0"

@@ -540,7 +540,7 @@ workers:
 | `pricePerHour` | `0` | `IGLOO_PRICE_PER_HOUR`: what one igloo pod's machine costs an hour, for `igloo.usage`; `0` is unknown |
 | `pools` | `[]` | [Compute pools](#compute-pools), each with `name` and the overrides listed there |
 | `workers.enabled` | `false` | [Distributed execution](#distributed-execution) on worker pods |
-| `workers.maxReplicas` | `4` | `IGLOO_WORKER_MAX`: the most worker pods igloo starts |
+| `workers.maxReplicas` | `16` | `IGLOO_WORKER_MAX`: the most worker pods igloo starts |
 | `workers.idleAfter` | `auto` | `IGLOO_WORKER_IDLE_AFTER`: stop workers after this long without tasks; `auto` for three times their last start, from 2 to 10 minutes |
 | `workers.startTimeout` | `3m` | `IGLOO_WORKER_START_TIMEOUT`: how long a statement waits for workers to start |
 | `workers.exchanges` | `object` | `IGLOO_EXCHANGES`: where workers exchange rows; `local` lets workers reach each other's task port and splits the spill volume 60% spill, 30% exchanges (`IGLOO_EXCHANGE_MAX_SIZE`) |

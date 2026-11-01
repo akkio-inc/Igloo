@@ -97,7 +97,7 @@ documented in [variables.tf](variables.tf).
 | Kubernetes Secrets | `igloo-admin`, `igloo-database`, `igloo-catalog-encryption` (+ `igloo-tls`) | Generated passwords and keys; the chart reads them by name. |
 | Helm release | `igloo` from `deploy/helm/igloo` | Skipped with `install_chart = false`; the `helm_values` output holds the values. |
 | Public IP | only with `expose_sql` | Static, so the address survives chart reinstalls. |
-| Worker node pools | only with `workers_enabled` | `workerspot` (Spot) and `workerreg` (Regular), `Standard_D16pds_v6` × 0-4, for [distributed-execution workers](#distributed-execution-workers); with `large_worker_enabled`, `largereg` (`Standard_E64pds_v6` × 0-1). The cluster autoscaler then uses the priority expander. |
+| Worker node pools | only with `workers_enabled` | `workerspot` (Spot) and `workerreg` (Regular), `Standard_D16pds_v6` × 0-16, for [distributed-execution workers](#distributed-execution-workers); with `large_worker_enabled`, `largereg` (`Standard_E64pds_v6` × 0-1). The cluster autoscaler then uses the priority expander. |
 
 ### Role assignments
 
@@ -239,7 +239,11 @@ default size keeps its nodes, and its managed OS disks, with
 parts on worker pods ([distributed execution](../../docs/distributed-execution.md)).
 It is off by default, so applying this version to an existing deployment
 changes nothing. With it on, the module adds two node pools for workers,
-both autoscaling from zero nodes to `workers_max` (4):
+both autoscaling from zero nodes to `workers_max` (16), which is 256 vCPUs at once
+where a statement is worth it, and nothing when idle: check the `Standard DPDSv6
+Family` and low-priority quotas above, or lower `workers_max`. A node Azure refuses
+leaves its worker unstarted, and the statement runs on fewer, or on an igloo pod
+when `workers.startTimeout` runs out. The pools:
 
 Workers have a workload identity of their own: they read the warehouse, and
 may only create files, in `_igloo_shuffle/` and statements' directories
