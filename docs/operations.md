@@ -704,6 +704,10 @@ more than DuckDB alone.
   warning: each statement then reads ahead at most 256 MiB in all, and
   never more than its share of the cache's free room, so reading ahead
   evicts nothing; with a full cache it reads nothing ahead.
+- A statement reads ahead a file only if no statement has for the same
+  columns within the hour: what was read is in the cache, as long as the cache
+  keeps it, and looking again means parsing the file's footer and asking the
+  file system for each of its blocks.
 - A block it has not fetched yet, or fails to, DuckDB fetches itself:
   prefetch only ever costs requests. Overfetch, blocks it read that the
   scans did not, shows in `igloo_prefetch_unread_bytes_total`, next to

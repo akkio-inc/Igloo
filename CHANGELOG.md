@@ -1908,6 +1908,9 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   large dashboard's statements learned under a twentieth of what they
   allocated, started beside the heavy ones next time and spilled. Runs
   cancelled after ten seconds or more count as needing all the memory.
+- A statement reads ahead only the files no statement has lately for the same
+  columns: a dashboard's 96 queries, in cache, each parsed the footers of every
+  file they read and asked for each of their blocks.
 - Queries with no policies to apply are prepared side by side from start to
   end, rather than each take the catalog lock exclusively at the last step:
   of the 60 s a dashboard's 136 prepares took, 50 s went waiting there.

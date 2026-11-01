@@ -232,6 +232,57 @@ func TestColumns(t *testing.T) {
 	}
 }
 
+// TestReadAheadOnce checks that a file a statement read ahead is not looked at
+// again for the same columns, that it is for others, and that it is after Hold,
+// which empties the cache.
+func TestReadAheadOnce(t *testing.T) {
+	local := testFile(t, 200000, 10000)
+	st, _ := os.Stat(local)
+	const path, etag, block = "s3://bucket/t/data/f.parquet", `"v1"`, 64 << 10
+	dir := t.TempDir()
+	var opens atomic.Int64
+	p, err := New(Options{Dir: dir, BlockSize: block, Concurrency: 8, Open: func(ctx context.Context, _ string) (Object, error) {
+		opens.Add(1)
+		f, err := os.Open(local)
+		return &localObject{File: f, etag: etag}, err
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.Close()
+	scan := func(ids ...int32) Scan { return Scan{Files: []File{{Path: path, Size: st.Size()}}, FieldIDs: ids} }
+	start := func(sc Scan) {
+		t.Helper()
+		stop := p.Start(context.Background(), []Scan{sc})
+		key := path + "\x00" + readColumns(sc)
+		waitFor(t, "the file read ahead", func() bool { return p.alreadyRead(key) })
+		stop()
+	}
+	start(scan(2))
+	if opens.Load() == 0 {
+		t.Fatal("the first statement fetched nothing")
+	}
+	looked := testutil.ToFloat64(p.present) + testutil.ToFloat64(p.blocks)
+	stop := p.Start(context.Background(), []Scan{scan(2)})
+	time.Sleep(100 * time.Millisecond)
+	stop()
+	if got := testutil.ToFloat64(p.present) + testutil.ToFloat64(p.blocks); got != looked {
+		t.Errorf("the next statement of the same columns looked at %v blocks", got-looked)
+	}
+	start(scan(3))
+	if got := testutil.ToFloat64(p.present) + testutil.ToFloat64(p.blocks); got == looked {
+		t.Error("a statement of other columns looked at no block")
+	}
+	looked = testutil.ToFloat64(p.present) + testutil.ToFloat64(p.blocks)
+	if err := p.Hold(func() error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+	start(scan(2))
+	if got := testutil.ToFloat64(p.present) + testutil.ToFloat64(p.blocks); got == looked {
+		t.Error("after Hold, a statement looked at no block")
+	}
+}
+
 // withTracking makes p tell the blocks DuckDB read as mode says, or skips
 // the test where the platform or the file system cannot.
 func withTracking(t *testing.T, p *Prefetcher, mode tracking) {
