@@ -576,6 +576,44 @@ run "workers_on_spot_with_on_demand_fallback" {
   }
 }
 
+run "workers_write_with_no_right_of_their_own" {
+  command = plan
+
+  variables {
+    workers_enabled = true
+  }
+
+  override_resource {
+    target = aws_iam_role.worker[0]
+    values = { arn = "arn:aws:iam::123456789012:role/igloo-worker" }
+  }
+
+  assert {
+    condition     = yamldecode(helm_release.igloo[0].values[0]).workers.serviceAccount.name == "igloo-worker" && yamldecode(helm_release.igloo[0].values[0]).workers.serviceAccount.annotations["eks.amazonaws.com/role-arn"] == "arn:aws:iam::123456789012:role/igloo-worker"
+    error_message = "Workers must have a service account and role of their own."
+  }
+
+  assert {
+    condition     = endswith(jsondecode(aws_iam_role.worker[0].assume_role_policy).Statement[0].Condition.StringEquals[keys(jsondecode(aws_iam_role.worker[0].assume_role_policy).Statement[0].Condition.StringEquals)[1]], "system:serviceaccount:igloo:igloo-worker") || endswith(jsondecode(aws_iam_role.worker[0].assume_role_policy).Statement[0].Condition.StringEquals[keys(jsondecode(aws_iam_role.worker[0].assume_role_policy).Statement[0].Condition.StringEquals)[0]], "system:serviceaccount:igloo:igloo-worker")
+    error_message = "Only the workers' service account may assume their role."
+  }
+
+  # Writes: only exchanges. No delete anywhere, and nothing that writes a
+  # table's location.
+  assert {
+    condition = alltrue([
+      for s in jsondecode(aws_iam_role_policy.worker_warehouse[0].policy).Statement :
+      endswith(s.Resource, "/warehouse/_igloo_shuffle/*") if can(s.Action[0])
+    ]) && !strcontains(aws_iam_role_policy.worker_warehouse[0].policy, "DeleteObject")
+    error_message = "The workers' role may write only under _igloo_shuffle, and delete nothing."
+  }
+
+  assert {
+    condition     = !strcontains(aws_iam_role_policy.worker_warehouse[0].policy, "sts:AssumeRole") && jsondecode(aws_iam_role.engines.assume_role_policy).Statement[0].Principal.AWS == aws_iam_role.service["igloo"].arn
+    error_message = "Workers must not be able to assume the role table files are written with."
+  }
+}
+
 run "workers_on_demand_without_instance_store" {
   command = plan
 

@@ -496,6 +496,34 @@ run "workers_on_spot_with_on_demand_fallback" {
   }
 }
 
+run "workers_have_an_identity_of_their_own" {
+  command = plan
+
+  variables {
+    workers_enabled = true
+  }
+
+  override_resource {
+    target = google_service_account.worker[0]
+    values = { email = "igloo-worker@test.iam.gserviceaccount.com", member = "serviceAccount:igloo-worker@test.iam.gserviceaccount.com", name = "projects/test/serviceAccounts/igloo-worker@test.iam.gserviceaccount.com" }
+  }
+
+  assert {
+    condition     = yamldecode(helm_release.igloo[0].values[0]).workers.serviceAccount.name == "igloo-worker" && yamldecode(helm_release.igloo[0].values[0]).workers.serviceAccount.annotations["iam.gke.io/gcp-service-account"] == "igloo-worker@test.iam.gserviceaccount.com" && yamldecode(helm_release.igloo[0].values[0]).workers.storage.gcs.existingSecret == "igloo-gcs-hmac-worker"
+    error_message = "Workers must have a service account and an HMAC key of their own."
+  }
+
+  assert {
+    condition     = google_storage_bucket_iam_member.worker_write[0].role == "roles/storage.objectCreator" && strcontains(google_storage_bucket_iam_member.worker_write[0].condition[0].expression, "igloo-write-[0-9a-f]+/") && strcontains(google_storage_bucket_iam_member.worker_write[0].condition[0].expression, "_igloo_shuffle/")
+    error_message = "Workers may only create objects, in exchanges and statements' directories."
+  }
+
+  assert {
+    condition     = length(google_storage_bucket_iam_member.worker_read) == 2 && !contains([for g in google_storage_bucket_iam_member.worker_read : g.role], "roles/storage.objectAdmin")
+    error_message = "Workers read the rest of the bucket, and may not change it."
+  }
+}
+
 run "workers_on_demand_only" {
   command = plan
 

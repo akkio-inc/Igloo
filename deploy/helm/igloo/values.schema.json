@@ -1020,6 +1020,67 @@
           "type": "string",
           "pattern": "^([0-9]+(\\.[0-9]+)?(ns|us|\u00b5s|ms|s|m|h))+$"
         },
+        "writes": {
+          "description": "Whether workers write tables' files themselves: auto where they have an identity of their own.",
+          "enum": [
+            "auto",
+            true,
+            false
+          ]
+        },
+        "serviceAccount": {
+          "description": "The workers' own service account, with a narrower cloud identity than the igloo pods'.",
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "create": {
+              "type": "boolean"
+            },
+            "name": {
+              "type": "string"
+            },
+            "annotations": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              }
+            }
+          }
+        },
+        "storage": {
+          "description": "Static keys for workers in place of storage.*.existingSecret.",
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "s3": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "existingSecret": {
+                  "type": "string"
+                }
+              }
+            },
+            "gcs": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "existingSecret": {
+                  "type": "string"
+                }
+              }
+            },
+            "azure": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "existingSecret": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
         "exchanges": {
           "description": "Where workers exchange rows: object storage, or their own disks.",
           "enum": [

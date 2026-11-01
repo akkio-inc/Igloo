@@ -93,6 +93,15 @@ locals {
         instanceType = var.workers_vm_size
         spot         = var.workers_spot
         region       = var.location
+        # An identity of their own (see identity.tf).
+        serviceAccount = {
+          create = true
+          name   = var.worker_service_account_name
+          annotations = {
+            "azure.workload.identity/client-id" = one(azurerm_user_assigned_identity.worker[*].client_id)
+          }
+        }
+        podLabels = local.workload_identity_label
         large = merge(
           { enabled = var.large_worker_enabled },
           { for k, v in merge(local.worker_chart_values["large"], { pricePerHour = var.large_worker_price_per_hour, instanceType = var.large_worker_vm_size, spot = var.large_worker_spot }) : k => v if var.large_worker_enabled },

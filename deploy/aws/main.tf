@@ -43,6 +43,7 @@ locals {
   # explicitly so the IAM trust policies below can name them.
   igloo_service_account   = "igloo"
   catalog_service_account = "igloo-catalog"
+  worker_service_account  = "igloo-worker"
   release_name            = "igloo"
   sql_service_name        = local.release_name
 

@@ -471,6 +471,34 @@ run "workers_on_spot_with_regular_fallback" {
   }
 }
 
+run "workers_have_an_identity_of_their_own" {
+  command = plan
+
+  variables {
+    workers_enabled = true
+  }
+
+  override_resource {
+    target = azurerm_user_assigned_identity.worker[0]
+    values = { id = "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/igloo-rg/providers/Microsoft.ManagedIdentity/userAssignedIdentities/igloo-worker", client_id = "00000000-0000-0000-0000-000000000042", principal_id = "00000000-0000-0000-0000-000000000043" }
+  }
+
+  assert {
+    condition     = yamldecode(helm_release.igloo[0].values[0]).workers.serviceAccount.name == "igloo-worker" && yamldecode(helm_release.igloo[0].values[0]).workers.serviceAccount.annotations["azure.workload.identity/client-id"] == "00000000-0000-0000-0000-000000000042" && yamldecode(helm_release.igloo[0].values[0]).workers.podLabels["azure.workload.identity/use"] == "true"
+    error_message = "Workers must have a service account and workload identity of their own."
+  }
+
+  assert {
+    condition     = azurerm_federated_identity_credential.worker[0].subject == "system:serviceaccount:igloo:igloo-worker"
+    error_message = "Only the workers' service account may act as their identity."
+  }
+
+  assert {
+    condition     = azurerm_role_assignment.worker_read[0].role_definition_name == "Storage Blob Data Reader" && azurerm_role_assignment.worker_write[0].condition_version == "2.0" && strcontains(azurerm_role_assignment.worker_write[0].condition, "StringLike 'warehouse/*/data/igloo-write-*'") && strcontains(azurerm_role_assignment.worker_write[0].condition, "StringLike 'warehouse/_igloo_shuffle/*'") && strcontains(azurerm_role_assignment.worker_write[0].condition, "(!(ActionMatches{'Microsoft.Storage/storageAccounts/blobServices/containers/blobs/delete'})) AND")
+    error_message = "Workers may change only exchanges and statements' directories, and delete nothing."
+  }
+}
+
 run "workers_on_regular_vms_only" {
   command = plan
 

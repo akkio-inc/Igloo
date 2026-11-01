@@ -103,6 +103,18 @@ render "${bundled[@]}" --set workers.enabled=true --set workers.exchanges=local 
 check "exchanges through object storage by default" '"object"' \
   "$(docf "$work/object.yaml" Deployment igloo | grep -A1 -E '^ +- name: IGLOO_EXCHANGES$' | sed -n 's/^ *value: //p')"
 check "workers take tasks from igloo pods only" "server" "$(admitted "$work/object.yaml")"
+writes_env() { docf "$1" Deployment igloo | grep -A1 -E '^ +- name: IGLOO_WORKER_WRITES$' | sed -n 's/^ *value: //p'; }
+sa_of() { docf "$1" Deployment igloo-workers | sed -n 's/^ *serviceAccountName: //p'; }
+check "workers with the igloo pods' identity write no table's files" '"off"|igloo' "$(writes_env "$work/object.yaml")|$(sa_of "$work/object.yaml")"
+render "${bundled[@]}" --set workers.enabled=true --set workers.serviceAccount.create=true \
+  --set 'workers.serviceAccount.annotations.eks\.amazonaws\.com/role-arn=arn:aws:iam::123456789012:role/w' >"$work/own-sa.yaml"
+check "workers with an identity of their own write them" '"on"|igloo-worker' "$(writes_env "$work/own-sa.yaml")|$(sa_of "$work/own-sa.yaml")"
+check "their service account carries its annotations" 'eks.amazonaws.com/role-arn: arn:aws:iam::123456789012:role/w' \
+  "$(docf "$work/own-sa.yaml" ServiceAccount igloo-worker | grep -o 'eks.amazonaws.com/role-arn: .*')"
+render "${bundled[@]}" --set workers.enabled=true --set workers.writes=true >"$work/writes-on.yaml"
+check "workers.writes true turns them on" '"on"' "$(writes_env "$work/writes-on.yaml")"
+render "${bundled[@]}" --set workers.enabled=true --set workers.serviceAccount.create=true --set workers.writes=false >"$work/writes-off.yaml"
+check "workers.writes false turns them off" '"off"' "$(writes_env "$work/writes-off.yaml")"
 check "workers.exchanges local sets IGLOO_EXCHANGES" '"local"' \
   "$(docf "$work/local.yaml" Deployment igloo | grep -A1 -E '^ +- name: IGLOO_EXCHANGES$' | sed -n 's/^ *value: //p')"
 check "and lets workers reach each other's task port" "server worker" "$(admitted "$work/local.yaml")"

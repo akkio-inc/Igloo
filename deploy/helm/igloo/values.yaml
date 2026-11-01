@@ -425,6 +425,33 @@ workers:
   # lets workers reach each other's task port, and the spill volume is split:
   # 60% for spill, 30% for exchanges, rather than 90% for spill).
   exchanges: object
+  # Whether workers write a table's files for statements that fill it from a
+  # query, under a directory of the statement's, which igloo pods commit after
+  # checking each file -> IGLOO_WORKER_WRITES (docs/distributed-execution.md):
+  # true, false, or auto: when workers have an identity of their own
+  # (serviceAccount.create or .name, or storage.*.existingSecret below), so
+  # that they are not holding the igloo pods' right to write the whole warehouse.
+  writes: auto
+  # The workers' own service account, so that their cloud identity can be
+  # narrower than the igloo pods': read the warehouse, write _igloo_shuffle/
+  # and, unless igloo pods can make credentials for a statement's directory
+  # (storage.s3.stsRoleArn on S3), directories named igloo-write-* under
+  # tables' locations. The OpenTofu modules make such an identity. With neither
+  # create nor name, workers use the igloo pods' account.
+  serviceAccount:
+    create: false
+    # Defaults to <fullname>-worker.
+    name: ""
+    annotations: {}
+  # Static keys for workers in place of storage.*.existingSecret, for the same
+  # reason (same keys in each Secret as there).
+  storage:
+    s3:
+      existingSecret: ""
+    gcs:
+      existingSecret: ""
+    azure:
+      existingSecret: ""
   # Secret with key "secret" (at least 32 characters) -> IGLOO_WORKER_SECRET,
   # which igloo and workers authenticate each other with. Generated and kept
   # across upgrades when empty.

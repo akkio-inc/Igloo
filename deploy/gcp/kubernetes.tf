@@ -68,6 +68,21 @@ resource "kubernetes_secret_v1" "gcs_hmac" {
   }
 }
 
+# The workers' key: read, and create objects in exchanges and statements'
+# directories only (see storage.tf).
+resource "kubernetes_secret_v1" "worker_hmac" {
+  count = var.workers_enabled ? 1 : 0
+
+  metadata {
+    name      = local.secret_names.worker_hmac
+    namespace = kubernetes_namespace_v1.igloo.metadata[0].name
+  }
+  data = {
+    hmac-key-id = google_storage_hmac_key.worker[0].access_id
+    hmac-secret = google_storage_hmac_key.worker[0].secret
+  }
+}
+
 resource "kubernetes_secret_v1" "tls" {
   count = local.tls_enabled ? 1 : 0
 

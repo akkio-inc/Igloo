@@ -132,6 +132,14 @@ locals {
         instanceType = var.workers_instance_types[0]
         spot         = var.workers_spot
         region       = var.region
+        # A role of their own, which writes no table's files (see iam.tf).
+        serviceAccount = {
+          create = true
+          name   = local.worker_service_account
+          annotations = {
+            "eks.amazonaws.com/role-arn" = one(aws_iam_role.worker[*].arn)
+          }
+        }
         large = merge(
           { enabled = var.large_worker_enabled },
           { for k, v in merge(local.worker_chart_values["large"], { pricePerHour = var.large_worker_price_per_hour, instanceType = var.large_worker_instance_types[0], spot = var.large_worker_spot }) : k => v if var.large_worker_enabled },

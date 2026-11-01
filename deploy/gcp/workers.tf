@@ -93,6 +93,15 @@ locals {
         instanceType = local.workers_machine_type
         spot         = var.workers_spot
         region       = var.region
+        # An identity of their own (see storage.tf).
+        serviceAccount = {
+          create = true
+          name   = local.worker_ksa
+          annotations = {
+            "iam.gke.io/gcp-service-account" = one(google_service_account.worker[*].email)
+          }
+        }
+        storage = { gcs = { existingSecret = local.secret_names.worker_hmac } }
         large = merge(
           { enabled = var.large_worker_enabled },
           { for k, v in merge(local.worker_chart_values["large"], { pricePerHour = var.large_worker_price_per_hour, instanceType = var.large_worker_machine_type, spot = var.large_worker_spot }) : k => v if var.large_worker_enabled },

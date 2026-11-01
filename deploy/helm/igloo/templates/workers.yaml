@@ -41,10 +41,11 @@ spec:
         {{- toYaml . | nindent 8 }}
         {{- end }}
     spec:
-      # The igloo pods' account: workers read the same object storage, with
-      # the same cloud identity. They never call the Kubernetes API, so they
-      # get no token for the scaling permission igloo pods have.
-      serviceAccountName: {{ include "igloo.serviceAccountName" . }}
+      # Their own account with workers.serviceAccount, whose cloud identity
+      # can be narrower; otherwise the igloo pods'. They never call the
+      # Kubernetes API, so they get no token for the scaling permission igloo
+      # pods have.
+      serviceAccountName: {{ include "igloo.workerServiceAccountName" . }}
       automountServiceAccountToken: false
       enableServiceLinks: false
       {{- include "igloo.imagePullSecrets" . | nindent 6 }}

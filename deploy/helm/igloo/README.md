@@ -544,6 +544,9 @@ workers:
 | `workers.idleAfter` | `auto` | `IGLOO_WORKER_IDLE_AFTER`: stop workers after this long without tasks; `auto` for three times their last start, from 2 to 10 minutes |
 | `workers.startTimeout` | `3m` | `IGLOO_WORKER_START_TIMEOUT`: how long a statement waits for workers to start |
 | `workers.exchanges` | `object` | `IGLOO_EXCHANGES`: where workers exchange rows; `local` lets workers reach each other's task port and splits the spill volume 60% spill, 30% exchanges (`IGLOO_EXCHANGE_MAX_SIZE`) |
+| `workers.writes` | `auto` | `IGLOO_WORKER_WRITES`: whether workers write a table's files for statements that fill it from a query, under a directory of the statement's, which igloo pods commit after checking each file ([docs](../../../docs/distributed-execution.md#workers-writing-tables)); `auto` is on where workers have an identity of their own (the next two rows), `true` or `false` otherwise |
+| `workers.serviceAccount.create` / `name` / `annotations` | `false` / `<fullname>-worker` / `{}` | The workers' own service account, whose cloud identity should read the warehouse and write only `_igloo_shuffle/`, and `igloo-write-*` directories under tables' locations unless `storage.s3.stsRoleArn` is set; the OpenTofu modules make it. Without `create` or `name`, workers use the igloo pods' account, with its right to write the whole warehouse |
+| `workers.storage.s3.existingSecret`, `gcs`, `azure` | `""` | Static keys for workers in place of `storage.*.existingSecret`, for the same reason |
 | `workers.existingSecret` | `""` | Secret with key `secret` (32+ characters) for `IGLOO_WORKER_SECRET`; generated and kept when empty |
 | `workers.duckdb.memoryLimit`, `threads` | `""`, `null` | As `duckdb.*`, from `workers.resources`; null threads: four per core |
 | `workers.duckdb.spillVolume.sizeLimit` / `medium` | `100Gi` / `""` | Workers' spill `emptyDir`; `IGLOO_DUCKDB_MAX_TEMP_SIZE` is 90% of it |

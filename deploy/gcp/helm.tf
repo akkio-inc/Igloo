@@ -128,6 +128,8 @@ resource "helm_release" "igloo" {
     kubernetes_secret_v1.database,
     kubernetes_secret_v1.catalog_encryption_key,
     kubernetes_secret_v1.gcs_hmac,
+    kubernetes_secret_v1.worker_hmac,
+    google_service_account_iam_member.worker_workload_identity,
     kubernetes_secret_v1.tls,
     google_storage_bucket_iam_member.warehouse,
     google_service_account_iam_member.igloo_workload_identity,

@@ -438,6 +438,17 @@ variable "catalog_service_account_name" {
   }
 }
 
+variable "worker_service_account_name" {
+  description = "Kubernetes service account for worker pods, with workers_enabled. Its Azure workload identity is bound to exactly this name."
+  type        = string
+  default     = "igloo-worker"
+
+  validation {
+    condition     = can(regex("^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$", var.worker_service_account_name)) && var.worker_service_account_name != var.igloo_service_account_name && var.worker_service_account_name != var.catalog_service_account_name
+    error_message = "worker_service_account_name must be a DNS label and differ from igloo_service_account_name and catalog_service_account_name."
+  }
+}
+
 variable "install_chart" {
   description = "Install the Igloo Helm chart. Set to false to create only the infrastructure, namespace and Secrets, then install the chart yourself with the helm_values output."
   type        = bool

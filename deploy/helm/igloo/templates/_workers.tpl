@@ -208,6 +208,8 @@ rounded down and at least 1; empty when neither is set. Call with
   value: {{ .Values.workers.startTimeout | quote }}
 - name: IGLOO_EXCHANGES
   value: {{ .Values.workers.exchanges | default "object" | quote }}
+- name: IGLOO_WORKER_WRITES
+  value: {{ include "igloo.workerWrites" . | quote }}
 {{- with .Values.workers.pricePerHour }}
 - name: IGLOO_WORKER_PRICE_PER_HOUR
   value: {{ . | toString | quote }}
@@ -297,7 +299,7 @@ rounded down and at least 1; empty when neither is set. Call with
   value: {{ .Values.storage.s3.urlStyle | quote }}
 - name: IGLOO_S3_USE_SSL
   value: {{ .Values.storage.s3.useSSL | quote }}
-{{- with .Values.storage.s3.existingSecret }}
+{{- with (.Values.workers.storage.s3.existingSecret | default .Values.storage.s3.existingSecret) }}
 - name: IGLOO_S3_ACCESS_KEY_ID
   valueFrom:
     secretKeyRef:
@@ -310,7 +312,7 @@ rounded down and at least 1; empty when neither is set. Call with
       key: secret-access-key
 {{- end }}
 {{- end }}
-{{- with .Values.storage.gcs.existingSecret }}
+{{- with (.Values.workers.storage.gcs.existingSecret | default .Values.storage.gcs.existingSecret) }}
 - name: IGLOO_GCS_HMAC_KEY_ID
   valueFrom:
     secretKeyRef:
@@ -322,7 +324,7 @@ rounded down and at least 1; empty when neither is set. Call with
       name: {{ . }}
       key: hmac-secret
 {{- end }}
-{{- with .Values.storage.azure.existingSecret }}
+{{- with (.Values.workers.storage.azure.existingSecret | default .Values.storage.azure.existingSecret) }}
 - name: IGLOO_AZURE_ACCOUNT_KEY
   valueFrom:
     secretKeyRef:

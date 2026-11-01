@@ -89,6 +89,26 @@ Images and service accounts
 {{- printf "%s:%s" .Values.catalog.image.repository (toString .Values.catalog.image.tag) -}}
 {{- end -}}
 
+{{/* The workers' service account: their own, or the igloo pods'. */}}
+{{- define "igloo.workerServiceAccountName" -}}
+{{- if .Values.workers.serviceAccount.create -}}
+{{- default (printf "%s-worker" (include "igloo.fullname" .)) .Values.workers.serviceAccount.name -}}
+{{- else if .Values.workers.serviceAccount.name -}}
+{{- .Values.workers.serviceAccount.name -}}
+{{- else -}}
+{{- include "igloo.serviceAccountName" . -}}
+{{- end -}}
+{{- end -}}
+
+{{/* on or off, for IGLOO_WORKER_WRITES: see workers.writes in values.yaml. */}}
+{{- define "igloo.workerWrites" -}}
+{{- $w := .Values.workers.writes | toString | lower -}}
+{{- $own := or .Values.workers.serviceAccount.create .Values.workers.serviceAccount.name .Values.workers.storage.s3.existingSecret .Values.workers.storage.gcs.existingSecret .Values.workers.storage.azure.existingSecret -}}
+{{- if or (eq $w "true") (eq $w "on") (and (eq $w "auto") $own) -}}on{{- else if or (eq $w "false") (eq $w "off") (eq $w "auto") -}}off{{- else -}}
+{{- fail (printf "workers.writes must be auto, true or false, got %q" $w) -}}
+{{- end -}}
+{{- end -}}
+
 {{- define "igloo.serviceAccountName" -}}
 {{- if .Values.serviceAccount.create -}}
 {{- default (include "igloo.fullname" .) .Values.serviceAccount.name -}}
