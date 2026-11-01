@@ -889,7 +889,7 @@ func TestLocalEstimate(t *testing.T) {
 	h := newHarness(t, 0.01, 3, 2)
 	h.tables["lineitem"].Bytes = 1 << 30
 	_, err := h.co.Plan(t.Context(), `SELECT l_returnflag, count(*) FROM lineitem GROUP BY 1`, harnessEnv{h}, ModeAuto)
-	if d, ok := LocalEstimate(err); !ok || d <= 0 || !strings.Contains(err.Error(), "one machine is faster") {
+	if d, ok := LocalEstimate(err); !ok || d <= 0 || !strings.Contains(err.Error(), "auto mode chose one machine") {
 		t.Errorf("auto mode's choice of one machine: %v, %v %v", err, d, ok)
 	}
 	// The workers' estimate, which the guard waits for too.

@@ -604,6 +604,14 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   the fewest tasks. `EXPLAIN DISTRIBUTED` shows the choice (`fleet`) and
   the ways weighed (`options`), and `query_history.placement` where a
   statement ran and why (see [when](docs/distributed-execution.md#when)).
+- Auto mode's estimates count the client's taking a result's rows, either
+  way, where one machine's estimate of 361 million ordered rows was 30 s
+  against 516 s; a sort or window that holds half of the replica's room or
+  more runs on workers, where configured, unless they take a quarter
+  longer than one machine, as DuckDB's sort exceeds its limit by about 40%
+  and that one finished within 2 GB of the memory watch; and the reason
+  for running on the replica names the rule that decided, where "one
+  machine is faster: one machine should take 30 s and workers 22 s" did not.
 - A statement that fills a table from a query, `CREATE [OR REPLACE] TABLE
   ... AS` (dbt's table models too), `INSERT INTO ... SELECT` and a
   materialized view's or dynamic table's full refresh, runs its query on

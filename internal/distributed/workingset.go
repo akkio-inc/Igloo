@@ -238,6 +238,9 @@ type planEstimate struct {
 	// up to maxKeeps: about 1 for a copy, next to nothing for an
 	// aggregate's few groups.
 	keeps float64
+	// fields are its result's rows times its columns, which a read sends
+	// the client; sorted is what its largest sort or window holds.
+	fields, sorted float64
 }
 
 // maxKeeps is the most rows a result is taken to have for each row its
@@ -280,19 +283,26 @@ func planOf(plan string, st planStats) (planEstimate, error) {
 	}
 	w := &setWalker{st: st, ctes: map[string]cte{}}
 	var result float64
+	var columns int
 	aggregated := false
 	for _, r := range roots {
-		rows, _ := w.walk(r)
+		rows, cols := w.walk(r)
 		result = rows.ours
 		if result <= 0 {
 			result = rows.duck
 		}
+		columns = len(cols)
 		aggregated = topAggregate(r)
 	}
 	if w.unknown != "" {
 		return planEstimate{}, errors.New("no estimate of the rows of " + w.unknown)
 	}
-	out := planEstimate{parts: w.parts, work: w.work, bytes: w.bytes()}
+	out := planEstimate{parts: w.parts, work: w.work, bytes: w.bytes(), fields: result * float64(max(columns, 1))}
+	for _, p := range w.parts {
+		if op := strings.ToUpper(p.op); strings.Contains(op, "ORDER_BY") || strings.Contains(op, "WINDOW") {
+			out.sorted = max(out.sorted, p.bytes)
+		}
+	}
 	if w.scanned > 0 {
 		out.keeps = min(result/w.scanned, maxKeeps)
 		if aggregated {

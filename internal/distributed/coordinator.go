@@ -355,7 +355,7 @@ func (co *Coordinator) Plan(ctx context.Context, query string, env Env, mode Mod
 		return nil, err
 	}
 	if !d.onWorkers {
-		u := &errUnsupported{reason: "one machine is faster: " + d.reason, key: plan.Key, tookOnWorkers: d.tookOnWorkers}
+		u := &errUnsupported{reason: "auto mode chose one machine: " + d.reason, key: plan.Key, tookOnWorkers: d.tookOnWorkers}
 		if d.e.workers > 0 && !math.IsInf(d.e.onWorkers, 1) {
 			u.oneMachine, u.onWorkers = d.e.oneMachine, d.e.onWorkers
 		}
@@ -574,10 +574,13 @@ func (co *Coordinator) planOn(ctx context.Context, query string, env Env, mode M
 		// session plans it, read once for a statement run again.
 		p, ok := co.planSet(ctx, env, query, plan.Stages, r)
 		if ok && !dry && r.planSet != p.set {
-			co.history.update(plan.Key, func(r *runs) { r.planSet, r.planBytes, r.planWork, r.planKeeps = p.set, p.bytes, p.work, p.keeps })
+			co.history.update(plan.Key, func(r *runs) {
+				r.planSet, r.planBytes, r.planWork, r.planKeeps, r.planFields, r.planSorted = p.set, p.bytes, p.work, p.keeps, p.fields, p.sorted
+			})
 		}
 		x.planSet, x.planParts, x.planned = p.set*co.memory.scale(), p.parts, ok
 		x.planBytes, x.planWork, x.planKeeps = p.bytes, p.work, p.keeps
+		x.planFields, x.planSorted = p.fields, p.sorted*co.memory.scale()
 	}
 	if fe, ok := env.(Fills); ok {
 		x.fill = fe.Fill()
@@ -724,7 +727,7 @@ func (co *Coordinator) fleet(ctx context.Context, ws []*worker, mayStart, large 
 // operators hold, when it was read now.
 func (co *Coordinator) planSet(ctx context.Context, env Env, query string, stages []*Stage, r runs) (planEstimate, bool) {
 	if r.planSet > 0 {
-		return planEstimate{set: r.planSet, bytes: r.planBytes, work: r.planWork, keeps: r.planKeeps}, true
+		return planEstimate{set: r.planSet, bytes: r.planBytes, work: r.planWork, keeps: r.planKeeps, fields: r.planFields, sorted: r.planSorted}, true
 	}
 	ex, can := env.(Explainer)
 	if !can {

@@ -157,6 +157,11 @@ type estimate struct {
 	// others are the statements running on the replica beside it, which
 	// share its cores (see choose).
 	others int
+	// stream is how long the client takes its rows, either way (see
+	// clientFieldRate); sorted is what its largest sort or window holds,
+	// and risky says that is near the replica's room (see riskyShare).
+	stream, sorted float64
+	risky          bool
 	// options are the ways on workers weighed, dollars says their costs are
 	// in dollars, and fleet why the one in workers and large, picked, was
 	// chosen.
@@ -267,7 +272,28 @@ type features struct {
 	// (see fillCost).
 	fill      bool
 	planKeeps float64
+	// planFields are the fields of its result's rows, which a read sends
+	// the client (see clientFieldRate), and planSorted what its largest
+	// sort or window holds, by the plan (see riskyShare).
+	planFields, planSorted float64
 }
+
+const (
+	// clientFieldRate is the fields a second a client takes of a result:
+	// 361 million rows of four columns, ordered, took 516 s to reach it,
+	// and 36 million 49 s, about 2.8 million fields a second either way.
+	// One machine's estimate counted none of it, 30 s for the 516.
+	clientFieldRate = 2.8e6
+	// riskyShare is the share of this replica's room for a statement past
+	// which a sort or window, holding that much, is risky there: DuckDB's
+	// sort takes about 40% more memory than its limit, and a sort of 361
+	// million rows of four columns, held at about 20 GB in a room of 37,
+	// finished within 2 GB of the memory watch's cancel. riskyWithin is how
+	// many times one machine's time workers may take and still run such a
+	// statement, where workers are configured.
+	riskyShare  = 0.5
+	riskyWithin = 1.25
+)
 
 // Fills is an Env whose statement fills a table from the query planned,
 // as CREATE TABLE ... AS does: this replica writes the table from the
@@ -421,9 +447,18 @@ func (x features) estimate(m machine, f fleet) estimate {
 	e.local = spillOn(set, m.memory)
 	e.spills = e.local.factor > 1
 	e.oneMachine *= e.local.factor
-	// A fill's rows, written here wherever the query runs.
+	// A fill's rows, written here wherever the query runs; a read's, sent
+	// to the client, from here or from the workers' merge alike.
 	here, there := x.fillCost(m.cores)
+	if !x.fill && x.planned {
+		e.stream = x.planFields / clientFieldRate
+		here, there = e.stream, e.stream
+	}
 	e.oneMachine += here
+	// A sort or window that holds near the replica's room is risky there
+	// (see riskyShare).
+	e.sorted = x.planSorted
+	e.risky = x.planned && m.memory > 0 && x.planSorted >= riskyShare*memoryShare*float64(m.memory)
 	if there > 0 {
 		for i := range e.options {
 			e.options[i].estimate += there
@@ -763,7 +798,29 @@ func chooseShared(e estimate, r runs, found bool, threshold time.Duration, now t
 	// on the other side, and, on one machine, where it should fit.
 	tryWorkers := func(took float64) bool { return e.onWorkers < exploreWithin*took }
 	tryOne := func(took float64) bool {
-		return e.oneMachine < exploreWithin*took && !e.memory && !e.spills && !r.heavy
+		return e.oneMachine < exploreWithin*took && !e.memory && !e.spills && !r.heavy && !e.risky
+	}
+	// A sort or window near the replica's room: workers, where they are
+	// configured, unless they take riskyWithin times one machine's time.
+	risky := func(oneMachine float64) bool {
+		return e.risky && e.workers > 0 && e.onWorkers <= riskyWithin*oneMachine*share
+	}
+	riskyReason := func(what string) string {
+		return fmt.Sprintf("%s, and its sort holds %s, near the %s one machine has for it (DuckDB's sort takes more than its limit)",
+			what, gigabytes(int64(e.sorted)), gigabytes(int64(e.local.room)))
+	}
+	// Why one machine, by the rule that decided: its time oneMachine.
+	here := func(oneMachine float64) string {
+		t := oneMachine * share
+		switch {
+		case e.workers == 0 || math.IsInf(e.onWorkers, 1):
+			return fmt.Sprintf("one machine should take %.0f s, and no way on workers would finish", t)
+		case t <= limit && !e.spills:
+			return fmt.Sprintf("one machine should take %.0f s, within the %.0f s a statement must take for workers to be worth it", t, limit)
+		case faster > 1:
+			return fmt.Sprintf("workers should take %.0f s, not %.1f times as fast as one machine's %.0f s, as a statement running alone needs", e.onWorkers, faster, t)
+		}
+		return fmt.Sprintf("workers should take %.0f s, no faster than one machine's %.0f s, shared", e.onWorkers, t)
 	}
 	switch {
 	case found && r.outOfMemory && e.workers > 0:
@@ -777,8 +834,11 @@ func chooseShared(e estimate, r runs, found bool, threshold time.Duration, now t
 		// machine at 178 s.
 		return true, true, fmt.Sprintf("it ran in %.0f s on %d workers; trying %d once, estimated at %.0f s", r.dist, r.distWorkers, e.workers, e.onWorkers)
 	case found && r.local > 0 && r.dist > 0:
-		if r.dist < r.local*share {
+		switch {
+		case r.dist < r.local*share:
 			return true, false, fmt.Sprintf("it ran in %.0f s on workers and %.0f s on one machine", r.dist, r.local)
+		case e.risky && r.dist <= riskyWithin*r.local*share:
+			return true, false, riskyReason(fmt.Sprintf("it ran in %.0f s on workers and %.0f s on one machine", r.dist, r.local))
 		}
 		return false, false, fmt.Sprintf("it ran in %.0f s on one machine and %.0f s on workers", r.local, r.dist)
 	case found && r.local > 0:
@@ -791,6 +851,8 @@ func chooseShared(e estimate, r runs, found bool, threshold time.Duration, now t
 			return false, false, fmt.Sprintf("it ran in %.0f s on one machine, well under the %.0f s estimated", r.local, e.oneMachine)
 		case worth(r.local):
 			return true, false, fmt.Sprintf("it ran in %.0f s on one machine, and workers should take %.0f s", r.local, e.onWorkers)
+		case risky(r.local):
+			return true, false, riskyReason(fmt.Sprintf("it ran in %.0f s on one machine, and workers should take %.0f s", r.local, e.onWorkers))
 		case e.workers > 0 && mayExplore && tryWorkers(r.local):
 			return true, true, fmt.Sprintf("it ran in %.0f s on one machine; trying workers, estimated at %.0f s", r.local, e.onWorkers)
 		}
@@ -815,14 +877,22 @@ func chooseShared(e estimate, r runs, found bool, threshold time.Duration, now t
 			return true, false, fmt.Sprintf("it ran in %.0f s on workers, whose exchanges held %.1f GB, more than one machine's memory holds", r.dist, float64(r.exchangeBytes)/1e9)
 		case r.dist <= e.onWorkers/2 || r.dist < e.oneMachine*share/faster:
 			return true, false, fmt.Sprintf("it ran in %.0f s on workers, and one machine should take %.0f s", r.dist, e.oneMachine)
+		case e.risky && r.dist <= riskyWithin*e.oneMachine*share:
+			return true, false, riskyReason(fmt.Sprintf("it ran in %.0f s on workers, and one machine should take %.0f s", r.dist, e.oneMachine))
 		}
-		return false, false, fmt.Sprintf("it ran in %.0f s on workers, and one machine should take %.0f s", r.dist, e.oneMachine)
+		if faster > 1 {
+			return false, false, fmt.Sprintf("it ran in %.0f s on workers, not %.1f times as fast as one machine's estimate of %.0f s, as a statement running alone needs",
+				r.dist, faster, e.oneMachine)
+		}
+		return false, false, fmt.Sprintf("it ran in %.0f s on workers, no faster than one machine's estimate of %.0f s, shared", r.dist, e.oneMachine*share)
 	case e.spills && e.workers > 0 && e.onWorkers <= spillWithin*e.oneMachine:
 		return true, false, fmt.Sprintf("one machine should take %.0f s or more, spilling, and workers %.0f s", e.oneMachine, e.onWorkers)
 	case worth(e.oneMachine):
 		return true, false, fmt.Sprintf("one machine should take %.0f s and workers %.0f s", e.oneMachine, e.onWorkers)
+	case risky(e.oneMachine):
+		return true, false, riskyReason(fmt.Sprintf("one machine should take %.0f s and workers %.0f s", e.oneMachine, e.onWorkers))
 	}
-	return false, false, fmt.Sprintf("one machine should take %.0f s and workers %.0f s", e.oneMachine, e.onWorkers)
+	return false, false, here(e.oneMachine)
 }
 
 // planKey identifies a statement in the history of its runs: its syntax

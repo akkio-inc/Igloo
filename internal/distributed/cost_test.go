@@ -446,7 +446,7 @@ func TestAutoMode(t *testing.T) {
 	h.co.maxBroadcast = h.tables["customer"].Bytes
 	for _, query := range []string{q, join} {
 		_, err := h.co.Plan(t.Context(), query, harnessEnv{h}, ModeAuto)
-		if !IsUnsupported(err) || PlanKey(err) == "" || !strings.Contains(err.Error(), "one machine is faster") {
+		if !IsUnsupported(err) || PlanKey(err) == "" || !strings.Contains(err.Error(), "auto mode chose one machine") {
 			t.Fatalf("%s: want one machine, got %v", short(query), err)
 		}
 	}

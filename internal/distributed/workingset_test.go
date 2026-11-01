@@ -511,3 +511,20 @@ func TestPlanKeeps(t *testing.T) {
 		}
 	}
 }
+
+// TestPlanResult checks the fields of a plan's result, which a read sends
+// its client, and what its largest sort holds.
+func TestPlanResult(t *testing.T) {
+	events := &Table{Name: "events", Rows: 1e9, Bytes: 5e10, Columns: []Column{{Name: "id", Type: "BIGINT"}, {Name: "day", Type: "DATE"},
+		{Name: "grp", Type: "INTEGER"}, {Name: "amt", Type: "BIGINT"}}}
+	st := newPlanStats([]*Stage{{Inputs: []Input{{Table: events}}}}, 16)
+	plan := op("ORDER_BY", []map[string]any{op("ICEBERG_SCAN", nil, "Projections", []string{"id", "day", "grp", "amt"},
+		"Estimated Cardinality", "1000000000")}, "Order By", []string{"id ASC"})
+	p, err := planOf(planJSON(t, plan), st)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.fields != 4e9 || p.sorted < 1e9*24 || p.sorted != p.set {
+		t.Errorf("fields %g, sorted %g of %g", p.fields, p.sorted, p.set)
+	}
+}

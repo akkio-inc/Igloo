@@ -482,6 +482,23 @@ replica's cores as DuckDB schedules them; [the replica's
 limit](workload-management.md#the-replicas-limit) and roles' limits hold
 heavy ones back.
 
+**Rows to the client, and sorts.** Both ways count the client's taking the
+result's rows, its fields at 2.8 million a second by DuckDB's plan, whether
+one machine sends them or the coordinator merges the workers': 361 million
+rows of four columns, ordered, took 516 s to reach the client from one
+machine, which was estimated at 30 s. A sort or window that holds half of
+the replica's room for a statement or more is risky there, as DuckDB's sort
+takes about 40% more memory than its limit (that sort finished within 2 GB
+of the memory watch's cancel): where workers are configured, it runs on
+them as long as they are estimated at no more than a quarter longer than
+one machine. When auto mode runs a statement on the replica, its reason
+names the rule that decided: one machine's time within
+`IGLOO_WORKER_THRESHOLD`, workers not 1.5 times as fast for a statement
+running alone, or no faster than the replica shared, as `EXPLAIN
+DISTRIBUTED` and `query_history.placement` show it (`this replica: auto mode
+chose one machine: one machine should take 30 s, within the 60 s a
+statement must take for workers to be worth it`).
+
 **Spilling.** A machine that runs a statement whole spills to disk when the
 rows its joins, groupings and distinct counts hold, its working set, are
 more than the 70% of its memory limit it has for them. Igloo estimates the

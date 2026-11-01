@@ -829,3 +829,51 @@ func TestFillCost(t *testing.T) {
 		t.Errorf("an aggregate fill: here (%s)", reason)
 	}
 }
+
+// TestOrderWithoutLimit checks a read whose result is its every row,
+// ordered: at ten times the data, 361 million rows of four columns took
+// 516 s to reach the client from one machine, estimated at 30 s, which
+// counted none of the sending, and came within 2 GB of the memory watch,
+// its sort held near the replica's room. The estimates count the client's
+// taking the rows, either way; a sort that holds half the room or more
+// runs on workers where they take no more than a quarter longer; and why
+// one machine runs a statement names the rule that decided.
+func TestOrderWithoutLimit(t *testing.T) {
+	now := time.Now()
+	ordered := features{bytes: 4e9, rows: 3.61e8, levels: 1, stages: 1, planned: true, planSet: 21e9, planBytes: 4e9,
+		planFields: 3.61e8 * 4, planSorted: 20.8e9}
+	e := ordered.estimate(scaleCoordinator, benchWorkers)
+	if e.stream < 500 || e.stream > 530 || e.oneMachine < e.stream || !e.risky {
+		t.Errorf("sending %.0f s, one machine %.0f s, risky %v", e.stream, e.oneMachine, e.risky)
+	}
+	workers, _, reason := choose(e, runs{}, false, DefaultThreshold, now)
+	if !workers || !strings.Contains(reason, "its sort holds 20.8 GB, near the 37.1 GB one machine has for it") {
+		t.Errorf("ordered rows: workers %v (%s)", workers, reason)
+	}
+	// After it ran 516 s on one machine: workers, at about as long.
+	if workers, _, reason := choose(e, runs{local: 516, explored: now}, true, DefaultThreshold, now); !workers {
+		t.Errorf("after 516 s on one machine: here (%s)", reason)
+	}
+	// A sort of a tenth of the room is no risk: one machine, not clearly
+	// slower.
+	small := ordered
+	small.planSorted = 3.7e9
+	e = small.estimate(scaleCoordinator, benchWorkers)
+	if workers, _, reason := choose(e, runs{}, false, DefaultThreshold, now); workers || e.risky ||
+		!strings.Contains(reason, "times as fast as one machine's") {
+		t.Errorf("a small sort: workers %v, risky %v (%s)", workers, e.risky, reason)
+	}
+	// Why one machine: the threshold, where it decided.
+	for _, c := range []struct {
+		e    estimate
+		want string
+	}{
+		{estimate{oneMachine: 30, onWorkers: 22, workers: 16}, "one machine should take 30 s, within the 60 s a statement must take for workers to be worth it"},
+		{estimate{oneMachine: 90, onWorkers: 70, workers: 16}, "workers should take 70 s, not 1.5 times as fast as one machine's 90 s"},
+		{estimate{oneMachine: 90, onWorkers: math.Inf(1)}, "no way on workers would finish"},
+	} {
+		if workers, _, reason := choose(c.e, runs{}, false, DefaultThreshold, now); workers || !strings.Contains(reason, c.want) {
+			t.Errorf("%+v: workers %v (%s), want %q", c.e, workers, reason, c.want)
+		}
+	}
+}
