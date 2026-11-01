@@ -28,7 +28,7 @@ func TestRefreshLeavesTheCatalog(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer remote.Close(ctx) //nolint:errcheck
-	if _, err := remote.Exec(ctx, "CREATE VIEW "+schema+".slow_counts AS SELECT pg_sleep(4)::text AS x, 1 AS n"); err != nil {
+	if _, err := remote.Exec(ctx, "CREATE VIEW "+schema+".slow_counts AS SELECT pg_sleep(6)::text AS x, 1 AS n"); err != nil {
 		t.Fatal(err)
 	}
 	store := federation.NewMemoryStore()
@@ -45,34 +45,12 @@ func TestRefreshLeavesTheCatalog(t *testing.T) {
 	mustExec(t, admin, "CREATE MATERIALIZED VIEW slow_view AS SELECT n FROM crm."+schema+".slow_counts")
 	other := env.testServer.admin(t, pgx.QueryExecModeSimpleProtocol)
 
-	done := make(chan error, 1)
 	start := time.Now()
-	go func() {
+	ended := alongside(t, other, env.testServer.url("igloo", adminPassword), func() error {
 		_, err := admin.Exec(ctx, "REFRESH MATERIALIZED VIEW slow_view")
-		done <- err
-	}()
-	time.Sleep(time.Second)
-	for _, q := range []string{"SELECT 42", "SELECT count(*) FROM information_schema.tables"} {
-		qctx, cancel := context.WithTimeout(ctx, 2*time.Second)
-		var n int64
-		err := other.QueryRow(qctx, q).Scan(&n)
-		cancel()
-		if err != nil {
-			t.Errorf("%s while the refresh reads: %v", q, err)
-		}
-	}
-	lctx, cancel := context.WithTimeout(ctx, 2*time.Second)
-	login, err := pgx.Connect(lctx, env.testServer.url("igloo", adminPassword))
-	cancel()
-	if err != nil {
-		t.Errorf("signing in while the refresh reads: %v", err)
-	} else {
-		_ = login.Close(ctx)
-	}
-	if err := <-done; err != nil {
-		t.Fatal(err)
-	}
-	if took := time.Since(start); took < 4*time.Second {
+		return err
+	}, "the refresh")
+	if took := ended.Sub(start); took < 6*time.Second {
 		t.Errorf("the refresh took %s: the source was not slow", took)
 	}
 	if got := sortedTexts(t, admin, "SELECT n FROM slow_view"); len(got) != 1 || got[0] != "1" {

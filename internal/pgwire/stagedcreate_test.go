@@ -133,7 +133,7 @@ func TestCreateTableAsDoesNotStopOtherSessions(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer remote.Close(ctx) //nolint:errcheck
-	if _, err := remote.Exec(ctx, "CREATE VIEW "+schema+".slow AS SELECT pg_sleep(4)::text AS x, 1 AS n"); err != nil {
+	if _, err := remote.Exec(ctx, "CREATE VIEW "+schema+".slow AS SELECT pg_sleep(6)::text AS x, 1 AS n"); err != nil {
 		t.Fatal(err)
 	}
 	store := federation.NewMemoryStore()
@@ -165,34 +165,12 @@ func TestCreateTableAsDoesNotStopOtherSessions(t *testing.T) {
 		if c.setup != "" {
 			mustExec(t, writer, c.setup)
 		}
-		done := make(chan error, 1)
 		start := time.Now()
-		go func() {
+		ended := alongside(t, other, env.url("igloo", adminPassword), func() error {
 			_, err := writer.Exec(ctx, c.stmt)
-			done <- err
-		}()
-		time.Sleep(time.Second)
-		for _, q := range []string{"SELECT 42", "SELECT count(*) FROM information_schema.tables"} {
-			qctx, cancel := context.WithTimeout(ctx, 2*time.Second)
-			var n int64
-			err := other.QueryRow(qctx, q).Scan(&n)
-			cancel()
-			if err != nil {
-				t.Errorf("%s while %s reads: %v", q, c.name, err)
-			}
-		}
-		lctx, cancel := context.WithTimeout(ctx, 2*time.Second)
-		login, err := pgx.Connect(lctx, env.url("igloo", adminPassword))
-		cancel()
-		if err != nil {
-			t.Errorf("signing in while %s reads: %v", c.name, err)
-		} else {
-			_ = login.Close(ctx)
-		}
-		if err := <-done; err != nil {
-			t.Fatalf("%s: %v", c.name, err)
-		}
-		if took := time.Since(start); took < 4*time.Second {
+			return err
+		}, c.name)
+		if took := ended.Sub(start); took < 6*time.Second {
 			t.Errorf("%s took %s: the source was not slow", c.name, took)
 		}
 		if c.after != "" {
@@ -204,4 +182,54 @@ func TestCreateTableAsDoesNotStopOtherSessions(t *testing.T) {
 			}
 		}
 	}
+}
+
+// alongside runs run, a statement that reads a slow source, and a second
+// in: on other, a statement and a listing of the catalog, and a login at
+// url. Each must end before run does: had run held the catalog lock, they
+// would have waited for it. It returns when run ended, and fails the test
+// if run failed.
+func alongside(t *testing.T, other *pgx.Conn, url string, run func() error, what string) time.Time {
+	t.Helper()
+	ctx := context.Background()
+	type result struct {
+		err error
+		at  time.Time
+	}
+	done := make(chan result, 1)
+	go func() {
+		err := run()
+		done <- result{err, time.Now()}
+	}()
+	time.Sleep(time.Second)
+	var names []string
+	var ends []time.Time
+	for _, q := range []string{"SELECT 42", "SELECT count(*) FROM information_schema.tables"} {
+		qctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		var n int64
+		if err := other.QueryRow(qctx, q).Scan(&n); err != nil {
+			t.Errorf("%s while %s reads: %v", q, what, err)
+		}
+		cancel()
+		names, ends = append(names, q), append(ends, time.Now())
+	}
+	lctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	login, err := pgx.Connect(lctx, url)
+	cancel()
+	if err != nil {
+		t.Errorf("signing in while %s reads: %v", what, err)
+	} else {
+		_ = login.Close(ctx)
+	}
+	names, ends = append(names, "signing in"), append(ends, time.Now())
+	r := <-done
+	if r.err != nil {
+		t.Fatalf("%s: %v", what, r.err)
+	}
+	for i, end := range ends {
+		if !end.Before(r.at) {
+			t.Errorf("%s while %s reads waited for it to end", names[i], what)
+		}
+	}
+	return r.at
 }
