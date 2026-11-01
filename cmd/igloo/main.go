@@ -525,6 +525,7 @@ func serve() error {
 		ExclusivePrepares:   !cfg.SharedPrepares,
 		ResultCacheSize:     cfg.ResultCacheSize,
 		QueryMemory:         eng.MemoryLimit(ctx),
+		HeavyInBackground:   cfg.HeavyInBackground,
 		RewriteMemory:       rewriteMemory(cfg, memory),
 		MemoryTotal:         memory.Total,
 		FreeMemory:          func(ctx context.Context) { dropDuckDBCaches(ctx, eng, log) },

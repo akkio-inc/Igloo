@@ -139,6 +139,13 @@ func New(ctx context.Context, cat *catalog.Client, eng *engine.Engine, log *slog
 	return m, nil
 }
 
+// For makes a manager of the same catalog for eng, which is attached to it
+// too, as the second DuckDB of a process is, and loads its copies of the
+// catalog's views.
+func (m *Manager) For(ctx context.Context, eng *engine.Engine) (*Manager, error) {
+	return New(ctx, m.cat, eng, m.log)
+}
+
 // Close releases the manager's connection.
 func (m *Manager) Close() error {
 	m.mu.Lock()

@@ -49,6 +49,9 @@ type Metrics struct {
 	// resultcache.go).
 	resultCache *prometheus.CounterVec
 	resultBytes prometheus.Gauge
+	// backgrounds counts the statements run in the second DuckDB (see
+	// background.go).
+	backgrounds prometheus.Counter
 	// aggPasses counts the tables CREATE TABLE ... AS filled in passes
 	// over their aggregate's groups (see aggpasses.go).
 	aggPasses prometheus.Counter
@@ -134,13 +137,17 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 			Name: "igloo_result_cache_bytes",
 			Help: "Memory the results the result cache keeps take, as Igloo estimates it.",
 		}),
+		backgrounds: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "igloo_background_statements_total",
+			Help: "Heavy statements run in the second DuckDB, whose threads give way to the first's.",
+		}),
 		aggPasses: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "igloo_aggregate_passes_total",
 			Help: "Tables CREATE TABLE ... AS filled in passes over its aggregate's groups, whose list, string or DISTINCT aggregates would not have fit in memory in one.",
 		}),
 	}
 	reg.MustRegister(m.sessions, m.queries, m.duration, m.logins, m.reruns, m.ids, m.filled, m.skipped, m.reports, m.recognized, m.fallbacks,
-		m.indexStatements, m.memoryExits, m.implicitRetries, m.prepares, m.sortedWrites, m.largeSorts, m.resultCache, m.resultBytes, m.aggPasses)
+		m.indexStatements, m.memoryExits, m.implicitRetries, m.prepares, m.sortedWrites, m.largeSorts, m.resultCache, m.resultBytes, m.aggPasses, m.backgrounds)
 	return m
 }
 
@@ -189,6 +196,12 @@ func (m *Metrics) sortedWrite() {
 func (m *Metrics) largeSort() {
 	if m != nil {
 		m.largeSorts.Inc()
+	}
+}
+
+func (m *Metrics) backgroundStatement() {
+	if m != nil {
+		m.backgrounds.Inc()
 	}
 }
 

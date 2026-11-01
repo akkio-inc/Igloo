@@ -42,6 +42,9 @@ services:
       IGLOO_PREFETCH: ${IGLOO_PREFETCH:-true}
       # Empty keeps 256 MiB of query results; 0 turns the result cache off.
       IGLOO_RESULT_CACHE_SIZE: ${IGLOO_RESULT_CACHE_SIZE:-}
+      # Runs heavy reads in a second DuckDB whose threads give way to the
+      # first's, on Linux (docs/workload-management.md).
+      IGLOO_HEAVY_IN_BACKGROUND: ${IGLOO_HEAVY_IN_BACKGROUND:-true}
       # How many queries may run at once; empty or off means no limit.
       IGLOO_MAX_CONCURRENT_STATEMENTS: ${IGLOO_MAX_CONCURRENT_STATEMENTS:-}
       IGLOO_STATEMENT_RESERVATIONS: ${IGLOO_STATEMENT_RESERVATIONS:-}

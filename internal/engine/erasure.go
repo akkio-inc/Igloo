@@ -279,5 +279,13 @@ func (e *Engine) EmptyCache(ctx context.Context) error {
 			return err
 		}
 	}
+	// The DuckDB for heavy statements keeps its own in memory (see
+	// background.go).
+	e.bgMu.Lock()
+	bg := e.bg
+	e.bgMu.Unlock()
+	if bg != nil {
+		return bg.EmptyCache(ctx)
+	}
 	return nil
 }

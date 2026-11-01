@@ -15,6 +15,13 @@ type options struct {
 	beforeLockdown []func(context.Context, *duckdb.Conn) error
 	catalogProxy   []func(*catalogproxy.Options)
 	sandbox        []func() []string
+	// background opens the second DuckDB of a process (see background.go).
+	background bool
+}
+
+// background opens the second DuckDB of a process, for heavy statements.
+func background() Option {
+	return func(o *options) { o.background = true }
 }
 
 // SandboxDirectories adds the locations f returns, when the sandbox is

@@ -2841,6 +2841,10 @@ var sessionFunctions = map[string]bool{
 	"col_description": true, "obj_description": true, "shobj_description": true,
 }
 
+// SessionFunction says a function of that name, in lower case, depends on
+// the session or the machine it runs on.
+func SessionFunction(name string) bool { return sessionFunctions[name] }
+
 // checkFunctions refuses a fragment that calls a function workers would
 // evaluate differently from the coordinator: one tied to the session, or
 // one a user defined, which only the coordinator has.

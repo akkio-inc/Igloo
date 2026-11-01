@@ -979,6 +979,7 @@ Igloo's metrics, besides the standard Go and process metrics:
 | `igloo_snowflake_implicit_conversions_total` | | Statements in [Snowflake's dialect](snowflake-sql.md#implicit-conversions) that DuckDB could bind only with Snowflake's implicit conversions, which Igloo then made |
 | `igloo_sorted_writes_total` | | Writes of rows in order too large to sort at once within `IGLOO_SORT_SPILL_BUDGET`, which Igloo sorted [a range of the order at a time](sql.md#writing-rows-in-order) |
 | `igloo_large_sorts_total` | | [Reads in order larger than memory](#reads-in-order-larger-than-memory) that Igloo sorted in runs and merged |
+| `igloo_background_statements_total` | | Heavy statements run in the second DuckDB of the process, whose threads give way to the first's ([heavy statements beside short ones](workload-management.md#heavy-statements-beside-short-ones)) |
 | `igloo_aggregate_passes_total` | | Tables `CREATE TABLE ... AS` filled in passes over its aggregate's groups, which would not have fit in memory in one ([aggregates too large for memory](sql.md#aggregates-too-large-for-memory)) |
 | `igloo_result_cache_total` | `outcome` = `hit`, `joined`, `missed`, `kept`, `unprepared` | Queries the [result cache](#result-cache) answered, answered with the result of the same query another session was running, or could not answer, and results it kept; `unprepared` counts the hits and joins answered before preparing the statement |
 | `igloo_result_cache_bytes` | | Memory the result cache's results take, as Igloo estimates it |

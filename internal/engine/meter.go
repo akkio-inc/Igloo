@@ -177,13 +177,27 @@ func (e *Engine) QueryMemory(ctx context.Context) (read func(context.Context) (i
 // keeps by writing buffers to its spill files (see memlimit.Adapt). It
 // fails if DuckDB cannot free enough memory for the new limit.
 func (e *Engine) SetMemoryLimit(ctx context.Context, n int64) error {
+	e.limit.Store(n)
+	if e.bgUsers.Load() > 0 {
+		// The two share it: weighed again at once (see background.go).
+		e.balanceNow()
+		return nil
+	}
+	return e.setLimit(ctx, n)
+}
+
+// setLimit sets DuckDB's memory limit, to n bytes.
+func (e *Engine) setLimit(ctx context.Context, n int64) error {
 	c, err := e.connector.Connect(ctx)
 	if err != nil {
 		return err
 	}
 	defer c.Close() //nolint:errcheck
-	_, err = c.(*duckdb.Conn).ExecContext(ctx, fmt.Sprintf("SET GLOBAL memory_limit = '%dMiB'", n>>20), nil)
-	return err
+	if _, err = c.(*duckdb.Conn).ExecContext(ctx, fmt.Sprintf("SET GLOBAL memory_limit = '%dMiB'", n>>20), nil); err != nil {
+		return err
+	}
+	e.current.Store(n)
+	return nil
 }
 
 // MemoryLimit is the query memory DuckDB has, in bytes: its memory_limit,

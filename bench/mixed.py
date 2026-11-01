@@ -23,6 +23,15 @@ against a synthetic ad-impressions schema:
   Each job is due every `--elt-every` seconds, the jobs spread over that
   period; a job still running when it is due again is skipped, as Igloo's
   own schedules do.
+- **Heavy reports.** `--heavy-sessions` sessions, each running long reports
+  one after another with their result cache off, as an analyst's session
+  beside the dashboards. With `--dashboard-users 0 --elt-streams 0`, what
+  they take alone.
+- **Probes.** `--probes` runs one statement a second of each kind in
+  `PROBES`, their result cache off, to tell where a dashboard waits: `ping`
+  takes Igloo's path and no DuckDB task, `cpu` only DuckDB's threads, and
+  `catalog` also loads a table from the catalog and reads its one small
+  file.
 
     python bench/mixed.py setup --rows 2000000
     python bench/mixed.py run --duration 120 --dashboard-users 8 --elt-streams 2 \\
@@ -164,6 +173,24 @@ DASHBOARDS = {
 ELT_QUERIES = {
     "rollup": "SELECT CAST(ts AS DATE) AS day, campaign_id, count(*) AS impressions, sum(cost) AS spend, "
     "count_if(clicked) AS clicks FROM {s}.impressions GROUP BY 1, 2",
+}
+
+
+# Long reports: joins and aggregates over every impression, as an analyst's
+# session runs. Each reads the whole table, and the second sorts it.
+HEAVY = {
+    "households": "SELECT g.household_id, count(DISTINCT i.campaign_id) AS campaigns, count(*) AS impressions, sum(i.cost) AS spend "
+    "FROM {s}.impressions i JOIN {s}.device_graph g ON g.device_id = i.device_id GROUP BY 1 ORDER BY spend DESC, 1 LIMIT 100",
+    "first_touch": "SELECT c.channel, avg(n) AS impressions_after_first FROM (SELECT i.campaign_id, row_number() OVER "
+    "(PARTITION BY i.device_id ORDER BY i.ts, i.campaign_id) AS n FROM {s}.impressions i) t JOIN {s}.campaigns c "
+    "ON c.campaign_id = t.campaign_id GROUP BY 1 ORDER BY 1",
+}
+
+# Where a statement waits: see the module's doc.
+PROBES = {
+    "ping": "SELECT 1",
+    "cpu": "SELECT sum(i % 7) FROM range(5000000) t(i)",
+    "catalog": "SELECT count(*) FROM {s}.campaigns",
 }
 
 
@@ -392,6 +419,35 @@ def run_one(conn, text: str, rec: Recorder, cls: str, name: str):
     rec.add(cls, name, start, time.time() - start, err)
 
 
+def heavy_session(k: int, args, connect, rec: Recorder, until: float):
+    """One analyst: long reports one after another, until the window ends."""
+    conn = connect("heavy")
+    names = sorted(HEAVY)
+    try:
+        i = k
+        while time.time() < until:
+            name = names[i % len(names)]
+            i += 1
+            text = f"/* mixed {args.run_id} heavy {name} */ " + HEAVY[name].format(s=args.schema)
+            run_one(conn, text, rec, "heavy", name)
+    finally:
+        conn.close()
+
+
+def probe_session(name: str, args, connect, rec: Recorder, until: float):
+    """Runs one kind of probe once a second, one at a time, until the window
+    ends."""
+    conn = connect("probe")
+    try:
+        while time.time() < until:
+            start = time.time()
+            text = f"/* mixed {args.run_id} probe {name} */ " + PROBES[name].format(s=args.schema)
+            run_one(conn, text, rec, "probe", name)
+            time.sleep(max(1 - (time.time() - start), 0))
+    finally:
+        conn.close()
+
+
 class ELT:
     """Runs the ELT jobs on their schedules with streams sessions. A job
     still running when it is due again is skipped."""
@@ -470,6 +526,10 @@ def run(args, connect, sampler: WorkerSampler | None = None) -> dict:
     elt = ELT(args, connect, rec, until, first_batch) if args.elt_streams else None
     if elt:
         threads += [threading.Thread(target=elt.stream, args=(k,), daemon=True) for k in range(args.elt_streams)]
+    threads += [threading.Thread(target=heavy_session, args=(k, args, connect, rec, until), daemon=True)
+                for k in range(args.heavy_sessions)]
+    if args.probes:
+        threads += [threading.Thread(target=probe_session, args=(name, args, connect, rec, until), daemon=True) for name in sorted(PROBES)]
     if sampler:
         sampler.start()
         threading.Timer(max(t0 - time.time(), 0), lambda: setattr(sampler, "counting", True)).start()
@@ -525,7 +585,8 @@ def report(res: dict, hist: list[tuple], args, coord_price: float, worker_price:
         "label": args.label,
         "config": {k: getattr(args, k) for k in ("schema", "rows", "batch_rows", "duration", "warmup", "dashboard_users",
                                                   "tile_concurrency", "think", "param_pool", "elt_streams", "elt_every",
-                                                  "elt_jobs", "seed", "coordinator", "worker", "spot_factor")},
+                                                  "elt_jobs", "heavy_sessions", "probes", "seed", "coordinator", "worker",
+                                                  "spot_factor")},
         "window_seconds": round(window, 1),
         "classes": summarize(res["records"], res["t0"], res["t1"]),
         "history": hs,
@@ -576,6 +637,8 @@ def parse(argv=None):
     r.add_argument("--elt-every", type=float, default=60, help="each job is due every this many seconds")
     r.add_argument("--elt-jobs", default=",".join(ELT_JOBS))
     r.add_argument("--batch-rows", type=int, default=200_000, help="impressions each ingest appends")
+    r.add_argument("--heavy-sessions", type=int, default=0, help="sessions running long reports one after another")
+    r.add_argument("--probes", action="store_true", help="run a probe of each kind in PROBES once a second")
     r.add_argument("--seed", type=int, default=1)
     r.add_argument("--metrics-url", help="Igloo's /metrics, to bill workers for the seconds they ran")
     r.add_argument("--coordinator", help="instance type in pricing.toml, or a price per hour")
@@ -614,7 +677,7 @@ def main(argv=None) -> None:
         conn = psycopg.connect(dsn, autocommit=True)
         with conn.cursor() as cur:
             cur.execute(f"SET query_tag = 'mixed:{args.run_id}:{cls}'")
-            if args.result_cache == "off":
+            if args.result_cache == "off" or cls in ("heavy", "probe"):
                 cur.execute("SET igloo_result_cache = off")
         return conn
 

@@ -265,6 +265,10 @@ type stagedFill struct {
 	s    *Server
 	sess *session
 	ctx  context.Context
+	// st is the statement it fills a table for, which may run in the second
+	// DuckDB (see background.go), and cpu what its INSERTs used.
+	st  *statement
+	cpu time.Duration
 	// ends ends the contexts again armed.
 	ends []context.CancelFunc
 }
@@ -275,6 +279,11 @@ func (f *stagedFill) fill(q string) (n int64, err error) {
 
 // fillAt is fill under ctx.
 func (f *stagedFill) fillAt(ctx context.Context, q string) (n int64, err error) {
+	if f.st != nil && f.s.writesInBackground(ctx, f.sess, f.st) {
+		if n, ran, err := f.fillInBackground(ctx, q); ran {
+			return n, err
+		}
+	}
 	err = f.s.runBound(f.sess, nil, func() error {
 		res, err := f.sess.conn.QueryContext(ctx, q, nil)
 		if err == nil {
@@ -282,6 +291,9 @@ func (f *stagedFill) fillAt(ctx context.Context, q string) (n int64, err error) 
 		}
 		return err
 	})
+	if used := f.sess.wl.meter.Last(q); used != nil && err == nil {
+		f.cpu += used.CPUTime
+	}
 	return n, err
 }
 
@@ -381,8 +393,16 @@ func (s *Server) runStagedCreate(ctx context.Context, sess *session, st *stateme
 		return 0, true, err
 	}
 
-	f := &stagedFill{s: s, sess: sess, ctx: ctx}
+	f := &stagedFill{s: s, sess: sess, ctx: ctx, st: st}
 	defer f.close()
+	if s.heavy != nil {
+		// Whether the next like it runs in the second DuckDB.
+		defer func() {
+			if err == nil && f.cpu > 0 {
+				s.heavy.observe(sess.wl.shape, f.cpu)
+			}
+		}()
+	}
 	if s.beforeFill != nil {
 		s.beforeFill(ctx)
 	}
@@ -551,6 +571,9 @@ func (s *Server) runStatement(ctx context.Context, sess *session, st *statement,
 					done, n, err := s.runWithIDs(ctx, sess, st, args, w)
 					if done {
 						written = n
+						return err
+					}
+					if ran, err := s.runWriteInBackground(ctx, sess, st, args, w); ran {
 						return err
 					}
 					return st.run(ctx, args, w)
