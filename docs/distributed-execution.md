@@ -22,6 +22,35 @@ the choices behind it and the measurements.
                                                     object storage (S3, GCS, ADLS)
 ```
 
+## Heavy reports finish in under 10 minutes at 25 billion rows
+
+Two heavy reports ran on about 25 billion rows of synthetic data in Amazon S3.
+Both join, unnest and compute window aggregates. Igloo chose by itself to run
+them on its 16 workers.
+
+| Rows in the tables it reads | Time | Cost |
+|---|---|---|
+| About 19 billion | 521&nbsp;s | $1.11 |
+| About 4 billion | 587&nbsp;s | $1.25 |
+
+Reruns returned the same rows. At a tenth of the data, both reports return the
+rows one machine returns.
+
+Losing a worker in the middle of a report costs about a third more time, and
+the report returns the same rows: the statement runs its parts again without
+that worker. A worker shut down gracefully, as on a Spot notice, costs about 3%.
+Here one of 16 workers stops about 40 s into a report at a tenth of the data:
+
+| How the worker stopped | Undisturbed | With it stopped |
+|---|---|---|
+| Machine force-stopped, with no notice | 116&nbsp;s | 153&nbsp;s (+31%) |
+| Shut down gracefully | 123&nbsp;s | 126&nbsp;s (+3%) |
+
+The workers were `m7gd.2xlarge` (8 vCPUs) and the coordinator an `m7gd.4xlarge`
+(16 vCPUs), on demand in us-east-1. Cost is those machines at list price, $7.69
+an hour, for the report's run time. Starting workers, and keeping them idle
+until they stop, comes on top ([sizing and cost](#sizing-and-cost)).
+
 ## What runs distributed
 
 Igloo looks for the part of a statement that reads its largest table and
@@ -839,7 +868,7 @@ workers' error. One that auto mode ran on the [large
 worker](#a-large-worker) runs on the other workers instead, as a statement
 forced onto them does: at a hundred times the data, a report of 250 GB
 whose large worker failed ran on the coordinator, spilled 167 GB and was
-killed after 9 minutes, where 16 workers took 729 s. Workers stay
+killed after 9 minutes, where 16 workers take 587 s. Workers stay
 up while a statement that ran tasks on them runs on the coordinator, and
 count as idle from when it ends. An error in the data itself, such as a failed cast
 or a division by zero, is the statement's error, as it would be on one
@@ -1236,7 +1265,7 @@ where the small workers cannot run it: the spill curve holds for most
 reports but runs far short for some, and at a hundred times the data a
 report whose working set was 5.3 times the large worker's room, estimated
 at 217 s there, spilling 2.5 times as long, ran past 1,800 s there, where
-16 workers ran it in 729 s (at ten times the data it spilled 11 times as
+16 workers run it in 587 s (at ten times the data it spilled 11 times as
 long on one machine). The small workers share a working set over their
 partitions instead. Auto mode runs a statement there when
 that estimate is within a fifth of the fastest way and the cheapest of
@@ -1498,8 +1527,9 @@ several instance types and zones, so that capacity one lacks another has.
   expression (`EXISTS`, a scalar subquery) runs on one machine; written as
   a join to a common table expression, it runs distributed. Give the
   machines that run such statements a lot of memory and fast spill disk.
-- Partitioned joins, aggregations and every step of a multi-stage plan
-  write what they exchange to object storage and read it back: that costs
+- On Kubernetes, or with `IGLOO_EXCHANGES=object`, partitioned joins,
+  aggregations and every step of a multi-stage plan write what they exchange
+  to object storage and read it back: that costs
   request charges and adds a few seconds per step, and
   leftovers of a coordinator that crashed mid-statement stay under
   `_igloo_shuffle/` for six hours or more, until a replica's sweep removes
