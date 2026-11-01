@@ -259,6 +259,54 @@ func (s *Server) stagedCreateOf(ctx context.Context, sess *session, query string
 	}
 }
 
+// stagedFill runs a staged create's INSERTs into its new table on the
+// session's connection, under ctx.
+type stagedFill struct {
+	s    *Server
+	sess *session
+	ctx  context.Context
+	// ends ends the contexts again armed.
+	ends []context.CancelFunc
+}
+
+func (f *stagedFill) fill(q string) (n int64, err error) {
+	err = f.s.runBound(f.sess, nil, func() error {
+		res, err := f.sess.conn.QueryContext(f.ctx, q, nil)
+		if err == nil {
+			n, err = countOf(res)
+		}
+		return err
+	})
+	return n, err
+}
+
+// again says whether an INSERT that failed with err may run again on less
+// at a time: DuckDB ran out of memory, its estimate short, or the memory
+// watch stopped the statement (ShedMemory), the replica running out of
+// memory, as it stopped a copy's count(DISTINCT) of a billion ids. After
+// the memory watch's stop, the fill goes on under what is left of the
+// statement's time (see rearm).
+func (f *stagedFill) again(err error) bool {
+	if f.ctx.Err() == nil {
+		return isOutOfMemory(err)
+	}
+	if f.sess.outer == nil || !f.sess.ranOutOfMemory(f.ctx, err) {
+		return false
+	}
+	ctx, end := f.sess.rearm(f.sess.outer, f.ctx)
+	f.ctx, f.ends = ctx, append(f.ends, end)
+	return true
+}
+
+// rearmed says whether the fill went on after the memory watch stopped it.
+func (f *stagedFill) rearmed() bool { return len(f.ends) > 0 }
+
+func (f *stagedFill) close() {
+	for _, end := range f.ends {
+		end()
+	}
+}
+
 // runStagedCreate carries out c, holding the catalog lock exclusively only
 // while it changes the catalog. done is false when c is CREATE TABLE of a
 // table or view that exists: the statement then runs as written, under the
@@ -326,45 +374,47 @@ func (s *Server) runStagedCreate(ctx context.Context, sess *session, c *stagedCr
 		return 0, true, err
 	}
 
-	fill := func(q string) (n int64, err error) {
-		err = s.runBound(sess, nil, func() error {
-			res, err := sess.conn.QueryContext(ctx, q, nil)
-			if err == nil {
-				n, err = countOf(res)
-			}
-			return err
-		})
-		return n, err
+	f := &stagedFill{s: s, sess: sess, ctx: ctx}
+	defer f.close()
+	if s.beforeFill != nil {
+		s.beforeFill(ctx)
 	}
 	plain := "INSERT INTO " + quoteName(c.staging) + "\n" + c.query
 	if text, ok := s.joinedInsert(parsedInsert{target: quoteName(c.staging), columns: visible,
 		source: strings.TrimRight(c.query, "; \t\r\n")}, idMembersOf(ids)); ok {
-		rows, err = fill(text)
+		rows, err = f.fill(text)
 		if err != nil && joinFailed(err) {
 			s.log.Debug("a new member table is filled without its ids", "table", c.target.String(), "err", err)
-			rows, err = fill(plain)
+			rows, err = f.fill(plain)
 		}
 	} else if sw := s.sortedWriteOf(ctx, sess, "INSERT INTO "+quoteName(c.staging), c.query); sw != nil {
 		// Too many rows in order to sort at once: a range at a time.
 		var done bool
 		if rows, done, err = s.runSortedWrite(ctx, sess, sw); !done && err == nil {
-			rows, err = fill(plain)
+			rows, err = f.fill(plain)
 		}
 	} else if ap := s.aggPassesOf(ctx, sess, c.query, 0); ap != nil {
 		// An aggregate whose states would not fit in memory: its groups a
 		// share at a time (see aggpasses.go).
-		rows, err = s.fillInPasses(ctx, fill, c.staging, ap)
-	} else if rows, err = fill(plain); isOutOfMemory(err) && ctx.Err() == nil {
-		// DuckDB's estimate was short: in passes, if the query allows,
-		// into the table the failed fill left empty.
-		if ap := s.aggPassesOf(ctx, sess, c.query, 16); ap != nil {
-			rows, err = s.fillInPasses(ctx, fill, c.staging, ap)
+		rows, err = s.fillInPasses(f, c.staging, ap)
+	} else if rows, err = f.fill(plain); err != nil && f.again(err) {
+		// DuckDB's estimate was short, or the memory watch stopped the
+		// fill: in passes, if the query allows, into the table the failed
+		// fill left empty.
+		if ap := s.aggPassesOf(f.ctx, sess, c.query, 16); ap != nil {
+			rows, err = s.fillInPasses(f, c.staging, ap)
+		} else if f.rearmed() {
+			err = errMemoryShed
 		}
+	}
+	if err != nil && errors.Is(f.ctx.Err(), context.DeadlineExceeded) && f.rearmed() {
+		err = errStatementTimeout
 	}
 	if err != nil {
 		dropStaging()
 		return 0, true, err
 	}
+	ctx = f.ctx
 	if ids != nil && s.idSyncMinRows > 0 && rows < s.idSyncMinRows && s.idDomainsOn {
 		// A small table: mapped shortly after, under its own name once it
 		// has it.

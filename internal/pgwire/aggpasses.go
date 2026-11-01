@@ -463,13 +463,21 @@ func asMap(v any) map[string]any {
 	return m
 }
 
-// fillInPasses fills staging with ap's passes, one after another. A pass
-// that runs out of memory, its groups more than DuckDB estimated, runs
-// again as the two passes of twice as many that its groups hash to, and the
-// passes after it are split likewise, up to maxAggPasses: a group's
-// hash(keys) % 2n is pass or pass + n exactly when hash(keys) % n is pass,
-// so the passes already done stay done.
-func (s *Server) fillInPasses(ctx context.Context, fill func(string) (int64, error), staging []string, ap *aggPasses) (int64, error) {
+// passFiller runs fillInPasses's INSERTs. again says whether one that
+// failed with err runs again on less at a time (see stagedFill.again).
+type passFiller interface {
+	fill(q string) (int64, error)
+	again(err error) bool
+}
+
+// fillInPasses fills staging with ap's passes, one after another, through
+// f. A pass that runs out of memory, its groups more than DuckDB estimated,
+// or that the memory watch stopped, runs again as the two passes of twice
+// as many that its groups hash to, and the passes after it are split
+// likewise, up to maxAggPasses: a group's hash(keys) % 2n is pass or
+// pass + n exactly when hash(keys) % n is pass, so the passes already done
+// stay done.
+func (s *Server) fillInPasses(f passFiller, staging []string, ap *aggPasses) (int64, error) {
 	s.log.Debug("an aggregate runs in passes", "passes", ap.passes, "groups", ap.groups)
 	s.metrics.aggregatePasses()
 	n := ap.passes
@@ -483,8 +491,8 @@ func (s *Server) fillInPasses(ctx context.Context, fill func(string) (int64, err
 		if err != nil {
 			return 0, err
 		}
-		m, err := fill("INSERT INTO " + quoteName(staging) + "\n" + q)
-		if isOutOfMemory(err) && 2*n <= maxAggPasses && ctx.Err() == nil {
+		m, err := f.fill("INSERT INTO " + quoteName(staging) + "\n" + q)
+		if err != nil && 2*n <= maxAggPasses && f.again(err) {
 			s.log.Debug("a pass ran out of memory; the rest run in twice as many", "passes", 2*n)
 			split := make([]int, 0, 2*len(pending))
 			for _, p := range pending {

@@ -1,7 +1,6 @@
 package pgwire
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -132,7 +131,7 @@ func TestAggregatePassesSplit(t *testing.T) {
 			ran = append(ran, pass)
 			return 1, nil
 		}
-		rows, err := s.fillInPasses(context.Background(), fill, []string{"t"}, ap)
+		rows, err := s.fillInPasses(funcFill(fill), []string{"t"}, ap)
 		return ran, rows, err
 	}
 
@@ -146,3 +145,10 @@ func TestAggregatePassesSplit(t *testing.T) {
 		t.Errorf("ran %q, %v; want the last pass 0 of %d to run out of memory", ran, err, maxAggPasses)
 	}
 }
+
+// funcFill is a passFiller of a function, whose passes run again when
+// DuckDB runs out of memory.
+type funcFill func(string) (int64, error)
+
+func (f funcFill) fill(q string) (int64, error) { return f(q) }
+func (funcFill) again(err error) bool           { return isOutOfMemory(err) }

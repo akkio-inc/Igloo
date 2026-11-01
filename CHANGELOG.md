@@ -2287,6 +2287,10 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   (`EXCEPT ALL`). A table with a column named `filename` or
   `file_row_number`, which would hide DuckDB's columns of each row's file
   and position, refreshes in full.
+- A `CREATE TABLE ... AS` of an aggregate that the memory watch stops while
+  it fills its table runs the fill again, its groups a share at a time, as
+  it does when DuckDB runs out of memory: the benchmark's copy of a
+  `count(DISTINCT)` of a billion ids failed with SQLSTATE `53200`.
 - A statement whose run lists a schema's tables as DuckDB binds it, as one
   over a table dropped since it was prepared does, binds again holding the
   catalog lock exclusively when other statements' binds hold it shared: it

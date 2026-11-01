@@ -526,6 +526,9 @@ type Server struct {
 	// starts to be prepared, with the context that ends its preparing (for
 	// tests).
 	beforePrepare func(ctx context.Context, text string)
+	// beforeFill, if set, runs as a staged CREATE TABLE ... AS starts to
+	// fill its table, with the context that ends the fill (for tests).
+	beforeFill func(context.Context)
 	// splitPairs writes report calls' pair counts as workers split them
 	// (see scanCounts) whether or not they fit workers (pairsFitWorkers),
 	// and unsplitPairs never; preferHybrid answers them as hybrids rather
@@ -876,6 +879,9 @@ type session struct {
 	// name, whether EXECUTE of it holds the catalog lock (see
 	// executeHolds).
 	sqlPrepared map[string]bool
+	// outer is the context runCancelable runs the statement's steps under,
+	// which a shed by the memory watch does not end, while it runs.
+	outer context.Context
 	// bindAlone has DuckDB's binds on the session's connection hold the
 	// catalog lock exclusively rather than shared, while a run whose bind
 	// the catalog proxy refused binds again (see runBound).
@@ -1389,6 +1395,10 @@ func (sess *session) cancelable(ctx context.Context, query string) (context.Cont
 // Cancel requests end it either way.
 func (sess *session) runCancelable(ctx context.Context, query string, fn func(context.Context) error) error {
 	defer sess.activity.Begin()()
+	// What a step run under it may run again under once the memory watch
+	// stopped it (see rearm).
+	defer func(was context.Context) { sess.outer = was }(sess.outer)
+	sess.outer = ctx
 	ctx, cancel := context.WithCancel(ctx)
 	sess.mu.Lock()
 	sess.running, sess.statement, sess.started, sess.shed, sess.queued = cancel, redactQuery(query), time.Now(), false, true
