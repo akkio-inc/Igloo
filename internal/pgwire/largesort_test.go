@@ -18,6 +18,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgproto3"
@@ -354,6 +355,84 @@ func TestLargeSortFalseInterrupt(t *testing.T) {
 	}
 	if left := largeSortDirs(t, spill); len(left) > 0 {
 		t.Errorf("left in the spill directory: %v", left)
+	}
+}
+
+// sortedArrow is an ArrowWriter that checks a result's last column ascends, and
+// returns stop once it has read a batch, if set.
+type sortedArrow struct {
+	t       *testing.T
+	calls   int
+	rows    int64
+	last    int64
+	stop    error
+	ordered bool
+}
+
+func (a *sortedArrow) Columns([]Column) error { return nil }
+func (a *sortedArrow) Row([]any) error        { return nil }
+func (a *sortedArrow) Complete(string) error  { return nil }
+func (a *sortedArrow) Records(rdr array.RecordReader) (int64, error) {
+	a.calls++
+	for rdr.Next() {
+		rec := rdr.RecordBatch()
+		col := rec.Column(int(rec.NumCols()) - 1).(*array.Int64)
+		for i := range col.Len() {
+			if a.rows > 0 && col.Value(i) < a.last {
+				a.t.Errorf("row %d: %d after %d", a.rows, col.Value(i), a.last)
+			}
+			a.last = col.Value(i)
+			a.rows++
+		}
+		if a.stop != nil {
+			return a.rows, a.stop
+		}
+	}
+	return a.rows, rdr.Err()
+}
+
+// TestLargeSortOverArrow reads rows in order larger than memory as Arrow record
+// batches, as Flight SQL reads them: in runs, every row in order. A statement
+// that fails once it has sent batches does not run again, which would send them
+// twice.
+func TestLargeSortOverArrow(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	file := filepath.Join(dir, "rows.parquet")
+	largeSortFile(t, file, 2_000_000)
+	metrics := NewMetrics(prometheus.NewRegistry())
+	ts := startServerWithConfig(t, config.Config{
+		DuckDB:  config.DuckDB{TempDir: t.TempDir(), MemoryLimit: "400MiB", Threads: 4, ExtensionDir: os.Getenv("IGLOO_TEST_EXTENSION_DIR")},
+		Storage: config.Storage{AllowedLocations: []string{dir + "/"}},
+	}, func(o *Options) { o.Metrics = metrics })
+	ctx := context.Background()
+	user, err := ts.store.Get(ctx, "igloo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	es, err := ts.srv.OpenEmbedded(ctx, user, "flight")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer es.Close() //nolint:errcheck
+	query := "SELECT id, ts, k, secs, n FROM read_parquet('" + file + "') ORDER BY n"
+	rec := &sortedArrow{t: t}
+	if err := es.Run(ctx, query, rec); err != nil {
+		t.Fatal(err)
+	}
+	if rec.rows != 2_000_000 || rec.calls != 1 {
+		t.Errorf("%d rows in %d calls, want 2000000 in one", rec.rows, rec.calls)
+	}
+	if got := testutil.ToFloat64(metrics.largeSorts); got != 1 {
+		t.Errorf("sorted in runs %v times, want once", got)
+	}
+
+	stopped := &sortedArrow{t: t, stop: errors.New("the client went away")}
+	if err := es.Run(ctx, query, stopped); err == nil {
+		t.Error("no error from a writer that failed")
+	}
+	if stopped.calls != 1 || stopped.rows == 0 {
+		t.Errorf("%d rows in %d calls, want some in one", stopped.rows, stopped.calls)
 	}
 }
 

@@ -62,12 +62,14 @@ func (st *statement) runArrow(ctx context.Context, args []driver.NamedValue, w w
 	// DuckDB computes the batches as the writer takes them, rather than all of
 	// them first: the session is the statement's until they are sent.
 	n, err := st.sendRecords(ctx, st.stmt.QueryArrowStreamContext, args, aw)
+	countArrowRows(w, n)
 	if errors.Is(err, duckdb.ErrFalseInterrupt) {
 		// See afterFalseInterrupt.
 		if n > 0 || !st.onlyReads() || st.readsOnce || writesSequence(st.prepared) {
 			return streamFailed(uint32(n))
 		}
 		n, err = st.sendRecords(ctx, st.stmt.QueryArrowContext, args, aw)
+		countArrowRows(w, n)
 		var de *duckdb.Error
 		if errors.As(err, &de) && de.Type == duckdb.ErrorTypeTransaction && strings.Contains(de.Msg, "aborted") {
 			return streamFailed(0)
@@ -77,6 +79,18 @@ func (st *statement) runArrow(ctx context.Context, args []driver.NamedValue, w w
 		return err
 	}
 	return w.Complete(commandTag(st.stmtType, st.query, n))
+}
+
+// countArrowRows counts rows sent as record batches among those w has written:
+// what runs a statement again, once it failed, goes by that to tell whether a
+// client has any of its rows, as it now may before a failure.
+func countArrowRows(w wire.DataWriter, n int64) {
+	if tw, ok := w.(*tagWriter); ok {
+		w = tw.DataWriter
+	}
+	if ew, ok := w.(*embeddedWriter); ok {
+		ew.written += uint32(n)
+	}
 }
 
 // sendRecords runs the statement through query and sends its record batches
