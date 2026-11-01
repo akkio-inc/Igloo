@@ -535,6 +535,15 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
 
 ### Distributed execution
 
+- A `SELECT ... ORDER BY` larger than memory on one machine sorts in runs and
+  merges them as the client reads them: its rows go to files in the spill
+  directory, each file is sorted within memory, and the merge streams them.
+  DuckDB's own sort of such a read goes up to 40% past its memory limit as it
+  returns rows, which is the memory watch's to cancel. On 72 million rows
+  under a limit of 9.7 GiB the process peaked at 3.5 GiB, where it had peaked
+  at 10.6 to 13.9 GiB, in the same time, with the first row after 6 seconds.
+  See [reads in order larger than
+  memory](docs/operations.md#reads-in-order-larger-than-memory).
 - Workers complete an aggregation's groups whenever they may be many (a
   `GROUP BY` of a large table's column, unless `ANALYZE`'s distinct counts
   put the groups at 10,000 or fewer), partitioned by group, counts of

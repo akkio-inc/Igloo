@@ -527,6 +527,11 @@ func (s *Server) runStatement(ctx context.Context, sess *session, st *statement,
 	if done, err := s.runSortedInsert(ctx, sess, st, args, w); done {
 		return err
 	}
+	// A read of more rows in order than memory holds sorts them in runs
+	// (see largesort.go).
+	if done, err := s.runLargeSort(ctx, sess, st, args, w); done {
+		return err
+	}
 	written := int64(-1)
 	run := func(ctx context.Context) error {
 		return s.runBound(sess, w, func() error {

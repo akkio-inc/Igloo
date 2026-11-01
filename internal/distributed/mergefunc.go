@@ -52,6 +52,39 @@ func RegisterMerged(conn *sql.Conn) error {
 	})
 }
 
+// MergeKey is a column of files of sorted rows that a merge orders by.
+type MergeKey struct {
+	Column           int
+	Desc, NullsFirst bool
+}
+
+// MergeableType reports whether OpenMerge can merge rows with a column of
+// DuckDB type t: compare and return its values as DuckDB does.
+func MergeableType(t string) bool { return mergeType(t) }
+
+// OpenMerge opens files of rows, each sorted by keys, to merge as a
+// statement reads them through MergedFunction, under a context that holds
+// the merge (see WithMerged). Release its Reader once the statement has
+// run.
+func OpenMerge(ctx context.Context, files []string, keys []MergeKey) (*MergedView, error) {
+	resolved := make([]resolvedKey, len(keys))
+	for i, k := range keys {
+		if k.Column < 0 {
+			return nil, fmt.Errorf("%w: a key of no column", errNotMergeable)
+		}
+		resolved[i] = resolvedKey{col: k.Column, desc: k.Desc, nullsFirst: k.NullsFirst}
+	}
+	r, err := newMergeReader(ctx, files, resolved)
+	if err != nil {
+		return nil, err
+	}
+	if _, _, err := mergedColumns(r.Schema()); err != nil {
+		r.Release()
+		return nil, err
+	}
+	return &MergedView{Reader: r}, nil
+}
+
 // mergedSource is MergedFunction's rows: those of a merge's reader, copied
 // into DuckDB's chunks a column at a time, read by one thread in order.
 type mergedSource struct {

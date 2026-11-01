@@ -346,8 +346,9 @@ log says
 with how many files and `bytes_freed`. Igloo deletes only the files DuckDB
 spills to, named `duckdb_temp_storage_*` and `duckdb_temp_block-*`, at the
 top of the directory, and the directories `igloo-sorted-write-*` where a
-[write of rows in order](sql.md#writing-rows-in-order) keeps them until it
-has written them, and leaves everything else.
+[write of rows in order](sql.md#writing-rows-in-order) or a
+[read of them](#reads-in-order-larger-than-memory) keeps them until it has
+finished with them, and leaves everything else.
 
 Give each Igloo process (each replica, compute pool and worker) a spill
 directory of its own, as the single-machine stack and the Helm chart do.
@@ -391,6 +392,36 @@ for the container images too: each process spills up to
 `IGLOO_DUCKDB_MAX_TEMP_SIZE` (in the chart, 90% of
 `duckdb.spillVolume.sizeLimit`), and a query that would need more fails
 with an error instead of filling the disk.
+
+### Reads in order larger than memory
+
+DuckDB's sort of more than its memory limit holds goes past the limit as it
+starts to return rows, by up to 40% on many threads, which on a machine with
+little to spare is the memory watch's to cancel. A `SELECT ... ORDER BY`
+whose plan estimates it takes more than half of the memory limit, and which
+reads all of its rows, sorts in runs on one machine, as workers do on
+several:
+
+1. One run of the query, without its `ORDER BY`, writes its rows to
+   uncompressed Parquet files in the spill directory, small enough to sort
+   well within memory.
+2. Each file is sorted, one at a time, into a run of its own.
+3. The runs are merged as the client reads them, so the first row comes as
+   the last run is sorted, not after the whole result has been sorted.
+
+On 72 million rows under a memory limit of 9.7 GiB on 16 threads, the process
+peaked at 3.5 GiB, where the same read sorted at once peaked at 10.6 to 13.9
+GiB, in the same time (103 seconds, 102 to 117 at once), and the first row
+came after 6 seconds. The files and runs take what the spill directory takes
+for such a sort; a read whose estimate passes `IGLOO_SORT_SPILL_BUDGET` sorts
+at once and is stopped as before. `igloo_large_sorts_total` counts these reads.
+
+Only an `ORDER BY` of the result's columns, by name, alias or position, of
+types the merge compares as DuckDB orders them (numbers, text without a
+collation, binary, dates and times, booleans), without `LIMIT` or `GROUP BY`,
+sorts this way. A statement with parameters, or one whose client reads a few rows
+at a time through a portal, sorts at once. So does any read if a step before
+its first row fails, with a warning in the log.
 
 ### When one machine is not enough
 
@@ -930,6 +961,7 @@ Igloo's metrics, besides the standard Go and process metrics:
 | `igloo_memory_exits_total` | | Times Igloo exited because a statement it canceled for running out of memory did not stop, or DuckDB went on with its work after it did, and memory was nearly gone (see [sizing](#sizing)) |
 | `igloo_snowflake_implicit_conversions_total` | | Statements in [Snowflake's dialect](snowflake-sql.md#implicit-conversions) that DuckDB could bind only with Snowflake's implicit conversions, which Igloo then made |
 | `igloo_sorted_writes_total` | | Writes of rows in order too large to sort at once within `IGLOO_SORT_SPILL_BUDGET`, which Igloo sorted [a range of the order at a time](sql.md#writing-rows-in-order) |
+| `igloo_large_sorts_total` | | [Reads in order larger than memory](#reads-in-order-larger-than-memory) that Igloo sorted in runs and merged |
 | `igloo_aggregate_passes_total` | | Tables `CREATE TABLE ... AS` filled in passes over its aggregate's groups, which would not have fit in memory in one ([aggregates too large for memory](sql.md#aggregates-too-large-for-memory)) |
 | `igloo_result_cache_total` | `outcome` = `hit`, `joined`, `missed`, `kept`, `unprepared` | Queries the [result cache](#result-cache) answered, answered with the result of the same query another session was running, or could not answer, and results it kept; `unprepared` counts the hits and joins answered before preparing the statement |
 | `igloo_result_cache_bytes` | | Memory the result cache's results take, as Igloo estimates it |

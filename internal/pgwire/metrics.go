@@ -41,6 +41,9 @@ type Metrics struct {
 	// sortedWrites counts the writes of rows in order sorted a range at a
 	// time (see sortedwrite.go).
 	sortedWrites prometheus.Counter
+	// largeSorts counts the reads of rows in order sorted in runs and
+	// merged (see largesort.go).
+	largeSorts prometheus.Counter
 	// resultCache counts the result cache's lookups and the results it
 	// kept, and resultBytes is the memory its results take (see
 	// resultcache.go).
@@ -115,6 +118,10 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 			Name: "igloo_shared_prepares_total",
 			Help: "Queries prepared alongside other statements, under the shared catalog lock (shared), and those that failed to prepare that way, or met a refused catalog listing meanwhile, and were prepared again under the exclusive lock (retried).",
 		}, []string{"lock"}),
+		largeSorts: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "igloo_large_sorts_total",
+			Help: "Reads of more rows in order than memory holds, sorted in runs and merged.",
+		}),
 		sortedWrites: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "igloo_sorted_writes_total",
 			Help: "Writes of rows in order (CREATE TABLE ... AS and INSERT with ORDER BY) too large to sort at once within IGLOO_SORT_SPILL_BUDGET, which Igloo sorted a range of the order at a time.",
@@ -133,7 +140,7 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 		}),
 	}
 	reg.MustRegister(m.sessions, m.queries, m.duration, m.logins, m.reruns, m.ids, m.filled, m.skipped, m.reports, m.recognized, m.fallbacks,
-		m.indexStatements, m.memoryExits, m.implicitRetries, m.prepares, m.sortedWrites, m.resultCache, m.resultBytes, m.aggPasses)
+		m.indexStatements, m.memoryExits, m.implicitRetries, m.prepares, m.sortedWrites, m.largeSorts, m.resultCache, m.resultBytes, m.aggPasses)
 	return m
 }
 
@@ -176,6 +183,12 @@ func (m *Metrics) prepare(lock string) {
 func (m *Metrics) sortedWrite() {
 	if m != nil {
 		m.sortedWrites.Inc()
+	}
+}
+
+func (m *Metrics) largeSort() {
+	if m != nil {
+		m.largeSorts.Inc()
 	}
 }
 

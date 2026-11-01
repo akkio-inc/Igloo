@@ -235,6 +235,43 @@ func (s *Server) sortedWriteOf(ctx context.Context, sess *session, insert, query
 	if s.sortBudget < 0 {
 		return nil
 	}
+	o := orderedQueryOf(ctx, sess, query)
+	if o == nil {
+		return nil
+	}
+	w := &sortedWrite{insert: insert, query: o.query, keys: o.keys}
+	if w.budget = s.sortSpillBudget(ctx, sess); w.budget <= 0 {
+		return nil
+	}
+	rows, err := estimatedRows(ctx, sess, w.query)
+	if err != nil {
+		return nil
+	}
+	width := rowWidth(o.cols)
+	w.estimate = int64(math.Min(float64(rows)*float64(width), math.MaxInt64/2))
+	if w.estimate <= w.budget {
+		return nil
+	}
+	return w
+}
+
+// orderedQuery is a query without its ORDER BY, the columns of its result,
+// and its ORDER BY by those columns.
+type orderedQuery struct {
+	query string
+	cols  []columnType
+	keys  []sortKey
+}
+
+// orderBy is o's ORDER BY.
+func (o *orderedQuery) orderBy() string {
+	return (&sortedWrite{keys: o.keys}).orderBy()
+}
+
+// orderedQueryOf reads query, or returns nil when it has no ORDER BY of its
+// result's columns alone, or a result that would not pass through Parquet
+// files unchanged.
+func orderedQueryOf(ctx context.Context, sess *session, query string) *orderedQuery {
 	query = strings.TrimRight(query, "; \t\r\n")
 	pos := topLevelKeyword(query, "ORDER", "BY")
 	if pos < 0 || topLevelKeyword(query[pos+len("ORDER"):], "ORDER", "BY") >= 0 {
@@ -248,15 +285,15 @@ func (s *Server) sortedWriteOf(ctx context.Context, sess *session, insert, query
 	if !ok || len(orders) == 0 {
 		return nil
 	}
-	w := &sortedWrite{insert: insert, query: strings.TrimRight(query[:pos], " \t\r\n")}
+	o := &orderedQuery{query: strings.TrimRight(query[:pos], " \t\r\n")}
 	// What is left must be the query without its ORDER BY.
-	if rest, ok := queryNode(ctx, sess, w.query); !ok {
+	if rest, ok := queryNode(ctx, sess, o.query); !ok {
 		return nil
 	} else if left, ok := orderModifier(rest); !ok || len(left) > 0 {
 		return nil
 	}
-	cols, err := describeTable(ctx, sess, "SELECT * FROM (\n"+w.query+"\n) AS "+sortSource)
-	if err != nil || !sortableColumns(cols) {
+	var err error
+	if o.cols, err = describeTable(ctx, sess, "SELECT * FROM (\n"+o.query+"\n) AS "+sortSource); err != nil || !sortableColumns(o.cols) {
 		return nil
 	}
 	defaultOrder, err := settingValue(ctx, sess.conn, "default_order")
@@ -267,22 +304,10 @@ func (s *Server) sortedWriteOf(ctx context.Context, sess *session, insert, query
 	if err != nil {
 		return nil
 	}
-	if w.keys, ok = sortKeysOf(node, orders, cols, strings.EqualFold(defaultOrder, "DESCENDING"), nullOrder); !ok {
+	if o.keys, ok = sortKeysOf(node, orders, o.cols, strings.EqualFold(defaultOrder, "DESCENDING"), nullOrder); !ok {
 		return nil
 	}
-	if w.budget = s.sortSpillBudget(ctx, sess); w.budget <= 0 {
-		return nil
-	}
-	rows, err := estimatedRows(ctx, sess, w.query)
-	if err != nil {
-		return nil
-	}
-	width := rowWidth(cols)
-	w.estimate = int64(math.Min(float64(rows)*float64(width), math.MaxInt64/2))
-	if w.estimate <= w.budget {
-		return nil
-	}
-	return w
+	return o
 }
 
 // queryNode is DuckDB's parse of query's top node, if query is a query.

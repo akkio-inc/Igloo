@@ -509,9 +509,9 @@ type Server struct {
 	fed     *federation.Manager
 	remotes connectionSource
 	dist    *distributed.Coordinator
-	// streamMerged says statements read merges of workers' sorted rows as
-	// they are made, through distributed.MergedFunction, which New
-	// registered on the engine's database.
+	// streamMerged says statements read merges of sorted rows as they are
+	// made, through distributed.MergedFunction, which New registered on the
+	// engine's database.
 	streamMerged bool
 	// beforeRefresh, if set, runs before a statement is checked and
 	// prepared again for its run, with the context that ends them (for
@@ -654,9 +654,7 @@ func New(engine Engine, opts Options, log *slog.Logger) (*Server, error) {
 	if s.meta == nil && opts.DDL != nil {
 		s.meta = opts.DDL
 	}
-	if s.dist != nil {
-		s.streamMerged = s.registerMerged()
-	}
+	s.streamMerged = s.registerMerged()
 	if s.audit != nil {
 		s.analyzer = newAnalyzer(s, s.audit.Immediate())
 	}
