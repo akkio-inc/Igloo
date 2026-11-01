@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/apache/iceberg-go"
+	icecat "github.com/apache/iceberg-go/catalog"
 	"github.com/apache/iceberg-go/table"
 
 	"github.com/akkio-inc/igloo/internal/catalog"
@@ -225,6 +226,23 @@ func TestRequestWaitsForFillUnderWay(t *testing.T) {
 			return []catalog.Pending{fill(time.Now().Add(time.Hour), running.Host, running.Process)}, nil
 		}
 		f.completed(f.erase(byEmail))
+	})
+	t.Run("the schema gone", func(t *testing.T) {
+		f := stagingFixture(t)
+		rows := &hookRows{testRows: f.rows, f: f}
+		rows.after = func(string) { swapTable(t, f, "crm.people", 0) }
+		f.svc.rows = rows
+		f.svc.opts.Making = func(context.Context, string) ([]catalog.Pending, error) {
+			if f.cat.tables["crm.people"] == nil {
+				return nil, icecat.ErrNoSuchNamespace
+			}
+			return nil, nil
+		}
+		r, err := f.svc.Submit(f.ctx, "privacy", []Wanted{byEmail})
+		if err != nil {
+			t.Fatal(err)
+		}
+		f.completed(settle(f, r.ID, 10))
 	})
 	t.Run("stopped", func(t *testing.T) {
 		f := stagingFixture(t)

@@ -120,6 +120,11 @@ func (s *Service) fillsUnderWay(ctx context.Context, r *Request) ([]string, erro
 	var out []string
 	for schema, tables := range schemas {
 		notes, err := s.opts.Making(ctx, schema)
+		if errors.Is(err, icecat.ErrNoSuchNamespace) {
+			// Dropped with its tables, as the request ran: nothing is being
+			// made in it.
+			continue
+		}
 		if err != nil {
 			return nil, unavailable(fmt.Errorf("read the notes of tables being made in %s: %w", schema, err))
 		}
