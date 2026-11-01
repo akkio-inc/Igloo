@@ -156,8 +156,6 @@ func TestFor(t *testing.T) {
 type fakeAzure struct {
 	code    string // an error of this code to the listing, if set
 	status  int
-	hns     string
-	noInfo  bool
 	list    string
 	blocks  map[string]int
 	deleted []string
@@ -167,15 +165,6 @@ func (f *fakeAzure) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	name := strings.TrimPrefix(r.URL.Path, "/warehouse/")
 	switch {
-	case q.Get("restype") == "account":
-		if f.noInfo {
-			rw.Header().Set("x-ms-error-code", "AuthorizationPermissionMismatch")
-			rw.WriteHeader(http.StatusForbidden)
-			return
-		}
-		rw.Header().Set("x-ms-is-hns-enabled", f.hns)
-		rw.Header().Set("x-ms-sku-name", "Standard_LRS")
-		rw.Header().Set("x-ms-account-kind", "StorageV2")
 	case q.Get("comp") == "list":
 		if f.code != "" {
 			rw.Header().Set("x-ms-error-code", f.code)
@@ -212,7 +201,7 @@ func listedBlob(name string, length int, extra string) string {
 	return fmt.Sprintf(`<Blob><Name>%s</Name><Properties><Last-Modified>Sun, 01 Nov 2026 10:00:00 GMT</Last-Modified><Etag>e</Etag><Content-Length>%d</Content-Length><BlobType>BlockBlob</BlobType>%s</Properties></Blob>`, name, length, extra)
 }
 
-func azureStoreOf(t *testing.T, f *fakeAzure, dfs bool) *azureStore {
+func azureStoreOf(t *testing.T, f *fakeAzure) *azureStore {
 	t.Helper()
 	srv := httptest.NewServer(f)
 	t.Cleanup(srv.Close)
@@ -222,41 +211,32 @@ func azureStoreOf(t *testing.T, f *fakeAzure, dfs bool) *azureStore {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return &azureStore{client: client, base: "abfss://warehouse@a.dfs.core.windows.net/", dfs: dfs}
+	return &azureStore{client: client, base: "abfss://warehouse@a.dfs.core.windows.net/"}
 }
 
-// TestAzureListingFailsClosed checks that nothing but a filesystem's refusal of the
-// listing passes for having no uploads: anything else must stop an erasure request
-// from completing.
+// TestAzureListingFailsClosed checks that no refusal of the listing passes for having
+// no uploads: real accounts of either kind list them, and anything else must stop an
+// erasure request from completing.
 func TestAzureListingFailsClosed(t *testing.T) {
 	ctx := context.Background()
 	const prefix = "abfss://warehouse@a.dfs.core.windows.net/w/"
 	for _, c := range []struct {
-		name   string
-		fake   fakeAzure
-		dfs    bool
-		refuse bool
+		name string
+		fake fakeAzure
 	}{
-		{"a filesystem refuses the query", fakeAzure{code: "InvalidQueryParameterValue", status: 400, hns: "true"}, true, false},
-		{"as an unsupported one", fakeAzure{code: "UnsupportedQueryParameter", status: 400, hns: "true"}, true, false},
-		{"an account with no namespace refuses it", fakeAzure{code: "InvalidQueryParameterValue", status: 400, hns: "false"}, true, true},
-		{"an az:// location on a filesystem", fakeAzure{code: "InvalidQueryParameterValue", status: 400, hns: "true"}, false, true},
-		{"the account will not say", fakeAzure{code: "InvalidQueryParameterValue", status: 400, noInfo: true}, true, true},
-		{"not found", fakeAzure{code: "ContainerNotFound", status: 404, hns: "true"}, true, true},
-		{"conflict", fakeAzure{code: "ContainerBeingDeleted", status: 409, hns: "true"}, true, true},
-		{"any other 400", fakeAzure{code: "InvalidUri", status: 400, hns: "true"}, true, true},
-		{"too many requests", fakeAzure{code: "ServerBusy", status: 429, hns: "true"}, true, true},
-		{"denied", fakeAzure{code: "AuthorizationPermissionMismatch", status: 403, hns: "true"}, true, true},
-		{"the store is down", fakeAzure{code: "InternalError", status: 500, hns: "true"}, true, true},
+		{"the query refused", fakeAzure{code: "InvalidQueryParameterValue", status: 400}},
+		{"as an unsupported one", fakeAzure{code: "UnsupportedQueryParameter", status: 400}},
+		{"not found", fakeAzure{code: "ContainerNotFound", status: 404}},
+		{"conflict", fakeAzure{code: "ContainerBeingDeleted", status: 409}},
+		{"any other 400", fakeAzure{code: "InvalidUri", status: 400}},
+		{"too many requests", fakeAzure{code: "ServerBusy", status: 429}},
+		{"denied", fakeAzure{code: "AuthorizationPermissionMismatch", status: 403}},
+		{"the store is down", fakeAzure{code: "InternalError", status: 500}},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			f := c.fake
-			got, err := azureStoreOf(t, &f, c.dfs).List(ctx, prefix)
-			if c.refuse && err == nil {
+			if got, err := azureStoreOf(t, &f).List(ctx, prefix); err == nil {
 				t.Errorf("no error, %d uploads: a request could complete without seeing them", len(got))
-			}
-			if !c.refuse && (err != nil || len(got) != 0) {
-				t.Errorf("%d uploads, %v", len(got), err)
 			}
 		})
 	}
@@ -266,9 +246,9 @@ func TestAzureListingFailsClosed(t *testing.T) {
 // through a commit of no blocks and a delete.
 func TestAzureUncommitted(t *testing.T) {
 	ctx := context.Background()
-	f := &fakeAzure{hns: "false", blocks: map[string]int{"w/staged": 2, "w/empty": 0}, list: listedBlob("w/full", 100, "") +
+	f := &fakeAzure{blocks: map[string]int{"w/staged": 2, "w/empty": 0}, list: listedBlob("w/full", 100, "") +
 		listedBlob("w/dir", 0, "<ResourceType>directory</ResourceType>") + listedBlob("w/staged", 0, "") + listedBlob("w/empty", 0, "") + listedBlob("w/gone", 0, "")}
-	s := azureStoreOf(t, f, false)
+	s := azureStoreOf(t, f)
 	got, err := s.List(ctx, "abfss://warehouse@a.dfs.core.windows.net/w/")
 	if err != nil {
 		t.Fatal(err)
