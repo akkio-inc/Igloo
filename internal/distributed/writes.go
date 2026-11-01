@@ -64,10 +64,27 @@ const WriteDirMark = "igloo-write-"
 // still do to its own attempt's files with credentials that cannot be revoked.
 const SealedDirMark = "igloo-sealed-"
 
-// WriteColumn is a column of a table's files: its field ID, by name.
+// WriteColumn is a column of a table's files: its field ID, by name, and those
+// of what it holds, if nested: a struct's fields, a list's element and a map's key
+// and value, by those names.
 type WriteColumn struct {
-	Name string `json:"name"`
-	ID   int    `json:"id"`
+	Name   string        `json:"name"`
+	ID     int           `json:"id"`
+	Fields []WriteColumn `json:"fields,omitempty"`
+}
+
+// copyFieldIDs is COPY's FIELD_IDS option of columns.
+func copyFieldIDs(columns []WriteColumn) string {
+	ids := make([]string, len(columns))
+	for i, c := range columns {
+		ids[i] = quoteLiteral(c.Name) + ": "
+		if len(c.Fields) == 0 {
+			ids[i] += strconv.Itoa(c.ID)
+			continue
+		}
+		ids[i] += "{__duckdb_field_id: " + strconv.Itoa(c.ID) + ", " + strings.TrimSuffix(strings.TrimPrefix(copyFieldIDs(c.Fields), "{"), "}") + "}"
+	}
+	return "{" + strings.Join(ids, ", ") + "}"
 }
 
 // WriteCredentials reach an attempt's directory and nothing else, for the
@@ -301,11 +318,7 @@ func (w *Worker) writeFiles(ctx context.Context, conn *duckdb.Conn, req *taskReq
 	for i, c := range cols {
 		names[i] = quoteIdent(c.Name)
 	}
-	ids := make([]string, len(wr.Columns))
-	for i, c := range wr.Columns {
-		ids[i] = quoteLiteral(c.Name) + ": " + strconv.Itoa(c.ID)
-	}
-	opts := []string{"FORMAT parquet", "FIELD_IDS {" + strings.Join(ids, ", ") + "}", "RETURN_STATS true", "FILENAME_PATTERN 'part_{i}'"}
+	opts := []string{"FORMAT parquet", "FIELD_IDS " + copyFieldIDs(wr.Columns), "RETURN_STATS true", "FILENAME_PATTERN 'part_{i}'"}
 	// The task's share of the worker's memory is that of one of shares tasks
 	// at once.
 	shares := max(w.slotCount/w.taskSlots(req.Slots), 1)

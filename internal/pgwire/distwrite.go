@@ -158,7 +158,7 @@ func (s *Server) newTableWrite(ctx context.Context, sess *session, schema, name 
 	casts := make([]string, len(fields))
 	outer := make([]string, 0, len(fields))
 	for i, f := range fields {
-		if !overwritable(f.Type) {
+		if !taskWrites(f.Type) {
 			return nil, fmt.Sprintf("column %s is of type %s, whose Parquet a task's COPY would not write as Iceberg's", f.Name, f.Type), nil
 		}
 		typ, ok := types[f.Name]
@@ -171,7 +171,7 @@ func (s *Server) newTableWrite(ctx context.Context, sess *session, schema, name 
 		}
 		casts[i] = "CAST(" + value + " AS " + typ + ") AS " + quoteIdent(f.Name)
 		outer = append(outer, quoteIdent(f.Name))
-		w.columns = append(w.columns, distributed.WriteColumn{Name: f.Name, ID: f.ID})
+		w.columns = append(w.columns, writeColumn(f.Name, f.ID, f.Type))
 	}
 	spec := tbl.Spec()
 	for _, field := range spec.Fields() {
@@ -530,13 +530,70 @@ func (w *tableWrite) commit(ctx context.Context, files []distributed.WrittenFile
 }
 
 // readWritten returns the data files of the files at paths, which workers wrote,
-// by footers it checks first (see distfooter.go). Workers write flat tables.
+// by footers it checks first (see distfooter.go), of at most what the table has.
 func readWritten(ctx context.Context, tx *table.Transaction, tbl *table.Table, paths []string) ([]iceberg.DataFile, error) {
 	fsys, err := tbl.FS(ctx)
 	if err != nil {
 		return nil, err
 	}
-	return tx.DataFilesFrom(ctx, &writtenFooters{IO: fsys, columns: len(tbl.Schema().Fields()), depth: 1}, paths)
+	columns, depth := 0, 0
+	for _, f := range tbl.Schema().Fields() {
+		e, d := parquetShape(f.Type)
+		columns, depth = columns+e, max(depth, d)
+	}
+	return tx.DataFilesFrom(ctx, &writtenFooters{IO: fsys, columns: columns, depth: depth + 1}, paths)
+}
+
+// parquetShape is how many elements of a Parquet schema a value of type t takes,
+// and how many levels of groups: a list and a map a group and a repeated group
+// around what they hold, and a struct a group.
+func parquetShape(t iceberg.Type) (elements, depth int) {
+	switch t := t.(type) {
+	case *iceberg.StructType:
+		for _, f := range t.FieldList {
+			e, d := parquetShape(f.Type)
+			elements, depth = elements+e, max(depth, d)
+		}
+		return elements + 1, depth + 1
+	case *iceberg.ListType:
+		e, d := parquetShape(t.Element)
+		return e + 2, d + 2
+	case *iceberg.MapType:
+		ke, kd := parquetShape(t.KeyType)
+		ve, vd := parquetShape(t.ValueType)
+		return ke + ve + 2, max(kd, vd) + 2
+	}
+	return 1, 0
+}
+
+// taskWrites says a task's COPY writes values of type t as Iceberg has them, with
+// their field IDs however they nest.
+func taskWrites(t iceberg.Type) bool {
+	switch t := t.(type) {
+	case *iceberg.StructType:
+		return !slices.ContainsFunc(t.FieldList, func(f iceberg.NestedField) bool { return !taskWrites(f.Type) })
+	case *iceberg.ListType:
+		return taskWrites(t.Element)
+	case *iceberg.MapType:
+		return taskWrites(t.KeyType) && taskWrites(t.ValueType)
+	}
+	return overwritable(t)
+}
+
+// writeColumn is the column of a task's files of a field.
+func writeColumn(name string, id int, t iceberg.Type) distributed.WriteColumn {
+	c := distributed.WriteColumn{Name: name, ID: id}
+	switch t := t.(type) {
+	case *iceberg.StructType:
+		for _, f := range t.FieldList {
+			c.Fields = append(c.Fields, writeColumn(f.Name, f.ID, f.Type))
+		}
+	case *iceberg.ListType:
+		c.Fields = []distributed.WriteColumn{writeColumn("element", t.ElementID, t.Element)}
+	case *iceberg.MapType:
+		c.Fields = []distributed.WriteColumn{writeColumn("key", t.KeyID, t.KeyType), writeColumn("value", t.ValueID, t.ValueType)}
+	}
+	return c
 }
 
 // add commits the files at paths to the table. A conflict with another

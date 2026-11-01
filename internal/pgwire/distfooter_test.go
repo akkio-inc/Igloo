@@ -11,6 +11,8 @@ import (
 	"sync/atomic"
 	"testing"
 
+	"github.com/apache/iceberg-go"
+
 	"github.com/akkio-inc/igloo/internal/distributed"
 )
 
@@ -231,4 +233,49 @@ func TestWorkersWriteCraftedFooter(t *testing.T) {
 		}
 	}
 	env.checkNoNotes(t)
+}
+
+// TestParquetShape checks how far a table's types let a file's schema go, against
+// a file DuckDB wrote of them (see TestWorkersWriteNested).
+func TestParquetShape(t *testing.T) {
+	prim := iceberg.PrimitiveTypes.Int64
+	list := &iceberg.ListType{ElementID: 2, Element: prim}
+	strct := &iceberg.StructType{FieldList: []iceberg.NestedField{{ID: 3, Name: "a", Type: prim}, {ID: 4, Name: "b", Type: list}}}
+	mp := &iceberg.MapType{KeyID: 5, KeyType: iceberg.PrimitiveTypes.String, ValueID: 6, ValueType: strct}
+	for _, c := range []struct {
+		t               iceberg.Type
+		elements, depth int
+	}{{prim, 1, 0}, {list, 3, 2}, {strct, 5, 3}, {mp, 8, 5}} {
+		if e, d := parquetShape(c.t); e != c.elements || d != c.depth {
+			t.Errorf("%s: %d elements, %d deep; want %d, %d", c.t, e, d, c.elements, c.depth)
+		}
+	}
+}
+
+// TestWorkersWriteNested checks that workers write nested columns, with the field
+// IDs of what they hold, and that the table reads as what the query made, through
+// a column added since.
+func TestWorkersWriteNested(t *testing.T) {
+	t.Parallel()
+	env := startWriteServer(t)
+	env.force(t)
+	query := `SELECT id, {'a': x, 'b': name, 'c': [x, x + 1]} AS s, [name, name || '!'] AS l, map([name], [x]) AS m,
+		[{'k': x}] AS ls FROM src`
+	mustExec(t, env.admin, "CREATE TABLE w_nested AS "+query)
+	check := "SELECT id, s.a, s.b, s.c[2], l[2], m[name], ls[1].k FROM w_nested AS n, (SELECT id AS i, name FROM src) AS o WHERE n.id = o.i ORDER BY ALL"
+	want := "SELECT id, s.a, s.b, s.c[2], l[2], m[name], ls[1].k FROM (" + query + ") AS n, (SELECT id AS i, name FROM src) AS o WHERE n.id = o.i ORDER BY ALL"
+	if got, want := env.local(t, check), env.local(t, want); got != want {
+		t.Errorf("rows differ:\n%.400s\nwant\n%.400s", got, want)
+	}
+	env.checkWrote(t, "w_nested")
+	// The table's nested columns are read by field ID.
+	mustExec(t, env.admin, "ALTER TABLE w_nested RENAME COLUMN s TO renamed")
+	if got, want := env.local(t, "SELECT count(*), sum(renamed.a) FROM w_nested"), env.local(t, "SELECT count(*), sum(x) FROM src"); got != want {
+		t.Errorf("after a rename: %s, want %s", got, want)
+	}
+	mustExec(t, env.admin, "INSERT INTO w_nested SELECT id, {'a': x, 'b': name, 'c': [x, x + 1]}, [name, name], map([name], [x]), [{'k': x}] FROM src")
+	if got, want := env.local(t, "SELECT count(*), sum(renamed.a) FROM w_nested"), env.local(t, "SELECT 2 * count(*), 2 * sum(x) FROM src"); got != want {
+		t.Errorf("after an INSERT: %s, want %s", got, want)
+	}
+	env.checkWrote(t, "w_nested")
 }

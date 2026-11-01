@@ -426,7 +426,7 @@ statement's rows are in the table when that commit is, or not at all.
   partitioned by bucket, or identity of decimals, whose partition values
   cannot be read from a file's bounds or written to its manifest; tables with
   an Iceberg sort order (Igloo keeps [its own as a property](sql.md));
-  nested, fixed, nanosecond and format-version-1 columns; a query that sorts,
+  fixed, nanosecond and format-version-1 columns; a query that sorts,
   limits or groups in its last step; a fill estimated at less than 256 MiB in
   auto mode, which would make small files; an `INSERT` that leaves out a column
   with a default.
