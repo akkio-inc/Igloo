@@ -423,6 +423,16 @@ func (w *tableWrite) commit(ctx context.Context, files []distributed.WrittenFile
 	return rows, nil
 }
 
+// readWritten returns the data files of the files at paths, which workers wrote,
+// by footers it checks first (see distfooter.go). Workers write flat tables.
+func readWritten(ctx context.Context, tx *table.Transaction, tbl *table.Table, paths []string) ([]iceberg.DataFile, error) {
+	fsys, err := tbl.FS(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return tx.DataFilesFrom(ctx, &writtenFooters{IO: fsys, columns: len(tbl.Schema().Fields()), depth: 1}, paths)
+}
+
 // add commits the files at paths to the table. A conflict with another
 // commit, which said so, tries again on the commit's table; one whose answer
 // was lost may have been made, which it reads back rather than add them
@@ -435,7 +445,7 @@ func (w *tableWrite) add(ctx context.Context, paths []string, check func([]icebe
 		tx := tbl.NewTransaction()
 		if added == nil {
 			var err error
-			if added, err = tx.DataFiles(ctx, paths); err != nil {
+			if added, err = readWritten(ctx, tx, tbl, paths); err != nil {
 				return fmt.Errorf("read the files workers wrote: %w", err)
 			}
 			if err := check(added, spec); err != nil {

@@ -24,6 +24,7 @@ import (
 	"runtime"
 
 	"github.com/apache/iceberg-go"
+	iceio "github.com/apache/iceberg-go/io"
 )
 
 // DataFiles returns the data files of the Parquet files at paths as
@@ -39,4 +40,10 @@ func (t *Transaction) DataFiles(ctx context.Context, paths []string) ([]iceberg.
 	}
 
 	return filesToDataFiles(ctx, fs, t.meta, paths, runtime.GOMAXPROCS(0))
+}
+
+// DataFilesFrom is DataFiles, reading the files' footers from fsys, for a caller
+// that checks what its parser is to read.
+func (t *Transaction) DataFilesFrom(ctx context.Context, fsys iceio.IO, paths []string) ([]iceberg.DataFile, error) {
+	return filesToDataFiles(ctx, fsys, t.meta, paths, runtime.GOMAXPROCS(0))
 }

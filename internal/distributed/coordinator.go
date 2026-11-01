@@ -1670,6 +1670,28 @@ func (co *Coordinator) watchTask(ctx context.Context, addr string, stop context.
 	}
 }
 
+// mostTaskHead bounds the line that heads a task's answer: what it did and the
+// files it wrote, of a few hundred bytes each.
+const mostTaskHead = 64 << 20
+
+// errHeadTooLong is a worker's answer whose head has no end in sight.
+var errHeadTooLong = fmt.Errorf("it is longer than %d bytes", mostTaskHead)
+
+// readHeadLine reads the line that heads a task's answer, up to mostTaskHead.
+func readHeadLine(br *bufio.Reader) ([]byte, error) {
+	var line []byte
+	for {
+		part, err := br.ReadSlice('\n')
+		if len(line)+len(part) > mostTaskHead {
+			return nil, errHeadTooLong
+		}
+		line = append(line, part...)
+		if !errors.Is(err, bufio.ErrBufferFull) {
+			return line, err
+		}
+	}
+}
+
 // fetchTask is fetch without the watch.
 func (co *Coordinator) fetchTask(ctx context.Context, w *worker, body []byte, path string, sp *spool) (*taskResult, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://"+w.addr+tasksPath, bytes.NewReader(body))
@@ -1728,7 +1750,10 @@ func (co *Coordinator) fetchTask(ctx context.Context, w *worker, body []byte, pa
 		}
 		return nil, res.Error
 	}
-	line, err := br.ReadBytes('\n')
+	line, err := readHeadLine(br)
+	if errors.Is(err, errHeadTooLong) {
+		return nil, fmt.Errorf("read result header from %s: %w", w.addr, err)
+	}
 	if err != nil {
 		return nil, &transportError{fmt.Errorf("read result header: %w", err)}
 	}

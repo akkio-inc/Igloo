@@ -323,7 +323,12 @@ func (o *overwritePlan) commit(ctx context.Context, paths []string, check func([
 		tx := tbl.NewTransaction()
 		if added == nil && len(paths) > 0 {
 			var err error
-			if added, err = tx.DataFiles(ctx, paths); err != nil {
+			if check != nil {
+				added, err = readWritten(ctx, tx, tbl, paths)
+			} else {
+				added, err = tx.DataFiles(ctx, paths)
+			}
+			if err != nil {
 				return fmt.Errorf("read the files the refresh wrote: %w", err)
 			}
 			if check != nil {
