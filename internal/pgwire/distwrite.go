@@ -384,14 +384,20 @@ func (w *tableWrite) seal(ctx context.Context, files []distributed.WrittenFile) 
 	}
 	w.sealed = sealedDir(w.dir)
 	out := make([]distributed.WrittenFile, len(files))
-	g, ctx := errgroup.WithContext(ctx)
+	start := time.Now()
+	var bytes int64
+	g, gctx := errgroup.WithContext(ctx)
 	g.SetLimit(sealCopies)
 	for i, f := range files {
 		out[i] = f
 		out[i].Path = w.sealed + "/part_" + strconv.Itoa(i) + ".parquet"
-		g.Go(func() error { return store.Copy(ctx, f.Path, out[i].Path) })
+		bytes += f.Size
+		g.Go(func() error { return store.Copy(gctx, f.Path, out[i].Path) })
 	}
-	return out, g.Wait()
+	err = g.Wait()
+	w.s.log.Info("copied the files workers wrote out of their reach", "table", w.schema+"."+w.name, "files", len(files), "bytes", bytes,
+		"seconds", time.Since(start).Seconds(), "err", err)
+	return out, err
 }
 
 // lateWritesAfter is how long after a statement ended it looks for what its
