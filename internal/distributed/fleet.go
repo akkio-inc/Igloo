@@ -118,8 +118,14 @@ type spill struct {
 // spills, and takes (set/room)^spillExponent times as long, or runs out of
 // memory past oomRatio.
 func spillOn(set float64, memory int64) spill {
+	return spillLenient(set, memory, slightSpill)
+}
+
+// spillLenient is spillOn of a working set that counts as fitting within
+// within times the room.
+func spillLenient(set float64, memory int64, within float64) spill {
 	s := spill{set: set, room: memoryShare * float64(max(memory, 0)), factor: 1}
-	if s.room <= 0 || set <= slightSpill*s.room {
+	if s.room <= 0 || set <= within*s.room {
 		return s
 	}
 	ratio := set / s.room

@@ -218,7 +218,7 @@ func TestFleetChoice(t *testing.T) {
 	// where 16 workers are estimated at 198 s. F3-like: 215 GB, 5.8 times
 	// the room, spilling: workers.
 	e1 := features{bytes: 7.744e10, exchanged: 7.744e10, held: 7.744e10, rows: 6.688e9, levels: 4, stages: 5,
-		planned: true, planSet: 46e9, planBytes: 3e9, planWork: 2033}
+		planned: true, planSet: 46e9, planBytes: 3e9, planWork: 2033, planJoins: 1}
 	f3 := features{bytes: 6.683e9, exchanged: 6.683e9, held: 6.683e9, rows: 1.273e10, levels: 8, stages: 28,
 		planned: true, planSet: 215e9, planBytes: 6.7e9, planWork: 153}
 	e = decide(e1, benchWorkers, runs{}, false)
@@ -353,8 +353,10 @@ func TestSpillingNotProbed(t *testing.T) {
 	here.ranHere, here.allocated = true, here.memory
 	e := f3.estimate(here, benchWorkers)
 	e.pick(r, benchWorkers)
-	if e.spills || math.Abs(e.oneMachine-47) > 3 {
-		t.Errorf("as on the benchmark: one machine %.0f s, %s", e.oneMachine, e.local)
+	// A run that held all of the replica's memory proves nothing either
+	// (see atLimit): it spills by the plan.
+	if !e.spills || e.local.set != 150e9 {
+		t.Errorf("after a run at the memory limit: one machine %.0f s, %s", e.oneMachine, e.local)
 	}
 	// A run cut short is no footprint (see workload.Controller.Completed):
 	// by the plan, it spills, and is not tried there.
@@ -925,5 +927,39 @@ func TestProbeOrdered(t *testing.T) {
 	short := []option{{workers: 4, estimate: 50, seconds: 50, cost: 1}, {workers: 16, estimate: 40, seconds: 40, measured: true, cost: 2}}
 	if o, probe := exploreFleet(short, short[1], runs{}, now); !probe || o.workers != 4 {
 		t.Errorf("a statement of 40 s: probes %v %s", probe, o)
+	}
+}
+
+// TestClearedHistory replays F3-like at ten times the data from a cleared
+// plan history: its plan's working set, 41 GB of aggregates and windows
+// counting people distinct over a FLATTEN's values, 1.1 times the room,
+// counted as fitting, estimated at 47 s against workers' 63 s; it held 51
+// GB, spilled 35 GB and the guard moved it after 88 s. Now it spills by
+// the estimate, and its first run is on workers. E1-like, whose 46 GB are
+// its joins', 1.24 times the room, still fits, and so does a statement of
+// a shape that held 38.5 GB of the replica's 53 GB to its end, whatever
+// its plan; one that held 51.4 GB of them, at the limit, does not.
+func TestClearedHistory(t *testing.T) {
+	now := time.Now()
+	f3 := features{bytes: 6.683e9, exchanged: 6.683e9, held: 6.683e9, rows: 1.273e10, levels: 8, stages: 28,
+		planned: true, planSet: 41.2e9, planBytes: 6.635e9, planWork: 179, planJoins: 0.005}
+	e := f3.estimate(scaleCoordinator, benchWorkers)
+	workers, _, reason := choose(e, runs{}, false, DefaultThreshold, now)
+	if !e.spills || !workers {
+		t.Errorf("F3-like, first run: spills %v, workers %v (%s; %s)", e.spills, workers, reason, e.local)
+	}
+	e1 := features{bytes: 7.744e10, exchanged: 7.744e10, held: 7.744e10, rows: 6.688e9, levels: 4, stages: 5,
+		planned: true, planSet: 46e9, planBytes: 3e9, planWork: 2033, planJoins: 0.98}
+	if e := e1.estimate(scaleCoordinator, benchWorkers); e.spills {
+		t.Errorf("E1-like: spills (%s)", e.local)
+	}
+	ran := scaleCoordinator
+	ran.ranHere, ran.allocated = true, 38_500_000_000
+	if e := f3.estimate(ran, benchWorkers); e.spills || e.local.set != 38.5e9 {
+		t.Errorf("after a run of 38.5 GB: %s", e.local)
+	}
+	ran.allocated = 51_366_780_928
+	if e := f3.estimate(ran, benchWorkers); !e.spills || e.local.set != 51_366_780_928 {
+		t.Errorf("after a run of 51.4 GB: %s", e.local)
 	}
 }

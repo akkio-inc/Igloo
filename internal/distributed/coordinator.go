@@ -576,11 +576,12 @@ func (co *Coordinator) planOn(ctx context.Context, query string, env Env, mode M
 		if ok && !dry && r.planSet != p.set {
 			co.history.update(plan.Key, func(r *runs) {
 				r.planSet, r.planBytes, r.planWork, r.planKeeps, r.planFields, r.planSorted = p.set, p.bytes, p.work, p.keeps, p.fields, p.sorted
+				r.planJoins = p.joins
 			})
 		}
 		x.planSet, x.planParts, x.planned = p.set*co.memory.scale(), p.parts, ok
 		x.planBytes, x.planWork, x.planKeeps = p.bytes, p.work, p.keeps
-		x.planFields, x.planSorted = p.fields, p.sorted*co.memory.scale()
+		x.planFields, x.planSorted, x.planJoins = p.fields, p.sorted*co.memory.scale(), p.joins
 	}
 	if fe, ok := env.(Fills); ok {
 		x.fill = fe.Fill()
@@ -727,7 +728,8 @@ func (co *Coordinator) fleet(ctx context.Context, ws []*worker, mayStart, large 
 // operators hold, when it was read now.
 func (co *Coordinator) planSet(ctx context.Context, env Env, query string, stages []*Stage, r runs) (planEstimate, bool) {
 	if r.planSet > 0 {
-		return planEstimate{set: r.planSet, bytes: r.planBytes, work: r.planWork, keeps: r.planKeeps, fields: r.planFields, sorted: r.planSorted}, true
+		return planEstimate{set: r.planSet, bytes: r.planBytes, work: r.planWork, keeps: r.planKeeps, fields: r.planFields, sorted: r.planSorted,
+			joins: r.planJoins}, true
 	}
 	ex, can := env.(Explainer)
 	if !can {

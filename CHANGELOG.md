@@ -604,6 +604,14 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   the fewest tasks. `EXPLAIN DISTRIBUTED` shows the choice (`fleet`) and
   the ways weighed (`options`), and `query_history.placement` where a
   statement ran and why (see [when](docs/distributed-execution.md#when)).
+- A report whose aggregates and windows were estimated just past the
+  replica's room now counts as spilling on its first run, and runs on
+  workers: estimated at 41 GB, 1.1 times the room, so fitting, at 47 s, it
+  held 51 GB, spilled 35 GB, and the guard moved it after 88 s. Estimates
+  within half again the room count as fitting only in the share joins'
+  hash tables hold, whose estimates run high. And a completed run of a
+  statement's shape that held 90% or more of the replica's limit no longer
+  proves it fits: it may have spilled any amount.
 - Auto mode no longer tries a statement of five minutes or more on a
   number of workers estimated past a fifth of its best way's time, to
   measure it, and a first run takes the best way: an ordered result of 361 million rows that

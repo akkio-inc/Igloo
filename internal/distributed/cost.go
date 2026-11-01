@@ -195,6 +195,24 @@ type machine struct {
 	allocated int64
 }
 
+// atLimit is the share of a machine's memory limit past which what a
+// statement of a shape held over a run it completed there (see
+// Footprints) says only that it held its limit: it may have spilled any
+// amount. At ten times the data, from a cleared plan history, a report
+// whose plan held about 160 GB, three times the replica's 53 GB, was run
+// there on what a run of its shape had held, at the limit, estimated at
+// 47 s and fitting; it held 51 GB, spilled 35 GB, and the guard moved it
+// after 88 s. A report that held 38.5 GB of the 53, and did not spill,
+// still fits so.
+const atLimit = 0.9
+
+// fitsHere says a statement of the shape of the one estimated ran to its
+// end on m holding less than atLimit of m's memory limit: proof that it
+// fits there.
+func (m machine) fitsHere() bool {
+	return m.ranHere && (m.memory <= 0 || float64(m.allocated) < atLimit*float64(m.memory))
+}
+
 // Loads is an Env whose session knows how many other statements run on the
 // replica now, which share its cores with the statement being planned
 // (see choose).
@@ -274,8 +292,25 @@ type features struct {
 	planKeeps float64
 	// planFields are the fields of its result's rows, which a read sends
 	// the client (see clientFieldRate), and planSorted what its largest
-	// sort or window holds, by the plan (see riskyShare).
-	planFields, planSorted float64
+	// sort or window holds, by the plan (see riskyShare); planJoins the
+	// share of its working set joins hold (see lenience).
+	planFields, planSorted, planJoins float64
+}
+
+// lenience is how many times one machine's room a working set by the plan
+// x may be estimated at and still count as fitting: slightSpill for what
+// joins hold, whose estimates ran high (a report's joins, estimated at 46
+// GB, 1.24 times the room, held 33 GB), and none for the rest. A report
+// whose aggregates and windows, counting people distinct over the values
+// of a FLATTEN, were estimated at 41 GB, 1.1 times the room, so fitting,
+// held 51 GB and spilled 35 GB, as its first run on one machine, from a
+// cleared plan history, did before the guard moved it. A working set not
+// by the plan keeps slightSpill.
+func (x features) lenience() float64 {
+	if !x.planned {
+		return slightSpill
+	}
+	return 1 + (slightSpill-1)*min(max(x.planJoins, 0), 1)
 }
 
 const (
@@ -403,6 +438,7 @@ func (x features) estimate(m machine, f fleet) estimate {
 	// fail then does not fall back to, by the bytes its exchanges' stages
 	// read.
 	share := memoryShare * float64(m.memory)
+	fits := m.fitsHere()
 	e.memory = m.memory > 0 && float64(workingSetFactor*x.exchanged) > share && !m.ranHere
 	// The ways on workers, and the one auto mode would take without what
 	// the statement took before (see plan, which corrects them).
@@ -437,14 +473,20 @@ func (x features) estimate(m machine, f fleet) estimate {
 	// that is within its share.
 	set := x.set()
 	e.farBeyond = m.memory > 0 && set > farBeyondRatio*memoryShare*float64(m.memory)
-	if m.ranHere && !(x.planned && set > footprintTrust*float64(m.allocated) && set > slightSpill*memoryShare*float64(m.memory)) {
+	within := x.lenience()
+	switch {
+	case fits && !(x.planned && set > footprintTrust*float64(m.allocated) && set > slightSpill*memoryShare*float64(m.memory)):
 		// What a run of its shape allocated here, unless DuckDB's plan holds
 		// far more, as when its tables have grown since: a report's shape
 		// that ran here at a tenth of the data allocated 53 GB, and its plan
-		// at a hundred times held 250 GB.
-		set = float64(m.allocated)
+		// at a hundred times held 250 GB. It held that and completed: it
+		// fits.
+		set, within = float64(m.allocated), math.Inf(1)
+	case m.ranHere:
+		// It ran here at its memory limit, holding at least that.
+		set = max(set, float64(m.allocated))
 	}
-	e.local = spillOn(set, m.memory)
+	e.local = spillLenient(set, m.memory, within)
 	e.spills = e.local.factor > 1
 	e.oneMachine *= e.local.factor
 	// A fill's rows, written here wherever the query runs; a read's, sent
