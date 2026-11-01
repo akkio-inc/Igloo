@@ -1830,8 +1830,10 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   used 5 seconds of all its cores) in a second DuckDB of its process, whose
   threads give way to the first's, and a read not yet known to be heavy starts
   again there when it runs long beside others. Beside one analyst's long reports
-  a dashboard's statement had little more than its own thread: over a billion
-  rows their p95 rose from 10 s to 245 s. Nothing needs setting, and
+  a dashboard's statement had little more than its own thread. Over a billion
+  rows on 12 cores dashboards take 3.0 s at the median and 8.1 s at p95 beside them,
+  47 statements a minute, as they do alone, where they took 13.7 s, 74 s and 10 a
+  minute. Nothing needs setting, and
   `IGLOO_HEAVY_IN_BACKGROUND=false` runs everything in the first (see [heavy
   statements beside short ones](docs/workload-management.md#heavy-statements-beside-short-ones)).
 - The result cache sends a dashboard's repeated queries again more often:

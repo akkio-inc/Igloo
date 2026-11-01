@@ -33,10 +33,10 @@ import (
 // pgwire's background.go). Its threads run on whatever the first DuckDB's
 // leave idle and give way at once, so a heavy statement alone takes what it
 // takes in the first, and beside dashboards gets only the cores they are not
-// using. A second replica at a low CPU weight, in the same measurements,
-// brought dashboards' p95 to within 1.5 times of idle while the heavy
-// statements ran 1.7 times as long, as the dashboards were using over half of
-// the cores.
+// using. Over a billion rows, dashboards' p95 beside the reports is now what it
+// is alone, 8.1 s, against 74 s; the longest report takes 567 s beside dashboards
+// that use all the cores they can have, where it took 436 s with them at a fifth
+// of their statements, and 267 s to 294 s alone in either.
 //
 // It reads the same catalog and read cache, but holds only what a query of
 // the catalog's tables needs: Igloo's functions over its own state are not

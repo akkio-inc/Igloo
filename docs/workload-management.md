@@ -228,6 +228,18 @@ threads give way to the first's (a nice value of 10). Alone it takes about
 what it takes in the first; beside others it gets the cores they leave idle,
 and about a tenth of those they use.
 
+Measured on 12 cores with `bench/mixed.py`, its statements' results not cached,
+beside one session's reports:
+
+| | Dashboards alone: p50, p95 | Beside the reports, in one DuckDB | Beside the reports, in two |
+|---|---|---|---|
+| A billion rows, 2 users | 3.6 s, 8.1 s, 46 a minute | 13.7 s, 74 s, 10 a minute | 3.0 s, 8.1 s, 47 a minute |
+| 200 million rows, 4 users | 0.5 s, 1.7 s, 147 a minute | 1.1 s, 4.2 s, 128 a minute | 0.8 s, 2.7 s, 144 a minute |
+
+Those dashboards use all the cores they can have, and the longest report over a
+billion rows took 567 s beside them where it took 436 s in one DuckDB, with the
+dashboards at a fifth of the statements, and 267 s to 294 s alone in either.
+
 The two share the memory limit. A heavy statement alone may use it all, the
 first's caches giving way to it. While the first reads tables it keeps what
 it holds, up to three quarters of the limit, for its statements not to read
