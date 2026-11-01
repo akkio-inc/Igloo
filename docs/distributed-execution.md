@@ -1665,9 +1665,9 @@ several instance types and zones, so that capacity one lacks another has.
   of their sets, and the coordinator, or in a subquery or common table
   expression one task, computes the sets from those groups: its memory grows
   with them, as a plain `GROUP BY`'s does not.
-- On Kubernetes, or with `IGLOO_EXCHANGES=object`, partitioned joins,
-  aggregations and every step of a multi-stage plan write what they exchange
-  to object storage and read it back: that costs
+- Where workers have no room on their disks, or with `IGLOO_EXCHANGES=object`,
+  partitioned joins, aggregations and every step of a multi-stage plan write
+  what they exchange to object storage and read it back: that costs
   request charges and adds a few seconds per step, and
   leftovers of a coordinator that crashed mid-statement stay under
   `_igloo_shuffle/` for six hours or more, until a replica's sweep removes
