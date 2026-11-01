@@ -47,6 +47,9 @@ type tableWrite struct {
 	schema, name string
 	tbl          *table.Table
 	overwrite    *overwritePlan
+	// gate, if set, may stop the commit once every file's footer has been read,
+	// which can take long.
+	gate func(context.Context) error
 	// sel is the target's Select, and columns its Columns; partitions the
 	// names of Select's partition columns.
 	sel        string
@@ -403,7 +406,15 @@ func (w *tableWrite) commit(ctx context.Context, files []distributed.WrittenFile
 		}
 	}
 	w.kept = paths
-	check := func(added []iceberg.DataFile, spec iceberg.PartitionSpec) error { return checkAdded(kept, added, spec) }
+	check := func(added []iceberg.DataFile, spec iceberg.PartitionSpec) error {
+		if err := checkAdded(kept, added, spec); err != nil {
+			return err
+		}
+		if w.gate != nil {
+			return w.gate(ctx)
+		}
+		return nil
+	}
 	var err error
 	if w.overwrite != nil {
 		w.left, err = w.overwrite.commitAt(ctx, w.dir, paths, nil, check)

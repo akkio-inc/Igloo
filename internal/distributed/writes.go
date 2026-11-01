@@ -454,6 +454,24 @@ func (ex *Execution) Written() []WrittenFile { return ex.written }
 // committed (see erasure.go).
 func (ex *Execution) ErasedSince() bool { return ex.co != nil && ex.co.erased.Load() > ex.erased }
 
+// ErasedNow is ErasedSince as the requests' ledger says at this moment, where
+// the coordinator's own idea can be erasureEvery behind: for just before a commit.
+func (ex *Execution) ErasedNow(ctx context.Context) (bool, error) {
+	if ex.co == nil {
+		return false, nil
+	}
+	if l := ex.co.ledger.Load(); l != nil {
+		latest, err := (*l).LatestDeletion(ctx)
+		if err != nil {
+			return false, err
+		}
+		if !latest.IsZero() {
+			ex.co.noteErased(latest.UnixNano())
+		}
+	}
+	return ex.ErasedSince(), nil
+}
+
 // workersMayWrite says workers may be asked to write tables' files.
 func (co *Coordinator) workersMayWrite() bool {
 	if co.opts.NoWorkerWrites {

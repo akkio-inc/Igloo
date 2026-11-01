@@ -1055,6 +1055,61 @@ func (erasedLedger) WorkerSeen(context.Context, string, string, string, time.Tim
 }
 func (erasedLedger) Emptied(context.Context, string, time.Time, string) error { return nil }
 
+// lateLedger says of the latest deletion what it was last told.
+type lateLedger struct {
+	erasedLedger
+	at atomic.Int64
+}
+
+func (l *lateLedger) LatestDeletion(context.Context) (time.Time, error) {
+	if n := l.at.Load(); n > 0 {
+		return time.Unix(0, n), nil
+	}
+	return time.Time{}, nil
+}
+
+// TestWorkersWriteErasedAtCommit checks that a deletion in the ledger stops a
+// commit about to land, though the coordinator would have heard of it only up to
+// 15 s later: the statement's query runs here on the tables as they are.
+func TestWorkersWriteErasedAtCommit(t *testing.T) {
+	t.Parallel()
+	env := startWriteServer(t)
+	env.force(t)
+	admin := env.admin
+	inDir := func(f string) bool { return strings.Contains(f, "/"+distributed.WriteDirMark) }
+	ledger := &lateLedger{}
+	ctx, stop := context.WithCancel(context.Background())
+	watched := make(chan struct{})
+	go func() {
+		defer close(watched)
+		env.co.WatchErasures(ctx, ledger)
+	}()
+	defer func() {
+		stop()
+		<-watched
+	}()
+	// The first statement commits: nothing has been deleted.
+	mustExec(t, admin, "CREATE TABLE w_gate AS SELECT id, x FROM src")
+	data, _ := liveFiles(t, admin, "w_gate")
+	if !slices.ContainsFunc(data, inDir) {
+		t.Fatalf("workers did not write it: %q", data)
+	}
+	mustExec(t, admin, "CREATE TABLE w_gated (id BIGINT, x BIGINT)")
+	env.srv.beforeWriteCommit = func(context.Context, string) error {
+		ledger.at.Store(time.Now().UnixNano())
+		return nil
+	}
+	defer func() { env.srv.beforeWriteCommit = nil }()
+	mustExec(t, admin, "INSERT INTO w_gated SELECT id, x FROM src")
+	if data, _ := liveFiles(t, admin, "w_gated"); slices.ContainsFunc(data, inDir) {
+		t.Errorf("files tasks wrote were committed: %q", data)
+	}
+	if got, want := env.local(t, "SELECT count(*), sum(x) FROM w_gated"), env.local(t, "SELECT count(*), sum(x) FROM src"); got != want {
+		t.Errorf("%s, want %s", got, want)
+	}
+	env.checkNoNotes(t)
+}
+
 // TestWorkersWriteErased checks that what tasks wrote is not committed when an
 // erasure request deleted files after they began: it runs here, and holds the
 // rows as they are now.

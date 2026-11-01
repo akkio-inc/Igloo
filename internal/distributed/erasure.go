@@ -334,6 +334,7 @@ type ErasureLedger interface {
 // WatchErasures keeps the workers up with erasure requests (PurgeWorkers),
 // every erasureEvery, until ctx is done.
 func (co *Coordinator) WatchErasures(ctx context.Context, ledger ErasureLedger) {
+	co.ledger.Store(&ledger)
 	t := time.NewTicker(erasureEvery)
 	defer t.Stop()
 	for {

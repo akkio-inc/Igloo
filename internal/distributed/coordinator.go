@@ -177,6 +177,8 @@ type Coordinator struct {
 	// erased is the latest deletion of erasure requests it knows of, in
 	// Unix nanoseconds, which statements' tasks carry (see erasure.go).
 	erased atomic.Int64
+	// ledger is where WatchErasures reads requests' deletions, for ErasedNow.
+	ledger atomic.Pointer[ErasureLedger]
 	// writeDeniedUntil is when workers may be asked to write tables' files
 	// again after one was refused (see noteWriteDenied), in Unix nanoseconds.
 	writeDeniedUntil atomic.Int64
