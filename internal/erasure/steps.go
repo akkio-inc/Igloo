@@ -1994,13 +1994,24 @@ func (s *Service) sortOrphans(listed map[string]time.Time, referenced pathSet) *
 		case referenced.has(p):
 		case names[path.Base(p)]:
 			o.unsure = append(o.unsure, p)
-		case now.Sub(mod) >= orphanAge:
+		case oddKey(p) || now.Sub(mod) >= orphanAge:
 			o.old = append(o.old, p)
 		default:
 			o.young[p] = mod
 		}
 	}
 	return o
+}
+
+// oddKey reports whether p's key is one no writer of a table makes and no engine could
+// read, with a segment a path could not have: only someone with the right to write
+// there could have put it there, and it goes whatever its age.
+func oddKey(p string) bool {
+	if _, rest, ok := strings.Cut(p, "://"); ok {
+		p = rest
+	}
+	p += "/"
+	return strings.Contains(p, "/../") || strings.Contains(p, "/./") || strings.Contains(p, "//")
 }
 
 // parquet keeps the Parquet files of paths.
