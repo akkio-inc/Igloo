@@ -173,6 +173,24 @@ func (g *governance) reload(ctx context.Context) error {
 	return nil
 }
 
+// reloadOwn is reload after a change this replica made only to the
+// policies of tables in Igloo's own schemas, which no user's statement
+// reads: the generation, which prepared statements' checks and kept
+// results are tied to, stays.
+func (g *governance) reloadOwn(ctx context.Context) error {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	next, err := g.store.Load(ctx)
+	if err != nil {
+		g.checked.Store(0)
+		return err
+	}
+	g.snap.Store(next)
+	g.checked.Store(time.Now().UnixNano())
+	g.confirmed.Store(g.checked.Load())
+	return nil
+}
+
 // template parses a policy's body, once per definition.
 func (g *governance) template(r *resolver, p policy.Policy) (*bodyTemplate, error) {
 	key := p.Name + "\x00" + p.Signature() + "\x00" + p.Body

@@ -233,6 +233,14 @@ func (d *dataVersion) bumpTables(keys []string, ok bool) {
 // table, which change nothing.
 var metricsPath = regexp.MustCompile(`^v1/(?:[^/?]+/)?namespaces/[^/?]+/tables/[^/?]+/metrics$`)
 
+// namespacesPath is where a namespace is made (POST), and
+// namespacePropertiesPath where its properties are set; neither has a
+// query.
+var (
+	namespacesPath          = regexp.MustCompile(`^v1/(?:[^/?]+/)?namespaces$`)
+	namespacePropertiesPath = regexp.MustCompile(`^v1/(?:[^/?]+/)?namespaces/[^/?]+/properties$`)
+)
+
 // tableKey identifies a table for its version: its namespace's levels and
 // its name, unescaped, in lower case.
 func tableKey(ns []string, name string) string {
@@ -257,6 +265,15 @@ func changedTables(method, rest string, body []byte) (keys []string, ok, none bo
 	}
 	if m := loadTablePath.FindStringSubmatch(rest); m != nil && (method == http.MethodPost || method == http.MethodDelete) {
 		return []string{tableKey(namespace(m[2]), unescape(m[3]))}, true, false
+	}
+	// Making a namespace, dropping one (only an empty one can be) or
+	// setting its properties changes no table, though it changes the
+	// listings: CREATE SCHEMA IF NOT EXISTS, which dbt runs each time,
+	// raised every table's version.
+	if method == http.MethodPost && namespacesPath.MatchString(path) ||
+		method == http.MethodDelete && namespaceCheckPath.MatchString(rest) ||
+		method == http.MethodPost && namespacePropertiesPath.MatchString(path) {
+		return nil, true, false
 	}
 	type ident struct {
 		Namespace []string `json:"namespace"`

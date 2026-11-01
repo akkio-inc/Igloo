@@ -77,6 +77,9 @@ type statement struct {
 	// table, which Igloo carries out in steps so that filling the table
 	// does not hold the catalog lock (see runStagedCreate).
 	staged *stagedCreate
+	// loadsGen is the catalog's generation as the statement was prepared
+	// and its loads recorded (see fromCache).
+	loadsGen uint64
 	// tempFill is set for CREATE [OR REPLACE] TEMP TABLE ... AS, which
 	// Igloo carries out in steps for the same reason (see runTempCreate).
 	tempFill *tempCreate

@@ -2219,6 +2219,13 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   query would, and a materialized view's or dynamic table's refresh holds
   the lock only to plan and to change the catalog. Each held it for its
   whole run.
+- ELT that makes, replaces, renames or drops tables, makes schemas or
+  refreshes materialized views no longer empties the result cache of
+  dashboards over other tables: `CREATE OR REPLACE TABLE`, `CREATE SCHEMA
+  IF NOT EXISTS` and a refresh each made every kept result unused, as the
+  mixed-load benchmark's rollup and refresh jobs did for every dashboard.
+  Results stay tied to the versions of the tables they read, and a
+  statement prepared before DDL binds again without the cache.
 - A statement whose run lists a schema's tables as DuckDB binds it, as one
   over a table dropped since it was prepared does, binds again holding the
   catalog lock exclusively when other statements' binds hold it shared: it

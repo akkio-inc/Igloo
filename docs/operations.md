@@ -685,9 +685,13 @@ none.
   another engine, no result of a statement that reads it kept before is
   used again, and a result is kept only if none of its tables changed
   while its statement ran; results of statements that read other tables
-  stay. A change the proxy cannot tell the tables of (to a namespace or a
-  view, say), to the catalog's views or to policies makes every result
-  kept before unused.
+  stay, through ELT that makes, replaces, renames or drops other tables,
+  makes schemas or refreshes materialized views: a dashboard over tables
+  ELT did not write kept 933 of 943 charts in the cache while ELT ran
+  alongside. A change the proxy cannot tell the tables of, to the
+  catalog's views, macros or connections, or to policies makes every
+  result kept before unused, and so does any DDL for the results it
+  answers before preparing a statement.
 - **Size.** Results take at most `IGLOO_RESULT_CACHE_SIZE` of memory, 256
   MiB unless set, each at most a sixteenth of it; the least recently used
   go first. `0` turns the cache off.

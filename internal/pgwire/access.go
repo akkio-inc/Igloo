@@ -69,6 +69,49 @@ func (s *Server) catalogGeneration() uint64 {
 	return g
 }
 
+// resultGeneration is catalogGeneration for the results the result cache
+// keeps of statements it has prepared: it leaves out the DDL that makes,
+// replaces, renames or drops tables, or makes schemas (see tablesOnly). A
+// prepared statement's result is tied to the versions of the tables
+// preparing it loaded, which such DDL raises (see TablesVersion), and a
+// statement that binds to another table after it loads another table. A
+// rollup's CREATE OR REPLACE TABLE, or dbt's CREATE SCHEMA IF NOT EXISTS,
+// emptied the cache of every dashboard. Views, macros, functions and
+// connections still change it, as their definitions change what a
+// statement means without a table's version showing it. The results it
+// answers before preparing a statement, by its text, stay tied to
+// catalogGeneration (see statementKey).
+func (s *Server) resultGeneration() uint64 {
+	g := s.defsGen.Load()
+	if s.ddl != nil {
+		g += s.ddl.Generation()
+	}
+	if s.remotes != nil {
+		g += s.remotes.Generation()
+	}
+	return g
+}
+
+// tablesOnly reports whether st, DDL that ran, only made, replaced,
+// renamed, altered or dropped tables, or made a schema, all through
+// DuckDB, which the catalog proxy saw: the changes TablesVersion follows
+// (see resultGeneration).
+func tablesOnly(st *statement) bool {
+	sc := &scanner{s: st.query}
+	switch st.stmtType {
+	case duckdb.STATEMENT_TYPE_CREATE:
+		if _, ok := parseCreateTable(st.query); ok {
+			return true
+		}
+		return sc.keywords("CREATE", "SCHEMA")
+	case duckdb.STATEMENT_TYPE_DROP:
+		return sc.keywords("DROP", "TABLE")
+	case duckdb.STATEMENT_TYPE_ALTER:
+		return sc.keywords("ALTER", "TABLE")
+	}
+	return false
+}
+
 // changesCatalog reports whether a statement of type t may change what
 // statements bind to.
 func changesCatalog(t duckdb.StmtType) bool {

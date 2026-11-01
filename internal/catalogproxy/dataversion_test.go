@@ -150,6 +150,9 @@ func TestTablesVersion(t *testing.T) {
 		send(http.MethodPost, "tables/rename", `{"source": {"namespace": ["sales"], "name": "carts"}, "destination": {"namespace": ["sales"], "name": "old_carts"}}`)
 	}, true)
 	step("a drop", func() { send(http.MethodDelete, "namespaces/sales/tables/carts", "") }, true)
-	step("a change to a namespace", func() { send(http.MethodPost, "namespaces/sales/properties", `{"updates": {}}`) }, true)
+	step("a namespace made", func() { send(http.MethodPost, "namespaces", `{"namespace": ["staging"]}`) }, false)
+	step("a namespace's properties", func() { send(http.MethodPost, "namespaces/sales/properties", `{"updates": {}}`) }, false)
+	step("a namespace dropped", func() { send(http.MethodDelete, "namespaces/staging", "") }, false)
+	step("a view", func() { send(http.MethodPost, "namespaces/sales/views", `{"name": "v"}`) }, true)
 	step("Invalidate", p.Invalidate, true)
 }

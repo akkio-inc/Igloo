@@ -287,6 +287,12 @@ func (s *Server) fromCache(ctx context.Context, sess *session, st *statement, ar
 	if ok, err := s.keepable(ctx, sess, st, settings); !ok {
 		return false, nil, nil, err
 	}
+	if st.loadsGen != s.catalogGeneration() {
+		// DDL ran since it was prepared: DuckDB binds it again as it runs,
+		// perhaps to other tables than its loads, which its result is tied
+		// to (see resultGeneration).
+		return false, nil, nil, nil
+	}
 	key, err := s.resultKey(ctx, sess, st, args, settings)
 	if err != nil {
 		return false, nil, nil, nil
@@ -587,7 +593,7 @@ func (s *Server) resultKey(ctx context.Context, sess *session, st *statement, ar
 		}
 	}
 	h.Write(settings[:])
-	_ = binary.Write(h, binary.LittleEndian, [2]uint64{s.catalogGeneration(), s.gov.gen.Load()})
+	_ = binary.Write(h, binary.LittleEndian, [2]uint64{s.resultGeneration(), s.gov.gen.Load()})
 	if sess.temps {
 		if sess.resultSalt == 0 {
 			var b [8]byte

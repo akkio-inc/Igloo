@@ -995,7 +995,19 @@ func (s *Server) ensureRefreshPolicy(ctx context.Context, name string) error {
 // is false, on the table schema.table of one of Igloo's schemas, by its
 // column __c0, so that no user's statement reads it: Igloo reads it on its
 // own connection.
+//
+// The policies' generation, which every result the result cache keeps is
+// tied to, stays as it is (see governance.reloadOwn): no user's statement
+// reads Igloo's schemas, so none changes, and a refresh of a materialized
+// view emptied the cache of every dashboard.
 func (s *Server) guardIglooTable(ctx context.Context, schema, table, name, comment string) error {
+	if snap := s.gov.snapshot(ctx); snap != nil {
+		if _, ok := snap.Catalog.Policy(name); ok && slices.ContainsFunc(snap.Catalog.RowFilters, func(f policy.RowFilter) bool {
+			return f.Policy == name && strings.EqualFold(f.Schema, schema) && strings.EqualFold(f.Table, table)
+		}) {
+			return nil
+		}
+	}
 	now := time.Now().UTC()
 	err := s.gov.store.Update(ctx, func(cat *policy.Catalog) error {
 		if _, ok := cat.Policy(name); !ok {
@@ -1014,7 +1026,7 @@ func (s *Server) guardIglooTable(ctx context.Context, schema, table, name, comme
 	if err != nil {
 		return policyStoreError(err)
 	}
-	if err := s.gov.reload(ctx); err != nil {
+	if err := s.gov.reloadOwn(ctx); err != nil {
 		s.log.Warn("could not reload policies", "err", err)
 	}
 	return nil
@@ -1057,7 +1069,7 @@ func (s *Server) dropState(ctx context.Context, sess *session, name string) {
 		s.log.Warn("could not drop a state table's policy", "table", refreshSchema+"."+name, "err", err)
 		return
 	}
-	if err := s.gov.reload(ctx); err != nil {
+	if err := s.gov.reloadOwn(ctx); err != nil {
 		s.log.Warn("could not reload policies", "err", err)
 	}
 }

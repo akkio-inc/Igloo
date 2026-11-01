@@ -540,8 +540,10 @@ type Server struct {
 	rooms    *cleanroom.Service
 	partners partnerDirectory
 	// ddlGen counts statements run here that may change the catalog; see
-	// catalogGeneration. catalogChanged adds to it.
-	ddlGen atomic.Uint64
+	// catalogGeneration. catalogChanged adds to it. defsGen counts those
+	// of them that may change what a statement's text means other than
+	// through the tables it loads (see resultGeneration).
+	ddlGen, defsGen atomic.Uint64
 	// tables is the index of tables the checks resolve names with (see
 	// indexedTables).
 	tables tableIndex
@@ -2173,6 +2175,12 @@ func (s *Server) preparedQuery(ctx context.Context, sess *session, user auth.Use
 		sess.observe(st, err)
 		if err == nil {
 			switch {
+			case changesCatalog(st.stmtType) && tablesOnly(st):
+				// DuckDB made the change, which the catalog proxy saw: its
+				// listings and the tables' versions follow it already
+				// (see resultGeneration).
+				s.ddlGen.Add(1)
+				sess.ddlCount++
 			case changesCatalog(st.stmtType):
 				s.catalogChanged()
 				sess.ddlCount++
@@ -2554,12 +2562,13 @@ func (s *Server) prepareHeld(ctx context.Context, sess *session, user auth.User,
 	// the lock, as no other bind runs alongside (see memoStatement), or with
 	// the tables of binds alongside when it holds it shared.
 	loads := s.engine.RecordLoads()
+	loadsGen := s.catalogGeneration()
 	// Whether it calls AI functions: DuckDB binds them as it prepares it
 	// (see aiHook).
 	sess.aiBound.Store(false)
 	defer func() {
 		if l := loads(); st != nil {
-			st.loads = l
+			st.loads, st.loadsGen = l, loadsGen
 			st.ai = sess.aiBound.Load()
 			// DuckDB has read the tables' snapshots for the block.
 			sess.noteTx(st)
@@ -3320,5 +3329,6 @@ func (h minLevel) WithGroup(name string) slog.Handler {
 // Igloo makes another way.
 func (s *Server) catalogChanged() {
 	s.ddlGen.Add(1)
+	s.defsGen.Add(1)
 	s.engine.CatalogChanged()
 }
