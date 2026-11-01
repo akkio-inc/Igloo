@@ -7,7 +7,7 @@ image:
   pullPolicy: Never
 resources:
   requests: { cpu: 100m, memory: 512Mi }
-  limits: { memory: 2Gi }
+  limits: { memory: 1Gi }
 duckdb:
   spillVolume:
     sizeLimit: 2Gi

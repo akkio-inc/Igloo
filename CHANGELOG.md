@@ -734,6 +734,11 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   not complete while any could hold its rows. Workers also write `INSERT ... BY
   NAME` and of some of a table's columns, partitioned views' refreshes, and tables
   with NOT NULL or nested columns.
+- DuckDB gets no more threads than leave each 125 MiB of its memory limit, its own
+  minimum, however many cores the machine has. A pod of 1 GiB on 16 cores ran 16
+  threads under a limit of 512 MiB, which held 190 to 270 MiB past the limit as it
+  spilled, took seven times as long, and had the memory watch cancel about one run in
+  three.
 - Workers exchange rows on their own disks by default on Kubernetes too
   (`workers.exchanges: auto`), where every worker of a statement has room on its spill
   volume: 1.8 to 2.8 times faster than object storage on EC2 with NVMe. Object storage
