@@ -401,3 +401,49 @@ func TestWorkloadShapeFollowsSearchPath(t *testing.T) {
 		t.Errorf("shapes on the paths small, small, large: %q, want one for each path", shapes)
 	}
 }
+
+// TestReplicaLimitCountsCreateTableAs checks that CREATE TABLE ... AS of an
+// Iceberg table waits behind the replica's limit, as its documentation says,
+// holding nothing while it does: other DDL goes ahead of it.
+func TestReplicaLimitCountsCreateTableAs(t *testing.T) {
+	t.Parallel()
+	ctl := workload.NewController(0)
+	ctl.LimitReplica(1)
+	env := startRefreshServer(t, func(o *Options) { o.Workload = ctl })
+	admin := env.admin
+	ctx := context.Background()
+	holder := env.testServer.admin(t, pgx.QueryExecModeSimpleProtocol)
+	mustExec(t, holder, "SET statement_timeout = '4s'")
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		_, _ = holder.Exec(ctx, slowQuery)
+	}()
+	probe := env.testServer.admin(t, pgx.QueryExecModeSimpleProtocol)
+	mustExec(t, probe, "SET statement_queued_timeout = '50ms'")
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := probe.Exec(ctx, "SELECT 0"); err != nil {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	mustExec(t, admin, "SET statement_queued_timeout = '200ms'")
+	_, err := admin.Exec(ctx, "CREATE TABLE behind AS SELECT 1 AS a")
+	if pgCode(err) != "57014" || !strings.Contains(err.Error(), "the replica's limit of 1 statement at once") {
+		t.Errorf("CREATE TABLE ... AS behind the replica's limit: %v", err)
+	}
+	start := time.Now()
+	mustExec(t, probe, "RESET statement_queued_timeout")
+	mustExec(t, probe, "CREATE TABLE other_ddl (a INTEGER)")
+	if d := time.Since(start); d > 2*time.Second {
+		t.Errorf("other DDL took %s behind it", d)
+	}
+	wg.Wait()
+	mustExec(t, admin, "RESET statement_queued_timeout")
+	mustExec(t, admin, "CREATE TABLE behind AS SELECT 1 AS a")
+	if n := count(t, admin, "SELECT count(*) FROM behind"); n != 1 {
+		t.Errorf("after the wait: %d rows", n)
+	}
+}
