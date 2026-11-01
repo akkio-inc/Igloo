@@ -734,6 +734,9 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   not complete while any could hold its rows. Workers also write `INSERT ... BY
   NAME` and of some of a table's columns, partitioned views' refreshes, and tables
   with NOT NULL or nested columns.
+- Workers are on by default in the Helm chart and the OpenTofu modules, as they scale
+  from zero and stop when idle, so a deployment with no heavy queries pays nothing
+  for them. Single-VM stays as it was, as it would need more machines.
 - Igloo starts up to 16 workers by default, where it was 4 (`IGLOO_WORKER_MAX`,
   `workers.maxReplicas`, `workers_max`): a report at ten times the data took 200 s
   on 4 and 112 s on 8 at about the same cost. Auto mode weighs how many a statement

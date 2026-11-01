@@ -148,6 +148,9 @@ locals {
     } : key => value if var.workers_enabled
   }
 
+  # The chart runs workers by default: without capacity for them here, it must not.
+  no_workers_helm_values = { for key, value in { workers = { enabled = false } } : key => value if !var.workers_enabled }
+
   # The worker node groups' autoscaling groups, which the cluster autoscaler
   # scales; it leaves the default node group alone.
   worker_autoscaling_groups = flatten([

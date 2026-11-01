@@ -107,7 +107,7 @@ resource "kubernetes_secret_v1" "tls" {
 ################################################################################
 
 locals {
-  helm_values = merge(local.helm_base_values, local.workers_helm_values)
+  helm_values = merge(local.helm_base_values, local.workers_helm_values, local.no_workers_helm_values)
 
   helm_base_values = {
     image = merge(

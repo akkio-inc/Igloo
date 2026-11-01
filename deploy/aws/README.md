@@ -19,7 +19,7 @@ module from other code, because it configures its own providers.
 | IAM | Two roles for service accounts (IRSA): one for the igloo pods and one for the Lakekeeper catalog. Each can be assumed only by its own Kubernetes service account and can only list, read, write and delete objects under `warehouse/` in the bucket. A third, `<name_prefix>-engines`, with the same access, can be assumed only by the igloo role: Igloo assumes it, with a session policy for one table, to hand [other engines](../../docs/external-engines.md) credentials for that table for an hour. |
 | Kubernetes | Namespace `igloo`, Secrets `igloo-admin` (key `password`), `igloo-database` (key `url`), `igloo-catalog-encryption` (key `encryption-key`), and `igloo-tls` when TLS is on. |
 | Helm | The Igloo chart: 2 igloo pods (1.5 CPU, 12 GiB each), the Lakekeeper catalog, and a ClusterIP SQL service (or a Network Load Balancer with `expose_sql`). |
-| Workers (optional) | With `workers_enabled`: node groups for [distributed-execution workers](#distributed-execution-workers), Spot with an on-demand fallback, from zero nodes, the Kubernetes cluster autoscaler to scale them, and an IAM role for it; with `large_worker_enabled`, a node group for one large worker too. Workers get an IAM role of their own: read the warehouse, write `_igloo_shuffle/` only. They write tables' files with credentials Igloo makes from the engines role for one task's directory ([security](../../docs/distributed-execution.md#security)). |
+| Workers | Unless `workers_enabled = false`: node groups for [distributed-execution workers](#distributed-execution-workers), Spot with an on-demand fallback, from zero nodes, the Kubernetes cluster autoscaler to scale them, and an IAM role for it; with `large_worker_enabled`, a node group for one large worker too. Workers get an IAM role of their own: read the warehouse, write `_igloo_shuffle/` only. They write tables' files with credentials Igloo makes from the engines role for one task's directory ([security](../../docs/distributed-execution.md#security)). |
 
 ## Prerequisites
 
@@ -229,10 +229,11 @@ igloo pods per node.
 
 ## Distributed-execution workers
 
-`workers_enabled = true` runs statements that read very large tables in
+`workers_enabled`, on by default, runs statements that read very large tables in
 parts on worker pods ([distributed execution](../../docs/distributed-execution.md)).
-It is off by default, so applying this version to an existing deployment
-changes nothing. With it on, the module adds:
+No worker machine starts until a statement is worth one, so a deployment with no
+heavy queries pays nothing for them; each running worker then costs its machine's
+price, and stops when idle. With it on, the module adds:
 
 | Node group | Capacity | Size | Runs |
 |---|---|---|---|
@@ -317,7 +318,7 @@ and Spot runs 50 to 70% below on-demand, varying by zone and hour. Left at
 | `expose_sql`, `sql_allowed_cidrs`, `sql_load_balancer_internal` | `false`, none, `false` | SQL access from outside the cluster |
 | `cluster_endpoint_public_access_cidrs`, `cluster_admin_arns` | `["0.0.0.0/0"]`, none | Kubernetes API access |
 | `allowed_locations`, `igloo_additional_policy_arns` | none | Let users `COPY` from or to other buckets: list the `s3://` prefixes and attach an IAM policy granting the igloo role access to them |
-| `workers_enabled`, `workers_spot`, `workers_instance_types`, `workers_max` | `false`, `true`, `["m7gd.4xlarge", "m6gd.4xlarge"]`, 16 | [Distributed-execution workers](#distributed-execution-workers): Spot with an on-demand fallback |
+| `workers_enabled`, `workers_spot`, `workers_instance_types`, `workers_max` | `true`, `true`, `["m7gd.4xlarge", "m6gd.4xlarge"]`, 16 | [Distributed-execution workers](#distributed-execution-workers): Spot with an on-demand fallback |
 | `workers_cpu`, `workers_memory`, `workers_disk_size_gib`, `workers_price_per_hour` | 90% of vCPUs, 85% of memory, 100, 0 | Worker pod size, node root volume, price for auto mode |
 | `large_worker_enabled`, `large_worker_spot`, `large_worker_instance_types`, `large_worker_price_per_hour` | `false`, `false`, `["r7gd.16xlarge"]`, 0 | One large worker, on-demand by default |
 | `cluster_autoscaler_chart_version` | `9.59.0` | Cluster autoscaler 1.35, for `kubernetes_version` 1.35; keep the two minor versions together |

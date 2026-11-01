@@ -213,6 +213,7 @@ run "rejects_bad_local_ssd_machine_family" {
 run "rejects_large_worker_without_workers" {
   command = plan
   variables {
+    workers_enabled      = false
     large_worker_enabled = true
   }
   expect_failures = [var.large_worker_enabled]

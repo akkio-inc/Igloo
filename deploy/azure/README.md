@@ -62,9 +62,8 @@ location = "eastus2"
 # Optional: cheaper, interruptible Igloo nodes.
 # spot_enabled = true
 
-# Optional: distributed-execution workers on Spot VMs (Regular ones when
-# Spot has no capacity), and one large worker.
-# workers_enabled      = true
+# Optional: one large worker, beside the distributed-execution workers on Spot
+# VMs (Regular ones when Spot has no capacity) that run by default.
 # large_worker_enabled = true
 EOF
 # With expose_sql, pass the certificate and key through the environment
@@ -97,7 +96,7 @@ documented in [variables.tf](variables.tf).
 | Kubernetes Secrets | `igloo-admin`, `igloo-database`, `igloo-catalog-encryption` (+ `igloo-tls`) | Generated passwords and keys; the chart reads them by name. |
 | Helm release | `igloo` from `deploy/helm/igloo` | Skipped with `install_chart = false`; the `helm_values` output holds the values. |
 | Public IP | only with `expose_sql` | Static, so the address survives chart reinstalls. |
-| Worker node pools | only with `workers_enabled` | `workerspot` (Spot) and `workerreg` (Regular), `Standard_D16pds_v6` × 0-16, for [distributed-execution workers](#distributed-execution-workers); with `large_worker_enabled`, `largereg` (`Standard_E64pds_v6` × 0-1). The cluster autoscaler then uses the priority expander. |
+| Worker node pools | unless `workers_enabled = false` | `workerspot` (Spot) and `workerreg` (Regular), `Standard_D16pds_v6` × 0-16, for [distributed-execution workers](#distributed-execution-workers); with `large_worker_enabled`, `largereg` (`Standard_E64pds_v6` × 0-1). The cluster autoscaler then uses the priority expander. |
 
 ### Role assignments
 
@@ -235,10 +234,11 @@ default size keeps its nodes, and its managed OS disks, with
 
 ## Distributed-execution workers
 
-`workers_enabled = true` runs statements that read very large tables in
+`workers_enabled`, on by default, runs statements that read very large tables in
 parts on worker pods ([distributed execution](../../docs/distributed-execution.md)).
-It is off by default, so applying this version to an existing deployment
-changes nothing. With it on, the module adds two node pools for workers,
+No worker machine starts until a statement is worth one, so a deployment with no
+heavy queries pays nothing for them; each running worker then costs its machine's
+price, and stops when idle. With it on, the module adds two node pools for workers,
 both autoscaling from zero nodes to `workers_max` (16), which is 256 vCPUs at once
 where a statement is worth it, and nothing when idle: check the `Standard DPDSv6
 Family` and low-priority quotas above, or lower `workers_max`. A node Azure refuses

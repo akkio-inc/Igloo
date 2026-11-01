@@ -21,7 +21,7 @@ Run it as a root module: it configures its own providers.
 | Cloud SQL for PostgreSQL 17 | Private IP only (private services access), TLS required, daily backups and point-in-time recovery, generated password. One database, `igloo`: the catalog uses schema `public`, Igloo's users and roles use schema `igloo_auth` |
 | Kubernetes namespace and Secrets | `igloo-admin` (`password`), `igloo-database` (`url`), `igloo-catalog-encryption` (`encryption-key`), `igloo-gcs-hmac` (`hmac-key-id`, `hmac-secret`), and `igloo-tls` when you supply a certificate |
 | Helm release `igloo` | The chart at `../helm/igloo`, wired to everything above |
-| Compute classes (optional) | With `workers_enabled`, `igloo-workers` (Spot first, then on-demand) for [distributed-execution workers](#distributed-execution-workers), and with `large_worker_enabled`, `igloo-large-worker`, installed by the Helm release `igloo-compute-classes` from `compute-classes/` |
+| Compute classes | Unless `workers_enabled = false`, `igloo-workers` (Spot first, then on-demand) for [distributed-execution workers](#distributed-execution-workers), and with `large_worker_enabled`, `igloo-large-worker`, installed by the Helm release `igloo-compute-classes` from `compute-classes/` |
 | Google APIs | Compute, GKE, Cloud SQL Admin, Service Networking, IAM, IAM Credentials, STS, Storage, Resource Manager. Left enabled on destroy |
 
 ## Why Autopilot
@@ -172,7 +172,7 @@ psql "host=sql.example.com port=5432 user=igloo dbname=igloo sslmode=verify-full
 | `bucket_soft_delete_days` | `7` | Deleted objects stay recoverable this long |
 | `deletion_protection` | `true` | Protect the cluster and database from deletion |
 | `control_plane_authorized_cidrs` | `[]` | CIDRs allowed on the control plane's public IP endpoint (none needed; see below) |
-| `workers_enabled`, `workers_spot`, `workers_machine_family`, `workers_max` | `false`, `true`, `n4`, `16` | [Distributed-execution workers](#distributed-execution-workers): Spot first, on-demand when Spot has no capacity |
+| `workers_enabled`, `workers_spot`, `workers_machine_family`, `workers_max` | `true`, `true`, `n4`, `16` | [Distributed-execution workers](#distributed-execution-workers): Spot first, on-demand when Spot has no capacity |
 | `workers_cpu`, `workers_memory`, `workers_spill_size`, `workers_cache_size`, `workers_price_per_hour` | `14`, `54Gi`, `80Gi`, `28Gi`, `0` | Worker pod size, volumes and price |
 | `large_worker_enabled`, `large_worker_spot`, `large_worker_machine_type`, `large_worker_price_per_hour` | `false`, `false`, `n4-highmem-64`, `0` | One large worker, on-demand by default |
 
@@ -235,10 +235,11 @@ GKE version supports it (C4D needs 1.32.9-gke.1711000 or later).
 
 ## Distributed-execution workers
 
-`workers_enabled = true` runs statements that read very large tables in
+`workers_enabled`, on by default, runs statements that read very large tables in
 parts on worker pods ([distributed execution](../../docs/distributed-execution.md)).
-It is off by default, so applying this version to an existing deployment
-changes nothing. Autopilot needs no node pool for them: the module creates
+No worker machine starts until a statement is worth one, so a deployment with no
+heavy queries pays nothing for them; each running worker then costs its machine's
+price, and stops when idle. Autopilot needs no node pool for them: the module creates
 a [custom compute
 class](https://cloud.google.com/kubernetes-engine/docs/concepts/about-custom-compute-classes),
 `igloo-workers`, and the chart's worker pods select it

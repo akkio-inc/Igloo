@@ -277,7 +277,7 @@ variable "duckdb_memory_limit" {
 variable "workers_enabled" {
   description = "Turn on distributed-execution workers, with a GKE compute class that runs them on Spot capacity and falls back to on-demand. Off by default, so existing deployments are unchanged."
   type        = bool
-  default     = false
+  default     = true
 }
 
 variable "workers_spot" {

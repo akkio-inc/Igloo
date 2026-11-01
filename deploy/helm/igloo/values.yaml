@@ -409,7 +409,7 @@ pools: []
 # their number to igloo. Give them their own node pool with a minimum size of
 # zero (nodeSelector, tolerations) so idle workers cost nothing.
 workers:
-  enabled: false
+  enabled: true
   # The most worker pods igloo starts -> IGLOO_WORKER_MAX. It weighs how many a
   # statement should run on, and stops them when idle; your cluster's nodes and
   # quota must have room for this many to start.

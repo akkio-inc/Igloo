@@ -1307,8 +1307,8 @@ auto mode what one worker's machine costs an hour
 The OpenTofu modules for [AWS](../deploy/aws/README.md#distributed-execution-workers),
 [Azure](../deploy/azure/README.md#distributed-execution-workers) and
 [Google Cloud](../deploy/gcp/README.md#distributed-execution-workers)
-provision the workers' capacity with `workers_enabled = true` (off by
-default): node pools that scale from zero, or on GKE Autopilot a compute
+provision the workers' capacity by default (`workers_enabled`, as the chart's
+`workers.enabled`), which costs nothing until a statement starts them: node pools that scale from zero, or on GKE Autopilot a compute
 class, on [Spot capacity with an on-demand fallback](#spot-workers), and
 the chart's `workers` values to match.
 

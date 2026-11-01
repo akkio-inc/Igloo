@@ -379,11 +379,27 @@ run "sql_not_exposed_by_default" {
 
   assert {
     condition = (
+      alltrue([for p in azurerm_kubernetes_cluster_node_pool.worker : p.auto_scaling_enabled && p.min_count == 0]) &&
+      yamldecode(helm_release.igloo[0].values[0]).workers.enabled == true
+    )
+    error_message = "workers are on by default, and their pools start from no nodes, so that no machine runs until a statement starts one"
+  }
+}
+
+run "workers_can_be_left_out" {
+  command = plan
+
+  variables {
+    workers_enabled = false
+  }
+
+  assert {
+    condition = (
       length(azurerm_kubernetes_cluster_node_pool.worker) == 0 &&
       length(kubernetes_config_map_v1.cluster_autoscaler_priority_expander) == 0 &&
-      !contains(keys(yamldecode(helm_release.igloo[0].values[0])), "workers")
+      yamldecode(helm_release.igloo[0].values[0]).workers == { enabled = false }
     )
-    error_message = "without workers_enabled there must be no worker pools, no priority expander and no workers values, so existing deployments are unchanged"
+    error_message = "with workers_enabled false there must be no worker pools and no priority expander, and the chart must run no workers"
   }
 }
 
@@ -917,6 +933,7 @@ run "rejects_large_worker_without_workers" {
   command = plan
 
   variables {
+    workers_enabled      = false
     large_worker_enabled = true
   }
 

@@ -350,8 +350,11 @@ other clients   ──> Service igloo ──────────────
 
 ## Distributed execution
 
-With `workers.enabled=true`, statements that read very large tables run in
-parts on worker pods ([distributed execution](../../../docs/distributed-execution.md)):
+By default, statements that read very large tables run in parts on worker pods
+([distributed execution](../../../docs/distributed-execution.md)).
+No worker machine starts until a statement is worth one, so a deployment with no
+heavy queries pays nothing for them; each running worker then costs its machine's
+price, and stops when idle. `workers.enabled=false` leaves them out.
 
 ```
 igloo pods ──TLS, port 7433──> Service igloo-workers (headless) ──> worker pods (0 to workers.maxReplicas)
@@ -539,7 +542,7 @@ workers:
 | `scaleToZero.nodeSelector`, `tolerations`, `affinity` | | Gateway pod scheduling, separate from igloo's |
 | `pricePerHour` | `0` | `IGLOO_PRICE_PER_HOUR`: what one igloo pod's machine costs an hour, for `igloo.usage`; `0` is unknown |
 | `pools` | `[]` | [Compute pools](#compute-pools), each with `name` and the overrides listed there |
-| `workers.enabled` | `false` | [Distributed execution](#distributed-execution) on worker pods |
+| `workers.enabled` | `true` | [Distributed execution](#distributed-execution) on worker pods, of which none run until a statement is worth it |
 | `workers.maxReplicas` | `16` | `IGLOO_WORKER_MAX`: the most worker pods igloo starts |
 | `workers.idleAfter` | `auto` | `IGLOO_WORKER_IDLE_AFTER`: stop workers after this long without tasks; `auto` for three times their last start, from 2 to 10 minutes |
 | `workers.startTimeout` | `3m` | `IGLOO_WORKER_START_TIMEOUT`: how long a statement waits for workers to start |

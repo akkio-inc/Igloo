@@ -613,7 +613,7 @@ variable "tls_private_key_pem" {
 variable "workers_enabled" {
   description = "Add autoscaling node pools for distributed-execution workers, from zero nodes, and turn workers on in the chart. Also sets the cluster autoscaler's expander to priority. Off by default, so existing deployments are unchanged."
   type        = bool
-  default     = false
+  default     = true
 }
 
 variable "workers_spot" {

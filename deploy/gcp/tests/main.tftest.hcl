@@ -422,15 +422,28 @@ run "spot" {
   }
 }
 
-run "no_workers_by_default" {
+run "workers_can_be_left_out" {
   command = plan
+
+  variables {
+    workers_enabled = false
+  }
 
   assert {
     condition = (
       length(helm_release.compute_classes) == 0 &&
-      !contains(keys(yamldecode(helm_release.igloo[0].values[0])), "workers")
+      yamldecode(helm_release.igloo[0].values[0]).workers == { enabled = false }
     )
-    error_message = "Without workers_enabled there must be no compute classes and no workers values, so existing deployments are unchanged."
+    error_message = "With workers_enabled false there must be no compute classes, and the chart must run no workers."
+  }
+}
+
+run "workers_by_default" {
+  command = plan
+
+  assert {
+    condition     = length(helm_release.compute_classes) == 1 && yamldecode(helm_release.igloo[0].values[0]).workers.enabled == true
+    error_message = "Workers are on by default, with their compute class, which starts no machine until a statement starts a worker."
   }
 }
 
