@@ -656,7 +656,10 @@ how fast a cold scan reads follows the threads, which Igloo caps by memory
 the blocks of the data files a statement's scans are about to read, with
 `IGLOO_PREFETCH_CONCURRENCY` (256) requests in flight for all statements
 together, which take them in turn; DuckDB then reads the blocks from local
-disk. `IGLOO_PREFETCH=false` turns it off. Against an object store
+disk. `IGLOO_PREFETCH=false` turns it off, and workers read nothing ahead
+unless their own says `true`: a fleet of workers reading cold, each task its
+share of the files, saved no time by it beyond what runs differ by, and nearly
+half of what it fetched went unread. Against an object store
 answering in 20 ms at 90 MB/s a connection, as S3 does, a cold scan of
 three columns of a 4 GB table took 2.4 s rather than 11.3 s on 16 cores,
 and 2.4 s rather than 6.6 s on three workers sharing them, fetching 1 to 3%
@@ -708,9 +711,9 @@ more than DuckDB alone.
 - It reads ahead for queries and for the queries of `CREATE TABLE ... AS`
   and `INSERT ... SELECT` that read catalog tables, other than tables that
   policies or a clean room protect, when the statement runs on the replica:
-  for a statement [workers](distributed-execution.md) run, they read ahead
-  each task's table files, as their own `IGLOO_PREFETCH` says, and the
-  replica reads nothing ahead; exchanges' files, which the read cache
+  for a statement [workers](distributed-execution.md) run, the replica reads
+  nothing ahead, and they each task's table files only if their own
+  `IGLOO_PREFETCH` is `true`; exchanges' files, which the read cache
   leaves out, are not read ahead. The scans are those distributed
   execution would plan. A session turns it off for itself with
   `SET igloo_prefetch = off` (`RESET`, `SHOW igloo_prefetch`).
@@ -718,7 +721,7 @@ more than DuckDB alone.
   writes blocks as the cache's extension does. At startup the log says
   `prefetch on`, or why it is off. The Helm chart gives its igloo pods and
   its workers a cache volume (`cacheVolume`, `workers.cacheVolume`), so
-  both read ahead.
+  both can read ahead.
 
 ## Result cache
 

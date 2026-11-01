@@ -167,7 +167,8 @@ services:
       IGLOO_DUCKDB_MEMORY_LIMIT: ${IGLOO_WORKER_MEMORY_LIMIT:-}
       IGLOO_DUCKDB_THREADS: ${IGLOO_WORKER_THREADS:-}
       IGLOO_CACHE_SIZE: ${IGLOO_CACHE_SIZE:-}
-      IGLOO_PREFETCH: ${IGLOO_PREFETCH:-true}
+      # Workers read ahead only if told to (see docs/operations.md, prefetch).
+      IGLOO_PREFETCH: ${IGLOO_WORKER_PREFETCH:-false}
       IGLOO_S3_ENDPOINT: ${S3_ENDPOINT:-}
       IGLOO_S3_REGION: ${S3_REGION:?}
       IGLOO_S3_URL_STYLE: ${S3_URL_STYLE:?}

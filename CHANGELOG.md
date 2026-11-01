@@ -535,6 +535,10 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
 
 ### Distributed execution
 
+- Workers read nothing ahead unless their `IGLOO_PREFETCH` says `true`. On a fleet
+  reading cold, each task its share of the files on many threads, reading ahead
+  saved no time beyond what runs differ by, and nearly half of what it fetched
+  went unread. One machine still reads ahead by default, where it helps.
 - Reads in order larger than memory sort in runs also with parameters, for a
   client that reads a few rows at a time through a portal (JDBC's fetch size),
   by expressions, and with columns the merge cannot compare or pass on, as
