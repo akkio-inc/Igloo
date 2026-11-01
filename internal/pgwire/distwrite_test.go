@@ -1143,6 +1143,10 @@ func TestListedIn(t *testing.T) {
 	if !noSuchDir(errors.New("Invalid Error: 404 The specified path does not exist.")) || noSuchDir(errors.New("Invalid Error: 403 denied")) {
 		t.Error("what a hierarchical account says of a directory that is not there")
 	}
+	got := dirsOf("abfss://c@h/t/d", []string{"abfss://c@h/t/d/q/a/f", "abfss://c@h/t/d/q/b/g", "abfss://c@h/t/d/h"})
+	if want := []string{"abfss://c@h/t/d/q/a", "abfss://c@h/t/d/q/b", "abfss://c@h/t/d/q", "abfss://c@h/t/d"}; !slices.Equal(got, want) {
+		t.Errorf("directories %q, want %q", got, want)
+	}
 }
 
 // erasedLedger says an erasure request has just deleted files.

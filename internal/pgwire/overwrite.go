@@ -1,6 +1,7 @@
 package pgwire
 
 import (
+	"cmp"
 	"context"
 	"crypto/rand"
 	"database/sql/driver"
@@ -9,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	iofs "io/fs"
+	"maps"
 	mrand "math/rand/v2"
 	"net/url"
 	"regexp"
@@ -19,6 +21,7 @@ import (
 
 	"github.com/apache/iceberg-go"
 	"github.com/apache/iceberg-go/table"
+	"golang.org/x/sync/errgroup"
 
 	"github.com/akkio-inc/igloo/internal/catalog"
 	"github.com/akkio-inc/igloo/internal/catalogproxy"
@@ -710,12 +713,47 @@ func (s *Server) deleteRefreshFiles(ctx context.Context, tbl *table.Table, dir s
 	if err != nil {
 		return err
 	}
+	g := new(errgroup.Group)
+	g.SetLimit(sealCopies)
 	for _, f := range files {
-		if err := fs.Remove(f); err != nil && !errors.Is(err, iofs.ErrNotExist) {
-			return fmt.Errorf("delete %s: %w", f, err)
+		g.Go(func() error {
+			if err := fs.Remove(f); err != nil && !errors.Is(err, iofs.ErrNotExist) {
+				return fmt.Errorf("delete %s: %w", f, err)
+			}
+			return nil
+		})
+	}
+	if err := g.Wait(); err != nil {
+		return err
+	}
+	if strings.HasPrefix(dir, "abfss://") {
+		for _, d := range dirsOf(dir, files) {
+			// One that holds something, as a late write's, stays for the second look.
+			_ = fs.Remove(d)
 		}
 	}
 	return nil
+}
+
+// dirsOf lists the directories from dir down to files, the deepest first: on an Azure
+// account with a hierarchical namespace, a directory is a thing of its own, and stays
+// when its files go, a dozen of them for every statement otherwise.
+func dirsOf(dir string, files []string) []string {
+	seen := map[string]bool{}
+	for _, f := range files {
+		for p := f; strings.HasPrefix(p, dir+"/"); {
+			p = p[:strings.LastIndexByte(p, '/')]
+			seen[p] = true
+		}
+	}
+	dirs := slices.Collect(maps.Keys(seen))
+	slices.SortFunc(dirs, func(a, b string) int {
+		if c := cmp.Compare(len(b), len(a)); c != 0 {
+			return c
+		}
+		return cmp.Compare(a, b)
+	})
+	return dirs
 }
 
 // writeDirName is the name of a refresh's directory, or a statement's.
