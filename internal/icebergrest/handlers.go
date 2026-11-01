@@ -181,6 +181,9 @@ func (s *Server) createNamespace(c *call) error {
 	if err := c.who.checkLocation(keys(req.Properties)); err != nil {
 		return err
 	}
+	if err := c.who.checkOwnProperties(keys(req.Properties)); err != nil {
+		return err
+	}
 	r, err := s.cat.call(c.ctx(), http.MethodPost, "namespaces", nil, body)
 	if err != nil {
 		return err
@@ -260,6 +263,9 @@ func (s *Server) updateNamespace(c *call) error {
 	if err := c.who.checkLocation(append(keys(req.Updates), req.Removals...)); err != nil {
 		return err
 	}
+	if err := c.who.checkOwnProperties(append(keys(req.Updates), req.Removals...)); err != nil {
+		return err
+	}
 	r, err := s.cat.call(c.ctx(), http.MethodPost, namespacePathOf(ns)+"/properties", nil, body)
 	if err != nil {
 		return err
@@ -276,6 +282,17 @@ func (c *caller) checkLocation(props []string) error {
 		return nil
 	}
 	return c.deny("only admins may choose a schema's location")
+}
+
+// checkOwnProperties refuses everyone a schema's properties that are Igloo's
+// own (igloo.*), which only Igloo writes, reaching the catalog itself: its
+// notes of what stopped processes left (see catalog.Pending) say which tables
+// and files it may drop and delete.
+func (c *caller) checkOwnProperties(props []string) error {
+	if !slices.ContainsFunc(props, func(p string) bool { return strings.HasPrefix(strings.ToLower(p), "igloo.") }) {
+		return nil
+	}
+	return c.deny("a schema's igloo.* properties are Igloo's own")
 }
 
 func keys(m map[string]string) []string {

@@ -521,7 +521,10 @@ ago) proves what is under its name is Igloo's own: the next `CREATE TABLE
 fills anything, `CREATE TABLE ... AS` checks that nothing else holds the
 name unseen, briefly putting an empty table under it when it is free, and
 fails at once if something does; an admin's `DROP TABLE name`, without `IF
-EXISTS`, releases such a hold, whoever left it.
+EXISTS`, releases such a hold, whoever left it. The [Iceberg REST
+catalog](external-engines.md) refuses everyone a schema's `igloo.*`
+properties, and a note whose directory is not its table's own deletes
+nothing.
 
 A full refresh of a materialized view or dynamic table writes the view's
 rows into a directory of their own under its table's data

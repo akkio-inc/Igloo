@@ -1540,6 +1540,10 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   `history.expire.max-snapshot-age-ms` of Java's `Long.MAX_VALUE`
   ("forever") as forever; it overflowed into a negative age that dropped
   every branch and tag.
+- A schema's `igloo.*` properties can no longer be set or removed through the
+  Iceberg REST catalog, by anyone: a writer could note a directory of another
+  table's as what a stopped write of theirs left, which the next write deleted.
+  A note whose directory is not its table's own now deletes nothing.
 - Erasure requests erase from the tables being made to replace their tagged
   tables (`name__igloo_new_...`), which a stopped `CREATE OR REPLACE TABLE`
   left, committed rows and files of workers alike, and which no request

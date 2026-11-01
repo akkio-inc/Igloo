@@ -1161,3 +1161,63 @@ func TestLateWritesStop(t *testing.T) {
 		t.Error("it went on with the server stopped")
 	}
 }
+
+// TestForgedNoteDeletesNothing: a note of what a stopped write left, as whoever
+// reaches the catalog itself can write one, deletes files only in a directory
+// of the table it names, as Igloo makes them. Any other is left, and the note
+// goes.
+func TestForgedNoteDeletesNothing(t *testing.T) {
+	env := startWriteServer(t)
+	env.force(t)
+	admin := env.admin
+	ctx := context.Background()
+	mustExec(t, admin, "CREATE TABLE w_victim (id BIGINT, x BIGINT)")
+	mustExec(t, admin, "INSERT INTO w_victim SELECT id, x FROM src")
+	mustExec(t, admin, "CREATE TABLE w_mine (id BIGINT, x BIGINT)")
+	loc := env.location(t, "w_victim")
+	before := written(t, loc)
+	if len(before) == 0 {
+		t.Fatal("workers wrote none of the victim's files: the test shows nothing")
+	}
+	base := strings.TrimSuffix(strings.TrimPrefix(loc, "file://"), "/") + "/data/"
+	own := regexp.MustCompile(".*/" + distributed.WriteDirMark + "[0-9a-f]+").FindString(before[0])
+	for _, dir := range []string{base + distributed.WriteDirMark + "*", own} {
+		note := catalog.Pending{Key: "igloo.pending.forged", Kind: catalog.PendingFiles, Name: dir, Target: "w_mine", Host: "gone", Process: "gone",
+			At: time.Now().Add(-2 * catalog.PendingStale)}
+		if err := env.srv.ddl.NotePending(ctx, "public", note); err != nil {
+			t.Fatal(err)
+		}
+		mustExec(t, admin, "INSERT INTO w_mine SELECT id, x FROM src")
+		env.srv.lateWrites.Wait()
+		if n := len(filesNotes(t, env.srv)); n != 0 {
+			t.Errorf("%s: %d notes left", dir, n)
+		}
+		if after := written(t, loc); !slices.Equal(after, before) {
+			t.Errorf("a note of %s deleted the victim's files: %d left of %d", dir, len(after), len(before))
+		}
+	}
+	if got := count(t, admin, "SELECT count(*) FROM w_victim"); got != count(t, admin, "SELECT count(*) FROM src") {
+		t.Errorf("the victim holds %d rows", got)
+	}
+
+	// What a stopped write of its own left goes.
+	left := strings.TrimSuffix(strings.TrimPrefix(env.location(t, "w_mine"), "file://"), "/") + "/data/" + distributed.WriteDirMark + "0123456789abcdef"
+	conn, err := env.srv.engine.Connect(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close() //nolint:errcheck
+	if _, err := conn.ExecContext(ctx, "COPY (SELECT 1 AS id, 2 AS x) TO "+quoteLiteral(left)+" (FORMAT parquet, FILENAME_PATTERN 'part_{i}', FILE_SIZE_BYTES 1000000)", nil); err != nil {
+		t.Fatal(err)
+	}
+	note := catalog.Pending{Key: "igloo.pending.stopped", Kind: catalog.PendingFiles, Name: left, Target: "w_mine", Host: "gone", Process: "gone",
+		At: time.Now().Add(-2 * catalog.PendingStale)}
+	if err := env.srv.ddl.NotePending(ctx, "public", note); err != nil {
+		t.Fatal(err)
+	}
+	mustExec(t, admin, "INSERT INTO w_mine SELECT id, x FROM src")
+	env.srv.lateWrites.Wait()
+	if n := filesIn(t, left); n != 0 {
+		t.Errorf("%d files a stopped write left are still there", n)
+	}
+}

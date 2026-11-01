@@ -10,6 +10,7 @@ import (
 	"io"
 	iofs "io/fs"
 	mrand "math/rand/v2"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
@@ -401,8 +402,9 @@ func currentFiles(ctx context.Context, tbl *table.Table) (data, deletes []iceber
 // those of stopped processes, and this process's own, or, with all, every
 // one, which the caller knows no refresh of the view is writing. Files a
 // snapshot of the table holds stay, a refresh having committed them before
-// it could forget its note.
-func (s *Server) clearRefreshFiles(ctx context.Context, schema, name string, all bool) error {
+// it could forget its note. old are locations the table had, whose directories
+// are its too.
+func (s *Server) clearRefreshFiles(ctx context.Context, schema, name string, all bool, old ...string) error {
 	if s.ddl == nil {
 		return nil
 	}
@@ -421,7 +423,7 @@ func (s *Server) clearRefreshFiles(ctx context.Context, schema, name string, all
 				return err
 			}
 		}
-		if err := s.clearNoted(ctx, schema, name, tbl, n); err != nil {
+		if err := s.clearNoted(ctx, schema, name, tbl, n, old...); err != nil {
 			return err
 		}
 	}
@@ -438,8 +440,17 @@ func (s *Server) clearNotedFiles(ctx context.Context, schema, name string, n cat
 }
 
 // clearNoted deletes the files note n says a stopped write left under tbl,
-// schema.name, nil if gone, unless a snapshot holds them, and forgets it.
-func (s *Server) clearNoted(ctx context.Context, schema, name string, tbl *table.Table, n catalog.Pending) error {
+// schema.name, nil if gone, or a location it had (old), unless a snapshot holds
+// them, and forgets it. A directory that is not one of these locations' own, as
+// Igloo notes them (see ownDirectory), is not its to delete: a note is a
+// schema's property, and the REST catalog keeps them from clients, but whoever
+// reaches the catalog itself can write one.
+func (s *Server) clearNoted(ctx context.Context, schema, name string, tbl *table.Table, n catalog.Pending, old ...string) error {
+	if tbl != nil && !slices.ContainsFunc(append(old, tbl.Location()), func(loc string) bool { return ownDirectory(loc, n.Name) }) {
+		s.log.Warn("a note of a stopped write names a directory that is not the table's; it deletes nothing, and goes",
+			"table", schema+"."+name, "dir", n.Name)
+		return s.ddl.ForgetPending(ctx, schema, n.Key)
+	}
 	if tbl != nil {
 		held, err := holdsFiles(ctx, tbl, n.Name)
 		if err != nil {
@@ -496,7 +507,7 @@ func (s *Server) deleteRefreshFiles(ctx context.Context, tbl *table.Table, dir s
 // if it does not find them all there, it does not know what the files it
 // finds are called, and deletes none.
 func (s *Server) deleteFilesExcept(ctx context.Context, tbl *table.Table, dir string, keep []string) error {
-	if !strings.Contains(dir, "/"+overwriteDir) && !strings.Contains(dir, "/"+distributed.WriteDirMark) {
+	if parent, name := splitDir(dir); !writeDirName.MatchString(name) || !strings.HasSuffix(parent, "/data") {
 		return fmt.Errorf("%s is not a refresh's directory, nor a statement's", dir)
 	}
 	conn, err := s.engine.Connect(ctx)
@@ -548,6 +559,25 @@ func (s *Server) deleteFilesExcept(ctx context.Context, tbl *table.Table, dir st
 		}
 	}
 	return nil
+}
+
+// writeDirName is the name of a refresh's directory, or a statement's.
+var writeDirName = regexp.MustCompile("^(" + overwriteDir + "|" + distributed.WriteDirMark + ")[0-9a-f]+$")
+
+// ownDirectory reports whether dir is a refresh's directory or a statement's
+// of the table at location: directly in its data, as Igloo makes them.
+func ownDirectory(location, dir string) bool {
+	parent, name := splitDir(dir)
+	return writeDirName.MatchString(name) && parent == strings.TrimSuffix(strings.TrimPrefix(location, "file://"), "/")+"/data"
+}
+
+// splitDir splits dir, a path or a URL, at its last slash.
+func splitDir(dir string) (parent, name string) {
+	i := strings.LastIndexByte(dir, '/')
+	if i < 0 {
+		return "", dir
+	}
+	return dir[:i], dir[i+1:]
 }
 
 // holdsFiles reports whether any snapshot of tbl holds a file in dir.
