@@ -207,6 +207,13 @@ func startTestWorker(t *testing.T, dir string, i int, gate *taskGate) (string, *
 // none.
 func startTestWorkerRB(t *testing.T, dir string, i int, gate *taskGate, rb string) (string, *distributed.Worker, func()) {
 	t.Helper()
+	return startTestWorkerCores(t, dir, i, gate, rb, 1)
+}
+
+// startTestWorkerCores is startTestWorkerRB of a worker that reports cores,
+// for auto mode's estimates.
+func startTestWorkerCores(t *testing.T, dir string, i int, gate *taskGate, rb string, cores int) (string, *distributed.Worker, func()) {
+	t.Helper()
 	tmp := filepath.Join(t.TempDir(), "worker")
 	if err := os.MkdirAll(tmp, 0o700); err != nil {
 		t.Fatal(err)
@@ -244,7 +251,7 @@ func startTestWorkerRB(t *testing.T, dir string, i int, gate *taskGate, rb strin
 	}
 	w, err := distributed.NewWorker(distributed.WorkerOptions{
 		Engine: workerEngine{c, gate}, Secret: testWorkerSecret, Version: "test", ID: fmt.Sprintf("w%d", i), TempDir: tmp,
-		Locations: []string{dir}, Cores: 1, MemoryBytes: 1 << 30,
+		Locations: []string{dir}, Cores: cores, MemoryBytes: 1 << 30,
 	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
 		t.Fatal(err)
@@ -299,10 +306,17 @@ func startDistServerWith(t *testing.T, dir string, workers int, coordinate func(
 // extension at rb, if set.
 func startDistServerRB(t *testing.T, dir string, workers int, rb string, coordinate func(*distributed.Options), configure ...func(*Options)) *distServer {
 	t.Helper()
+	return startDistServerCores(t, dir, workers, 1, rb, coordinate, configure...)
+}
+
+// startDistServerCores is startDistServerRB with workers that report cores
+// each, for auto mode's estimates.
+func startDistServerCores(t *testing.T, dir string, workers, cores int, rb string, coordinate func(*distributed.Options), configure ...func(*Options)) *distServer {
+	t.Helper()
 	ds := &distServer{source: &lakeSource{dir: dir, files: map[string][]distributed.File{}}, gate: newTaskGate()}
 	var addrs []string
 	for i := range workers {
-		addr, w, stop := startTestWorkerRB(t, dir, i, ds.gate, rb)
+		addr, w, stop := startTestWorkerCores(t, dir, i, ds.gate, rb, cores)
 		addrs = append(addrs, addr)
 		ds.workers = append(ds.workers, w)
 		ds.stops = append(ds.stops, stop)

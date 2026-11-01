@@ -800,3 +800,32 @@ func TestListPrices(t *testing.T) {
 		t.Errorf("by list prices: %d workers, large %v, dollars %v (%s)", e.workers, e.large, e.dollars, e.fleet)
 	}
 }
+
+// TestFillCost checks what writing a fill's rows adds to its estimates: a
+// copy of a table of 50 GB of files at ten times the data, whose rows this
+// replica writes wherever the query runs, and after fetching them from the
+// workers where it runs there, stays here, where a read of the same query
+// runs on workers; an aggregate of it, whose result keeps a hundredth of
+// its rows at most, runs on workers either way.
+func TestFillCost(t *testing.T) {
+	now := time.Now()
+	copyOf := features{bytes: 5e10, rows: 1e9, levels: 1, stages: 1, planned: true, planSet: 1e9, planBytes: 5e10, planKeeps: 1}
+	decide := func(x features) (bool, string) {
+		t.Helper()
+		e := x.estimate(scaleCoordinator, benchWorkers)
+		workers, _, reason := choose(e, runs{}, false, DefaultThreshold, now)
+		return workers, reason
+	}
+	if workers, reason := decide(copyOf); !workers {
+		t.Errorf("a read of the copy's query: here (%s)", reason)
+	}
+	copyOf.fill = true
+	if workers, reason := decide(copyOf); workers {
+		t.Errorf("the copy: on workers (%s)", reason)
+	}
+	aggregate := copyOf
+	aggregate.planKeeps = aggregateKeeps
+	if workers, reason := decide(aggregate); !workers {
+		t.Errorf("an aggregate fill: here (%s)", reason)
+	}
+}

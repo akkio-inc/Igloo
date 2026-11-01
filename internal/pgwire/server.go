@@ -542,6 +542,9 @@ type Server struct {
 	// fails it with its error; tests use it to make a statement run out of
 	// memory here.
 	failLocal func(ctx context.Context, st *statement) error
+	// failFill, if set, runs before a fill's query runs on this replica
+	// (see fillOn), and fails it with its error.
+	failFill func(ctx context.Context, query string) error
 	// rewriteHook, if set, is the last of Igloo's rewrites of a statement
 	// before it is checked and prepared (see rewrite); tests use it to
 	// write what only Igloo may, such as the columns of ID domains' ids.
@@ -2168,6 +2171,12 @@ func (s *Server) preparedQuery(ctx context.Context, sess *session, user auth.Use
 			aiNotice(w, sp)
 		}
 		sess.wl.counted, sess.wl.shape = false, ""
+		if st.filled != nil {
+			// A fill's query ran on workers, or here, as a read of it would
+			// (see fillOn): the history says where, and auto mode learns how
+			// long it took.
+			parts, st.filled = *st.filled, nil
+		}
 		releaseCatalog()
 		s.finishResult(fill, err)
 		var used *audit.Resources

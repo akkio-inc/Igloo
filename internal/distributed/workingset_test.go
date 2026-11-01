@@ -480,3 +480,34 @@ func heldPeak(t *testing.T, h *harness, query string) float64 {
 	<-stopped
 	return float64(max(peak.Load(), 1))
 }
+
+// TestPlanKeeps checks the share of the rows a plan's scans read that its
+// result keeps, which a fill writes (see fillCost): all of them for a
+// copy, a filter's share for a filtered one, and no more than a hundredth
+// for an aggregate, whose groups DuckDB takes for all its input rows.
+func TestPlanKeeps(t *testing.T) {
+	events := &Table{Name: "events", Rows: 1e9, Bytes: 5e10, Columns: []Column{{Name: "id", Type: "BIGINT"}, {Name: "day", Type: "DATE"},
+		{Name: "grp", Type: "INTEGER"}}}
+	st := newPlanStats([]*Stage{{Inputs: []Input{{Table: events}}}}, 16)
+	scan := func(card string, extra ...any) map[string]any {
+		return op("ICEBERG_SCAN", nil, append([]any{"Projections", []string{"id", "day", "grp"}, "Estimated Cardinality", card}, extra...)...)
+	}
+	for _, c := range []struct {
+		name string
+		plan map[string]any
+		want float64
+	}{
+		{"copy", op("PROJECTION", []map[string]any{scan("1000000000")}, "Projections", []string{"id", "day", "grp"}), 1},
+		{"filtered copy", op("PROJECTION", []map[string]any{scan("40000000", "Filters", "grp<2")}, "Projections", []string{"id", "day", "grp"}), 0.04},
+		{"aggregate", op("ORDER_BY", []map[string]any{op("HASH_GROUP_BY", []map[string]any{scan("1000000000")},
+			"Groups", []string{"#0", "#1"}, "Aggregates", []string{"count(DISTINCT #2)"}, "Estimated Cardinality", "1000000000")}), aggregateKeeps},
+	} {
+		p, err := planOf(planJSON(t, c.plan), st)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if math.Abs(p.keeps-c.want) > c.want/100 {
+			t.Errorf("%s: keeps %g, want %g", c.name, p.keeps, c.want)
+		}
+	}
+}

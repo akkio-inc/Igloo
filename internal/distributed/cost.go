@@ -261,6 +261,52 @@ type features struct {
 	planParts []heldPart
 	planBytes int64
 	planWork  float64
+	// fill says the statement fills a table from the query's rows, which
+	// this replica writes wherever the query runs, and planKeeps the share
+	// of the rows its scans read that the query's result has, by the plan
+	// (see fillCost).
+	fill      bool
+	planKeeps float64
+}
+
+// Fills is an Env whose statement fills a table from the query planned,
+// as CREATE TABLE ... AS does: this replica writes the table from the
+// query's rows wherever the query runs, from the workers' results where it
+// runs on workers (see fillCost). Its runs are kept apart from reads of the
+// same query.
+type Fills interface {
+	Fill() bool
+}
+
+const (
+	// fillWriteRate is the bytes of table files a second a core of this
+	// replica writes, compressed as it reads them: one of 16 cores wrote a
+	// billion rows of four columns, about 10 GB of files, in 163 s, about
+	// 60 MB/s in all.
+	fillWriteRate = 3.75e6
+	// fillFetchRate is the bytes of files a second this replica fetches of
+	// the workers' results, to write the table from them.
+	fillFetchRate = 400e6
+)
+
+// fillCost is what writing a fill's rows adds to its time, on a replica of
+// cores: it writes them wherever the query runs (here), and fetches them
+// from the workers first where it runs there (onWorkers), files about the
+// share of the bytes it reads that its rows are of the rows it reads (see
+// planEstimate.keeps). A copy, whose rows are as many as it reads, takes
+// about as long either way, writing them, and runs on workers only where
+// they are clearly faster still; an aggregate's few rows add nothing.
+func (x features) fillCost(cores int) (here, onWorkers float64) {
+	if !x.fill || !x.planned || x.planKeeps <= 0 {
+		return 0, 0
+	}
+	read := float64(x.bytes)
+	if x.planBytes > 0 {
+		read = float64(x.planBytes)
+	}
+	out := x.planKeeps * read
+	write := out / (fillWriteRate * float64(max(cores, 1)))
+	return write, write + out/fillFetchRate
 }
 
 // set is the working set of a plan of features x on one machine: what
@@ -375,6 +421,17 @@ func (x features) estimate(m machine, f fleet) estimate {
 	e.local = spillOn(set, m.memory)
 	e.spills = e.local.factor > 1
 	e.oneMachine *= e.local.factor
+	// A fill's rows, written here wherever the query runs.
+	here, there := x.fillCost(m.cores)
+	e.oneMachine += here
+	if there > 0 {
+		for i := range e.options {
+			e.options[i].estimate += there
+			e.options[i].seconds = e.options[i].estimate
+			e.options[i].cost = e.options[i].costOn(f)
+		}
+		e.pick(runs{}, f)
+	}
 	return e
 }
 

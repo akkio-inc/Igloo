@@ -604,6 +604,20 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   the fewest tasks. `EXPLAIN DISTRIBUTED` shows the choice (`fleet`) and
   the ways weighed (`options`), and `query_history.placement` where a
   statement ran and why (see [when](docs/distributed-execution.md#when)).
+- A statement that fills a table from a query, `CREATE [OR REPLACE] TABLE
+  ... AS` (dbt's table models too), `INSERT INTO ... SELECT` and a
+  materialized view's or dynamic table's full refresh, runs its query on
+  workers where auto mode would run it there as a read, by the same
+  estimates, history, grants and policies, the replica writing the table
+  from their results: a `count(DISTINCT)` of a billion IDs into a table,
+  which the memory watch canceled on the replica, sends it a thousand rows.
+  Auto mode counts the replica's writing of the rows on both sides, and
+  their fetch from the workers, so a copy stays on the replica unless
+  workers are clearly faster. The guard, a run out of memory, the failure
+  history and the fallbacks work as for reads, a fill whose workers run
+  out of memory goes on in passes, and a fill from a table with masking
+  or row access policies stays on the replica. Workers write no table's
+  files.
 - DuckDB's memory limit, where `IGLOO_DUCKDB_MEMORY_LIMIT` does not set it,
   is what Igloo's memory leaves after the eighth it keeps free before it
   lowers DuckDB's limit, its reserve and an eighth of the limit itself,

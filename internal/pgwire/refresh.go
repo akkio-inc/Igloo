@@ -1,6 +1,7 @@
 package pgwire
 
 import (
+	"cmp"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -147,6 +148,7 @@ func (s *Server) refreshView(ctx context.Context, sess *session, user auth.User,
 		return refreshResult{}, err
 	}
 	_ = st.close()
+	checked := st.access
 	// What runs is the query as policies rewrite it for user, so the view
 	// holds what its owner may see of protected tables.
 	query, g, _, err := s.policyRewrite(ctx, sess, user, duckdb.STATEMENT_TYPE_SELECT, s.rewrite(ctx, sess, user, j.Statement), nil, nil)
@@ -155,7 +157,7 @@ func (s *Server) refreshView(ctx context.Context, sess *session, user auth.User,
 	}
 	state := decodeRefresh(j.Refresh)
 	r := &refresher{s: s, sess: sess, job: j, schema: schema, table: table, qualified: qualified, query: query, st: state,
-		digest: digest(query)}
+		digest: digest(query), access: checked, guard: g}
 	res, err := r.run(ctx)
 	res.used = r.used
 	if err != nil {
@@ -182,6 +184,42 @@ type refresher struct {
 	temps []string
 	// used adds up what DuckDB measured of the statements it ran.
 	used audit.Resources
+	// access is what grants let the refresh read, and guard how policies
+	// rewrote its query, for a run of its query on workers (see rebuild).
+	access *access
+	guard  *guard
+	// placement is where its query ran, when it ran on workers.
+	placement string
+}
+
+// rebuild replaces the view's rows with its query's, the query on workers
+// where auto mode would run it there as a read by the view's owner (see
+// fillOn), the view written from their results.
+func (r *refresher) rebuild(ctx context.Context) (int64, error) {
+	write := func(ctx context.Context, source string) (int64, error) {
+		return r.replaceRows(ctx, "SELECT * FROM ("+source+") AS refresh")
+	}
+	start := time.Now()
+	f := &stagedFill{s: r.s, sess: r.sess, ctx: ctx}
+	defer f.close()
+	src := r.s.fillSource(ctx, r.sess, &statement{access: r.access, guard: r.guard}, r.query)
+	rows, parts, _, err := r.s.fillOn(f, src, func(ctx context.Context) (int64, error) { return write(ctx, r.query) }, write)
+	if err == nil && parts.key != "" {
+		r.s.dist.ObserveOn(parts.key, parts.workers, parts.large, time.Since(cmp.Or(parts.since, start)))
+	}
+	if err == nil && parts.workers > 0 {
+		r.placement = parts.placement
+	}
+	return rows, err
+}
+
+// onWorkers says, for a refresh's detail, where its query ran when it ran
+// on workers (see rebuild).
+func (r *refresher) onWorkers() string {
+	if r.placement == "" {
+		return ""
+	}
+	return "; its query ran on " + r.placement
 }
 
 // exec runs q on the refresh's connection, and adds what DuckDB measured
@@ -755,12 +793,12 @@ func (r *refresher) full(ctx context.Context, why string) (refreshResult, error)
 	p := r.plan
 	if p == nil || p.Reason != "" || r.snaps == nil || r.st.Mode == refreshFull {
 		// Nothing to go on from: the query as it is, and no state.
-		rows, err := r.replaceRows(ctx, "SELECT * FROM ("+r.query+") AS refresh")
+		rows, err := r.rebuild(ctx)
 		if err != nil {
 			return refreshResult{}, err
 		}
 		r.dropState(ctx)
-		res, _, err := r.done(ctx, refreshResult{rows: rows, action: actionFull, detail: detail})
+		res, _, err := r.done(ctx, refreshResult{rows: rows, action: actionFull, detail: detail + r.onWorkers()})
 		return res, err
 	}
 	pins := make([]incremental.Pin, len(p.Sources))
@@ -795,12 +833,12 @@ func (r *refresher) full(ctx context.Context, why string) (refreshResult, error)
 		// The state cannot hold these values: the query as it is, until it
 		// changes.
 		r.st.Unkeepable, r.st.UnkeepableReason, r.st.Incremental, r.st.Reason = r.digest, reason, false, reason
-		rows, err := r.replaceRows(ctx, "SELECT * FROM ("+r.query+") AS refresh")
+		rows, err := r.rebuild(ctx)
 		if err != nil {
 			return refreshResult{}, err
 		}
 		r.dropState(ctx)
-		res, _, err := r.done(ctx, refreshResult{rows: rows, action: actionFull, detail: "ran the query over every row: " + reason})
+		res, _, err := r.done(ctx, refreshResult{rows: rows, action: actionFull, detail: "ran the query over every row: " + reason + r.onWorkers()})
 		return res, err
 	}
 	name, err := r.makeState(ctx)

@@ -234,6 +234,39 @@ type planEstimate struct {
 	parts []heldPart
 	bytes int64
 	work  float64
+	// keeps is the share of the rows its scans read that its result has,
+	// up to maxKeeps: about 1 for a copy, next to nothing for an
+	// aggregate's few groups.
+	keeps float64
+}
+
+// maxKeeps is the most rows a result is taken to have for each row its
+// scans read, as joins multiply them; aggregateKeeps the most an
+// aggregate's is. DuckDB takes an aggregate's groups for all its input
+// rows, without distinct counts of its keys: a count(DISTINCT) of a
+// billion IDs by day and group kept 1,500 rows.
+const (
+	maxKeeps       = 4
+	aggregateKeeps = 0.01
+)
+
+// topAggregate says a plan's result is an aggregate's, through the
+// operators that order, project, filter or limit its rows.
+func topAggregate(n *planNode) bool {
+	for n != nil {
+		name := strings.ToUpper(n.Name)
+		switch {
+		case strings.Contains(name, "GROUP_BY"), strings.Contains(name, "AGGREGATE"):
+			return true
+		case len(n.Children) != 1:
+			return false
+		case name == "ORDER_BY", name == "PROJECTION", name == "FILTER", name == "TOP_N", strings.Contains(name, "LIMIT"):
+			n = n.Children[0]
+		default:
+			return false
+		}
+	}
+	return false
 }
 
 // planOf estimates a statement by its DuckDB plan (see planEstimate).
@@ -246,13 +279,26 @@ func planOf(plan string, st planStats) (planEstimate, error) {
 		return planEstimate{}, errors.New("an empty plan")
 	}
 	w := &setWalker{st: st, ctes: map[string]cte{}}
+	var result float64
+	aggregated := false
 	for _, r := range roots {
-		w.walk(r)
+		rows, _ := w.walk(r)
+		result = rows.ours
+		if result <= 0 {
+			result = rows.duck
+		}
+		aggregated = topAggregate(r)
 	}
 	if w.unknown != "" {
 		return planEstimate{}, errors.New("no estimate of the rows of " + w.unknown)
 	}
 	out := planEstimate{parts: w.parts, work: w.work, bytes: w.bytes()}
+	if w.scanned > 0 {
+		out.keeps = min(result/w.scanned, maxKeeps)
+		if aggregated {
+			out.keeps = min(out.keeps, aggregateKeeps)
+		}
+	}
 	for _, p := range w.parts {
 		out.set += p.bytes
 	}
@@ -270,6 +316,8 @@ type setWalker struct {
 	ctes  map[string]cte
 	scans []scanRead
 	work  float64
+	// scanned is the rows of the tables its scans read.
+	scanned float64
 }
 
 // cte is a common table expression's rows and columns, for its scans.
@@ -415,6 +463,12 @@ func (w *setWalker) walk(n *planNode) (rowsEstimate, []column) {
 			}
 		case !ok:
 			w.unknown = name
+		}
+		switch {
+		case t != nil && t.Rows > 0:
+			w.scanned += float64(t.Rows)
+		case ok:
+			w.scanned += card
 		}
 		if t != nil {
 			read := columnSet{}

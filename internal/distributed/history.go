@@ -67,6 +67,7 @@ type runs struct {
 	planSet   float64
 	planBytes int64
 	planWork  float64
+	planKeeps float64
 	// localMemory, distMemory and largeMemory are the memory its runs had:
 	// the replica's limit on one machine, the smallest worker's on workers,
 	// the large worker's on it; zero when not known. Runs under other

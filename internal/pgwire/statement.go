@@ -113,6 +113,13 @@ type statement struct {
 	// was prepared: they run under an ai.Statement begun before each run
 	// (see beginAI).
 	ai bool
+	// fill says the statement is the query a statement fills a table
+	// from, prepared for the planner (see fillSource).
+	fill bool
+	// filled is where the query of a fill of a table ran, on workers or
+	// here, as for a read of it (see fillOn): for the query history, and
+	// for auto mode's history of the query.
+	filled *distParts
 }
 
 // prepare compiles query on conn. clientOIDs are parameter types the client

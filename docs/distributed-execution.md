@@ -326,6 +326,41 @@ workers run them as they run any other. Igloo's own text names those
 columns where it counts through ids. A member table with a policy of its
 own stays on the replica.
 
+### Fills
+
+A statement that fills a table from a query runs the query where auto mode
+would run it as a read, by the same estimates, history, grants and
+policies: `CREATE TABLE ... AS` (dbt's table models' `create table ... as
+(...)` too), `CREATE OR REPLACE TABLE ... AS`, `INSERT INTO ... SELECT`, and
+a materialized view's or dynamic table's full refresh. On workers, the
+coordinator writes the table from the workers' results, `INSERT INTO` the
+table the SQL that combines them, as it sends a read's client what it
+combines; workers write no table's files. A `count(DISTINCT)` of a billion
+IDs by day and group into a table, which held the replica at its memory
+limit until the memory watch canceled it, sends the replica a thousand
+rows to write.
+
+The coordinator writes a fill's rows wherever its query runs, and fetches
+them from the workers first where it runs there, so auto mode adds that to
+both sides' estimates: about the share of the bytes the query reads that
+its rows are of the rows its scans read, by DuckDB's plan (an aggregate's
+result is taken for a hundredth of its rows at most, as DuckDB takes its
+groups for all of them), written at 3.75 MB of files a second a core of the
+replica and fetched at 400 MB/s. A copy, whose rows are as many as it
+reads, takes about as long either way and stays on the replica unless
+workers are faster still by the margin auto mode asks of any statement.
+Fills keep their own history, apart from reads of the same query. A fill
+auto mode runs on the replica is guarded as a read is (see [when](#when)):
+past its time, or once it runs out of memory there, its query runs on
+workers, into the table its run on the replica left empty. One whose
+workers run out of memory goes on in passes on the replica where its
+query allows (see [aggregates too large for memory](sql.md#aggregates-too-large-for-memory)). A fill from a table
+masking or row access policies apply to, directly or through a view,
+stays on the replica, as reads of it do. `query_history.placement` says
+where the fill's query ran, and a refresh's detail says so where it ran
+on workers. Fills of tables of member columns of ID domains, sorted
+writes and fills in a transaction block run on the replica, as before.
+
 ### Window functions
 
 A `SELECT` that does not aggregate, and whose window functions all

@@ -535,6 +535,10 @@ func (co *Coordinator) planOn(ctx context.Context, query string, env Env, mode M
 		keyed = restoreValues(clone(stmt), values).(node)
 	}
 	plan.Key = planKey(keyed, plan.Stages)
+	if fe, ok := env.(Fills); ok && fe.Fill() {
+		// A fill's runs time its write too: apart from reads of its query.
+		plan.Key += "-fill"
+	}
 	if shape != "" {
 		co.shapes.planned(shape, plan.Key)
 	}
@@ -570,10 +574,13 @@ func (co *Coordinator) planOn(ctx context.Context, query string, env Env, mode M
 		// session plans it, read once for a statement run again.
 		p, ok := co.planSet(ctx, env, query, plan.Stages, r)
 		if ok && !dry && r.planSet != p.set {
-			co.history.update(plan.Key, func(r *runs) { r.planSet, r.planBytes, r.planWork = p.set, p.bytes, p.work })
+			co.history.update(plan.Key, func(r *runs) { r.planSet, r.planBytes, r.planWork, r.planKeeps = p.set, p.bytes, p.work, p.keeps })
 		}
 		x.planSet, x.planParts, x.planned = p.set*co.memory.scale(), p.parts, ok
-		x.planBytes, x.planWork = p.bytes, p.work
+		x.planBytes, x.planWork, x.planKeeps = p.bytes, p.work, p.keeps
+	}
+	if fe, ok := env.(Fills); ok {
+		x.fill = fe.Fill()
 	}
 	e := x.estimate(m, f)
 	e.others = others
@@ -717,7 +724,7 @@ func (co *Coordinator) fleet(ctx context.Context, ws []*worker, mayStart, large 
 // operators hold, when it was read now.
 func (co *Coordinator) planSet(ctx context.Context, env Env, query string, stages []*Stage, r runs) (planEstimate, bool) {
 	if r.planSet > 0 {
-		return planEstimate{set: r.planSet, bytes: r.planBytes, work: r.planWork}, true
+		return planEstimate{set: r.planSet, bytes: r.planBytes, work: r.planWork, keeps: r.planKeeps}, true
 	}
 	ex, can := env.(Explainer)
 	if !can {

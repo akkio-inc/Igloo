@@ -270,8 +270,13 @@ type stagedFill struct {
 }
 
 func (f *stagedFill) fill(q string) (n int64, err error) {
+	return f.fillAt(f.ctx, q)
+}
+
+// fillAt is fill under ctx.
+func (f *stagedFill) fillAt(ctx context.Context, q string) (n int64, err error) {
 	err = f.s.runBound(f.sess, nil, func() error {
-		res, err := f.sess.conn.QueryContext(f.ctx, q, nil)
+		res, err := f.sess.conn.QueryContext(ctx, q, nil)
 		if err == nil {
 			n, err = countOf(res)
 		}
@@ -307,11 +312,13 @@ func (f *stagedFill) close() {
 	}
 }
 
-// runStagedCreate carries out c, holding the catalog lock exclusively only
-// while it changes the catalog. done is false when c is CREATE TABLE of a
-// table or view that exists: the statement then runs as written, under the
-// lock, for DuckDB's own error or, with IF NOT EXISTS, its notice.
-func (s *Server) runStagedCreate(ctx context.Context, sess *session, c *stagedCreate) (rows int64, done bool, err error) {
+// runStagedCreate carries out c, of st, holding the catalog lock
+// exclusively only while it changes the catalog. done is false when c is
+// CREATE TABLE of a table or view that exists: the statement then runs as
+// written, under the lock, for DuckDB's own error or, with IF NOT EXISTS,
+// its notice. Its query runs on workers where auto mode would run it there
+// as a read (see fillOn).
+func (s *Server) runStagedCreate(ctx context.Context, sess *session, st *statement, c *stagedCreate) (rows int64, done bool, err error) {
 	exec := func(ctx context.Context, q string) error {
 		_, err := sess.conn.ExecContext(ctx, q, nil)
 		return err
@@ -397,14 +404,28 @@ func (s *Server) runStagedCreate(ctx context.Context, sess *session, c *stagedCr
 		// An aggregate whose states would not fit in memory: its groups a
 		// share at a time (see aggpasses.go).
 		rows, err = s.fillInPasses(f, c.staging, ap)
-	} else if rows, err = f.fill(plain); err != nil && f.again(err) {
-		// DuckDB's estimate was short, or the memory watch stopped the
-		// fill: in passes, if the query allows, into the table the failed
-		// fill left empty.
-		if ap := s.aggPassesOf(f.ctx, sess, c.query, 16); ap != nil {
-			rows, err = s.fillInPasses(f, c.staging, ap)
-		} else if f.rearmed() {
-			err = errMemoryShed
+	} else {
+		// Its query on workers where auto mode runs it there as a read,
+		// the new table filled from their results.
+		into := "INSERT INTO " + quoteName(c.staging) + "\n"
+		here := func(ctx context.Context) (int64, error) { return f.fillAt(ctx, plain) }
+		from := func(ctx context.Context, source string) (int64, error) { return f.fillAt(ctx, into+source) }
+		var (
+			parts distParts
+			again bool
+		)
+		rows, parts, again, err = s.fillOn(f, s.fillSource(f.ctx, sess, st, c.query), here, from)
+		st.filled = &parts
+		if err != nil && (again || errors.Is(err, errWorkerMemory) && f.ctx.Err() == nil) {
+			// DuckDB's estimate was short, the memory watch stopped the
+			// fill, or a worker ran out of memory: in passes here, if the
+			// query allows, into the table the failed fill left empty.
+			if ap := s.aggPassesOf(f.ctx, sess, c.query, 16); ap != nil {
+				rows, err = s.fillInPasses(f, c.staging, ap)
+				st.filled = nil
+			} else if f.rearmed() {
+				err = errMemoryShed
+			}
 		}
 	}
 	if err != nil && errors.Is(f.ctx.Err(), context.DeadlineExceeded) && f.rearmed() {
@@ -490,7 +511,7 @@ func (s *Server) runStatement(ctx context.Context, sess *session, st *statement,
 		sess.notePrepared(st.query)
 	}
 	if st.staged != nil && !sess.inTx {
-		rows, done, err := s.runStagedCreate(ctx, sess, st.staged)
+		rows, done, err := s.runStagedCreate(ctx, sess, st, st.staged)
 		if done {
 			if err != nil {
 				return err
@@ -507,22 +528,30 @@ func (s *Server) runStatement(ctx context.Context, sess *session, st *statement,
 		return err
 	}
 	written := int64(-1)
-	err := s.runBound(sess, w, func() error {
-		return runWithCommitRetry(ctx, sess, st, func() error {
-			if err := st.freshForRun(ctx, sess.conn); err != nil {
-				return err
-			}
-			return sess.profiled(ctx, st, func() error {
-				// An INSERT into a member table writes the ids it can.
-				done, n, err := s.runWithIDs(ctx, sess, st, args, w)
-				if done {
-					written = n
+	run := func(ctx context.Context) error {
+		return s.runBound(sess, w, func() error {
+			return runWithCommitRetry(ctx, sess, st, func() error {
+				if err := st.freshForRun(ctx, sess.conn); err != nil {
 					return err
 				}
-				return st.run(ctx, args, w)
+				return sess.profiled(ctx, st, func() error {
+					// An INSERT into a member table writes the ids it can.
+					done, n, err := s.runWithIDs(ctx, sess, st, args, w)
+					if done {
+						written = n
+						return err
+					}
+					return st.run(ctx, args, w)
+				})
 			})
 		})
-	})
+	}
+	// An INSERT INTO ... SELECT runs its query on workers where auto mode
+	// runs it there as a read (see fillOn).
+	if done, err := s.runInsertFill(ctx, sess, st, len(args), w, run); done {
+		return err
+	}
+	err := run(ctx)
 	if err == nil && st.ids != nil {
 		// And then those of the values that had none.
 		s.fillIDs(ctx, sess, st.ids, written)

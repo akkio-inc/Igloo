@@ -213,18 +213,51 @@ func sessionMode(sess *session, user auth.User) distributed.Mode {
 // rows to w. done is false when st did not run, and should run on this
 // replica; parts is what running it took.
 func (s *Server) runDistributed(ctx context.Context, sess *session, user auth.User, st *statement, args []driver.NamedValue, w *tagWriter, mode distributed.Mode) (parts distParts, done bool, err error) {
+	r, parts, done, err := s.startDistributed(ctx, sess, user, st, mode)
+	if r == nil {
+		return parts, done, err
+	}
+	defer r.end()
+	if err := st.runFinal(ctx, sess.conn, r.ex.SQL, r.ex.Merged(), args, w); err != nil {
+		if w.Written() > 0 || ctx.Err() != nil || distributed.DataError(err) || bitmapsDidNotFit(err) {
+			// Combining the workers' bitmaps did not fit either: the
+			// session runs the statement again with the hash.
+			return r.parts, true, err
+		}
+		s.dist.Metrics().Fallback("combine_error")
+		s.log.Warn("could not combine a distributed statement's results; running it here", "user", user.Name, "err", err)
+		return distParts{release: s.dist.Keep()}, false, nil
+	}
+	return r.parts, true, nil
+}
+
+// distRun is a statement's parts as they ran on workers: ex holds their
+// results, which ex.SQL, run on this replica, combines into the
+// statement's; parts is how they ran, and end lets go of the results and
+// of the workers.
+type distRun struct {
+	ex    *distributed.Execution
+	parts distParts
+	end   func()
+}
+
+// startDistributed runs st's parts on workers if it qualifies in mode, and
+// returns their results to combine (see runDistributed). Without them,
+// done false says st runs on this replica, and parts why, for the guard;
+// done true that it must not, and err why.
+func (s *Server) startDistributed(ctx context.Context, sess *session, user auth.User, st *statement, mode distributed.Mode) (run *distRun, parts distParts, done bool, err error) {
 	if s.dist == nil || st.stmtType != duckdb.STATEMENT_TYPE_SELECT || st.kind != returnsRows || sess.inTx || mode == distributed.ModeOff {
-		return parts, false, nil
+		return nil, parts, false, nil
 	}
 	if reason := policyReason(st); reason != "" {
 		s.log.Debug("statement runs on this replica", "user", user.Name, "reason", reason)
-		return parts, false, nil
+		return nil, parts, false, nil
 	}
 	env := &sessionEnv{s: s, sess: sess, user: user, st: st}
 	plan, err := s.dist.Plan(ctx, st.query, env, mode)
 	if err != nil {
 		if ctx.Err() != nil {
-			return parts, true, ctx.Err()
+			return nil, parts, true, ctx.Err()
 		}
 		parts.key = distributed.PlanKey(err)
 		if parts.key != "" {
@@ -243,12 +276,12 @@ func (s *Server) runDistributed(ctx context.Context, sess *session, user auth.Us
 		} else {
 			s.log.Debug("statement runs on this replica", "user", user.Name, "reason", err)
 		}
-		return parts, false, nil
+		return nil, parts, false, nil
 	}
 	settings, err := s.distributedSettings(ctx, sess)
 	if err != nil {
 		s.log.Debug("statement runs on this replica", "user", user.Name, "reason", err)
-		return parts, false, nil
+		return nil, parts, false, nil
 	}
 	// The workers stay up while the statement runs, here too.
 	release := s.dist.Keep()
@@ -276,25 +309,25 @@ func (s *Server) runDistributed(ctx context.Context, sess *session, user auth.Us
 		}
 		switch {
 		case ctx.Err() != nil:
-			return parts, true, ctx.Err()
+			return nil, parts, true, ctx.Err()
 		case distributed.DataError(err):
-			return parts, true, err
+			return nil, parts, true, err
 		case distributed.BitmapMemory(err):
 			// A task's bitmaps did not fit: the session runs the statement
 			// again with DuckDB's hash (see rerunWithoutBitmaps).
-			return parts, true, err
+			return nil, parts, true, err
 		case distributed.OutOfMemory(err):
 			// Another worker, or this replica, would run out the same way.
 			// The query history records where it failed, for the replicas
 			// that read it when they start.
 			s.log.Warn("a worker ran out of memory running part of a statement; the statement fails rather than run again",
 				"user", user.Name, "err", err)
-			return distParts{workers: plan.Workers(), large: plan.Large(), placement: plan.Placement(), key: plan.Key}, true, errWorkerMemory
+			return nil, distParts{workers: plan.Workers(), large: plan.Large(), placement: plan.Placement(), key: plan.Key}, true, errWorkerMemory
 		case distributed.IsUnsupported(err):
 			// The workers found what planning could not, such as data
 			// files without field IDs.
 			s.log.Debug("statement runs on this replica", "user", user.Name, "reason", err)
-			return parts, false, nil
+			return nil, parts, false, nil
 		}
 		if plan.Large() && !plan.FitsHere() {
 			// The large worker failed, and this replica would not hold the
@@ -302,10 +335,13 @@ func (s *Server) runDistributed(ctx context.Context, sess *session, user auth.Us
 			// workers does.
 			s.log.Warn("the large worker could not run a statement, which this replica would not hold; running it on the workers",
 				"user", user.Name, "err", err)
-			p, ran, err := s.runDistributed(ctx, sess, user, st, args, w, distributed.ModeOn)
+			r, p, ran, err := s.startDistributed(ctx, sess, user, st, distributed.ModeOn)
+			if r != nil {
+				r.parts.placement = "after the large worker failed: " + r.parts.placement
+				return r, r.parts, true, nil
+			}
 			if ran {
-				p.placement = "after the large worker failed: " + p.placement
-				return p, true, err
+				return nil, p, true, err
 			}
 			if p.release != nil {
 				p.release()
@@ -317,7 +353,7 @@ func (s *Server) runDistributed(ctx context.Context, sess *session, user auth.Us
 			// machine: fail now.
 			s.log.Warn("workers could not run a statement, which would not fit in this replica's memory; it fails",
 				"user", user.Name, "err", err)
-			return parts, true, fmt.Errorf("workers could not run the statement, and it needs more memory than this replica has: %w", err)
+			return nil, parts, true, fmt.Errorf("workers could not run the statement, and it needs more memory than this replica has: %w", err)
 		}
 		reason := "worker_error"
 		if errors.Is(err, distributed.ErrNoWorkers) {
@@ -325,22 +361,10 @@ func (s *Server) runDistributed(ctx context.Context, sess *session, user auth.Us
 		}
 		s.dist.Metrics().Fallback(reason)
 		s.log.Warn("workers could not run a statement; running it here", "user", user.Name, "err", err)
-		return parts, false, nil
+		return nil, parts, false, nil
 	}
-	defer release()
-	defer ex.Close()
 	parts = distParts{workers: ex.Workers, large: ex.Large, placement: plan.Placement(), stages: ex.Stages, exchanges: ex.Exchanges, key: plan.Key}
-	if err := st.runFinal(ctx, sess.conn, ex.SQL, ex.Merged(), args, w); err != nil {
-		if w.Written() > 0 || ctx.Err() != nil || distributed.DataError(err) || bitmapsDidNotFit(err) {
-			// Combining the workers' bitmaps did not fit either: the
-			// session runs the statement again with the hash.
-			return parts, true, err
-		}
-		s.dist.Metrics().Fallback("combine_error")
-		s.log.Warn("could not combine a distributed statement's results; running it here", "user", user.Name, "err", err)
-		return distParts{release: s.dist.Keep()}, false, nil
-	}
-	return parts, true, nil
+	return &distRun{ex: ex, parts: parts, end: func() { ex.Close(); release() }}, parts, true, nil
 }
 
 // guardFactor, guardAlternative and guardMinimum say when a statement auto
@@ -913,6 +937,10 @@ func tableColumns(ctx context.Context, sess *session, db, schema, table string) 
 }
 
 // Setting returns the session's value of a DuckDB setting.
+// Fill says the statement planned is the query a statement fills a table
+// from, which this replica writes from its rows (distributed.Fills).
+func (e *sessionEnv) Fill() bool { return e.st.fill }
+
 // Others counts the statements running on this replica beside the
 // session's, for auto mode's choice (distributed.Loads).
 func (e *sessionEnv) Others() int { return e.s.othersRunning(e.sess) }
