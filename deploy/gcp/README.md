@@ -250,6 +250,9 @@ warehouse, and may only create objects under `_igloo_shuffle/` and in
 statements' directories (`igloo-write-*` under a table's `data/`), by an IAM
 Condition, with no overwrite or delete, as they
 [write tables' files](../../docs/distributed-execution.md#workers-writing-tables).
+The condition limits them to those names, and not to one statement's directory,
+which IAM cannot express: Igloo refuses any file outside the statement's
+directory, and commits its own copies of those it accepts.
 
 ```yaml
 apiVersion: cloud.google.com/v1

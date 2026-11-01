@@ -532,8 +532,15 @@ run "workers_have_an_identity_of_their_own" {
   }
 
   assert {
-    condition     = google_storage_bucket_iam_member.worker_write[0].role == "roles/storage.objectCreator" && strcontains(google_storage_bucket_iam_member.worker_write[0].condition[0].expression, "igloo-write-[0-9a-f]+/") && strcontains(google_storage_bucket_iam_member.worker_write[0].condition[0].expression, "_igloo_shuffle/")
+    condition     = google_storage_bucket_iam_member.worker_write[0].role == "roles/storage.objectCreator" && strcontains(google_storage_bucket_iam_member.worker_write[0].condition[0].expression, "extract('/data/igloo-write-{dir}/') != ''") && strcontains(google_storage_bucket_iam_member.worker_write[0].condition[0].expression, "/objects/warehouse/_igloo_shuffle/')")
     error_message = "Workers may only create objects, in exchanges and statements' directories."
+  }
+
+  # A plan does not evaluate the condition; Google refuses one with any other
+  # function when it is applied ("undeclared reference to 'matches'").
+  assert {
+    condition     = length(regexall("\\.[A-Za-z]+\\(", google_storage_bucket_iam_member.worker_write[0].condition[0].expression)) == length(regexall("resource\\.name\\.(startsWith|endsWith|extract)\\(", google_storage_bucket_iam_member.worker_write[0].condition[0].expression))
+    error_message = "IAM Conditions have only startsWith, endsWith and extract on a resource's name."
   }
 
   assert {
