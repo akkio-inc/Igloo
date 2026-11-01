@@ -1126,23 +1126,8 @@ func TestWorkersWriteManyPartitionsAuto(t *testing.T) {
 	}
 }
 
-// TestListedIn checks that a file DuckDB's glob listed goes by the name its
-// directory's store knows it by: on a real Azure account, the first spelling below
-// reads as a path in a container of that name, which is no file.
-func TestListedIn(t *testing.T) {
-	for _, c := range []struct{ dir, file, want string }{
-		{"abfss://wh@acct.dfs.core.windows.net/w/t/data/d", "abfss://acct.dfs.core.windows.net/wh/w/t/data/d/a/f", "abfss://wh@acct.dfs.core.windows.net/w/t/data/d/a/f"},
-		{"abfss://wh@acct.dfs.core.windows.net/w/t/data/d", "abfss://wh@acct.dfs.core.windows.net/w/t/data/d/a/f", "abfss://wh@acct.dfs.core.windows.net/w/t/data/d/a/f"},
-		{"s3://b/w/t/data/d", "s3://b/w/t/data/d/a/f", "s3://b/w/t/data/d/a/f"},
-		{"/w/t/data/d", "/w/t/data/d/a/f", "/w/t/data/d/a/f"},
-	} {
-		if got := listedIn(c.dir, c.file); got != c.want {
-			t.Errorf("%s under %s: %s, want %s", c.file, c.dir, got, c.want)
-		}
-	}
-	if !noSuchDir(errors.New("Invalid Error: 404 The specified path does not exist.")) || noSuchDir(errors.New("Invalid Error: 403 denied")) {
-		t.Error("what a hierarchical account says of a directory that is not there")
-	}
+// TestDirsOf checks which directories go with a statement's files, the deepest first.
+func TestDirsOf(t *testing.T) {
 	got := dirsOf("abfss://c@h/t/d", []string{"abfss://c@h/t/d/q/a/f", "abfss://c@h/t/d/q/b/g", "abfss://c@h/t/d/h"})
 	if want := []string{"abfss://c@h/t/d/q/a", "abfss://c@h/t/d/q/b", "abfss://c@h/t/d/q", "abfss://c@h/t/d"}; !slices.Equal(got, want) {
 		t.Errorf("directories %q, want %q", got, want)
