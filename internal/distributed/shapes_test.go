@@ -43,6 +43,9 @@ func TestShapesOnWorkers(t *testing.T) {
 		{"right join using", `SELECT count(*) AS n, count(o_orderstatus) AS s FROM lorders RIGHT JOIN (SELECT l_orderkey AS o_orderkey, l_quantity FROM olines) l USING (o_orderkey)`, "(relation)"},
 		{"inner join using", `SELECT o_orderpriority, count(*) AS n FROM lorders JOIN (SELECT l_orderkey AS o_orderkey, l_quantity FROM olines) l USING (o_orderkey) GROUP BY 1 ORDER BY 1`, "(relation)"},
 		{"natural inner join", `SELECT o_orderpriority, count(*) AS n FROM lorders NATURAL JOIN (SELECT l_orderkey AS o_orderkey, l_quantity FROM olines) l GROUP BY 1 ORDER BY 1`, "(relation)"},
+		{"rollup in a subquery", `SELECT count(*) AS n, sum(c) AS c, sum(g) AS g FROM (SELECT l_returnflag, l_linestatus, count(*) AS c, grouping(l_returnflag) AS g FROM olines GROUP BY ROLLUP (l_returnflag, l_linestatus)) x`, "GROUPING SETS"},
+		{"grouping sets in a common table expression", `WITH s AS (SELECT l_returnflag, l_shipmode, sum(l_quantity) AS q, count(DISTINCT l_orderkey) AS o FROM olines GROUP BY GROUPING SETS ((l_returnflag), (l_shipmode), ())) SELECT count(*) AS n, sum(q) AS q, sum(o) AS o FROM s`, "GROUPING SETS"},
+		{"cube joined to a table", `SELECT o_orderpriority, sum(c) AS c FROM (SELECT l_orderkey, l_returnflag, count(*) AS c FROM olines GROUP BY CUBE (l_orderkey, l_returnflag)) l JOIN lorders o ON o.o_orderkey = l.l_orderkey GROUP BY 1 ORDER BY 1`, "GROUPING SETS"},
 		{"a search of text", `SELECT o_orderkey, o_comment FROM lorders WHERE o_comment LIKE '%special%requests%'`, "~~"},
 		{"contains", `SELECT o_orderkey, o_comment FROM lorders WHERE contains(o_comment, 'furious')`, "contains"},
 	} {

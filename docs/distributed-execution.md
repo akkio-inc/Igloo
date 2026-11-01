@@ -1617,8 +1617,9 @@ several instance types and zones, so that capacity one lacks another has.
   common table expression, it runs distributed. Give the machines that run
   such statements a lot of memory and fast spill disk.
 - `ROLLUP`, `CUBE` and `GROUPING SETS` run on workers up to the finest groups
-  of their sets, and the coordinator computes the sets from those groups:
-  its memory grows with them, as a plain `GROUP BY`'s does not.
+  of their sets, and the coordinator, or in a subquery or common table
+  expression one task, computes the sets from those groups: its memory grows
+  with them, as a plain `GROUP BY`'s does not.
 - Partitioned joins, aggregations and every step of a multi-stage plan
   write what they exchange to object storage and read it back: that costs
   request charges and adds a few seconds per step, and

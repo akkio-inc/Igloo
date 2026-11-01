@@ -269,7 +269,7 @@ func TestBucketedBesideOthers(t *testing.T) {
 		{"groups without the key", `SELECT c.c_mktsegment, sum(o.c) AS c FROM (SELECT o_custkey, count(*) AS c FROM orders16 GROUP BY 1) o JOIN customer c ON c.c_custkey = o.o_custkey GROUP BY 1 ORDER BY 1`,
 			nil, 0, -1},
 		{"rollup", `SELECT o.o_orderpriority, sum(l.c) AS c FROM (SELECT l_orderkey, count(*) AS c FROM lineitem8 GROUP BY ROLLUP (l_orderkey)) l JOIN orders16 o ON o.o_orderkey = l.l_orderkey GROUP BY 1 ORDER BY 1`,
-			nil, 0, -1},
+			[]string{"orders16"}, 1, 0},
 		{"a limit", `SELECT o.o_orderpriority, count(*) AS n FROM lineitem8 l JOIN (SELECT o_orderkey, o_orderpriority FROM orders16 ORDER BY o_orderkey LIMIT 500) o ON l.l_orderkey = o.o_orderkey GROUP BY 1 ORDER BY 1`,
 			nil, 0, -1},
 		// Keys that are not the column, or are more than it.

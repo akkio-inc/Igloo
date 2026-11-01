@@ -535,6 +535,9 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
 
 ### Distributed execution
 
+- `ROLLUP`, `CUBE` and `GROUPING SETS` in a subquery or common table expression
+  run on workers, as they do in a statement, where they left it to the
+  coordinator.
 - Workers read nothing ahead unless their `IGLOO_PREFETCH` says `true`. On a fleet
   reading cold, each task its share of the files on many threads, reading ahead
   saved no time beyond what runs differ by, and nearly half of what it fetched

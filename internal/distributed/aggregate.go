@@ -262,7 +262,15 @@ func (pl *planner) relationAggregate(c *candidate) (*jobBuild, error) {
 	if q := qualifyTopK(c.sel, func(e node) (node, error) { return a.rewrite(e, "select") }); q != nil {
 		combine["qualify"] = q
 	}
-	return &jobBuild{fragment: fragment, second: &secondStage{fragment: combine, keys: a.groupColumns(), whole: len(a.groups) == 0}}, nil
+	// Without groups, or of grouping sets, whose groups no partition holds
+	// whole: its one task computes them over every partial result.
+	return &jobBuild{fragment: fragment, second: &secondStage{fragment: combine, keys: a.groupColumns(), whole: len(a.groups) == 0 || !a.singleSet()}}, nil
+}
+
+// singleSet reports whether the aggregation groups by all of its groups, once:
+// no grouping sets.
+func (a *aggregation) singleSet() bool {
+	return len(a.sets) == 0 || (len(a.sets) == 1 && len(a.sets[0].([]any)) == len(a.groups))
 }
 
 // wholeGroups reports whether the partitions the candidate's stage reads
@@ -693,7 +701,7 @@ func partialArgs(name string, args int) error {
 func (a *aggregation) choose() error {
 	// One grouping set of every group expression, or none: grouping sets
 	// are applied by the coordinator, over the finest groups.
-	single := len(a.sets) == 0 || (len(a.sets) == 1 && len(a.sets[0].([]any)) == len(a.groups))
+	single := a.singleSet()
 	additive := true
 	for _, ac := range a.aggs {
 		if ac.distinct >= 0 && !additiveDistinct[ac.name] {
@@ -726,11 +734,8 @@ func (a *aggregation) choose() error {
 	case a.c.relation:
 		// The coordinator's combine step runs on workers, over whole groups.
 		a.mode = aggGather
-		if len(a.distincts) > 0 && additive && a.inPlace() {
+		if single && len(a.distincts) > 0 && additive && a.inPlace() {
 			a.mode = aggInPlace
-		}
-		if !single {
-			return unsupported("grouping sets in a relation")
 		}
 		return nil
 	case collation != "":
