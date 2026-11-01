@@ -78,7 +78,40 @@ const (
 	// smallSource is the most rows a side of a cross product without
 	// tables of its own may have for the product to count every pair.
 	smallSource = 1024
+	// unnestValues is how many rows UNNEST makes of a row, where DuckDB counts
+	// one and nothing here knows the lists. Lists of 3, 6, 2 and 2 values,
+	// FLATTEN's of a report, made more than three of a row, and taking it for one
+	// took the working set of a report that counts people distinct over them for
+	// half what DuckDB held, 2.9 GB of 5.4 GB; a report's of six objects at 157
+	// million events held about what one a row would come to.
+	unnestValues = 2
+	// A grouping's threads each aggregate what they can in a hash table of a
+	// few thousand groups, and past that hand rows on and start anew, keeping
+	// what they handed on, not one row a group. So what DuckDB held went by
+	// steps, measured on 16 threads, of 16 and of 64 million rows at about 60
+	// bytes a row: next to nothing up to 10,000 groups; from 20,000 to 200,000
+	// groups, 14 to 20 million rows whatever the input; and from 500,000, 86%
+	// of the input and more. groupsInTable, groupRowsAThread and groupRowsAGroup,
+	// and groupsKeptWhole, are those steps. A thread's count of groups, as this
+	// took before, gave a fifth of what it held at 200,000 groups.
+	groupsInTable    = 15_000
+	groupRowsAThread = 900_000
+	groupRowsAGroup  = 2
+	groupsKeptWhole  = 300_000
 )
+
+// groupEntries is how many rows a grouping of in rows into groups holds, its
+// threads apart before they are merged: see groupsInTable.
+func groupEntries(in, groups, threads float64) float64 {
+	held := groups * threads
+	switch {
+	case groups >= groupsKeptWhole:
+		held = in
+	case groups >= groupsInTable:
+		held = threads * (groupRowsAThread + groupRowsAGroup*groups)
+	}
+	return min(in, held)
+}
 
 // heldFactors are how many times the rows and widths an operator holds by
 // the plan DuckDB holds at its peak, for its layout: a hash join's
@@ -535,7 +568,12 @@ func (w *setWalker) walk(n *planNode) (rowsEstimate, []column) {
 		est.ours = min(est.ours, max(in.ours, 1))
 		// Each thread aggregates its share of the rows apart, all the
 		// groups it meets, before they are merged.
-		entries := min(in.ours, est.ours*float64(w.st.threads))
+		entries := groupEntries(in.ours, est.ours, float64(w.st.threads))
+		if product(groups) <= 0 {
+			// How many groups only by DuckDB's estimate, often far too many:
+			// what the steps say of them is no better than a thread's count.
+			entries = min(entries, est.ours*float64(w.st.threads))
+		}
 		if len(rows) == 0 {
 			entries = est.ours
 		}
@@ -548,6 +586,10 @@ func (w *setWalker) walk(n *planNode) (rowsEstimate, []column) {
 	case name == "UNGROUPED_AGGREGATE":
 		w.distinct(name, n.strs("Aggregates"), inCols, in.ours, 0)
 		return rowsEstimate{duck: 1, ours: 1, kept: 1}, make([]column, len(n.strs("Aggregates")))
+	case name == "UNNEST":
+		// As many rows as its lists have values, which nothing here knows.
+		est.ours *= unnestValues
+		return est, limitDistinct(inCols, est.ours)
 	case name == "ORDER_BY" || name == "WINDOW":
 		est = in
 		if name == "WINDOW" {
