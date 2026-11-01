@@ -2,6 +2,7 @@ package pgwire
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -11,6 +12,7 @@ import (
 	"time"
 
 	icebergio "github.com/apache/iceberg-go/io"
+	"golang.org/x/sync/errgroup"
 )
 
 // Footers of files workers wrote. The coordinator parses them in its own
@@ -35,6 +37,11 @@ const (
 	// say of each column's bounds stays until the commit. Past it, a statement
 	// that is really that many files gets the error, not the replica's end.
 	mostFootersBytes = 1 << 30
+	// footerReads is how many files' footers a statement reads at a time. That
+	// is waiting on the store, some three requests a file, however few the
+	// replica's cores: at two at a time on S3, 4,767 files took 351 s. Parsing
+	// them, which takes the memory, stays at a replica's cores.
+	footerReads = 32
 	// parquetTail is the footer's length and the magic that end a file.
 	parquetTail = 8
 	// footerNesting is how deep structs and lists go in a footer: a column's
@@ -372,16 +379,51 @@ func checkFooter(footer []byte, columns, depth int) error {
 }
 
 // writtenFooters is the store as the parser of a statement's written files sees
-// it: Open reads a file's footer, once, and checks it, and what it returns holds
+// it: Open gives a file's footer, read once and checked, and what it returns holds
 // those bytes and nothing else of the file.
 type writtenFooters struct {
 	icebergio.IO
 	columns, depth int
 	read           atomic.Int64
+	fetched        map[string]*footerFile
 }
 
-// Open reads and checks the footer of the file at name.
+// fetch reads and checks the footers of the files at paths, footerReads at a time,
+// for Open to give.
+func (o *writtenFooters) fetch(ctx context.Context, paths []string) error {
+	files := make([]*footerFile, len(paths))
+	g, ctx := errgroup.WithContext(ctx)
+	g.SetLimit(footerReads)
+	for i, p := range paths {
+		g.Go(func() error {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			f, err := o.footer(p)
+			files[i] = f
+			return err
+		})
+	}
+	if err := g.Wait(); err != nil {
+		return err
+	}
+	o.fetched = make(map[string]*footerFile, len(paths))
+	for i, p := range paths {
+		o.fetched[p] = files[i]
+	}
+	return nil
+}
+
+// Open gives the footer of the file at name, read now unless fetch read it.
 func (o *writtenFooters) Open(name string) (icebergio.File, error) {
+	if f, ok := o.fetched[name]; ok {
+		return &footerFile{name: f.name, size: f.size, tail: f.tail}, nil
+	}
+	return o.footer(name)
+}
+
+// footer reads and checks the footer of the file at name.
+func (o *writtenFooters) footer(name string) (*footerFile, error) {
 	f, err := o.IO.Open(name)
 	if err != nil {
 		return nil, err

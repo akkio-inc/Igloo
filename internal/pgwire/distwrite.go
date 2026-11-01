@@ -547,7 +547,11 @@ func readWritten(ctx context.Context, tx *table.Transaction, tbl *table.Table, p
 		e, d := parquetShape(f.Type)
 		columns, depth = columns+e, max(depth, d)
 	}
-	return tx.DataFilesFrom(ctx, &writtenFooters{IO: fsys, columns: columns, depth: depth + 1}, paths)
+	footers := &writtenFooters{IO: fsys, columns: columns, depth: depth + 1}
+	if err := footers.fetch(ctx, paths); err != nil {
+		return nil, err
+	}
+	return tx.DataFilesFrom(ctx, footers, paths)
 }
 
 // parquetShape is how many elements of a Parquet schema a value of type t takes,
