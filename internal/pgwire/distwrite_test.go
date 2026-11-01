@@ -1076,7 +1076,7 @@ func TestWorkersDoNotWrite(t *testing.T) {
 // auto mode, now that they write it.
 func TestWorkersWriteAuto(t *testing.T) {
 	t.Parallel()
-	env := startWriteServer(t)
+	env := startWriteServerOn(t, writeWorkers{cores: 8, memory: 64 << 30, claim: 3 << 30}, nil)
 	mustExec(t, env.admin, "CREATE TABLE w_auto AS SELECT id, x FROM src")
 	env.force(t)
 	if got, want := env.local(t, "SELECT count(*), sum(x) FROM w_auto"), env.local(t, "SELECT count(*), sum(x) FROM src"); got != want {

@@ -347,11 +347,12 @@ type Fills interface {
 }
 
 const (
-	// fillWriteRate is the bytes of table files a second a core of this
-	// replica writes, compressed as it reads them: one of 16 cores wrote a
-	// billion rows of four columns, about 10 GB of files, in 163 s, about
-	// 60 MB/s in all.
-	fillWriteRate = 3.75e6
+	// fillWriteRate is the bytes of table files a second a core writes,
+	// compressed as it reads them. On real S3, a COPY of 60 million rows of 16
+	// columns, 2.07 GB of files, made 57 MB/s on 1 thread, 107 on 2, 197 on 4, 323
+	// on 8 and 468 on 16, read included; a replica of 2 cores made 38 MB/s a core
+	// through Iceberg, workers 35 and, with their copies, 25.
+	fillWriteRate = 30e6
 	// fillFetchRate is the bytes of files a second this replica fetches of
 	// the workers' results, to write the table from them.
 	fillFetchRate = 400e6

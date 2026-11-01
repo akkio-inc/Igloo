@@ -360,7 +360,7 @@ thousand rows to write.
 Auto mode counts a fill's writing on each side: about the share of the bytes
 the query reads that its rows are of the rows its scans read, by DuckDB's
 plan (an aggregate's result is taken for a hundredth of its rows at most, as
-DuckDB takes its groups for all of them), written at 3.75 MB of files a
+DuckDB takes its groups for all of them), written at 30 MB of files a
 second a core of whichever writes them, the replica's or, where tasks write
 them, the workers', with what a coordinator that writes them fetches from
 the workers at 400 MB/s. So a copy workers write runs there where they are
