@@ -241,11 +241,6 @@ It is off by default, so applying this version to an existing deployment
 changes nothing. With it on, the module adds two node pools for workers,
 both autoscaling from zero nodes to `workers_max` (4):
 
-Workers have a workload identity of their own: they read the warehouse, and
-may change only `_igloo_shuffle/` and statements' directories (`igloo-write-*`
-under a table's `data/`), by a role assignment condition, with no delete, as
-they [write tables' files](../../docs/distributed-execution.md#workers-writing-tables).
-
 - `workerspot`, Spot VMs of `workers_vm_size` (`Standard_D16pds_v6`: 16
   vCPU, 64 GiB, 880 GiB local NVMe disk), unless `workers_spot = false`;
 - `workerreg`, Regular VMs of the same size, to fall back to.
