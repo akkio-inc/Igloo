@@ -246,10 +246,14 @@ leaves its worker unstarted, and the statement runs on fewer, or on an igloo pod
 when `workers.startTimeout` runs out. The pools:
 
 Workers have a workload identity of their own: they read the warehouse, and
-may only create files, in `_igloo_shuffle/` and statements' directories
-(`igloo-write-*` under a table's `data/`), by a role that holds that one action
-and a role assignment condition, with no overwrite, move, delete or container
-action, as they [write tables' files](../../docs/distributed-execution.md#workers-writing-tables).
+may only write files in `_igloo_shuffle/` and statements' directories
+(`igloo-write-*` under a table's `data/`), by a role that holds those two actions
+and a role assignment condition, with no move, delete or container action, as they
+[write tables' files](../../docs/distributed-execution.md#workers-writing-tables).
+DuckDB creates a file and then appends to it, which takes the right to write, and
+so to overwrite, in those directories. A worker can then change what is in a
+statement's directory, and nothing in a table: Igloo commits its own copies, in
+directories no worker can write to.
 
 - `workerspot`, Spot VMs of `workers_vm_size` (`Standard_D16pds_v6`: 16
   vCPU, 64 GiB, 880 GiB local NVMe disk), unless `workers_spot = false`;

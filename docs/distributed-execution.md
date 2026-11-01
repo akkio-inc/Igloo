@@ -1030,7 +1030,8 @@ give the workers more memory.
   the OpenTofu module for AWS gives it none. Google Cloud and Azure have nothing
   DuckDB could use of the kind: their modules give workers an identity that
   can only create files under `_igloo_shuffle/` and directories of that name
-  under tables' locations, with no overwrite, move or delete. A worker told no gets the
+  under tables' locations, with no move or delete, and on Google Cloud no overwrite;
+  on Azure, DuckDB's appends need the right to overwrite there. A worker told no gets the
   statement planned again, the coordinator writing the table
   (`IGLOO_WORKER_WRITES=off` always does), and no worker is asked for ten
   minutes.
@@ -1636,7 +1637,8 @@ several instance types and zones, so that capacity one lacks another has.
   of their sets, and the coordinator, or in a subquery or common table
   expression one task, computes the sets from those groups: its memory grows
   with them, as a plain `GROUP BY`'s does not.
-- Partitioned joins, aggregations and every step of a multi-stage plan
+- Where workers have no room on their disks, or with `IGLOO_EXCHANGES=object`,
+  partitioned joins, aggregations and every step of a multi-stage plan
   write what they exchange to object storage and read it back: that costs
   request charges and adds a few seconds per step, and
   leftovers of a coordinator that crashed mid-statement stay under
