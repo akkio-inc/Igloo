@@ -236,7 +236,7 @@ func TestBucketedBesideOthers(t *testing.T) {
 		{"a semi join", `SELECT o_orderpriority, count(*) AS n FROM orders16 WHERE o_orderkey IN (SELECT l_orderkey FROM lineitem8 WHERE l_quantity > 40) GROUP BY 1 ORDER BY 1`,
 			[]string{"orders16"}, 1, 0},
 		{"an anti join", `SELECT o_orderpriority, count(*) AS n FROM orders16 o WHERE NOT EXISTS (SELECT 1 FROM lineitem8 l WHERE l.l_orderkey = o.o_orderkey AND l_quantity > 40) GROUP BY 1 ORDER BY 1`,
-			nil, 0, -1},
+			[]string{"orders16"}, 1, 0},
 		{"the side of an outer join that groups", `SELECT o.o_orderpriority, count(*) AS n, sum(l.c) AS c FROM orders16 o LEFT JOIN (SELECT l_orderkey, count(*) AS c FROM lineitem8 WHERE l_quantity > 40 GROUP BY 1) l ON l.l_orderkey = o.o_orderkey GROUP BY 1 ORDER BY 1`,
 			[]string{"lineitem8", "orders16"}, 0, 0},
 		{"a subquery that groups by the key", `SELECT o.o_orderpriority, sum(l.c) AS c, sum(l.q) AS q FROM (SELECT l_orderkey, count(*) AS c, sum(l_quantity) AS q FROM lineitem8 GROUP BY 1) l JOIN orders16 o ON o.o_orderkey = l.l_orderkey GROUP BY 1 ORDER BY 1`,
@@ -248,7 +248,7 @@ func TestBucketedBesideOthers(t *testing.T) {
 
 		// A key another column of a join in the subquery computes.
 		{"a join on another column", `SELECT t.o_orderpriority, sum(s.q) AS q FROM (SELECT l.l_partkey AS k, l.l_quantity AS q FROM lineitem8 l JOIN orders16 o ON o.o_orderkey = l.l_orderkey) s JOIN orders16 t ON t.o_orderkey = s.k GROUP BY 1 ORDER BY 1`,
-			nil, 0, -1},
+			[]string{"lineitem8", "orders16"}, 1, 0},
 		// A key computed from the table's: the subquery is a relation
 		// written to the other table's buckets.
 		{"a key the subquery computes", `SELECT o.o_orderpriority, count(*) AS n FROM lineitem8 l JOIN (SELECT o_orderkey + 1 AS o_orderkey, o_orderpriority FROM orders16) o ON l.l_orderkey = o.o_orderkey GROUP BY 1 ORDER BY 1`,

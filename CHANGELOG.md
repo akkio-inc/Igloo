@@ -535,6 +535,18 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
 
 ### Distributed execution
 
+- More shapes of statement run on workers, and return the rows of one machine.
+  A correlated subquery over a large table is the join it means, by partition:
+  `EXISTS` a semi join, `NOT EXISTS` an anti join, a scalar subquery of `min`,
+  `max`, `sum`, `avg` or a count a `LEFT JOIN` to its groups. `INTERSECT`,
+  `EXCEPT` and `UNION` of distinct rows compute partition by partition rather
+  than on the coordinator, also in a subquery. `SELECT DISTINCT` completes its
+  groups on workers. `USING` and `NATURAL` joins are read by the columns they
+  name, outer ones among them, which left their largest side to the coordinator.
+  A join inside a subquery on a column other than the statement's key is a
+  relation. A scan that looks up three characters or more of a column's text
+  (`LIKE '%word%'`, `contains`) runs on workers, as one by a constant does.
+  See [what runs on workers](docs/distributed-execution.md).
 - A statement that fails as its rows stream no longer reports that it was
   canceled when nothing canceled it. DuckDB's thread that reads the rows can
   report an interrupt in place of another thread's failure, which clients saw

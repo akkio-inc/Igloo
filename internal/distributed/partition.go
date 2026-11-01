@@ -409,8 +409,14 @@ func (pl *planner) keyInputs(c *candidate) error {
 			sc, item = c.scope, th.item
 		}
 		if !(u.splittable || u.semi || u.outer || th != nil) || !inScope(sc) {
-			if (u.splittable || u.outerSub) && u.scope != nil && u.scope.ref != nil {
+			switch {
+			case (u.splittable || u.outerSub) && u.scope != nil && u.scope.ref != nil:
 				c.tooDeep = u
+			case (u.splittable || u.outer || u.semi) && u.scope == c.scope && len(c.keyed) > 0 && c.keyed[0].use != nil && c.keyed[0].through == nil && c.keyScope.ref != nil:
+				// The inputs keyed so far are joined in a subquery of this
+				// FROM, as it passes on none of their keys: the subquery is
+				// the relation, joined to this table.
+				c.tooDeep = c.keyed[0].use
 			}
 			return unsupported("%s, too large for every worker to read, is read where its rows cannot be divided", u.table)
 		}

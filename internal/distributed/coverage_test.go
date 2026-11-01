@@ -39,7 +39,7 @@ func TestCoverageShapes(t *testing.T) {
 		{"TABLESAMPLE", `SELECT count(*) FROM lineitem TABLESAMPLE reservoir(500 ROWS)`, false},
 		{"rows of a scan", `SELECT l_orderkey, l_comment FROM lineitem WHERE l_suppkey = 11`, true},
 		{"rows of a scan", `SELECT o_orderkey, o_orderdate FROM orders WHERE o_custkey IN (5, 6, 7) ORDER BY 1`, true},
-		{"rows of a scan", `SELECT l_orderkey FROM lineitem WHERE l_comment LIKE '%regular%'`, false},
+		{"rows of a scan", `SELECT l_orderkey FROM lineitem WHERE l_comment LIKE '%regular%'`, true},
 		{"subquery without aggregation", `SELECT x.l_orderkey, count(*) OVER () FROM (SELECT l_orderkey FROM lineitem WHERE l_partkey = 9) AS x`, true},
 		{"subquery without aggregation", `WITH s AS (SELECT l_orderkey, l_extendedprice FROM lineitem WHERE l_suppkey IN (1, 2))
 			SELECT *, rank() OVER (ORDER BY l_extendedprice DESC) FROM s`, true},

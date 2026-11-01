@@ -39,7 +39,8 @@ func TestSelectiveRowsAndSubqueries(t *testing.T) {
 		{`SELECT x.l_orderkey, x.l_shipmode, rank() OVER (ORDER BY x.l_orderkey) AS r FROM (SELECT l_orderkey, l_shipmode FROM lineitem) AS x ORDER BY 3, 2 LIMIT 30`, true},
 		// What still runs on one machine: a subquery of every row and column.
 		{`SELECT x.l_orderkey, count(*) OVER () AS n FROM (SELECT * FROM lineitem) AS x ORDER BY 1 LIMIT 3`, false},
-		{`SELECT l_orderkey, l_comment FROM lineitem WHERE l_comment LIKE '%furious%'`, false},
+		{`SELECT l_orderkey, l_comment FROM lineitem WHERE l_comment LIKE '%furious%'`, true},
+		{`SELECT l_orderkey, l_comment FROM lineitem WHERE l_comment LIKE '%a%'`, false},
 		{`SELECT l_returnflag, count(*) FROM lineitem l GROUP BY 1 HAVING count(*) > (SELECT count(*) FROM orders WHERE o_orderstatus = l_returnflag) ORDER BY 1`, false},
 	} {
 		t.Run(short(tc.query), func(t *testing.T) {

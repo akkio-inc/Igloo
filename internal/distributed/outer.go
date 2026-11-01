@@ -42,17 +42,67 @@ func (oj *outerJoin) nullable(side *fromItem) bool {
 	return true
 }
 
+// usingConds are the conditions that ref's USING, or a natural join's common
+// columns, stand for between the items of its sides, for telling what its
+// sides are joined on: they are never printed. A column some items of a side
+// share is the first's, which the side's own joins make equal to the others'.
+func usingConds(ref node, left, right []*fromItem) []node {
+	var columns []string
+	for _, c := range list(ref, "using_columns") {
+		columns = append(columns, strings.ToLower(str(c)))
+	}
+	if str(ref["ref_type"]) == "NATURAL" {
+		for _, l := range left {
+			if l.columns == nil {
+				return nil
+			}
+			for _, col := range l.columns {
+				if ownerIn(right, col) != nil && !slices.Contains(columns, col) {
+					columns = append(columns, col)
+				}
+			}
+		}
+	}
+	var out []node
+	for _, col := range columns {
+		l, r := ownerIn(left, col), ownerIn(right, col)
+		if l == nil || r == nil {
+			continue
+		}
+		out = append(out, node{"class": "COMPARISON", "type": "COMPARE_EQUAL",
+			"left":  node{"class": "COLUMN_REF", "type": "COLUMN_REF", "column_names": []any{l.name, col}},
+			"right": node{"class": "COLUMN_REF", "type": "COLUMN_REF", "column_names": []any{r.name, col}}})
+	}
+	return out
+}
+
+// ownerIn returns the first of items with a column called name (lower case).
+func ownerIn(items []*fromItem, name string) *fromItem {
+	for _, it := range items {
+		if slices.Contains(it.columns, name) {
+			return it
+		}
+	}
+	return nil
+}
+
 // addOuterJoin records ref, a join whose sides added the uses and rels of
 // rd between the indexes of us and rs (left side from [0] to [1], right
 // from [1] to [2]), if it is a LEFT, RIGHT or FULL join of one item of sc
-// to another with a condition, and marks the sides that may be read by
+// to another with conditions conds, and marks the sides that may be read by
 // partition for it.
-func (sc *scope) addOuterJoin(ref node, rd *reads, us, rs [3]int) {
+func (sc *scope) addOuterJoin(ref node, rd *reads, conds []node, us, rs [3]int) {
 	kind := str(ref["join_type"])
-	if kind == "OUTER" {
+	switch kind {
+	case "OUTER":
 		kind = "FULL"
+	case "ANTI":
+		// It keeps the left rows that no right row matches: the right side
+		// read by partition needs the left partitioned alike, as a LEFT JOIN's
+		// does, or each task would keep a row the others match.
+		kind = "LEFT"
 	}
-	if kind != "LEFT" && kind != "RIGHT" && kind != "FULL" || str(ref["ref_type"]) != "REGULAR" || child(ref, "condition") == nil {
+	if kind != "LEFT" && kind != "RIGHT" && kind != "FULL" || str(ref["ref_type"]) != "REGULAR" && str(ref["ref_type"]) != "NATURAL" || len(conds) == 0 {
 		return
 	}
 	item := func(from, to [2]int) (*fromItem, func()) {
@@ -86,7 +136,7 @@ func (sc *scope) addOuterJoin(ref node, rd *reads, us, rs [3]int) {
 	if left == nil || right == nil {
 		return
 	}
-	oj := &outerJoin{kind: kind, cond: conjuncts(child(ref, "condition")), left: left, right: right}
+	oj := &outerJoin{kind: kind, cond: conds, left: left, right: right}
 	sc.outerJoins = append(sc.outerJoins, oj)
 	if oj.nullable(left) {
 		markLeft()

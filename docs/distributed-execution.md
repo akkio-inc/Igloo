@@ -47,10 +47,13 @@ values the workers found) and runs the rest of the statement: `HAVING`,
 subqueries. A statement that ranks the groups with `ROW_NUMBER()`, `RANK()`
 or `DENSE_RANK()` and keeps the first few of each partition (`WHERE rank <=
 10`) has the workers send only the groups that may rank so. Queries without aggregation are divided the same way when they
-keep few rows: `SELECT DISTINCT`, `ORDER BY ... LIMIT` of up to a
+keep few rows: `SELECT DISTINCT`, whose groups workers complete as a `GROUP
+BY`'s, `ORDER BY ... LIMIT` of up to a
 million rows, and a `SELECT ... WHERE` that filters the large table by a
 column equal to a constant, in a list, or equal to a subquery's value (`WHERE
-account_id = 42`), as the statement or as a subquery or common table
+account_id = 42`), or looks up three characters or more of a column's text
+(`WHERE note LIKE '%refund%'`, `contains(note, 'refund')`), as the statement or
+as a subquery or common table
 expression whose rows the coordinator reads to run the rest (a window over
 all of them, say); and every row of a table, filtered or not, ordered by
 `ORDER BY` without `LIMIT` by an order the coordinator merges by (below):
@@ -174,8 +177,8 @@ person, to an exchange that both branches of the `UNION ALL` fill, and
 partition the media events by person as well; then each worker joins one
 partition of both and counts its people per genre and cohort, which no
 other partition holds, and so for the cohorts' sizes, and a last round adds
-up each genre and cohort's counts. The coordinator gets a row per genre and
-cohort, and runs the final join itself. A
+up each genre and cohort's counts, and joins them by cohort. The coordinator
+gets the result's rows. A
 common table expression is computed once, however many parts read it,
 and a part the coordinator runs that reads it too reads what the workers
 wrote. One that only one part reads and that only filters tables is read
@@ -207,15 +210,23 @@ In detail, a part runs distributed when:
   `x IN (SELECT y ...)` is a semi join to a relation workers compute,
   partitioned by `y`, and a subquery of one row
   (`ver = (SELECT max(ver) FROM t WHERE ...)`) one that every task reads.
+  A correlated subquery over a large table is the join it means, where its
+  `WHERE` only makes its columns equal to the statement's and otherwise
+  filters its own rows: `EXISTS` a semi join, `NOT EXISTS` an anti join, and a
+  scalar subquery of `min`, `max`, `sum`, `avg` (or arithmetic on them) or a
+  count a `LEFT JOIN` to its groups, in `WHERE` or in a select list that does
+  not group.
   It may also read relations workers compute: common table expressions
   and subqueries in `FROM` that are themselves such `SELECT`s, with
   grouping and `DISTINCT` but no `ORDER BY` or `LIMIT`, and no window
   functions but aggregates over all their rows (`min(day) OVER ()`) or
   windows that all partition their rows by the same columns (see
   [window functions](#window-functions)), or a `UNION ALL` of them, or a
-  `UNION` of distinct rows, whose branches write their rows partitioned by
-  all of their columns and whose last stage keeps each partition's
-  distinct rows.
+  `UNION` of distinct rows, an `INTERSECT` or an `EXCEPT`, whose branches
+  write their rows partitioned by all of their columns and whose last stage
+  computes it over each partition's rows. Those three run so as a statement
+  too, with the coordinator reading what they keep, and sorting or limiting
+  it. Joins are read by their conditions, `USING` and `NATURAL` among them.
   An `ORDER BY` without `LIMIT` in such a subquery or common table
   expression counts for nothing where what reads it sorts again,
   aggregates, or takes distinct rows, as a report's last `SELECT` sorts
@@ -304,7 +315,9 @@ partitioned by the groups so that each worker computes whole groups;
 aggregates over `DISTINCT` values of unrelated
 expressions in one `SELECT` (`count(DISTINCT a), count(DISTINCT b)`),
 window functions over rows but those of the next section, a large table read again in a correlated
-subquery expression (`EXISTS`, a scalar subquery: TPC-H Q17, Q20, Q21),
+subquery expression of another shape (`NOT IN`, whose rows depend on whether
+any of its subquery's is `NULL`; a correlation by anything but equal columns;
+a scalar subquery of another aggregate, or that gives a value over no rows),
 subqueries in `GROUP BY`, samples of a number of rows,
 large tables joined on different keys in one `SELECT`, statements that call user-defined macros
 or session functions (`getvariable`, `current_setting`), tables with
@@ -1588,9 +1601,13 @@ several instance types and zones, so that capacity one lacks another has.
 - The large inputs of one `SELECT` are partitioned by one key. Large tables
   joined on different keys need a step each: a common table expression or
   subquery per key. A large table read again in a correlated subquery
-  expression (`EXISTS`, a scalar subquery) runs on one machine; written as
-  a join to a common table expression, it runs distributed. Give the
-  machines that run such statements a lot of memory and fast spill disk.
+  expression that is not the join it means (`NOT IN`, a correlation by
+  anything but equal columns) runs on one machine; written as a join to a
+  common table expression, it runs distributed. Give the machines that run
+  such statements a lot of memory and fast spill disk.
+- `ROLLUP`, `CUBE` and `GROUPING SETS` run on workers up to the finest groups
+  of their sets, and the coordinator computes the sets from those groups:
+  its memory grows with them, as a plain `GROUP BY`'s does not.
 - Partitioned joins, aggregations and every step of a multi-stage plan
   write what they exchange to object storage and read it back: that costs
   request charges and adds a few seconds per step, and

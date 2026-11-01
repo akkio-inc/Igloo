@@ -1935,6 +1935,41 @@ func (pl *planner) cast(e node, typ string) (node, error) {
 // limits. It is only worth it when that cuts the rows down: with a WHERE
 // clause, DISTINCT, or LIMIT, with ORDER BY or not (any rows, which its
 // stage stops sending once it has enough: see Stage.enough).
+// searchesText reports whether a WHERE clause looks a column's text up by a
+// pattern or a part of it of at least minSearch characters (x LIKE '%word%',
+// contains(x, 'word')), as scans of long text do, which keep few rows: workers
+// read the text, and the coordinator what they keep. A pattern of a character
+// or two may keep most of them, which would cross for nothing.
+func searchesText(where node) bool {
+	for _, c := range conjuncts(where) {
+		if str(c["class"]) != "FUNCTION" {
+			continue
+		}
+		switch strings.ToLower(str(c["function_name"])) {
+		case "~~", "~~*", "contains", "starts_with", "prefix", "suffix", "ends_with", "regexp_matches":
+		default:
+			continue
+		}
+		args := list(c, "children")
+		if len(args) != 2 {
+			continue
+		}
+		col, pattern := args[0].(node), args[1].(node)
+		if str(col["class"]) != "COLUMN_REF" || str(pattern["class"]) != "CONSTANT" {
+			continue
+		}
+		v := child(pattern, "value")
+		text := strings.NewReplacer("%", "", "_", "").Replace(str(v["value"]))
+		if str(child(v, "type")["id"]) == "VARCHAR" && len(text) >= minSearch {
+			return true
+		}
+	}
+	return false
+}
+
+// minSearch is the fewest characters of a search that searchesText counts.
+const minSearch = 3
+
 func (pl *planner) rowsJob(c *candidate) (*jobBuild, error) {
 	sel := c.sel
 	if (hasClass(sel["select_list"], "WINDOW") || child(sel, "qualify") != nil || hasClass(sel["modifiers"], "WINDOW")) && c.window == nil {
@@ -1961,7 +1996,10 @@ func (pl *planner) rowsJob(c *candidate) (*jobBuild, error) {
 	// a column equal to a constant, in a list or equal to a subquery's
 	// value, as auto mode's estimates take it (filtersSelectively): workers
 	// read the table, and the coordinator what they keep.
-	selective := c.split != nil && child(sel, "where_clause") != nil && filtersSelectively(node{"where_clause": child(sel, "where_clause")}, c.split.table)
+	selective := c.split != nil && child(sel, "where_clause") != nil && (filtersSelectively(node{"where_clause": child(sel, "where_clause")}, c.split.table) || searchesText(child(sel, "where_clause")))
+	// And so do those of what workers compute as a whole, to be read as it
+	// is (see setOperationJob).
+	selective = selective || pl.gathers[identity(sel)]
 	// And so do those of a subquery whose rows the coordinator reads to run
 	// the rest, as a window over all of them, where they are fewer than
 	// the table's, by its filters or its columns: workers read the table in

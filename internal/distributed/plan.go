@@ -367,6 +367,9 @@ type planner struct {
 	noInline  bool
 	grouped   int
 	noGrouped bool
+	// gathers are the SELECTs that read a set operation workers compute,
+	// whose rows the coordinator reads as they are (see setOperationJob).
+	gathers map[uintptr]bool
 	// fused numbers the views of stages fusePartitions took out.
 	fused int
 	// reasons say why candidates were not distributed, for logs.
@@ -606,6 +609,12 @@ func (pl *planner) skip(err error) {
 func (pl *planner) query(n node, top bool, ctes cteScope) (node, error) {
 	switch str(n["type"]) {
 	case "SELECT_NODE":
+		if work := pl.distinctGroups(n); work != nil {
+			replaced, err := pl.job(work, top, ctes)
+			if err != nil || replaced != nil {
+				return replaced, err
+			}
+		}
 		replaced, err := pl.job(n, top, ctes)
 		if err != nil || replaced != nil {
 			return replaced, err
@@ -622,6 +631,10 @@ func (pl *planner) query(n node, top bool, ctes cteScope) (node, error) {
 			return nil, err
 		}
 	case "SET_OPERATION_NODE":
+		replaced, err := pl.setOperationJob(n, top, ctes)
+		if err != nil || replaced != nil {
+			return replaced, err
+		}
 		// Its branches, which read its common table expressions, then them.
 		inner := ctes.with(n)
 		for _, side := range []string{"left", "right"} {
@@ -1013,6 +1026,9 @@ func (pl *planner) analyze(c *candidate, ctes cteScope) error {
 	if err := pl.semiJoins(sel, ctes); err != nil {
 		return err
 	}
+	if err := pl.scalarJoins(sel, ctes); err != nil {
+		return err
+	}
 	if child(sel, "sample") != nil {
 		return unsupported("USING SAMPLE")
 	}
@@ -1275,24 +1291,27 @@ func (pl *planner) from(ref node, splittable bool, ctes cteScope, sc *scope, rd 
 		if err != nil {
 			return err
 		}
-		uses0, rels0 := len(rd.uses), len(rd.rels)
+		uses0, rels0, items0 := len(rd.uses), len(rd.rels), len(sc.items)
 		if err := pl.from(child(ref, "left"), splittable && left, ctes, sc, rd); err != nil {
 			return err
 		}
-		uses, rels := len(rd.uses), len(rd.rels)
+		uses, rels, items := len(rd.uses), len(rd.rels), len(sc.items)
 		if err := pl.from(child(ref, "right"), splittable && right, ctes, sc, rd); err != nil {
 			return err
 		}
+		conds := append(conjuncts(child(ref, "condition")), usingConds(ref, sc.items[items0:items], sc.items[items:])...)
 		if splittable {
-			sc.addOuterJoin(ref, rd, [3]int{uses0, uses, len(rd.uses)}, [3]int{rels0, rels, len(rd.rels)})
+			sc.addOuterJoin(ref, rd, conds, [3]int{uses0, uses, len(rd.uses)}, [3]int{rels0, rels, len(rd.rels)})
 		}
+		jt := str(ref["join_type"])
 		switch {
-		case str(ref["join_type"]) == "INNER" && str(ref["ref_type"]) != "ASOF":
-			sc.conds = append(sc.conds, conjuncts(child(ref, "condition"))...)
-		case str(ref["join_type"]) == "SEMI" && str(ref["ref_type"]) == "REGULAR" && splittable:
+		case jt == "INNER" && str(ref["ref_type"]) != "ASOF":
+			sc.conds = append(sc.conds, conds...)
+		case (jt == "SEMI" || jt == "ANTI") && str(ref["ref_type"]) == "REGULAR" && splittable:
 			// Its right side's rows may be partitioned by the join's key: a
-			// row on the left meets all of its matches in one partition.
-			sc.semiConds = append(sc.semiConds, conjuncts(child(ref, "condition"))...)
+			// row on the left meets all of its matches in one partition, and
+			// is kept, or not, by them.
+			sc.semiConds = append(sc.semiConds, conds...)
 			for _, u := range rd.uses[uses:] {
 				u.semi = true
 			}

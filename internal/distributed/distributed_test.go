@@ -366,7 +366,7 @@ func TestLocal(t *testing.T) {
 		// workers sort them for the coordinator to merge (see
 		// TestStreamedMerge), but not by an order it cannot merge by.
 		`SELECT l_orderkey, l_comment FROM lineitem WHERE l_quantity > 1`,
-		`SELECT l_orderkey FROM lineitem WHERE l_comment LIKE '%furious%' ORDER BY l_orderkey + 1`,
+		`SELECT l_orderkey FROM lineitem WHERE l_quantity > 1 ORDER BY l_orderkey + 1`,
 		// Correlated: a large table read again per row.
 		`SELECT count(*) FROM lineitem l WHERE l_quantity < (SELECT avg(l_quantity) FROM lineitem WHERE l_partkey = l.l_partkey)`,
 		`SELECT string_agg(l_comment, ',' ORDER BY l_comment) FROM lineitem`,
