@@ -26,6 +26,7 @@ import (
 	"os"
 	"slices"
 	"strconv"
+	"sync/atomic"
 	"time"
 
 	"github.com/apache/iceberg-go/io"
@@ -42,6 +43,23 @@ import (
 
 var unsupportedS3Props = []string{
 	io.S3ConnectTimeout,
+}
+
+// defaultCredentials, when set, provide the credentials of an S3 file
+// system whose properties give none (see SetDefaultCredentials).
+var defaultCredentials atomic.Pointer[aws.CredentialsProvider]
+
+// SetDefaultCredentials has every S3 file system whose properties give no
+// credentials use p, rather than a provider of the SDK's default chain of
+// its own, whose cache starts empty: one file system a table, each fetched
+// credentials from the instance metadata service on its first request.
+// Nil sets none. (Igloo patch.)
+func SetDefaultCredentials(p aws.CredentialsProvider) {
+	if p == nil {
+		defaultCredentials.Store(nil)
+		return
+	}
+	defaultCredentials.Store(&p)
 }
 
 // ParseAWSConfig parses S3 properties and returns a configuration.
@@ -78,6 +96,8 @@ func ParseAWSConfig(ctx context.Context, props map[string]string) (*aws.Config, 
 	if accessKey != "" || secretAccessKey != "" || token != "" {
 		opts = append(opts, config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(
 			props[io.S3AccessKeyID], props[io.S3SecretAccessKey], props[io.S3SessionToken])))
+	} else if p := defaultCredentials.Load(); p != nil {
+		opts = append(opts, config.WithCredentialsProvider(*p))
 	}
 
 	if proxy, ok := props[io.S3ProxyURI]; ok {

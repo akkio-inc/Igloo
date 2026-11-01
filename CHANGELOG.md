@@ -2098,6 +2098,16 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
 
 ### Fixed
 
+- Planning a statement no longer fetches AWS credentials, nor fails for
+  want of them. iceberg-go builds an S3 file system for each table it
+  loads, each with a provider of the credential chain of its own, so the
+  first request of every statement's scan planning, on the replica and
+  when workers ran it, fetched credentials from the EC2 instance metadata
+  service under the statement's deadline; under load the service answered
+  late, and statements ran on the replica instead. Igloo now holds one set
+  for the process, fetched once for every caller waiting and refreshed in
+  the background ahead of expiry, and hands out those held at once while
+  they are valid.
 - A statement that does not stop once canceled, or past its statement
   timeout, no longer holds its client: 30 seconds on, its client's
   connection is closed and the server logs DuckDB's progress; the session

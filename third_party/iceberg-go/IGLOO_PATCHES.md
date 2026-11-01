@@ -26,6 +26,14 @@ were removed; the code is otherwise unchanged except for these patches:
 - `catalog/rest/rest.go`, `RenameView` (new): renames a view through the
   REST catalog's `views/rename` endpoint, as `RenameTable` does for tables.
   Igloo renames views for `ALTER VIEW ... RENAME TO`, which dbt runs.
+- `io/gocloud/s3.go`, `SetDefaultCredentials` (new) and `ParseAWSConfig`:
+  an S3 file system whose properties give no credentials uses the provider
+  set, rather than a provider of the SDK's default chain of its own. Every
+  table iceberg-go loads gets a file system, and each such provider started
+  with an empty cache, so the first request of every scan planning fetched
+  credentials from the EC2 instance metadata service, under the statement's
+  deadline, which under load timed out. Igloo sets one process-wide
+  provider, refreshed ahead of expiry in the background (`internal/awscreds`).
 - `io/gocloud/s3.go`, `createS3Bucket`: the S3 client makes 10 attempts of
   a request rather than the SDK's 3, unless `AWS_MAX_ATTEMPTS` or the AWS
   config sets a number. S3 answers 503 SlowDown to a prefix that gets more

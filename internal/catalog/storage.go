@@ -2,15 +2,21 @@ package catalog
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"io"
+	"log/slog"
 	"net/http"
 	"strings"
+	"sync"
 
 	iceio "github.com/apache/iceberg-go/io"
 	// Registers the s3://, gs:// and abfss:// file systems.
-	_ "github.com/apache/iceberg-go/io/gocloud"
+	"github.com/apache/iceberg-go/io/gocloud"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 
+	"github.com/akkio-inc/igloo/internal/awscreds"
 	"github.com/akkio-inc/igloo/internal/config"
 )
 
@@ -47,9 +53,32 @@ func ioProperties(s config.Storage) map[string]string {
 		if s.S3.AccessKeyID != "" {
 			props[iceio.S3AccessKeyID] = s.S3.AccessKeyID
 			props[iceio.S3SecretAccessKey] = s.S3.SecretAccessKey
+		} else {
+			useSharedCredentials(s.S3.Region)
 		}
 	}
 	return props
+}
+
+// sharedCredentials sets the process's one provider of AWS credentials for
+// S3 file systems without keys of their own, once (see package awscreds).
+var sharedCredentials sync.Once
+
+// useSharedCredentials has iceberg-go's S3 file systems without keys of
+// their own take their credentials from one provider for the process, of
+// the default chain resolved for region, which refreshes them in the
+// background (see package awscreds), rather than each from the instance
+// metadata service on its first request, under its statement's deadline.
+func useSharedCredentials(region string) {
+	sharedCredentials.Do(func() {
+		gocloud.SetDefaultCredentials(awscreds.New(func(ctx context.Context) (aws.CredentialsProvider, error) {
+			cfg, err := awsconfig.LoadDefaultConfig(ctx, awsconfig.WithRegion(region))
+			if err != nil {
+				return nil, err
+			}
+			return cfg.Credentials, nil
+		}, slog.Default().With("component", "aws-credentials")))
+	})
 }
 
 // ownCredentials makes iceberg-go use Igloo's storage settings, as DuckDB
