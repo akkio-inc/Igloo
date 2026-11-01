@@ -955,6 +955,64 @@ func TestWorkersWriteDenied(t *testing.T) {
 	}
 }
 
+// TestWorkersSessionFunctions checks that what a fill's last step computes from
+// the session is computed here, where workers would take another branch or read
+// their own settings: its rows are those this replica computes, whatever else
+// of the statement may run on workers. Statement time is the same on all of them.
+func TestWorkersSessionFunctions(t *testing.T) {
+	t.Parallel()
+	env := startWriteServer(t)
+	env.force(t)
+	ctx := context.Background()
+	mustExec(t, env.admin, "SET VARIABLE sess_var = 'from-the-session'")
+	shapes := map[string]string{
+		"grouped":  "SELECT id, count(DISTINCT x) AS n, %s AS v FROM src GROUP BY id",
+		"plain":    "SELECT id, 1 AS n, %s AS v FROM (SELECT id FROM src) s",
+		"filtered": "SELECT id, 1 AS n, 'kept' AS v FROM (SELECT id FROM src) s WHERE (%s) IS NOT NULL",
+	}
+	exprs := []string{
+		"current_schema()",
+		"current_database()",
+		"getvariable('sess_var')",
+		"CASE WHEN getvariable('sess_var') = 'from-the-session' THEN 'masked' ELSE 'UNMASKED' END",
+		"current_setting('temp_directory')",
+		"current_setting('threads')",
+		"version()",
+		"has_table_privilege('src', 'select')",
+		"pg_table_is_visible(0)",
+		"current_connection_id() > 0",
+	}
+	n := 0
+	for shape, q := range shapes {
+		for _, e := range exprs {
+			n++
+			name := fmt.Sprintf("sess_%d", n)
+			query := fmt.Sprintf(q, e)
+			if _, err := env.admin.Exec(ctx, "CREATE TABLE "+name+" AS "+query); err != nil {
+				t.Errorf("%s, %s: %v", shape, e, err)
+				continue
+			}
+			data, _ := liveFiles(t, env.admin, name)
+			if i := slices.IndexFunc(data, func(p string) bool { return strings.Contains(p, "/igloo-write-") }); i >= 0 {
+				t.Errorf("%s, %s: workers wrote %s", shape, e, data[i])
+			}
+			check := "SELECT count(*), min(CAST(v AS VARCHAR)), max(CAST(v AS VARCHAR)) FROM "
+			got := env.local(t, check+name)
+			if want := env.local(t, check+"("+query+") q"); got != want {
+				t.Errorf("%s, %s: committed %s, this replica computes %s", shape, e, got, want)
+			}
+		}
+	}
+
+	// Statement time is fixed before the plan, so workers may compute it, and
+	// every file of a statement holds the same.
+	mustExec(t, env.admin, "CREATE TABLE sess_time AS SELECT id, count(DISTINCT x) AS n, CAST(now() AS VARCHAR) AS v FROM src GROUP BY id")
+	env.checkWrote(t, "sess_time")
+	if got := env.local(t, "SELECT count(DISTINCT v) FROM sess_time"); got != "1" {
+		t.Errorf("a statement's rows hold %s times", got)
+	}
+}
+
 // TestWorkersDoNotWrite checks that a fill stays with this replica's writes
 // inside a transaction block, and over a source with a policy.
 func TestWorkersDoNotWrite(t *testing.T) {

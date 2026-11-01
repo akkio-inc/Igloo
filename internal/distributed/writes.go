@@ -550,6 +550,12 @@ func (pl *planner) markWrites(final node) {
 	if last == nil || last.placeholder == "" || last.merge != nil || last.enough > 0 || !pl.rowWise(final, last) {
 		return
 	}
+	// What a fragment may not hold, a combine step that runs as one may not
+	// either: a session's function, a user's, or a parameter. On a worker,
+	// current_schema() is main and a session's variable is NULL.
+	if hasClass(final, "PARAMETER") || pl.checkFunctions(final) != nil {
+		return
+	}
 	sql, err := pl.p.print(final)
 	if err != nil {
 		return

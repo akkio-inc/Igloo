@@ -2705,6 +2705,7 @@ var timeFunctions = map[string]string{
 	"today": "DATE", "current_date": "DATE",
 	"current_time": "TIME WITH TIME ZONE", "get_current_time": "TIME WITH TIME ZONE",
 	"localtime": "TIME", "localtimestamp": "TIMESTAMP",
+	"current_localtime": "TIME", "current_localtimestamp": "TIMESTAMP",
 }
 
 // fixTime replaces the statement's calls of now() and its relatives with
@@ -2826,6 +2827,18 @@ var sessionFunctions = map[string]bool{
 	"has_function_privilege": true, "has_language_privilege": true, "has_schema_privilege": true,
 	"has_sequence_privilege": true, "has_server_privilege": true, "has_table_privilege": true,
 	"has_tablespace_privilege": true, "pg_has_role": true, "version": true, "igloo_ml_score": true,
+	// The rest of what DuckDB says is not consistent (duckdb_functions()'s
+	// stability), or reads the session's connection or catalog.
+	"ago": true, "current_connection_id": true, "current_query_id": true, "current_transaction_id": true,
+	"get_block_size": true, "stats": true, "write_log": true, "has_foreign_data_wrapper_privilege": true,
+	"inet_client_addr": true, "inet_client_port": true, "inet_server_addr": true, "inet_server_port": true,
+	"pg_conf_load_time": true, "pg_postmaster_start_time": true, "pg_is_other_temp_schema": true,
+	"pg_my_temp_schema": true, "pg_collation_is_visible": true, "pg_conversion_is_visible": true,
+	"pg_function_is_visible": true, "pg_opclass_is_visible": true, "pg_operator_is_visible": true,
+	"pg_opfamily_is_visible": true, "pg_table_is_visible": true, "pg_ts_config_is_visible": true,
+	"pg_ts_dict_is_visible": true, "pg_ts_parser_is_visible": true, "pg_ts_template_is_visible": true,
+	"pg_type_is_visible": true, "pg_get_constraintdef": true, "pg_get_expr": true, "pg_get_viewdef": true,
+	"col_description": true, "obj_description": true, "shobj_description": true,
 }
 
 // checkFunctions refuses a fragment that calls a function workers would
