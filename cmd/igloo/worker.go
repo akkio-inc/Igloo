@@ -299,6 +299,7 @@ func workerWriteCredentials(ctx context.Context, cfg config.Config, log *slog.Lo
 type footprints interface {
 	Observe(shape string, footprint int64)
 	ObserveUnfinished(shape string, held int64)
+	ObserveForm(key string, lists bool, cpu time.Duration)
 }
 
 // longUnmeasured is how long a run that ended early must have run, without
@@ -329,6 +330,12 @@ func seedHistory(ctx context.Context, seed func([]distributed.Run), fp footprint
 		unfinished bool
 	}
 	var fs []footprint
+	type form struct {
+		key   string
+		lists bool
+		cpu   time.Duration
+	}
+	var forms []form
 	for read := 0; read < most; read += pageSize {
 		qs, err := store.Queries(ctx, audit.Viewer{All: true}, page)
 		if err != nil {
@@ -336,6 +343,9 @@ func seedHistory(ctx context.Context, seed func([]distributed.Run), fp footprint
 			break
 		}
 		for _, q := range qs {
+			if q.FlattenKey != "" && q.Outcome == audit.OutcomeOK && q.Resources != nil && q.Workers == 0 {
+				forms = append(forms, form{q.FlattenKey, q.FlattenLists, q.Resources.CPUTime})
+			}
 			switch {
 			case q.PlanKey == "":
 			case q.Outcome == audit.OutcomeOK:
@@ -371,6 +381,10 @@ func seedHistory(ctx context.Context, seed func([]distributed.Run), fp footprint
 	// Newest first: oldest first, so the last run weighs most.
 	slices.Reverse(rs)
 	slices.Reverse(fs)
+	slices.Reverse(forms)
+	for _, f := range forms {
+		fp.ObserveForm(f.key, f.lists, f.cpu)
+	}
 	if seed != nil {
 		seed(rs)
 	}

@@ -255,7 +255,7 @@ func (s *Server) translate(ctx context.Context, sess *session, text string, impl
 func (s *Server) flattenForm(ctx context.Context, sess *session, source string, tr *translation) *translation {
 	key := s.workloadShape(ctx, sess, source)
 	lateral := tr.SQL
-	if !s.flattens.choose(key, func() bool { return estimateFlattenLists(ctx, sess, lateral) }) {
+	if !s.workload.ChooseForm(key, func() bool { return estimateFlattenLists(ctx, sess, lateral) }) {
 		tr.flattenKey = key
 		return tr
 	}

@@ -38,6 +38,9 @@ type Controller struct {
 	// footprints.go).
 	history footprints
 
+	// forms pick the form of each statement shape's FLATTENs (see forms.go).
+	forms flattenForms
+
 	mu       sync.Mutex
 	reserved int64
 	running  map[string]int

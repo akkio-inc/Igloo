@@ -499,3 +499,71 @@ func TestPeaks(t *testing.T) {
 	stop()
 	<-done
 }
+
+// TestFlattenForms checks the form each statement shape's FLATTENs take:
+// the estimate's for the first statement, asked for once; the other for
+// the next; either while neither has ended; and from then on the one whose
+// latest runs took the less CPU time at best.
+func TestFlattenForms(t *testing.T) {
+	f := NewController(0)
+	asked := 0
+	estimate := func() bool { asked++; return true }
+	for i, want := range []bool{true, false, true} {
+		if got := f.ChooseForm("a", estimate); got != want {
+			t.Errorf("statement %d: lists %v, want %v", i, got, want)
+		}
+	}
+	if asked != 1 {
+		t.Errorf("asked DuckDB %d times", asked)
+	}
+	f.ObserveForm("a", false, 2*time.Second)
+	if f.ChooseForm("a", estimate) {
+		t.Error("with only the lateral form's run ended, not the lateral form")
+	}
+	f.ObserveForm("a", true, 5*time.Second)
+	if f.ChooseForm("a", estimate) {
+		t.Error("the slower form")
+	}
+	f.ObserveForm("a", true, time.Second)
+	if !f.ChooseForm("a", estimate) {
+		t.Error("not the form that became faster")
+	}
+	// A run beside others takes longer: it changes nothing until the faster
+	// run is no longer among the latest.
+	f.ObserveForm("a", true, 5*time.Second)
+	if !f.ChooseForm("a", estimate) {
+		t.Error("a slower run of the faster form moved the shape off it")
+	}
+	for range formRuns {
+		f.ObserveForm("a", true, 5*time.Second)
+	}
+	if f.ChooseForm("a", estimate) {
+		t.Error("the form that became slower")
+	}
+	f.ObserveForm("unseen", true, time.Second)
+	if f.ChooseForm("b", func() bool { return false }) || !f.ChooseForm("b", estimate) {
+		t.Error("another shape: not the estimate's, then the other form")
+	}
+}
+
+// TestFormsFromTheHistory checks what a restart keeps of a shape's forms: both
+// seen, the faster; one seen, the other next, and then the faster.
+func TestFormsFromTheHistory(t *testing.T) {
+	never := func() bool { t.Error("asked DuckDB of a shape in the history"); return false }
+	f := NewController(0)
+	f.ObserveForm("both", false, 5*time.Second)
+	f.ObserveForm("both", true, 2*time.Second)
+	if !f.ChooseForm("both", never) {
+		t.Error("with both seen, not the faster")
+	}
+	f.ObserveForm("one", true, 2*time.Second)
+	if f.ChooseForm("one", never) {
+		t.Error("with one seen, not the other next")
+	}
+	f.ObserveForm("one", false, 5*time.Second)
+	if !f.ChooseForm("one", never) {
+		t.Error("with both seen by then, not the faster")
+	}
+	var none *Controller
+	none.ObserveForm("x", true, time.Second)
+}

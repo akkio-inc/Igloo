@@ -87,6 +87,25 @@ func TestSeedHistory(t *testing.T) {
 			t.Errorf("seeded footprint of %s completed %v", shape, ok)
 		}
 	}
+	// A shape's FLATTEN forms, both seen, take the faster.
+	forms := workload.NewController(22 * gb)
+	formStore := audit.NewMemoryStore(audit.MemoryQueries, audit.MemoryLogins)
+	if err := formStore.WriteQueries(context.Background(), []audit.Query{
+		{ID: "1", Start: now.Add(-2 * time.Minute), Outcome: audit.OutcomeOK, FlattenKey: "k",
+			Resources: &audit.Resources{CPUTime: 5 * time.Second}},
+		{ID: "2", Start: now.Add(-time.Minute), Outcome: audit.OutcomeOK, FlattenKey: "k", FlattenLists: true,
+			Resources: &audit.Resources{CPUTime: 2 * time.Second}},
+		{ID: "3", Start: now.Add(-time.Second), Outcome: audit.OutcomeError, FlattenKey: "k",
+			Resources: &audit.Resources{CPUTime: time.Second}},
+		{ID: "4", Start: now.Add(-time.Second), Outcome: audit.OutcomeOK, FlattenKey: "k", Workers: 2,
+			Resources: &audit.Resources{CPUTime: time.Second}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	seedHistory(context.Background(), nil, forms, 22*gb, formStore, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if !forms.ChooseForm("k", func() bool { t.Error("asked DuckDB of a shape in the history"); return false }) {
+		t.Error("seeded forms: not the faster")
+	}
 	// Without a coordinator, footprints all the same.
 	footprints = workload.NewController(22 * gb)
 	seedHistory(context.Background(), nil, footprints, 22*gb, store, slog.New(slog.NewTextHandler(io.Discard, nil)))

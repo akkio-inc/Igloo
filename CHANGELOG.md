@@ -1927,6 +1927,9 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
 - A statement's thread sleeps while DuckDB's workers hold all its tasks,
   rather than ask for one again and again without a pause, a core for every
   statement waiting on its workers.
+- A replica keeps the forms of `FLATTEN`s through a restart, from the query
+  history, rather than try them again: a dashboard's first build after one took
+  half as long again as the next.
 - A `FLATTEN` of a column takes the form DuckDB's estimates point to, then
   whichever form its shape's latest runs took the less CPU time in at best (see
   [Snowflake SQL](docs/snowflake-sql.md)): two dashboard queries over tens

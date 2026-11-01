@@ -503,10 +503,7 @@ type Server struct {
 	reportPlanned atomic.Int64
 	settings      auth.SettingStore
 	workload      *workload.Controller
-	// flattens picks the form of each statement shape's FLATTENs of
-	// columns (see flattenForms).
-	flattens flattenForms
-	pool     string
+	pool          string
 	// shares carries out Delta Sharing statements, and external are its
 	// external tables.
 	shares   *sharing.Service
@@ -2227,7 +2224,7 @@ func (s *Server) preparedQuery(ctx context.Context, sess *session, user auth.Use
 			used = sess.measure(st)
 		}
 		if used != nil && tr != nil && tr.flattenKey != "" {
-			s.flattens.observe(tr.flattenKey, tr.flattenLists, used.CPUTime)
+			s.workload.ObserveForm(tr.flattenKey, tr.flattenLists, used.CPUTime)
 		}
 		peak, sampled := sess.wl.peak, sess.wl.sampled
 		if used != nil && parts.workers == 0 && s.heavy != nil {
@@ -2288,7 +2285,7 @@ func (s *Server) preparedQuery(ctx context.Context, sess *session, user auth.Use
 		}
 		s.recordQuery(sess, queryRecord{text: q.Query, start: start, err: err, rows: tw.rows(), acc: st.access,
 			policies: st.policies(), used: used, queued: queued, analyze: st.sourceText(), stmtType: st.stmtType, parts: parts, ai: spend,
-			shape: shape, peak: peak})
+			shape: shape, peak: peak, form: formOf(tr)})
 		if err != nil {
 			s.log.Debug("statement failed", "user", user.Name, "err", err)
 		}
