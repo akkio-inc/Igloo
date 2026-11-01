@@ -689,9 +689,9 @@ func (r *refresher) incremental(ctx context.Context) (refreshResult, string, err
 			case k > i:
 				pins[k], err = r.pinAt(ctx, other.Table(), oc.From)
 			case oc.AppendOnly():
-				pins[k].View = views[other.Table()][0]
+				pins[k].View, pins[k].Changed = views[other.Table()][0], true
 			default:
-				pins[k].View, sign = views[other.Table()][2], other.Alias
+				pins[k].View, pins[k].Changed, pins[k].Signed, sign = views[other.Table()][2], true, true, other.Outer
 			}
 			if err != nil {
 				return refreshResult{}, "", err

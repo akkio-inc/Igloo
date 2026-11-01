@@ -397,7 +397,10 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   is read at the snapshot the refresh records. Anything else refreshes in
   full, and `SHOW MATERIALIZED VIEWS` and the run's `detail` in
   `igloo.task_history` say why (see [incremental
-  refresh](docs/loading.md#incremental-refresh)).
+  refresh](docs/loading.md#incremental-refresh)). What these read may be a
+  `WITH` clause, a subquery in `FROM` or a `UNION ALL`; a query that filters
+  and computes from one aggregate's rows is that aggregate, and `UNION` is
+  `SELECT DISTINCT` over `UNION ALL`.
 - Snowflake's dynamic tables: `CREATE [OR REPLACE] DYNAMIC TABLE ...
   TARGET_LAG = '...' | DOWNSTREAM WAREHOUSE = ... [REFRESH_MODE = AUTO |
   FULL | INCREMENTAL] [INITIALIZE = ...] AS query`, `ALTER DYNAMIC TABLE

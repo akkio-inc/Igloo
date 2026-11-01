@@ -441,7 +441,8 @@ func TestWorkersWrite(t *testing.T) {
 	})
 
 	t.Run("materialized view", func(t *testing.T) {
-		mv := "WITH o AS (SELECT * FROM lake.public.src) SELECT id, x FROM o WHERE g < 5"
+		// Its column renamed in FROM, it is refreshed in full.
+		mv := "SELECT i AS id, x FROM lake.public.src AS o(i) WHERE g < 5"
 		mustExec(t, admin, "CREATE MATERIALIZED VIEW w_mv AS "+mv)
 		mustExec(t, admin, "REFRESH MATERIALIZED VIEW w_mv")
 		if _, detail, _, _ := viewRefresh(t, admin, "public.w_mv"); !strings.Contains(detail, "its query ran on") {
@@ -1440,7 +1441,7 @@ func TestWorkersOutOfMemoryOnWrite(t *testing.T) {
 		leftAlone(t, "w_oom_i")
 	})
 	t.Run("materialized view", func(t *testing.T) {
-		mustExec(t, admin, "CREATE MATERIALIZED VIEW w_oom_mv AS WITH o AS (SELECT * FROM lake.public.src) SELECT id, g, x, repeat(name, 1800) AS c FROM o")
+		mustExec(t, admin, "CREATE MATERIALIZED VIEW w_oom_mv AS SELECT i AS id, g, x, repeat(name, 1800) AS c FROM lake.public.src AS o(i)")
 		mustExec(t, admin, "REFRESH MATERIALIZED VIEW w_oom_mv")
 		env.checkWide(t, "w_oom_mv")
 		env.checkNoNotes(t)

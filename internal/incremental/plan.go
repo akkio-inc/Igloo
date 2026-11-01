@@ -15,6 +15,9 @@
 //     (outer joins while the side they fill with NULLs is unchanged): rows
 //     appended to a table add the rows the query gives for them, by the
 //     delta rule Δ(A⋈B) = ΔA⋈B' + A⋈ΔB, A the old table and B' the new.
+//   - The same through WITH clauses, subqueries in FROM and UNION ALL, and
+//     UNION at the top of a query, as SELECT DISTINCT over UNION ALL (see
+//     nested.go).
 //   - GROUP BY (or SELECT DISTINCT, or aggregates of the whole input) with
 //     count(*), count(x), sum(x) and avg(x) of integers and decimals,
 //     min(x) and max(x), and count(DISTINCT x) of integers kept in roaring
@@ -82,8 +85,9 @@ type Env struct {
 type Source struct {
 	// Schema and Name are the catalog table's.
 	Schema, Name string
-	// Alias is what the query calls it.
-	Alias string
+	// Alias is what the query calls it, and Outer what the query's own FROM
+	// calls what reads it: the alias, or a subquery's around it.
+	Alias, Outer string
 	// Nullable says it is on a side of an outer join that the join fills
 	// with NULLs: rows appended to it can remove rows of the result, so a
 	// refresh after it changed is full.
@@ -123,8 +127,10 @@ type Plan struct {
 	keyTypes, aggTypes, argTypes []string
 	// templates are parsed expressions, by text.
 	templates map[string]node
-	// cols are the sources that have each column, by lower-case name.
+	// cols are what the query's own FROM names (see scopes) that have each
+	// column, by lower-case name, of top.
 	cols map[string][]int
+	top  []scope
 }
 
 // aggregate is an aggregate call of the query: count_star, count, sum,
@@ -152,6 +158,10 @@ type Pin struct {
 	Version int64
 	// View is a temporary view to read instead.
 	View string
+	// Changed says this is the source whose changes the refresh reads: a
+	// UNION ALL around it reads only the branch that has it (see pinned).
+	// Signed says View has the column __igloo_sign (see Input).
+	Changed, Signed bool
 }
 
 // unsupported ends planning with a reason.
@@ -183,11 +193,22 @@ func (p *Plan) analyze(ctx context.Context, query string) error {
 	if err != nil {
 		return err
 	}
+	if err := inlineCTEs(root, nil); err != nil {
+		return err
+	}
+	if str(root["type"]) == "SET_OPERATION_NODE" {
+		if str(root["setop_type"]) != "UNION" {
+			return refuse("it has %s", strings.ReplaceAll(str(root["setop_type"]), "_", " "))
+		}
+		if root, err = p.topSetOperation(ctx, root); err != nil {
+			return err
+		}
+	}
 	if typ := str(root["type"]); typ != "SELECT_NODE" {
 		return refuse("it is not a plain SELECT (%s)", strings.ToLower(strings.TrimSuffix(typ, "_NODE")))
 	}
-	if m, ok := root["cte_map"].(node); ok && len(list(m["map"])) > 0 {
-		return refuse("it has a WITH clause")
+	if root, err = p.promote(ctx, root); err != nil {
+		return err
 	}
 	for _, k := range []string{"qualify", "sample"} {
 		if root[k] != nil {
@@ -217,18 +238,20 @@ func (p *Plan) analyze(ctx context.Context, query string) error {
 	if from == nil || str(from["type"]) == "EMPTY" {
 		return refuse("it reads no table")
 	}
-	if err := p.sources(ctx, from, false); err != nil {
+	if err := p.sources(ctx, from, false, ""); err != nil {
 		return err
+	}
+	if len(p.Sources) == 0 {
+		return refuse("it reads no table")
 	}
 	// Names that one source alone has are qualified with it, so that
 	// expressions compare whatever the query wrote.
+	if p.top, err = p.scopes(ctx, from); err != nil {
+		return err
+	}
 	cols := map[string][]int{}
-	for i, s := range p.Sources {
-		names, err := p.env.Columns(ctx, s.Schema, s.Name)
-		if err != nil {
-			return err
-		}
-		for _, n := range names {
+	for i, s := range p.top {
+		for _, n := range s.cols {
 			k := strings.ToLower(n)
 			if !slices.Contains(cols[k], i) {
 				cols[k] = append(cols[k], i)
@@ -346,9 +369,30 @@ func (p *Plan) analyze(ctx context.Context, query string) error {
 }
 
 // sources collects the tables from reads, in order, and checks its joins.
-// nullable says from is on a side an outer join fills with NULLs.
-func (p *Plan) sources(ctx context.Context, from node, nullable bool) error {
+// nullable says from is on a side an outer join fills with NULLs; outer is
+// the alias of the query's own subquery from is in, if it is in one.
+func (p *Plan) sources(ctx context.Context, from node, nullable bool, outer string) error {
 	switch t := str(from["type"]); t {
+	case "SUBQUERY":
+		if from["sample"] != nil {
+			return refuse("it samples a subquery")
+		}
+		if str(from["alias"]) == "" {
+			from["alias"] = "__igloo_q" + strconv.Itoa(len(p.Sources))
+		}
+		if outer == "" {
+			outer = str(from["alias"])
+		}
+		body, _ := from["subquery"].(node)["node"].(node)
+		if body == nil {
+			return refuse("it has a subquery it cannot read")
+		}
+		if str(body["type"]) == "SET_OPERATION_NODE" {
+			if err := p.nameUnion(ctx, from, body); err != nil {
+				return err
+			}
+		}
+		return p.linear(ctx, body, nullable, outer)
 	case "BASE_TABLE":
 		if from["at_clause"] != nil {
 			return refuse("it reads a table at a snapshot (AT)")
@@ -376,7 +420,10 @@ func (p *Plan) sources(ctx context.Context, from node, nullable bool) error {
 		if alias == "" {
 			alias = str(from["table_name"])
 		}
-		p.Sources = append(p.Sources, Source{Schema: schema, Name: name, Alias: alias, Nullable: nullable})
+		if outer == "" {
+			outer = alias
+		}
+		p.Sources = append(p.Sources, Source{Schema: schema, Name: name, Alias: alias, Outer: outer, Nullable: nullable})
 		p.refs = append(p.refs, from)
 		return nil
 	case "JOIN":
@@ -399,10 +446,10 @@ func (p *Plan) sources(ctx context.Context, from node, nullable bool) error {
 		default:
 			return refuse("it has a %s join", strings.ToLower(str(from["join_type"])))
 		}
-		if err := p.sources(ctx, left, nullable || ln); err != nil {
+		if err := p.sources(ctx, left, nullable || ln, outer); err != nil {
 			return err
 		}
-		return p.sources(ctx, right, nullable || rn)
+		return p.sources(ctx, right, nullable || rn, outer)
 	default:
 		return refuse("it reads a %s", strings.ToLower(strings.ReplaceAll(t, "_", " ")))
 	}
@@ -422,7 +469,7 @@ func (p *Plan) qualifyAll(root node, cols map[string][]int) error {
 				switch {
 				case len(names) == 1:
 					if ix := cols[strings.ToLower(str(names[0]))]; len(ix) == 1 {
-						v["column_names"] = []any{p.Sources[ix[0]].Alias, names[0]}
+						v["column_names"] = []any{p.top[ix[0]].alias, names[0]}
 					}
 				case len(names) >= 3 && err == nil:
 					err = refuse("it names a column with its table's schema (%s)", joinNames(names))
@@ -498,7 +545,8 @@ func (p *Plan) checkExpr(v any, aggregates bool) error {
 				}
 			}
 			return nil
-		} else if t == "BASE_TABLE" {
+		} else if t == "BASE_TABLE" || t == "SUBQUERY" && v["class"] == nil {
+			// A subquery in FROM was checked (see linear).
 			return nil
 		}
 		switch c := str(v["class"]); c {
@@ -945,16 +993,25 @@ func (p *Plan) findAggregate(_ context.Context, a aggregate) (node, error) {
 	return found, nil
 }
 
-// pinned returns a copy of the query with its sources read as pins say.
+// pinned returns a copy of the query with its sources read as pins say. A
+// UNION ALL with the changed source under it is the branch that has it. The
+// selects around a source whose changes come signed pass the sign on, for the
+// query's own, which Input writes.
 func (p *Plan) pinned(ctx context.Context, pins []Pin) (node, error) {
 	if len(pins) != len(p.refs) {
 		return nil, fmt.Errorf("incremental: %d pins for %d sources", len(pins), len(p.refs))
 	}
+	changed := slices.IndexFunc(pins, func(pin Pin) bool { return pin.Changed })
 	q := clone(p.root)
 	i := 0
-	var visit func(t node) error
-	visit = func(t node) error {
+	// from visits a FROM; it returns the alias of what in it passes the sign
+	// on, if anything does.
+	var from func(t node) (string, error)
+	var query func(n node) (node, bool, error)
+	from = func(t node) (string, error) {
 		switch str(t["type"]) {
+		case "EMPTY":
+			return "", nil
 		case "BASE_TABLE":
 			pin := pins[i]
 			src := p.Sources[i]
@@ -962,26 +1019,94 @@ func (p *Plan) pinned(ctx context.Context, pins []Pin) (node, error) {
 			if pin.View != "" {
 				t["catalog_name"], t["schema_name"], t["table_name"] = "temp", "main", pin.View
 				t["alias"] = src.Alias
-				return nil
+				if pin.Signed {
+					return src.Alias, nil
+				}
+				return "", nil
 			}
 			if pin.Version < 0 {
-				return nil
+				return "", nil
 			}
 			at, err := p.expr(ctx, "1 FROM t AT (VERSION => "+strconv.FormatInt(pin.Version, 10)+")")
 			if err != nil {
-				return err
+				return "", err
 			}
 			t["at_clause"] = at
-			return nil
+			return "", nil
 		case "JOIN":
-			if err := visit(t["left"].(node)); err != nil {
-				return err
+			l, err := from(t["left"].(node))
+			if err != nil {
+				return "", err
 			}
-			return visit(t["right"].(node))
+			r, err := from(t["right"].(node))
+			if err != nil {
+				return "", err
+			}
+			if l != "" {
+				return l, nil
+			}
+			return r, nil
+		case "SUBQUERY":
+			sub := t["subquery"].(node)
+			n, signed, err := query(sub["node"].(node))
+			if err != nil {
+				return "", err
+			}
+			sub["node"] = n
+			if signed {
+				return str(t["alias"]), nil
+			}
+			return "", nil
 		}
-		return fmt.Errorf("incremental: unexpected %s", str(t["type"]))
+		return "", fmt.Errorf("incremental: unexpected %s", str(t["type"]))
 	}
-	if err := visit(q["from_table"].(node)); err != nil {
+	query = func(n node) (node, bool, error) {
+		switch str(n["type"]) {
+		case "SELECT_NODE":
+			alias, err := from(n["from_table"].(node))
+			if err != nil || alias == "" {
+				return n, false, err
+			}
+			sel := list(n["select_list"])
+			// A star passes it on as it does the view's other columns.
+			if !slices.ContainsFunc(sel, func(s any) bool {
+				sn := s.(node)
+				return str(sn["class"]) == "STAR" && (str(sn["relation_name"]) == "" || strings.EqualFold(str(sn["relation_name"]), alias))
+			}) {
+				c, err := p.expr(ctx, quoteIdent(alias)+".__igloo_sign")
+				if err != nil {
+					return nil, false, err
+				}
+				n["select_list"] = append(sel, c)
+			}
+			return n, true, nil
+		case "SET_OPERATION_NODE":
+			start := i
+			left, right := n["left"].(node), n["right"].(node)
+			nl, nr := leaves(left), leaves(right)
+			switch {
+			case changed >= start && changed < start+nl:
+				kept, signed, err := query(left)
+				i = start + nl + nr
+				return kept, signed, err
+			case changed >= start+nl && changed < start+nl+nr:
+				i = start + nl
+				return query(right)
+			}
+			l, ls, err := query(left)
+			if err != nil {
+				return nil, false, err
+			}
+			r, rs, err := query(right)
+			if err != nil {
+				return nil, false, err
+			}
+			n["left"], n["right"] = l, r
+			return n, ls || rs, nil
+		}
+		return nil, false, fmt.Errorf("incremental: unexpected %s", str(n["type"]))
+	}
+	if _, err := from(q["from_table"].(node)); err != nil {
 		return nil, err
 	}
 	return q, nil
