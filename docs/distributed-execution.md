@@ -406,6 +406,14 @@ statement's rows are in the table when that commit is, or not at all.
   files a worker wrote later than that are orphan files of the table, for
   [maintenance](operations.md#table-maintenance) and erasure requests. The partition
   directories are named by a hash, so no value of the table is in a path.
+- **Memory.** A task bounds what its writer holds by its share of the worker's
+  memory: row groups of at most 128 MiB, an eighth of its share over its threads
+  or the partitions' files it keeps open, which rows of many kilobytes need on a
+  small worker. Auto mode takes rows wider than a task could hold (at least two
+  vectors of 2,048 rows a thread, by what its scans read a row) to this replica
+  where it has the room. A fill that still runs out of memory on workers, after
+  the retries with smaller tasks, runs on the replica if it has the room for the
+  query, or else with the replica writing the table from the workers' results.
 - **Partitions.** Identity of booleans, integers, dates, timestamps and
   strings, truncate of integers and strings, and year, month, day and hour are
   written by workers, one file per partition per task until compaction merges

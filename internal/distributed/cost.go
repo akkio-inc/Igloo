@@ -398,6 +398,45 @@ func (x features) onWorkersWrite(cores int) float64 {
 	return x.fillOut() / (fillWriteRate * float64(max(cores, 1)))
 }
 
+const (
+	// writeVectorRows are the rows DuckDB holds together, whatever else
+	// bounds them, and writeVectorHeld how many vectors a thread of a task
+	// that writes holds: rows of 10.8 KB held 110 MiB, of 102 KB 837 MiB and of
+	// 1 MiB over 3.8 GiB, on two threads.
+	writeVectorRows, writeVectorHeld = 2048, 2
+	// rowFileShare is what a row takes in a table's files, of what it takes in
+	// memory, as DuckDB's compression of text leaves it.
+	rowFileShare = 0.25
+)
+
+// rowBytes is the bytes a row a fill writes takes in memory, by what its scans
+// read a row; 0 where that is not known. What an expression makes of a row,
+// such as repeat(), no estimate says: a task bounds what it holds, and a fill
+// whose workers run out of memory runs elsewhere (see Plan.FitsHere).
+func (x features) rowBytes() float64 {
+	if x.rows <= 0 {
+		return 0
+	}
+	read := float64(x.bytes)
+	if x.planBytes > 0 {
+		read = float64(x.planBytes)
+	}
+	return read / x.rows / rowFileShare
+}
+
+// writeFits reports whether a worker's task of f holds a fill's rows as it
+// writes them: at least what its threads' vectors take, within half of the
+// task's share of the worker's memory.
+func (x features) writeFits(f fleet) bool {
+	width := x.rowBytes()
+	if width <= 0 || f.memory <= 0 {
+		return true
+	}
+	threads := float64(max(f.threads, f.cores, 1))
+	share := float64(f.memory) / float64(taskSlots(f.cores, f.memory))
+	return writeVectorRows*writeVectorHeld*threads*width <= share/2
+}
+
 // defaultMinWorkerWrite is the fewest bytes of files workers write rather
 // than the coordinator: fewer take the coordinator a few seconds, and each
 // task's file would be a small one.

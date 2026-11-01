@@ -140,6 +140,74 @@ func TestRowWiseFinal(t *testing.T) {
 	}
 }
 
+// TestWriteBounds checks what a task's COPY may hold: little on a small worker,
+// and Iceberg's own row groups on one with room.
+func TestWriteBounds(t *testing.T) {
+	const mib, gib = 1 << 20, 1 << 30
+	for _, c := range []struct {
+		memory          int64
+		shares, writers int
+		want            int64
+	}{
+		{953 * mib, 1, 2, 59 * mib},
+		{953 * mib, 1, 45, 2*mib + 677*mib/1024},
+		{16 * gib, 4, 16, 32 * mib},
+		{512 * gib, 8, 8, 128 * mib},
+		{256 * mib, 1, 256, 1 * mib},
+		{0, 1, 2, 128 * mib},
+	} {
+		got := writeRowGroup(c.memory, c.shares, c.writers)
+		if got < c.want*9/10 || got > c.want*11/10 {
+			t.Errorf("writeRowGroup(%d MiB, %d, %d) = %d MiB, want about %d", c.memory/mib, c.shares, c.writers, got/mib, c.want/mib)
+		}
+	}
+	if got := writeFilesOpen(953*mib, 1, true); got < 40 || got > 50 {
+		t.Errorf("files open on a small worker, uploading: %d", got)
+	}
+	if got := writeFilesOpen(64*gib, 4, true); got != mostWriteFiles {
+		t.Errorf("files open with room: %d", got)
+	}
+	if got := writeFilesOpen(100*mib, 1, true); got != leastWriteFiles {
+		t.Errorf("files open with next to none: %d", got)
+	}
+	if got := writeFlush(953*mib, 1, 2); got < 7_000 || got > 8_000 {
+		t.Errorf("rows gathered on a small worker: %d", got)
+	}
+	if got := writeFlush(64*mib, 1, 2); got != 4_096 {
+		t.Errorf("rows gathered with next to no memory: %d", got)
+	}
+	if got := writeFlush(2048*gib, 1, 2); got != 524_288 {
+		t.Errorf("rows gathered with room: %d", got)
+	}
+}
+
+// TestWriteFits checks whether auto mode takes a worker's task to hold a fill's
+// rows: by the width of the rows the fill reads, as its files show it.
+func TestWriteFits(t *testing.T) {
+	small := fleet{memory: 1 << 30, cores: 2, threads: 2}
+	large := fleet{memory: 64 << 30, cores: 16, threads: 16}
+	narrow := features{bytes: 5e10, rows: 1e9, fill: true}
+	wide := features{bytes: 1e11, rows: 1e6, fill: true}
+	for _, c := range []struct {
+		name string
+		x    features
+		f    fleet
+		want bool
+	}{
+		{"narrow rows on a small worker", narrow, small, true},
+		{"rows of 100 KB of files on a small worker", wide, small, false},
+		{"rows of 100 KB of files on a large worker", wide, large, false},
+		{"rows of 1 KB of files on a small worker", features{bytes: 1e10, rows: 1e7, fill: true}, small, true},
+		{"rows of 10 KB of files on a large worker", features{bytes: 1e11, rows: 1e7, fill: true}, large, true},
+		{"rows not known", features{bytes: 1e11, fill: true}, small, true},
+		{"memory not known", wide, fleet{cores: 2, threads: 2}, true},
+	} {
+		if got := c.x.writeFits(c.f); got != c.want {
+			t.Errorf("%s: %v (rows of %.0f bytes)", c.name, got, c.x.rowBytes())
+		}
+	}
+}
+
 // TestWriteCredentials checks that a task's attempt carries what was made for
 // its directory, and none where none can be.
 func TestWriteCredentials(t *testing.T) {

@@ -198,6 +198,65 @@ func (w *Worker) checkWriteRequest(wr *writeRequest) error {
 	return nil
 }
 
+// What a task's COPY holds. DuckDB's Parquet writer gathers rows until a row
+// group has 122,880 of them, on each of its threads and for each partition:
+// rows of 10.8 KB, 1.3 GB a group, took a worker's DuckDB of 953 MB out of
+// memory, whatever the retries. Bounded by bytes, two threads held 345 MiB at
+// 64 MiB a group, 188 at 32 and 110 at 16, in the same time and the same files;
+// below that, about two vectors of 2,048 rows a thread (writeVectorRows). Over
+// partitions it also gathers 524,288 rows a thread before it hands them to the
+// partitions' writers: 64 partitions of those rows ran out of memory, and held
+// 240 MiB at 16,384 rows and 2 MiB a group. Narrow rows took 10% longer at 16,384
+// rows, and half as long again at 4,096.
+const (
+	// mostWriteRowGroup is Iceberg's own default of a row group's bytes, and
+	// leastWriteRowGroup as few as a row group's bytes get: what is written in
+	// groups this small on a small worker, compaction merges.
+	mostWriteRowGroup  = 128 << 20
+	leastWriteRowGroup = 1 << 20
+	// mostWriteFiles and leastWriteFiles bound the partitions' files a task
+	// keeps open. Past them, DuckDB closes one and later opens another.
+	mostWriteFiles, leastWriteFiles = maxPartitions, 8
+	// wideWriteRow is the width of rows a task's partitioned COPY allows for
+	// before it hands them on: types do not say what a string takes.
+	wideWriteRow = 16 << 10
+)
+
+// writeRowGroup is the bytes of a row group of each of writers, on a worker
+// of memory in shares tasks at once: all of them within an eighth of its share,
+// for what the writer holds beside them (about 2.7 times the group) and the
+// rest of the task.
+func writeRowGroup(memory int64, shares, writers int) int64 {
+	if memory <= 0 {
+		return mostWriteRowGroup
+	}
+	return min(max(memory/int64(max(shares, 1))/8/int64(max(writers, 1)), leastWriteRowGroup), mostWriteRowGroup)
+}
+
+// writeFilesOpen is how many partitions' files a task keeps open, each with
+// an upload's buffer where it writes to object storage (see uploadBuffer):
+// those within a quarter of its share of the worker's memory.
+func writeFilesOpen(memory int64, shares int, uploads bool) int {
+	if memory <= 0 {
+		return 100
+	}
+	if !uploads {
+		return mostWriteFiles
+	}
+	n := memory / int64(max(shares, 1)) / 4 / uploadBuffer
+	return int(min(max(n, leastWriteFiles), mostWriteFiles))
+}
+
+// writeFlush is how many rows each of a task's threads gathers before it hands
+// them to the partitions' writers: as shuffleFlush, but at wideWriteRow.
+func writeFlush(memory int64, shares, threads int) int64 {
+	const most, least = 524_288, 4_096
+	if memory <= 0 {
+		return most
+	}
+	return min(max(memory/int64(max(shares, 1))/4/int64(max(threads, 1))/wideWriteRow, least), most)
+}
+
 // writeFiles writes the rows of query, in Parquet with field IDs, under the
 // attempt's directory, and lists the files.
 func (w *Worker) writeFiles(ctx context.Context, conn *duckdb.Conn, req *taskRequest, query string, cols []Column) (*taskResult, error) {
@@ -221,7 +280,8 @@ func (w *Worker) writeFiles(ctx context.Context, conn *duckdb.Conn, req *taskReq
 		defer drop()
 	}
 	// No order to keep: a statement with one keeps to the coordinator (see
-	// rowWise), and its threads need not wait for each other.
+	// rowWise), and its threads need not wait for each other; DuckDB bounds a
+	// row group's bytes only then.
 	if _, err := conn.ExecContext(ctx, "SET SESSION preserve_insertion_order = false", nil); err != nil {
 		return nil, err
 	}
@@ -239,12 +299,26 @@ func (w *Worker) writeFiles(ctx context.Context, conn *duckdb.Conn, req *taskReq
 		ids[i] = quoteLiteral(c.Name) + ": " + strconv.Itoa(c.ID)
 	}
 	opts := []string{"FORMAT parquet", "FIELD_IDS {" + strings.Join(ids, ", ") + "}", "RETURN_STATS true", "FILENAME_PATTERN 'part_{i}'"}
+	// The task's share of the worker's memory is that of one of shares tasks
+	// at once.
+	shares := max(w.slotCount/w.taskSlots(req.Slots), 1)
+	threads := threadsOf(ctx, conn)
+	writers := threads
 	if len(wr.Partitions) > 0 {
 		// DuckDB cannot bound a partition's files by their size.
 		opts = append(opts, "PARTITION_BY ("+strings.Join(wr.Partitions, ", ")+")")
+		writers = writeFilesOpen(w.opts.MemoryBytes, shares, uploadsInParts(to))
+		if _, err := conn.ExecContext(ctx, fmt.Sprintf("SET SESSION partitioned_write_max_open_files = %d", writers), nil); err != nil {
+			return nil, err
+		}
+		if _, err := conn.ExecContext(ctx, fmt.Sprintf("SET SESSION partitioned_write_flush_threshold = %d",
+			writeFlush(w.opts.MemoryBytes, shares, threads)), nil); err != nil {
+			return nil, err
+		}
 	} else if wr.FileBytes > 0 {
 		opts = append(opts, "FILE_SIZE_BYTES "+strconv.FormatInt(wr.FileBytes, 10))
 	}
+	opts = append(opts, "ROW_GROUP_SIZE_BYTES "+strconv.FormatInt(writeRowGroup(w.opts.MemoryBytes, shares, writers), 10))
 	if wr.RowGroup > 0 {
 		opts = append(opts, "ROW_GROUP_SIZE "+strconv.FormatInt(wr.RowGroup, 10))
 	}

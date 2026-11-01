@@ -326,6 +326,30 @@ func (s *Server) startDistributed(ctx context.Context, sess *session, user auth.
 			// A task's bitmaps did not fit: the session runs the statement
 			// again with DuckDB's hash (see rerunWithoutBitmaps).
 			return nil, parts, true, err
+		case distributed.OutOfMemory(err) && st.fill && plan.FitsHere():
+			// A fill's tasks hold what writing Parquet takes, which is not what
+			// a read's query does: this replica may well write it, and has what
+			// its plan holds. It has had the retries with smaller tasks.
+			s.dist.Metrics().Fallback("worker_memory")
+			s.log.Warn("workers ran out of memory on a fill, which this replica has the room for; running it here", "user", user.Name, "err", err)
+			return nil, parts, false, nil
+		case distributed.OutOfMemory(err) && st.writer != nil && plan.WorkersWrite():
+			// Too much for this replica's memory: its tasks may fare better
+			// with this replica writing the table from their results.
+			s.dist.Metrics().Fallback("worker_memory")
+			s.log.Warn("workers ran out of memory writing a table's files; this replica writes them", "user", user.Name, "err", err)
+			st.writer = nil
+			r, p, ran, err := s.startDistributed(ctx, sess, user, st, mode)
+			if r != nil {
+				return r, r.parts, true, nil
+			}
+			if ran {
+				return nil, p, true, err
+			}
+			if p.release != nil {
+				p.release()
+			}
+			return nil, p, false, nil
 		case distributed.OutOfMemory(err):
 			// Another worker, or this replica, would run out the same way.
 			// The query history records where it failed, for the replicas

@@ -611,6 +611,14 @@ func (co *Coordinator) planOn(ctx context.Context, query string, env Env, mode M
 	// enough to be worth their files.
 	x.workersWrite = opts.writes && slices.ContainsFunc(plan.Stages, func(s *Stage) bool { return s.writeSQL != "" }) &&
 		(opts.force || x.fillOut() >= co.minWorkerWrite())
+	if x.fill && !x.writeFits(f) {
+		// Rows as wide as these are more than a task of theirs holds, in a file
+		// of the table's or of its results; this replica, if it has the room.
+		x.workersWrite = false
+		if mode == ModeAuto && co.opts.MemoryBytes >= f.memory {
+			return nil, nil, unsupported("its rows take about %d KB each, more than a task on a worker of %d MiB holds", int64(x.rowBytes())>>10, f.memory>>20)
+		}
+	}
 	plan.writes = x.workersWrite
 	e := x.estimate(m, f)
 	e.others = others

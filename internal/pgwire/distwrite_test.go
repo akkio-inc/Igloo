@@ -47,6 +47,10 @@ type writeFault struct {
 	request func(task map[string]any) faultAction
 	// probe, if set, answers the probes as a worker refused them.
 	probe bool
+	// memory, if set, answers the tasks that write as a worker out of memory.
+	memory bool
+	// short counts those answers.
+	short atomic.Int64
 	wrote atomic.Int64
 	// busy counts the requests the worker has not answered yet.
 	busy atomic.Int64
@@ -71,8 +75,15 @@ func (f *writeFault) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 	writes := task["write"] != nil
 	isProbe := writes && task["task"] == float64(-1)
 	f.mu.Lock()
-	request, answer, probe := f.request, f.answer, f.probe
+	request, answer, probe, memory := f.request, f.answer, f.probe, f.memory
 	f.mu.Unlock()
+	if writes && !isProbe && memory {
+		f.short.Add(1)
+		rw.Header().Set("Content-Type", "application/json")
+		rw.WriteHeader(http.StatusUnprocessableEntity)
+		_, _ = rw.Write([]byte(`{"error":{"message":"Out of Memory Error: of a test","out_of_memory":true}}` + "\n"))
+		return
+	}
 	if isProbe && probe {
 		rw.Header().Set("Content-Type", "application/json")
 		rw.WriteHeader(http.StatusUnprocessableEntity)
@@ -185,6 +196,21 @@ func startWriteServer(t *testing.T, configure ...func(*Options)) *writeEnv {
 // coordinate leaves them.
 func startWriteServerWith(t *testing.T, coordinate func(*distributed.Options), configure ...func(*Options)) *writeEnv {
 	t.Helper()
+	return startWriteServerOn(t, writeWorkers{cores: 8, memory: 1 << 30, claim: 300 << 20}, coordinate, configure...)
+}
+
+// writeWorkers says what workers a writeEnv has: of cores, taking their memory
+// for memory, and with a DuckDB of limit, if set; and what size every table
+// claims, if set.
+type writeWorkers struct {
+	cores         int
+	memory, claim int64
+	limit         string
+}
+
+// startWriteServerOn is startWriteServerWith on such workers.
+func startWriteServerOn(t *testing.T, workers writeWorkers, coordinate func(*distributed.Options), configure ...func(*Options)) *writeEnv {
+	t.Helper()
 	ext := os.Getenv("IGLOO_TEST_EXTENSION_DIR")
 	if ext == "" {
 		t.Skip("IGLOO_TEST_EXTENSION_DIR not set")
@@ -205,7 +231,7 @@ func startWriteServerWith(t *testing.T, coordinate func(*distributed.Options), c
 	}
 	var addrs []string
 	for i := range 2 {
-		addr, _, _ := startTestWorkerCores(t, dir, i, env.gate, "", 8)
+		addr, _, _ := startTestWorkerLimited(t, dir, i, env.gate, "", workers.cores, workers.memory, workers.limit)
 		f := &writeFault{target: addr, client: &http.Transport{TLSClientConfig: clientTLS, ForceAttemptHTTP2: true}}
 		srv := httptest.NewUnstartedServer(f)
 		srv.TLS = serverTLS.Clone()
@@ -223,7 +249,7 @@ func startWriteServerWith(t *testing.T, coordinate func(*distributed.Options), c
 		t.Fatal(err)
 	}
 	opts := distributed.Options{
-		Source: sizedSource{distributed.NewIceberg(cat), 300 << 20}, Secret: testWorkerSecret, Version: "test", Cores: 1,
+		Source: sizedSource{distributed.NewIceberg(cat), workers.claim}, Secret: testWorkerSecret, Version: "test", Cores: 1,
 		TempDir: filepath.Join(dir, "coordinator"), Warehouse: dir + "/", Threshold: time.Second, MinWorkerWrite: 1,
 		Storage: distributed.NewStorage(icebergio.LocalFS{}), Pool: distributed.PoolOptions{Addresses: addrs},
 	}
@@ -1220,4 +1246,142 @@ func TestForgedNoteDeletesNothing(t *testing.T) {
 	if n := filesIn(t, left); n != 0 {
 		t.Errorf("%d files a stopped write left are still there", n)
 	}
+}
+
+// wideRows are rows of about 10.8 KB, 432 MB of them: row groups as DuckDB
+// gathers them hold them all.
+const wideRows = "SELECT id, g, x, repeat(name, 1800) AS c FROM src"
+
+// checkWide checks that table holds what wideRows does.
+func (e *writeEnv) checkWide(t *testing.T, table string) {
+	t.Helper()
+	sum := "SELECT count(*), sum(length(c)), sum(x), bit_xor(hash(id, c)) FROM "
+	if got, want := e.local(t, sum+table), e.local(t, sum+"("+wideRows+")"); got != want {
+		t.Errorf("%s: %s, want %s", table, got, want)
+	}
+}
+
+// TestWorkersWriteWideRows checks that workers of a DuckDB of 256 MB write rows
+// a row group of 122,880 of which would take 1.3 GB: the task bounds its row
+// groups by the bytes it has, partitioned or not, in auto mode and when forced.
+func TestWorkersWriteWideRows(t *testing.T) {
+	t.Parallel()
+	env := startWriteServerOn(t, writeWorkers{cores: 2, memory: 256 << 20, limit: "256MB"}, nil)
+	admin := env.admin
+	t.Run("forced", func(t *testing.T) {
+		env.force(t)
+		mustExec(t, admin, "CREATE TABLE w_wide AS "+wideRows)
+		env.checkWide(t, "w_wide")
+		env.checkWrote(t, "w_wide")
+	})
+	t.Run("partitioned", func(t *testing.T) {
+		env.force(t)
+		mustExec(t, admin, "CREATE TABLE w_wide_p AS "+wideRows+" LIMIT 0")
+		mustExec(t, admin, "ALTER TABLE w_wide_p SET PARTITIONED BY (g)")
+		mustExec(t, admin, "INSERT INTO w_wide_p "+wideRows)
+		env.checkWide(t, "w_wide_p")
+		env.checkWrote(t, "w_wide_p")
+	})
+	t.Run("auto", func(t *testing.T) {
+		mustExec(t, admin, "RESET distributed_execution")
+		mustExec(t, admin, "CREATE TABLE w_wide_auto AS "+wideRows)
+		env.checkWide(t, "w_wide_auto")
+		env.checkNoNotes(t)
+	})
+}
+
+// TestWorkersOutOfMemoryOnWrite checks that a fill that runs out of memory on
+// workers, after its retries with smaller tasks, runs on this replica, on every
+// way a table is filled: here with workers that do not know their memory is
+// 64 MB, so that no task bounds what it holds, and whose out of memory is real.
+// (At 128 MB, the retries with smaller tasks succeed.)
+func TestWorkersOutOfMemoryOnWrite(t *testing.T) {
+	t.Parallel()
+	env := startWriteServerOn(t, writeWorkers{cores: 2, memory: 0, limit: "64MB"}, nil)
+	env.force(t)
+	admin := env.admin
+	inDir := func(f string) bool { return strings.Contains(f, "/"+distributed.WriteDirMark) }
+	leftAlone := func(t *testing.T, table string) {
+		t.Helper()
+		env.checkWide(t, table)
+		data, _ := liveFiles(t, admin, table)
+		if slices.ContainsFunc(data, inDir) {
+			t.Errorf("workers wrote it: %q", data)
+		}
+		if left := written(t, env.location(t, table)); len(left) != 0 {
+			t.Errorf("files left: %q", left)
+		}
+		env.checkNoNotes(t)
+	}
+	t.Run("create", func(t *testing.T) {
+		mustExec(t, admin, "CREATE TABLE w_oom AS "+wideRows)
+		leftAlone(t, "w_oom")
+	})
+	t.Run("replace", func(t *testing.T) {
+		mustExec(t, admin, "CREATE OR REPLACE TABLE w_oom AS "+wideRows)
+		leftAlone(t, "w_oom")
+	})
+	t.Run("insert", func(t *testing.T) {
+		mustExec(t, admin, "CREATE TABLE w_oom_i AS "+wideRows+" LIMIT 0")
+		mustExec(t, admin, "INSERT INTO w_oom_i "+wideRows)
+		leftAlone(t, "w_oom_i")
+	})
+	t.Run("materialized view", func(t *testing.T) {
+		mustExec(t, admin, "CREATE MATERIALIZED VIEW w_oom_mv AS WITH o AS (SELECT * FROM lake.public.src) SELECT id, g, x, repeat(name, 1800) AS c FROM o")
+		mustExec(t, admin, "REFRESH MATERIALIZED VIEW w_oom_mv")
+		env.checkWide(t, "w_oom_mv")
+		env.checkNoNotes(t)
+	})
+}
+
+// TestWorkersShortOfMemoryWriting checks what follows tasks that run out of
+// memory only as they write. A statement this replica has the room for runs
+// here. One it does not, by its estimates, runs on workers again, with this
+// replica writing the table from their results.
+func TestWorkersShortOfMemoryWriting(t *testing.T) {
+	t.Parallel()
+	short := func(env *writeEnv) {
+		for _, f := range env.faults {
+			f.set(func(f *writeFault) { f.memory = true })
+		}
+	}
+	shortAnswers := func(env *writeEnv) int64 { return env.faults[0].short.Load() + env.faults[1].short.Load() }
+	inDir := func(f string) bool { return strings.Contains(f, "/"+distributed.WriteDirMark) }
+	t.Run("room here", func(t *testing.T) {
+		t.Parallel()
+		env := startWriteServer(t)
+		env.force(t)
+		short(env)
+		mustExec(t, env.admin, "CREATE TABLE w_short AS SELECT id, x FROM src")
+		if shortAnswers(env) == 0 {
+			t.Fatal("no task wrote")
+		}
+		if got, want := env.local(t, "SELECT count(*), sum(x) FROM w_short"), env.local(t, "SELECT count(*), sum(x) FROM src"); got != want {
+			t.Errorf("%s, want %s", got, want)
+		}
+		if data, _ := liveFiles(t, env.admin, "w_short"); slices.ContainsFunc(data, inDir) {
+			t.Errorf("files of tasks: %q", data)
+		}
+		env.checkNoNotes(t)
+	})
+	t.Run("no room here", func(t *testing.T) {
+		t.Parallel()
+		// By the estimates: this replica's 1 MB would not hold what the
+		// exchange's stage reads.
+		env := startWriteServerWith(t, func(o *distributed.Options) { o.MemoryBytes = 1 << 20 })
+		env.force(t)
+		short(env)
+		query := "SELECT a.id, b.x FROM src AS a JOIN src AS b ON a.id = b.id"
+		mustExec(t, env.admin, "CREATE TABLE w_short AS "+query)
+		if shortAnswers(env) == 0 {
+			t.Fatal("no task wrote")
+		}
+		if got, want := env.local(t, "SELECT count(*), sum(x) FROM w_short"), env.local(t, "SELECT count(*), sum(b.x) FROM src AS a JOIN src AS b ON a.id = b.id"); got != want {
+			t.Errorf("%s, want %s", got, want)
+		}
+		if data, _ := liveFiles(t, env.admin, "w_short"); slices.ContainsFunc(data, inDir) {
+			t.Errorf("files of tasks: %q", data)
+		}
+		env.checkNoNotes(t)
+	})
 }
