@@ -1126,6 +1126,25 @@ func TestWorkersWriteManyPartitionsAuto(t *testing.T) {
 	}
 }
 
+// TestListedIn checks that a file DuckDB's glob listed goes by the name its
+// directory's store knows it by: on a real Azure account, the first spelling below
+// reads as a path in a container of that name, which is no file.
+func TestListedIn(t *testing.T) {
+	for _, c := range []struct{ dir, file, want string }{
+		{"abfss://wh@acct.dfs.core.windows.net/w/t/data/d", "abfss://acct.dfs.core.windows.net/wh/w/t/data/d/a/f", "abfss://wh@acct.dfs.core.windows.net/w/t/data/d/a/f"},
+		{"abfss://wh@acct.dfs.core.windows.net/w/t/data/d", "abfss://wh@acct.dfs.core.windows.net/w/t/data/d/a/f", "abfss://wh@acct.dfs.core.windows.net/w/t/data/d/a/f"},
+		{"s3://b/w/t/data/d", "s3://b/w/t/data/d/a/f", "s3://b/w/t/data/d/a/f"},
+		{"/w/t/data/d", "/w/t/data/d/a/f", "/w/t/data/d/a/f"},
+	} {
+		if got := listedIn(c.dir, c.file); got != c.want {
+			t.Errorf("%s under %s: %s, want %s", c.file, c.dir, got, c.want)
+		}
+	}
+	if !noSuchDir(errors.New("Invalid Error: 404 The specified path does not exist.")) || noSuchDir(errors.New("Invalid Error: 403 denied")) {
+		t.Error("what a hierarchical account says of a directory that is not there")
+	}
+}
+
 // erasedLedger says an erasure request has just deleted files.
 type erasedLedger struct{}
 

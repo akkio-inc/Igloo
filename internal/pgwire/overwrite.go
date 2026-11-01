@@ -10,6 +10,7 @@ import (
 	"io"
 	iofs "io/fs"
 	mrand "math/rand/v2"
+	"net/url"
 	"regexp"
 	"slices"
 	"strconv"
@@ -642,6 +643,29 @@ func (s *Server) forgetRefreshFiles(ctx context.Context, schema string, note cat
 	}
 }
 
+// noSuchDir reports whether DuckDB could not list a directory for not being there:
+// an Azure account with a hierarchical namespace says so, where other stores list
+// nothing.
+func noSuchDir(err error) bool {
+	return strings.Contains(err.Error(), "The specified path does not exist")
+}
+
+// listedIn is file, which DuckDB's glob listed under dir, as dir spells it: DuckDB
+// gives abfss://account.host/container/path for abfss://container@account.host/path,
+// which the store's IO reads as a path in the container named for the first.
+func listedIn(dir, file string) string {
+	u, err := url.Parse(dir)
+	if err != nil || u.Scheme != "abfss" || u.User == nil {
+		return file
+	}
+	container := u.User.Username()
+	rest, ok := strings.CutPrefix(file, "abfss://"+u.Host+"/"+container+"/")
+	if !ok {
+		return file
+	}
+	return "abfss://" + container + "@" + u.Host + "/" + rest
+}
+
 // deleteRefreshFiles deletes the files in dir, a refresh's or a statement's
 // directory under the table's data.
 func (s *Server) deleteRefreshFiles(ctx context.Context, tbl *table.Table, dir string) error {
@@ -656,6 +680,9 @@ func (s *Server) deleteRefreshFiles(ctx context.Context, tbl *table.Table, dir s
 	// Tasks write in directories of their own under it.
 	res, err := conn.QueryContext(ctx, "SELECT file FROM glob("+quoteLiteral(dir+"/**")+")", nil)
 	if err != nil {
+		if noSuchDir(err) {
+			return nil
+		}
 		return err
 	}
 	var files []string
@@ -667,10 +694,13 @@ func (s *Server) deleteRefreshFiles(ctx context.Context, tbl *table.Table, dir s
 		}
 		if err != nil {
 			_ = res.Close()
+			if noSuchDir(err) {
+				return nil
+			}
 			return err
 		}
 		f, _ := dest[0].(string)
-		files = append(files, f)
+		files = append(files, listedIn(dir, f))
 	}
 	_ = res.Close()
 	if len(files) == 0 {
