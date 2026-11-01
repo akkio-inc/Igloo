@@ -421,10 +421,13 @@ statement's rows are in the table when that commit is, or not at all.
 - **Partitions.** Identity of booleans, integers, dates, timestamps and
   strings, truncate of integers and strings, and year, month, day and hour are
   written by workers, one file per partition per task until compaction merges
-  them, each task sorting its rows by partition first. So a table of many
-  partitions gets many small files at first. Auto mode looks at a fill's first
-  rows, for up to 3 s, and has this replica write a table whose files would be
-  under 8 MiB on average; `distributed_execution = 'on'` still sends it to workers.
+  them. So a table of many partitions gets many small files at first. A look at
+  a fill's first rows, for up to 3 s, says how many partitions to expect: a task
+  keeps that many files open, if they fit in half of a worker's memory at about 8
+  MiB each, and otherwise sorts its rows by partition first, which takes longer but
+  makes a file of each. Auto mode has this replica write a table whose files would
+  be under 8 MiB on average, or need that sort; `distributed_execution = 'on'` still
+  sends it to workers.
 - **On the coordinator's way instead**, as the log says at debug level: tables
   partitioned by bucket, or identity of decimals, whose partition values
   cannot be read from a file's bounds or written to its manifest; tables with

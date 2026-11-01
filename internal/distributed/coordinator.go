@@ -619,8 +619,12 @@ func (co *Coordinator) planOn(ctx context.Context, query string, env Env, mode M
 	// enough to be worth their files.
 	x.workersWrite = opts.writes && slices.ContainsFunc(plan.Stages, func(s *Stage) bool { return s.writeSQL != "" }) &&
 		(opts.force || x.fillOut() >= co.minWorkerWrite())
-	if x.workersWrite && mode == ModeAuto && !dry && !co.partitionFilesFit(ctx, env, query, x, f) {
-		x.workersWrite = false
+	if x.workersWrite && !dry {
+		parts := co.fillPartitions(ctx, env, query, x)
+		plan.writeParts = int64(parts)
+		if mode == ModeAuto && !co.partitionFilesFit(parts, x, f) {
+			x.workersWrite = false
+		}
 	}
 	if x.fill && !x.writeFits(f) {
 		// Rows as wide as these are more than a task of theirs holds, in a file

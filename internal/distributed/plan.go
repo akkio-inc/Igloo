@@ -203,6 +203,9 @@ type Plan struct {
 	// target is how, once the caller said (Write).
 	writes bool
 	target *WriteTarget
+	// writeParts is how many partitions the table's rows are estimated to have,
+	// for how its tasks write them; zero for not known.
+	writeParts int64
 	// versions are the snapshots the statement reads tables at, AT
 	// (VERSION => n), by key: Execute runs it on workers only if each is
 	// the snapshot it loads (see pinVersion).

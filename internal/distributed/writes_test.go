@@ -164,6 +164,24 @@ func TestPartitionFiles(t *testing.T) {
 			t.Errorf("%s: %v partitions, want %v", c.name, got, c.want)
 		}
 	}
+	const mib, gib = 1 << 20, 1 << 30
+	for _, c := range []struct {
+		memory int64
+		want   int
+	}{
+		{953 * mib, 59},
+		{2355 * mib, 147},
+		{64 * gib, 4096},
+		{100 * mib, leastWriteFiles},
+		{0, 100},
+	} {
+		if got := writeFilesFit(c.memory, true); got != c.want {
+			t.Errorf("%d MiB: %d files fit, want %d", c.memory/mib, got, c.want)
+		}
+	}
+	if got := writeFilesFit(953*mib, false); got != mostWriteFiles {
+		t.Errorf("%d files fit on disk", got)
+	}
 	for _, c := range []struct {
 		name  string
 		bytes int64

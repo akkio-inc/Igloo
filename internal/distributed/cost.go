@@ -479,30 +479,38 @@ func writeTasks(bytes int64, f fleet) float64 {
 	return float64(min(max(want, min(2, most)), most))
 }
 
-// partitionFilesFit reports whether the files workers would write of a fill are
-// worth writing there: its tasks each write a file of each partition, so that a
-// table of many gets many small files. It looks at the rows only where the table
-// is partitioned, and goes by what it has if it cannot.
-func (co *Coordinator) partitionFilesFit(ctx context.Context, env Env, query string, x features, f fleet) bool {
+// fillPartitions estimates how many partitions a fill's rows have, by a look at them:
+// zero for a table with none, or if it cannot tell.
+func (co *Coordinator) fillPartitions(ctx context.Context, env Env, query string, x features) float64 {
 	pf, ok := env.(PartitionedFills)
 	if !ok {
-		return true
+		return 0
 	}
 	ctx, cancel := context.WithTimeout(ctx, partitionSampleTime)
 	defer cancel()
 	half, all, sampled, err := pf.FillPartitions(ctx, query, partitionSample)
 	if err != nil {
 		co.log.Debug("could not count a fill's partitions", "err", err)
+		return 0
 	}
-	if err != nil || all == 0 {
+	return partitionsOf(half, all, sampled, x.rows)
+}
+
+// partitionFilesFit reports whether the files workers would write of a fill of parts
+// partitions are worth writing there: its tasks each write a file of each partition,
+// so that a table of many gets many small files, and of more than a worker's task
+// can keep open they first sort the rows, which is more than a read of them takes.
+func (co *Coordinator) partitionFilesFit(parts float64, x features, f fleet) bool {
+	if parts == 0 {
 		return true
 	}
-	parts, tasks := partitionsOf(half, all, sampled, x.rows), writeTasks(x.bytes, f)
-	if x.fillOut()/(tasks*parts) >= min(leastPartitionFile, co.minWorkerWrite()) {
+	tasks := writeTasks(x.bytes, f)
+	if x.fillOut()/(tasks*parts) >= min(leastPartitionFile, co.minWorkerWrite()) &&
+		(f.memory <= 0 || parts <= float64(writeFilesFit(f.memory, true))) {
 		return true
 	}
-	co.log.Info("this replica writes a partitioned table, whose files would be small on workers", "partitions", int64(parts), "tasks", int64(tasks),
-		"bytes", int64(x.fillOut()))
+	co.log.Info("this replica writes a partitioned table, whose files would be small on workers, or many for them", "partitions", int64(parts),
+		"tasks", int64(tasks), "bytes", int64(x.fillOut()), "worker_memory", f.memory)
 	return false
 }
 
