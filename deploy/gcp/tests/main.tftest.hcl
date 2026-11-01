@@ -81,7 +81,7 @@ run "defaults" {
   }
 
   assert {
-    condition     = google_storage_bucket.warehouse.lifecycle_rule[0].action[0].type == "AbortIncompleteMultipartUpload" && google_storage_bucket.warehouse.lifecycle_rule[0].condition[0].age == 1
+    condition     = one(google_storage_bucket.warehouse.lifecycle_rule[0].action).type == "AbortIncompleteMultipartUpload" && one(google_storage_bucket.warehouse.lifecycle_rule[0].condition).age == 1
     error_message = "Unfinished uploads hold rows, so a rule aborts them after a day."
   }
 
