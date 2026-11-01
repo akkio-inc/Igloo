@@ -41,7 +41,7 @@ type Workers struct {
 	// Exchanges is where workers write the rows they exchange: object (the
 	// warehouse's object storage), local (their own disks), or auto, the
 	// default (their own disks when every worker of a statement has room
-	// there and runs outside Kubernetes, object storage otherwise). ExchangeMax,
+	// there, object storage otherwise). ExchangeMax,
 	// on a worker, caps the bytes of exchanges on its disk; zero leaves
 	// them to the disk's free space.
 	Exchanges   string

@@ -1809,12 +1809,11 @@ const minLocalRoom = 1 << 30
 
 // localFor reports whether workers ws write a statement's exchanges to
 // their own disks: always with LocalExchanges; with AutoExchanges, when
-// every one reports minLocalRoom for them and runs outside Kubernetes,
-// whose pods' volumes the chart sets up for exchanges only when told to
-// (workers.exchanges: local). At ten times the data on 16 workers with
-// NVMe, two reports took 34 and 62 s with exchanges on workers' disks, 96
-// and 205 s through object storage, which also turned requests away under
-// the load.
+// every one reports minLocalRoom for them, which is room in a directory of
+// theirs: on Kubernetes the chart's emptyDir, with a part of it set aside for
+// them. At ten times the data on 16 workers with NVMe, two reports took 34 and
+// 62 s with exchanges on workers' disks, 96 and 205 s through object storage,
+// which also turned requests away under the load.
 func (co *Coordinator) localFor(ws []*worker) bool {
 	if co.opts.LocalExchanges {
 		return true
@@ -1823,7 +1822,7 @@ func (co *Coordinator) localFor(ws []*worker) bool {
 		return false
 	}
 	for _, w := range ws {
-		if w.status.Kubernetes || w.status.LocalRoom < minLocalRoom {
+		if w.status.LocalRoom < minLocalRoom {
 			return false
 		}
 	}

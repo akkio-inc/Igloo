@@ -7,7 +7,7 @@ image:
   pullPolicy: Never
 resources:
   requests: { cpu: 100m, memory: 512Mi }
-  limits: { memory: 1Gi }
+  limits: { memory: 2Gi }
 duckdb:
   spillVolume:
     sizeLimit: 2Gi
@@ -29,3 +29,21 @@ objectStorage:
   resources:
     requests: { cpu: 50m, memory: 128Mi }
     limits: { memory: 1Gi }
+# Small workers, with a volume that leaves room for exchanges on the node's disk, and
+# that stop soon.
+workers:
+  maxReplicas: 2
+  idleAfter: 30s
+  startTimeout: 5m
+  resources:
+    requests: { cpu: 100m, memory: 512Mi }
+    limits: { memory: 2Gi }
+  duckdb:
+    spillVolume:
+      sizeLimit: 8Gi
+  cacheVolume:
+    sizeLimit: 2Gi
+# Statements run with and without workers are compared, so each must run.
+extraEnv:
+  - name: IGLOO_RESULT_CACHE_SIZE
+    value: "0"

@@ -98,10 +98,14 @@ admitted() {
   docf "$1" NetworkPolicy igloo-workers | sed -n '/ingress:/,/port: http/p' | grep -o 'component: .*' | sed 's/component: //' |
     tr '\n' ' ' | sed 's/ $//'
 }
-render "${bundled[@]}" --set workers.enabled=true >"$work/object.yaml"
+render "${bundled[@]}" --set workers.enabled=true --set workers.exchanges=object >"$work/object.yaml"
 render "${bundled[@]}" --set workers.enabled=true --set workers.exchanges=local >"$work/local.yaml"
-check "exchanges through object storage by default" '"object"' \
-  "$(docf "$work/object.yaml" Deployment igloo | grep -A1 -E '^ +- name: IGLOO_EXCHANGES$' | sed -n 's/^ *value: //p')"
+render "${bundled[@]}" >"$work/auto.yaml"
+render "${bundled[@]}" --set workers.duckdb.spillVolume.medium=Memory >"$work/memory.yaml"
+exchanges_env() { docf "$1" Deployment igloo | grep -A1 -E '^ +- name: IGLOO_EXCHANGES$' | sed -n 's/^ *value: //p'; }
+check "exchanges on workers' disks where they have room, by default" '"auto"' "$(exchanges_env "$work/auto.yaml")"
+check "through object storage on a volume in memory" '"object"' "$(exchanges_env "$work/memory.yaml")"
+check "workers.exchanges object sets IGLOO_EXCHANGES" '"object"' "$(exchanges_env "$work/object.yaml")"
 check "workers take tasks from igloo pods only" "server" "$(admitted "$work/object.yaml")"
 writes_env() { docf "$1" Deployment igloo | grep -A1 -E '^ +- name: IGLOO_WORKER_WRITES$' | sed -n 's/^ *value: //p'; }
 sa_of() { docf "$1" Deployment igloo-workers | sed -n 's/^ *serviceAccountName: //p'; }
@@ -135,11 +139,14 @@ check "workers.writes false turns them off" '"off"' "$(writes_env "$work/writes-
 check "workers.exchanges local sets IGLOO_EXCHANGES" '"local"' \
   "$(docf "$work/local.yaml" Deployment igloo | grep -A1 -E '^ +- name: IGLOO_EXCHANGES$' | sed -n 's/^ *value: //p')"
 check "and lets workers reach each other's task port" "server worker" "$(admitted "$work/local.yaml")"
+check "as by default" "server worker" "$(admitted "$work/auto.yaml")"
 spill_env() { docf "$1" Deployment igloo-workers | grep -A1 -E "^ +- name: $2\$" | sed -n 's/^ *value: //p'; }
 check "workers spill to 90% of their volume" '"92160MiB"|' \
   "$(spill_env "$work/object.yaml" IGLOO_DUCKDB_MAX_TEMP_SIZE)|$(spill_env "$work/object.yaml" IGLOO_EXCHANGE_MAX_SIZE)"
 check "with local exchanges, 60% spill and 30% exchanges" '"61440MiB"|"30720MiB"' \
   "$(spill_env "$work/local.yaml" IGLOO_DUCKDB_MAX_TEMP_SIZE)|$(spill_env "$work/local.yaml" IGLOO_EXCHANGE_MAX_SIZE)"
+check "as by default" '"61440MiB"|"30720MiB"' \
+  "$(spill_env "$work/auto.yaml" IGLOO_DUCKDB_MAX_TEMP_SIZE)|$(spill_env "$work/auto.yaml" IGLOO_EXCHANGE_MAX_SIZE)"
 if render "${bundled[@]}" --set workers.enabled=true --set workers.exchanges=nvme >/dev/null 2>&1; then
   fail "refuses workers.exchanges=nvme"
 else

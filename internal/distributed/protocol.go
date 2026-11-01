@@ -300,8 +300,6 @@ type workerStatus struct {
 	// share of its exchange directory's free space a task may take
 	// (localShare), within IGLOO_EXCHANGE_MAX_SIZE.
 	LocalRoom int64 `json:"local_room,omitempty"`
-	// Kubernetes says it runs in a Kubernetes pod.
-	Kubernetes bool `json:"kubernetes,omitempty"`
 	// Cache names what the worker keeps of what it read past its tasks,
 	// for erasure requests (WorkerErasure.Cache), and Erased is the latest
 	// deletion of erasure requests it was purged of, in Unix nanoseconds;

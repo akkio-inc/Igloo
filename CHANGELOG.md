@@ -734,6 +734,10 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   not complete while any could hold its rows. Workers also write `INSERT ... BY
   NAME` and of some of a table's columns, partitioned views' refreshes, and tables
   with NOT NULL or nested columns.
+- Workers exchange rows on their own disks by default on Kubernetes too
+  (`workers.exchanges: auto`), where every worker of a statement has room on its spill
+  volume: 1.8 to 2.8 times faster than object storage on EC2 with NVMe. Object storage
+  takes them otherwise, or with a spill volume in memory.
 - Workers are on by default in the Helm chart and the OpenTofu modules, as they scale
   from zero and stop when idle, so a deployment with no heavy queries pays nothing
   for them. Single-VM stays as it was, as it would need more machines.
