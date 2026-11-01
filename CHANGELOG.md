@@ -2184,6 +2184,12 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   query would, and a materialized view's or dynamic table's refresh holds
   the lock only to plan and to change the catalog. Each held it for its
   whole run.
+- A statement whose run lists a schema's tables as DuckDB binds it, as one
+  over a table dropped since it was prepared does, binds again holding the
+  catalog lock exclusively when other statements' binds hold it shared: it
+  failed with `HTTP 423 Locked`, the catalog proxy's refusal to let a
+  listing walk the tables alongside other binds, which preparing such a
+  statement already retried. The proxy logs the refusal at debug level.
 - A write into a table partitioned into more than 100 partitions, such as
   `bucket(256, column)`, writes a file a partition: DuckDB kept 100 files
   open and closed and reopened the others, writing thousands of files of a

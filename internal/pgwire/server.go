@@ -867,6 +867,10 @@ type session struct {
 	// name, whether EXECUTE of it holds the catalog lock (see
 	// executeHolds).
 	sqlPrepared map[string]bool
+	// bindAlone has DuckDB's binds on the session's connection hold the
+	// catalog lock exclusively rather than shared, while a run whose bind
+	// the catalog proxy refused binds again (see runBound).
+	bindAlone bool
 	// held, while set, keeps queries recorded for the history (see
 	// holdRecords).
 	held *[]queryRecord
@@ -1115,7 +1119,12 @@ func (s *Server) openSession(ctx context.Context) (context.Context, error) {
 	// connection, so none runs while DDL renames or drops a table or a
 	// listing walks the set (see shareCatalog); running the statement after
 	// that holds nothing more.
-	conn.SetBindHold(func() func() { return s.shareCatalog(sess) })
+	conn.SetBindHold(func() func() {
+		if sess.bindAlone {
+			return s.holdCatalog(sess)
+		}
+		return s.shareCatalog(sess)
+	})
 	for _, stmt := range sessionCatalogSetup(sess.user.Name, sess.user.Role == auth.RoleAdmin, s.version, s.engine.BitmapsLoaded()) {
 		if _, err := conn.ExecContext(ctx, stmt, nil); err != nil {
 			s.sessions.remove(sess)

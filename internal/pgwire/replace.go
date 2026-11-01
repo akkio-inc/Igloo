@@ -315,12 +315,15 @@ func (s *Server) runStagedCreate(ctx context.Context, sess *session, c *stagedCr
 		return 0, true, err
 	}
 
-	fill := func(q string) (int64, error) {
-		res, err := sess.conn.QueryContext(ctx, q, nil)
-		if err != nil {
-			return 0, err
-		}
-		return countOf(res)
+	fill := func(q string) (n int64, err error) {
+		err = s.runBound(sess, nil, func() error {
+			res, err := sess.conn.QueryContext(ctx, q, nil)
+			if err == nil {
+				n, err = countOf(res)
+			}
+			return err
+		})
+		return n, err
 	}
 	plain := "INSERT INTO " + quoteName(c.staging) + "\n" + c.query
 	if text, ok := s.joinedInsert(parsedInsert{target: quoteName(c.staging), columns: visible,
@@ -431,18 +434,20 @@ func (s *Server) runStatement(ctx context.Context, sess *session, st *statement,
 		return err
 	}
 	written := int64(-1)
-	err := runWithCommitRetry(ctx, sess, st, func() error {
-		if err := st.freshForRun(ctx, sess.conn); err != nil {
-			return err
-		}
-		return sess.profiled(ctx, st, func() error {
-			// An INSERT into a member table writes the ids it can.
-			done, n, err := s.runWithIDs(ctx, sess, st, args, w)
-			if done {
-				written = n
+	err := s.runBound(sess, w, func() error {
+		return runWithCommitRetry(ctx, sess, st, func() error {
+			if err := st.freshForRun(ctx, sess.conn); err != nil {
 				return err
 			}
-			return st.run(ctx, args, w)
+			return sess.profiled(ctx, st, func() error {
+				// An INSERT into a member table writes the ids it can.
+				done, n, err := s.runWithIDs(ctx, sess, st, args, w)
+				if done {
+					written = n
+					return err
+				}
+				return st.run(ctx, args, w)
+			})
 		})
 	})
 	if err == nil && st.ids != nil {

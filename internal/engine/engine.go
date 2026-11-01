@@ -257,7 +257,10 @@ func (e *Engine) LocalDatabase() string { return e.local }
 // so DuckDB fails the statement instead (see catalogproxy's shared holds,
 // and SharedRefusals). A step that walks or erases without the exclusive
 // side fails rather than crash the instance, and a query prepared under
-// the shared side is prepared again under the exclusive one.
+// the shared side is prepared again under the exclusive one, as a run is
+// bound again under it (see pgwire's runBound). The proxy cannot serve the
+// request, nor wait for the other binds to end: it cannot tell which
+// session made it, and the session that did holds the shared side itself.
 //
 // Once it has the lock, it gives back the catalog's names to the tables
 // that binds named in another case (see respell), before the holder lists

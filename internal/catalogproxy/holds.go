@@ -2,6 +2,7 @@ package catalogproxy
 
 import (
 	"net/http"
+	"strings"
 	"sync/atomic"
 )
 
@@ -27,6 +28,14 @@ import (
 // heldShared is the message of the proxy's refusal of a listing or a drop
 // while the catalog lock is held shared.
 const heldShared = "igloo: the catalog's tables are not listed, dropped or renamed while statements are bound alongside"
+
+// RefusedShared reports whether msg, the message of an error DuckDB
+// returned, may be its report of the proxy's refusal while the catalog lock
+// was held shared: the message, or the status, which is all DuckDB names of
+// some failed requests.
+func RefusedShared(msg string) bool {
+	return strings.Contains(msg, heldShared) || strings.Contains(msg, "423") || strings.Contains(msg, "Locked")
+}
 
 // SetSharedHold sets held, which reports whether the engine's catalog lock
 // is held shared now, and not exclusively; until it is set, nothing is
@@ -57,7 +66,9 @@ func (p *Proxy) refuseShared(w http.ResponseWriter, r *http.Request, rest string
 		return false
 	}
 	p.refusals.Add(1)
-	p.log.Warn("refused a catalog request while the catalog lock is held shared", "method", r.Method, "path", rest)
+	// Igloo prepares or binds the statement again under the exclusive lock
+	// (pgwire's prepareChecked and runBound): nothing for an operator to do.
+	p.log.Debug("refused a catalog request while the catalog lock is held shared", "method", r.Method, "path", rest)
 	writeError(w, http.StatusLocked, "CommitFailedException", heldShared)
 	return true
 }
