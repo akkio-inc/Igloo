@@ -26,11 +26,13 @@ import (
 	"net/url"
 	"path"
 	"path/filepath"
-	"slices"
 	"strings"
 	"time"
 
+	"cloud.google.com/go/storage"
+	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/container"
 	icebergio "github.com/apache/iceberg-go/io"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"gocloud.dev/blob"
 	"gocloud.dev/gcerrors"
 )
@@ -130,13 +132,17 @@ func (bfs *blobFileIO) Open(path string) (icebergio.File, error) {
 }
 
 func (bfs *blobFileIO) Remove(name string) error {
-	var err error
-	name, err = bfs.preprocess(name)
+	key, err := bfs.preprocess(name)
 	if err != nil {
 		return &fs.PathError{Op: "remove", Path: name, Err: err}
 	}
+	if hasDotSegment(key) {
+		if done, err := bfs.removeLiteral(bfs.ctx, name, key); done || err != nil {
+			return err
+		}
+	}
 
-	return bfs.Delete(bfs.ctx, name)
+	return bfs.Delete(bfs.ctx, key)
 }
 
 // Copy copies the file at src to dst, in the store, in the same bucket.
@@ -209,100 +215,137 @@ func createBlobFS(ctx context.Context, bucket *blob.Bucket, keyExtractor KeyExtr
 	return &blobFileIO{Bucket: bucket, keyExtractor: keyExtractor, ctx: ctx}
 }
 
+// WalkDir calls fn with each file under root, by a listing of them: not with the
+// directories, which object stores do not have, and not by a walk of directories,
+// which could not end. A key can hold what no path may, and with a .. segment a walk
+// by directories comes back to where it was, on and on: whoever could write such a key
+// could stop a process that listed it. Each file goes by its key as it is.
 func (bfs *blobFileIO) WalkDir(root string, fn fs.WalkDirFunc) error {
 	parsed, err := url.Parse(root)
 	if err != nil {
 		return fmt.Errorf("invalid URL %s: %w", root, err)
 	}
 
-	walkPath := strings.TrimPrefix(parsed.Path, "/")
-	if walkPath == "" {
-		walkPath = "."
-	}
-
+	key := strings.TrimPrefix(parsed.Path, "/")
 	parsed.Path = ""
+	base := strings.TrimSuffix(parsed.String(), "/") + "/"
 
-	return fs.WalkDir(walkFS{Bucket: bfs.Bucket, root: walkPath, ctx: bfs.ctx}, walkPath, func(path string, d fs.DirEntry, err error) error {
-		return fn(parsed.JoinPath(path).String(), d, err)
-	})
-}
-
-// walkFS is a bucket walked by its listings, in which what has something under it is
-// a directory, whatever a blob of its name says: on an Azure account with a
-// hierarchical namespace a directory also opens as a blob of no length, and fs.WalkDir
-// would take it for one file, and list nothing under it.
-type walkFS struct {
-	*blob.Bucket
-	root string
-	ctx  context.Context
-}
-
-// Stat implements fs.StatFS.
-func (w walkFS) Stat(name string) (fs.FileInfo, error) {
-	if name == w.root && name != "." {
-		it := w.Bucket.List(&blob.ListOptions{Prefix: name + "/"})
-		if _, err := it.Next(w.ctx); err == nil {
-			return walkEntry{name: path.Base(name), dir: true}, nil
-		}
+	opts := &blob.ListOptions{}
+	if key != "" && key != "." {
+		opts.Prefix = strings.TrimSuffix(key, "/") + "/"
 	}
-	f, err := w.Bucket.Open(name)
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close() //nolint:errcheck
 
-	return f.Stat()
-}
-
-// ReadDir implements fs.ReadDirFS.
-func (w walkFS) ReadDir(name string) ([]fs.DirEntry, error) {
-	prefix := name + "/"
-	if name == "." {
-		prefix = ""
-	}
-	it := w.Bucket.List(&blob.ListOptions{Prefix: prefix, Delimiter: "/"})
-	var out []fs.DirEntry
+	found := false
+	it := bfs.Bucket.List(opts)
 	for {
-		o, err := it.Next(w.ctx)
+		o, err := it.Next(bfs.ctx)
 		if errors.Is(err, io.EOF) {
 			break
 		}
 		if err != nil {
-			return out, err
+			return walkEnd(fn(root, nil, err))
 		}
-		out = append(out, walkEntry{name: path.Base(strings.TrimSuffix(o.Key, "/")), dir: o.IsDir, size: o.Size, modTime: o.ModTime})
+		if isDirectoryMarker(o) {
+			continue
+		}
+		found = true
+		err = fn(base+o.Key, walkEntry{name: path.Base(o.Key), size: o.Size, modTime: o.ModTime}, nil)
+		if errors.Is(err, fs.SkipDir) {
+			continue
+		}
+		if err != nil {
+			return walkEnd(err)
+		}
 	}
-	slices.SortFunc(out, func(a, b fs.DirEntry) int { return strings.Compare(a.Name(), b.Name()) })
+	if found || opts.Prefix == "" {
+		return nil
+	}
 
-	return out, nil
+	// Nothing under it: the root itself, if it is a file.
+	attrs, err := bfs.Attributes(bfs.ctx, key)
+	if err != nil {
+		if gcerrors.Code(err) == gcerrors.NotFound {
+			err = &fs.PathError{Op: "walk", Path: root, Err: fs.ErrNotExist}
+		}
+
+		return walkEnd(fn(root, nil, err))
+	}
+
+	return walkEnd(fn(root, walkEntry{name: path.Base(key), size: attrs.Size, modTime: attrs.ModTime}, nil))
 }
 
-// walkEntry is what a listing says of a file or directory.
+// walkEnd is what WalkDir returns of what its function said, as fs.WalkDir does.
+func walkEnd(err error) error {
+	if errors.Is(err, fs.SkipAll) || errors.Is(err, fs.SkipDir) {
+		return nil
+	}
+
+	return err
+}
+
+// isDirectoryMarker reports whether a listed object is a directory and no file: of
+// an Azure account with a hierarchical namespace, which lists its directories as
+// blobs of no length, or what other tools leave on other stores.
+func isDirectoryMarker(o *blob.ListObject) bool {
+	if o.IsDir {
+		return true
+	}
+	var item container.BlobItem
+	if o.As(&item) && item.Properties != nil && item.Properties.ResourceType != nil && strings.EqualFold(*item.Properties.ResourceType, "directory") {
+		return true
+	}
+
+	return o.Size == 0 && strings.HasSuffix(o.Key, "/")
+}
+
+// walkEntry is what a listing says of a file.
 type walkEntry struct {
 	name    string
-	dir     bool
 	size    int64
 	modTime time.Time
 }
 
-func (e walkEntry) Name() string { return e.name }
-func (e walkEntry) Size() int64  { return e.size }
-func (e walkEntry) IsDir() bool  { return e.dir }
-func (e walkEntry) Sys() any     { return nil }
+func (e walkEntry) Name() string               { return e.name }
+func (e walkEntry) Size() int64                { return e.size }
+func (e walkEntry) IsDir() bool                { return false }
+func (e walkEntry) Sys() any                   { return nil }
+func (e walkEntry) Type() fs.FileMode          { return 0 }
+func (e walkEntry) Mode() fs.FileMode          { return 0o444 }
+func (e walkEntry) ModTime() time.Time         { return e.modTime }
+func (e walkEntry) Info() (fs.FileInfo, error) { return e, nil }
 
-func (e walkEntry) Type() fs.FileMode { return e.Mode().Type() }
-
-func (e walkEntry) Mode() fs.FileMode {
-	if e.dir {
-		return fs.ModeDir | 0o555
-	}
-
-	return 0o444
+// hasDotSegment reports whether key has a segment gocloud would not leave as it is:
+// it escapes "../" before it asks the store, so that its Delete asks for another key.
+func hasDotSegment(key string) bool {
+	return strings.Contains("/"+key, "/../")
 }
 
-func (e walkEntry) ModTime() time.Time { return e.modTime }
+// removeLiteral deletes the object of a key gocloud would change, by the store's own
+// client; done is false for a store where it has no such client.
+func (bfs *blobFileIO) removeLiteral(ctx context.Context, name, key string) (done bool, err error) {
+	u, err := url.Parse(name)
+	if err != nil {
+		return false, err
+	}
+	bucket := u.Host
+	var s3Client *s3.Client
+	if bfs.Bucket.As(&s3Client) {
+		_, err := s3Client.DeleteObject(ctx, &s3.DeleteObjectInput{Bucket: &bucket, Key: &key})
 
-func (e walkEntry) Info() (fs.FileInfo, error) { return e, nil }
+		return true, err
+	}
+	var gcs *storage.Client
+	if bfs.Bucket.As(&gcs) {
+		err := gcs.Bucket(bucket).Object(key).Delete(ctx)
+		if errors.Is(err, storage.ErrObjectNotExist) {
+			err = nil
+		}
+
+		return true, err
+	}
+
+	return false, nil
+}
 
 func (bfs *blobFileIO) DeleteFiles(ctx context.Context, paths []string) ([]string, error) {
 	if len(paths) == 0 {
@@ -319,6 +362,14 @@ func (bfs *blobFileIO) DeleteFiles(ctx context.Context, paths []string) ([]strin
 			errs = errors.Join(errs, fmt.Errorf("failed to delete %s: %w", p, err))
 
 			continue
+		}
+
+		if hasDotSegment(key) {
+			if done, err := bfs.removeLiteral(ctx, p, key); done && err == nil {
+				deleted = append(deleted, p)
+
+				continue
+			}
 		}
 
 		if err := bfs.Delete(ctx, key); err != nil {

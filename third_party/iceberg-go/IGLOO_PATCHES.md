@@ -166,9 +166,12 @@ compact large tables within `IGLOO_MAINTENANCE_MEMORY`:
   Arrow side's already did, instead of Arrow's default allocator, so a
   caller that counts memory through the context sees them.
 
-- `io/gocloud/blob.go`, `WalkDir`: the root of a walk is a directory if anything
-  is under it, though a blob of its name opens: on an Azure account with a
-  hierarchical namespace, a directory is that too, and the walk listed one file.
+- `io/gocloud/blob.go`, `WalkDir`: goes by a flat listing, not fs.WalkDir. On an
+  Azure account with a hierarchical namespace a directory opens as a blob of no
+  length, and the walk listed one file; and a key with a `..` segment, which S3
+  and GCS allow, had the walk come back to where it was until the stack ran out.
+  `Remove` and `DeleteFiles` delete such a key by the store's own client, as
+  gocloud escapes what it asks for.
 
 Drop this copy and the `replace` directive once an iceberg-go release reads
 DuckDB-written tables, lets callers choose these Parquet writer defaults,
