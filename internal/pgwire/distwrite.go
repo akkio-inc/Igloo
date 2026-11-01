@@ -122,17 +122,23 @@ func (s *Server) newTableWrite(ctx context.Context, sess *session, schema, name 
 	for _, c := range described {
 		types[c.name] = c.typ
 	}
-	// Which of the query's columns is each of the table's.
+	// Which of the query's columns is each of the table's: -1 for one it does
+	// not write, which holds NULL.
 	source := make([]int, len(fields))
 	switch {
 	case len(order) > 0:
-		if len(order) != len(fields) || n != len(fields) {
-			return nil, "the statement does not write every column of the table", nil
+		if n != len(order) {
+			return nil, "the query's columns are not those the statement names", nil
 		}
 		for i, f := range fields {
 			source[i] = slices.IndexFunc(order, func(c string) bool { return strings.EqualFold(c, f.Name) })
-			if source[i] < 0 {
-				return nil, "the statement does not write every column of the table", nil
+			if source[i] < 0 && (f.Required || f.WriteDefault != nil) {
+				return nil, "the statement does not write column " + f.Name + ", which has a default or is NOT NULL", nil
+			}
+		}
+		for _, c := range order {
+			if !slices.ContainsFunc(fields, func(f iceberg.NestedField) bool { return strings.EqualFold(c, f.Name) }) {
+				return nil, "the statement names a column the table does not have", nil
 			}
 		}
 	case n != len(fields):
@@ -161,7 +167,11 @@ func (s *Server) newTableWrite(ctx context.Context, sess *session, schema, name 
 		if !ok {
 			return nil, "column " + f.Name + " does not show in the table's description", nil
 		}
-		casts[i] = "CAST(" + aliases[source[i]] + " AS " + typ + ") AS " + quoteIdent(f.Name)
+		value := "NULL"
+		if source[i] >= 0 {
+			value = aliases[source[i]]
+		}
+		casts[i] = "CAST(" + value + " AS " + typ + ") AS " + quoteIdent(f.Name)
 		outer = append(outer, quoteIdent(f.Name))
 		w.columns = append(w.columns, distributed.WriteColumn{Name: f.Name, ID: f.ID})
 	}
@@ -602,8 +612,12 @@ func (s *Server) clearStoppedWrites(ctx context.Context, schema, name string) er
 // insertWriter returns how workers would write the rows of src, the query
 // of an INSERT of p, into its table, or nil.
 func (s *Server) insertWriter(ctx context.Context, sess *session, p parsedInsert, src *statement) *tableWrite {
+	order := p.columns
 	if p.byName {
-		return nil
+		order = make([]string, len(src.columns))
+		for i, c := range src.columns {
+			order[i] = c.Name
+		}
 	}
 	sc := &scanner{s: p.target}
 	name, ok := sc.name()
@@ -628,5 +642,5 @@ func (s *Server) insertWriter(ctx context.Context, sess *session, p parsedInsert
 			return nil
 		}
 	}
-	return s.tableWriter(ctx, sess, target.Schema, target.Table, src, p.columns)
+	return s.tableWriter(ctx, sess, target.Schema, target.Table, src, order)
 }

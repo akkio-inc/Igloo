@@ -1010,6 +1010,32 @@ func TestWorkersSessionFunctions(t *testing.T) {
 	}
 }
 
+// TestWorkersWriteNamedColumns checks that workers write an INSERT of some of a
+// table's columns, in any order or by name, as DuckDB's would: NULL for the others.
+func TestWorkersWriteNamedColumns(t *testing.T) {
+	t.Parallel()
+	env := startWriteServer(t)
+	env.force(t)
+	admin := env.admin
+	for _, c := range []struct{ name, insert, want string }{
+		{"some", "INSERT INTO w_named (id, x) SELECT id, x FROM src", "SELECT id, x, NULL AS name, NULL AS g FROM src"},
+		{"reordered", "INSERT INTO w_named (x, g, name, id) SELECT x, g, name, id FROM src", "SELECT id, x, name, g FROM src"},
+		{"some reordered", "INSERT INTO w_named (name, id) SELECT name, id FROM src", "SELECT id, NULL AS x, name, NULL AS g FROM src"},
+		{"by name", "INSERT INTO w_named BY NAME SELECT g, id, name, x FROM src", "SELECT id, x, name, g FROM src"},
+		{"some by name", "INSERT INTO w_named BY NAME SELECT x, id FROM src", "SELECT id, x, NULL AS name, NULL AS g FROM src"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			mustExec(t, admin, "DROP TABLE IF EXISTS w_named")
+			mustExec(t, admin, "CREATE TABLE w_named (id BIGINT, x BIGINT, name VARCHAR, g BIGINT)")
+			mustExec(t, admin, c.insert)
+			if got, want := env.local(t, "SELECT * FROM w_named ORDER BY ALL"), env.local(t, "SELECT * FROM ("+c.want+") ORDER BY ALL"); got != want {
+				t.Errorf("rows differ from those of %s", c.want)
+			}
+			env.checkWrote(t, "w_named")
+		})
+	}
+}
+
 // TestWorkersDoNotWrite checks that a fill stays with this replica's writes
 // inside a transaction block, and over a source with a policy.
 func TestWorkersDoNotWrite(t *testing.T) {

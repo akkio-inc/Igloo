@@ -428,8 +428,8 @@ statement's rows are in the table when that commit is, or not at all.
   an Iceberg sort order (Igloo keeps [its own as a property](sql.md));
   nested, fixed, nanosecond and format-version-1 columns; a query that sorts,
   limits or groups in its last step; a fill estimated at less than 256 MiB in
-  auto mode, which would make small files; `INSERT ... BY NAME`, and an
-  `INSERT` without every column of the table; a partitioned view's refresh.
+  auto mode, which would make small files; an `INSERT` that leaves out a column
+  with a default.
   So do fills of ID domains' member tables, sorted writes and fills in a
   transaction block, on the replica, and fills from tables with policies. A
   commit that fails after workers wrote runs the fill on the replica, unless
