@@ -411,12 +411,17 @@ func checkWritten(dir string, files []shuffleFile, rows int64) error {
 	return nil
 }
 
+// writtenName is what a path may hold below an attempt's directory, which is
+// all a task's COPY writes (see writeFiles): no glob character, which DuckDB
+// would take for a pattern when it reads the file, no escape, no query.
+var writtenName = regexp.MustCompile(`^[A-Za-z0-9._=/-]+$`)
+
 // UnderDir reports whether p is strictly under dir, as a plain path: no
-// segment that leads elsewhere, however it is spelled, no query, nothing a
-// store or a client would read otherwise than as written.
+// segment that leads elsewhere, however it is spelled, nothing a store or a
+// client would read otherwise than as written.
 func UnderDir(p, dir string) bool {
 	rest, ok := strings.CutPrefix(p, strings.TrimSuffix(dir, "/")+"/")
-	if !ok || rest == "" || strings.ContainsAny(p, "?#\\\x00") || strings.Contains(p, "%") {
+	if !ok || !writtenName.MatchString(rest) {
 		return false
 	}
 	for _, seg := range strings.Split(rest, "/") {
