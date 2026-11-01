@@ -358,13 +358,20 @@ func TestEstimateFromHistory(t *testing.T) {
 			t.Errorf("Estimate(%q) = %d, want %d", shape, got, want)
 		}
 	}
+	// The median of its latest runs: one lighter run changes nothing, most do.
+	c.Observe("heavy", 8*gb)
+	if got := c.Estimate("heavy"); got != 20*gb {
+		t.Errorf("after a lighter run: %d", got)
+	}
 	c.Observe("heavy", 8*gb)
 	if got := c.Estimate("heavy"); got != 4*gb {
-		t.Errorf("after a lighter run: %d", got)
+		t.Errorf("after lighter runs: %d", got)
 	}
 
 	ctx := context.Background()
-	c.Observe("heavy", 40*gb)
+	for range footprintRuns {
+		c.Observe("heavy", 40*gb)
+	}
 	running, _, _ := c.Admit(ctx, Limits{Memory: c.Estimate("medium")})
 	admitted := make(chan struct{})
 	go func() {
@@ -395,26 +402,31 @@ func TestEstimateFromHistory(t *testing.T) {
 	}
 }
 
-// TestPeaks checks what statements are seen holding: the most of what
-// DuckDB held while each ran, less what the others beside it reserved; none
-// for one no sample fell within; FootprintOf, the smaller of that and what
-// it allocated; and runs that ended early, which only raise their shape's
-// footprint.
+// TestPeaks checks what statements are seen holding: the most of their share
+// of what DuckDB held while each ran, by what they reserved; none for one no
+// sample fell within; FootprintOf, two thirds of what it allocated or what it
+// was seen holding if more; and runs that ended early, which only raise their
+// shape's footprint.
 func TestPeaks(t *testing.T) {
 	const gb = int64(1) << 30
 	c := NewController(22 * gb)
 	c.LimitReplica(8)
 	ctx := context.Background()
-	heavy, _, _ := c.Admit(ctx, Limits{Counted: true, Memory: 10 * gb})
+	heavy, _, _ := c.Admit(ctx, Limits{Counted: true, Memory: 16 * gb})
 	light, _, _ := c.Admit(ctx, Limits{Counted: true})
 	c.sample(12 * gb)
-	c.sample(15 * gb)
-	if peak, ok := light(); !ok || peak != 5*gb {
-		t.Errorf("the light statement's peak %d (%v), want 5 GB", peak, ok)
+	// 22 GB over 16: a share of 16 and of 1.375 GB.
+	held := 15 * gb
+	c.sample(held)
+	smallest := 22 * gb / minReservationShare
+	want := int64(float64(held) * float64(smallest) / float64(16*gb+smallest))
+	if peak, ok := light(); !ok || peak != want {
+		t.Errorf("the light statement's peak %d (%v), want %d", peak, ok, want)
 	}
-	c.sample(9 * gb)
-	if peak, ok := heavy(); !ok || peak != 15*gb {
-		t.Errorf("the heavy statement's peak %d (%v), want 15 GB", peak, ok)
+	// Alone, a statement is charged with all of it.
+	c.sample(20 * gb)
+	if peak, ok := heavy(); !ok || peak != 20*gb {
+		t.Errorf("the heavy statement's peak %d (%v), want 20 GB", peak, ok)
 	}
 	short, _, _ := c.Admit(ctx, Limits{Counted: true})
 	if _, ok := short(); ok {
@@ -425,7 +437,8 @@ func TestPeaks(t *testing.T) {
 		allocated, peak int64
 		sampled         bool
 		want            int64
-	}{{84 * gb, 12 * gb, true, 12 * gb}, {gb, 12 * gb, true, gb}, {3 * gb, 0, false, 3 * gb}, {3 * gb, -2 * gb, true, 0}} {
+	}{{84 * gb, 12 * gb, true, 56 * gb}, {3 * gb, 12 * gb, true, 3 * gb}, {3 * gb, 0, false, 2 * gb}, {3 * gb, -2 * gb, true, 2 * gb},
+		{12 * gb, 10 * gb, true, 10 * gb}} {
 		if got := FootprintOf(f.allocated, f.peak, f.sampled); got != f.want {
 			t.Errorf("FootprintOf(%d, %d, %v) = %d, want %d", f.allocated, f.peak, f.sampled, got, f.want)
 		}

@@ -7,11 +7,12 @@ import (
 
 // SampleMemory reads, every interval until ctx ends, the memory that
 // DuckDB holds for running statements (read), and keeps for each statement
-// running under the controller's limits the most of it that the
-// statements beside it had not reserved: its peak, which its release
-// returns. Statements beside it that hold more than they reserved, or
-// reserved nothing, are counted in its peak too, so a peak errs high, and
-// FootprintOf takes the smaller of it and what the statement allocated.
+// running under the controller's limits the most of its share of it: its
+// peak, which its release returns. Statements beside each other share what
+// DuckDB holds by what they reserved, a statement that reserved nothing as if
+// it reserved the smallest reservation there is, so a peak is exact for a
+// statement alone and otherwise only an indication: FootprintOf takes it for
+// what it holds only when it says more than what the statement allocated does.
 func (c *Controller) SampleMemory(ctx context.Context, every time.Duration, read func(context.Context) (int64, error)) {
 	if c == nil {
 		return
@@ -30,13 +31,17 @@ func (c *Controller) SampleMemory(ctx context.Context, every time.Duration, read
 	}
 }
 
-// sample charges held to the statements running now, less what the others
-// reserved.
+// sample charges held to the statements running now, each its share.
 func (c *Controller) sample(held int64) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	weight := func(w *waiter) int64 { return max(w.memory, c.budget/minReservationShare, 1) }
+	var weights int64
 	for w := range c.active {
-		w.peak = max(w.peak, held-(c.reserved-w.memory))
+		weights += weight(w)
+	}
+	for w := range c.active {
+		w.peak = max(w.peak, int64(float64(held)*float64(weight(w))/float64(weights)))
 		w.sampled = true
 	}
 }

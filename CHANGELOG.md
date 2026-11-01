@@ -1894,6 +1894,13 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   larger dashboard at ten times the data, which ran 80 minutes without
   finishing on 8 cores, takes 2,148 seconds; a smaller one takes 255 seconds
   rather than 301.
+- Statements learn what they hold from what they allocated, the median of
+  their shape's latest runs, not from what the replica held less what the
+  statements beside them reserved, which said next to nothing beside a
+  statement that had reserved much and held little yet: four in ten of a
+  large dashboard's statements learned under a twentieth of what they
+  allocated, started beside the heavy ones next time and spilled. Runs
+  cancelled after ten seconds or more count as needing all the memory.
 - A `FLATTEN` of a column takes the form DuckDB's estimates point to, then
   whichever form its shape's latest run took less CPU time in (see
   [Snowflake SQL](docs/snowflake-sql.md)): two dashboard queries over tens

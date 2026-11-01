@@ -298,15 +298,18 @@ replica started, reserves nothing and starts at once. A role's own
 
 DuckDB measures what a statement allocated over its whole run, counting
 memory it freed and allocated again, and the peak of the whole process,
-not of one statement. So the replica reads what DuckDB holds for running
-statements (their hash tables, sorts and the like, not its caches) every
-100 ms, and charges each statement running then with what the statements
-beside it had not reserved. A statement's shape learns the smaller of that
-peak and what it allocated, or, for a statement too short for a reading,
-what it allocated. A run that ends early, cancelled or out of memory,
-raises its shape's footprint to what it was seen holding, so that heavy
-statements cancelled at their timeout do not start together again, unseen,
-next time. When it starts, a replica reads what the past week's statements
+not of one statement. A statement alone holds at its most between two
+fifths and all of what it allocated, and that holds whatever runs beside
+it, so a run's footprint is two thirds of what it allocated, or what the
+replica saw it hold if that is more: every 100 ms the replica reads what
+DuckDB holds for running statements (their hash tables, sorts and the like,
+not its caches) and shares it among them by what they reserved, which is
+exact only for a statement alone. A shape's footprint is the median of its
+latest eight runs. A run that ends early, cancelled or out of memory, raises
+it to what it was seen holding, or, if it ran ten seconds or more, to all
+the memory, so that heavy statements cancelled at their timeout do not start
+together again, unseen, next time. When it starts, a replica reads what the
+past week's statements
 held from the [query history](sql.md#query-history), those that ran on a
 replica with its memory limit, within a quarter, so that a restart does
 not forget them; a run from before the history kept peaks counts by what it

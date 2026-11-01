@@ -1,6 +1,10 @@
 package workload
 
-import "sync"
+import (
+	"slices"
+	"sync"
+	"time"
+)
 
 // Reservations from statements' history. A replica's statements share one
 // memory pool, so several heavy ones at once spill to disk, and on a disk
@@ -18,16 +22,33 @@ import "sync"
 //
 // DuckDB 1.5 measures what a statement allocated over its run, which counts
 // memory freed and allocated again each time, and the process's peak, not
-// a statement's. Reserving what statements allocated, a dashboard's two
-// heaviest statements at ten times the data, which allocated 84 GB each on
-// a replica of 22 GB, reserved all of it: each waited 50 to 100 s for the
-// others to end and then ran alone, and the dashboard's statements ran
-// 662 s in all but waited 4,740. The controller now samples what DuckDB
-// holds while statements run (see SampleMemory) and learns the smaller of
-// that peak and what the statement allocated (see FootprintOf). It learns
-// from runs that did not end too (see ObserveUnfinished): heavy statements
-// that never ended, cancelled at their timeout, were never learned and
-// started together, six or seven at once, until all spilled.
+// a statement's. Alone, a statement holds at its most between two fifths and
+// all of what it allocated, two thirds on most shapes of a dashboard, and that
+// holds whatever runs beside it, unlike anything sampled: what DuckDB holds
+// for all the statements running cannot be told apart, and less what the
+// others reserved it said next to nothing for a statement beside one that
+// reserved much and held little yet. Four in ten of a large dashboard's
+// statements learned under a twentieth of what they allocated, started beside
+// the heavy ones next time and spilled, and the next run's footprints and
+// times differed from the last's by a fifth. So a run's footprint is
+// heldShare of what it allocated, or what it was seen holding if more (see
+// FootprintOf); and a shape's is the median of its latest runs, since DuckDB
+// counts some of what other statements allocate on the same threads, up to
+// twenty times a small statement's own. It learns from runs that did not end
+// too (see ObserveUnfinished): heavy statements that never ended, cancelled at
+// their timeout, were never learned and started together, six or seven at
+// once, until all spilled.
+
+// heldShare is the share of what a run allocated that it is taken to hold at
+// its most.
+const heldShare = 2.0 / 3
+
+// footprintRuns is how many of a shape's latest runs its footprint looks at.
+const footprintRuns = 8
+
+// LongUnfinished is how long a run that ended early must have run to be taken
+// for one that needed all the memory it ran with.
+const LongUnfinished = 10 * time.Second
 
 // minReservationShare is the smallest reservation, as a share of the
 // budget, that an estimate makes; a smaller one is none.
@@ -41,14 +62,27 @@ const maxFootprints = 4096
 type footprints struct {
 	mu       sync.Mutex
 	fraction float64
-	held     map[string]footprint
+	held     map[string]*footprint
 }
 
-// footprint is what statements of a shape held at once, and whether the
-// run it was learned from ended before its end.
+// footprint is what statements of a shape held at once: what its latest
+// completed runs held, and the most a run seen since, which ended before its
+// end, held.
 type footprint struct {
-	held       int64
-	unfinished bool
+	runs       []int64
+	unfinished int64
+}
+
+// held is what statements of the shape hold, and whether a run that ended
+// before its end says so: the median of its latest runs, the lower one of two,
+// or more, what a run that ended early held.
+func (f *footprint) held() (int64, bool) {
+	var median int64
+	if len(f.runs) > 0 {
+		sorted := slices.Sorted(slices.Values(f.runs))
+		median = sorted[(len(sorted)-1)/2]
+	}
+	return max(median, f.unfinished), f.unfinished > median
 }
 
 // EstimateFromHistory makes the controller reserve, for a statement that
@@ -64,43 +98,54 @@ func (c *Controller) EstimateFromHistory(fraction float64) {
 // query history when it starts, as its statements had them under the same
 // memory limit.
 func (c *Controller) Observe(shape string, footprint int64) {
-	c.observe(shape, footprint, false)
+	if c == nil || shape == "" || footprint < 0 {
+		return
+	}
+	fp := c.history.of(shape)
+	defer c.history.mu.Unlock()
+	fp.runs = append(fp.runs, footprint)
+	if len(fp.runs) > footprintRuns {
+		fp.runs = fp.runs[len(fp.runs)-footprintRuns:]
+	}
+	fp.unfinished = 0
 }
 
 // ObserveUnfinished records what a statement of shape was seen holding in a
 // run that ended before its end, cancelled or failed: at least that much,
 // so it raises what a shape's runs held and never lowers it.
 func (c *Controller) ObserveUnfinished(shape string, held int64) {
-	c.observe(shape, held, true)
-}
-
-func (c *Controller) observe(shape string, n int64, atLeast bool) {
-	if c == nil || shape == "" || n < 0 {
+	if c == nil || shape == "" || held < 0 {
 		return
 	}
-	f := &c.history
+	fp := c.history.of(shape)
+	defer c.history.mu.Unlock()
+	fp.unfinished = max(fp.unfinished, held)
+}
+
+// of returns shape's footprint, a new one if it has none, with f.mu held.
+func (f *footprints) of(shape string) *footprint {
 	f.mu.Lock()
-	defer f.mu.Unlock()
 	if f.held == nil || len(f.held) >= maxFootprints {
-		f.held = make(map[string]footprint)
+		f.held = make(map[string]*footprint)
 	}
-	if old, ok := f.held[shape]; atLeast && ok && old.held >= n {
-		return
+	fp := f.held[shape]
+	if fp == nil {
+		fp = &footprint{}
+		f.held[shape] = fp
 	}
-	f.held[shape] = footprint{held: n, unfinished: atLeast}
+	return fp
 }
 
-// FootprintOf is what Observe learns of a run that allocated allocated
-// over its whole run and was seen holding at most peak, if sampled: the
-// smaller of the two, since a run allocates at least what it holds at
-// once, and peak may count memory that statements beside it held.
-// Without a sample, the run was too short to measure, and allocated
-// stands in.
+// FootprintOf is what Observe learns of a run that allocated allocated over
+// its whole run and was seen holding at most peak, if sampled: heldShare of
+// what it allocated, or what it was seen holding if more, since a run
+// allocates at least what it holds at once.
 func FootprintOf(allocated, peak int64, sampled bool) int64 {
-	if !sampled {
-		return allocated
+	held := int64(heldShare * float64(allocated))
+	if sampled {
+		held = max(held, min(peak, allocated))
 	}
-	return max(min(allocated, peak), 0)
+	return max(held, 0)
 }
 
 // Estimate returns the memory a statement of shape is to reserve: the
@@ -112,11 +157,8 @@ func (c *Controller) Estimate(shape string) int64 {
 	if c == nil || shape == "" || c.history.fraction == 0 || c.budget <= 0 {
 		return 0
 	}
-	f := &c.history
-	f.mu.Lock()
-	held := f.held[shape].held
-	f.mu.Unlock()
-	r := int64(float64(held) * f.fraction)
+	held, _, _ := c.footprint(shape)
+	r := int64(float64(held) * c.history.fraction)
 	if r < c.budget/minReservationShare {
 		return 0
 	}
@@ -156,5 +198,9 @@ func (c *Controller) footprint(shape string) (held int64, unfinished, ok bool) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	fp, ok := f.held[shape]
-	return fp.held, fp.unfinished, ok
+	if !ok {
+		return 0, false, false
+	}
+	held, unfinished = fp.held()
+	return held, unfinished, true
 }
