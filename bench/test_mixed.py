@@ -123,6 +123,28 @@ class CostTest(unittest.TestCase):
         self.assertIsNone(bad.read())
         self.assertEqual(bad.failures, 1)
 
+    def test_sampler_keeps_count_over_failed_scrape(self):
+        s = mixed.WorkerSampler("http://x")
+        s.tick(16, 100.0)            # before the window: not counted
+        s.counting = True
+        s.tick(16, 101.0)
+        s.tick(None, 102.0)          # a scrape that failed keeps 16
+        s.tick(8, 103.0)
+        self.assertEqual(s.seconds, 16 + 16 + 8)
+        self.assertEqual(len(s.samples), 3)
+
+    def test_report_uses_metrics_despite_failed_scrapes(self):
+        s = mixed.WorkerSampler("http://x")
+        s.samples, s.seconds, s.failures = [(1.0, 16.0)], 9600.0, 2
+        args = mixed.parse(["run"])
+        res = {"t0": 0.0, "t1": 600.0, "records": [], "skipped": {}}
+        hist = [("dashboard", "delivery.kpis", 0, 100000, 16)] * 50   # 50 overlapping statements on 16 workers
+        out = mixed.report(res, hist, args, 0.85, 0.43, s)
+        self.assertEqual(out["worker_seconds"], 9600.0)
+        self.assertTrue(out["worker_seconds_source"].startswith("metrics (2 failed scrapes"))
+        out = mixed.report(res, hist, args, 0.85, 0.43, mixed.WorkerSampler("http://x"))
+        self.assertTrue(out["worker_seconds_source"].startswith("history"))
+
 
 class SQLTest(unittest.TestCase):
     def test_setup_and_jobs(self):
@@ -180,7 +202,7 @@ class RunTest(unittest.TestCase):
         self.assertIn("4 AS batch_id", ingests[0])
         self.assertIn("range(1030, 1040)", ingests[0])
         out = mixed.report(res, [("dashboard", "delivery.kpis", 10, 20, 0)], args, 1.0, 1.0, None)
-        self.assertEqual(out["worker_seconds_source"], "history (busy only)")
+        self.assertEqual(out["worker_seconds_source"], "history (statements' workers times duration)")
         self.assertIn("dashboard", out["classes"])
 
     def test_errors_recorded(self):

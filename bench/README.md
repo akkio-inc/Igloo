@@ -295,8 +295,10 @@ Statements run with `IGLOO_DSN`'s user, and their text starts with
 history can be read per run. Cost is the coordinator's price for the
 window plus each worker's for the seconds it ran: with `--metrics-url`
 the client samples `igloo_distributed_workers` every second, idle tails
-included; without it, workers are billed only for the seconds their
-statements ran there (a lower bound). Prices come from `pricing.toml`
+included (a scrape that fails keeps the last count); without it, workers
+are billed for the seconds their statements ran there, which leaves out
+idle time but counts a worker once per concurrent statement, so it can come
+out far above what the workers cost. Prices come from `pricing.toml`
 (`--coordinator`, `--worker` name instance types) or are given per hour;
 `--spot-factor` scales the worker price. On a fleet, raise `--rows` at
 setup (10 billion takes the generator about as long as `load-media.sql`

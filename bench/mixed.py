@@ -39,10 +39,13 @@ workers too.
 (an instance type in pricing.toml) or `--coordinator-price`, per hour. With
 `--metrics-url`, the client samples `igloo_distributed_workers` every
 second, so workers are billed for the seconds they were running, idle tail
-included; `--worker`/`--worker-price` price them (`--spot-factor` scales a
-Spot price). Without it, workers are billed only for the seconds their
-statements ran (`duration_ms` times `workers` from the history), a lower
-bound. Results report cost over the window and per hour.
+included (a scrape that fails keeps the last count); `--worker`/
+`--worker-price` price them (`--spot-factor` scales a Spot price). Without
+it, workers are billed for the seconds their statements ran (`duration_ms`
+times `workers` from the history): that leaves out idle time, and counts a
+worker once for each statement it ran at once, so with many concurrent
+statements it can come out far above what the workers cost. Results report
+cost over the window and per hour.
 
 Synthetic data only: rows are computed from their number, as in
 deploy/single-vm/sql/load-media.sql.
@@ -310,6 +313,8 @@ class WorkerSampler(threading.Thread):
         self.counting = False
         self.samples: list[tuple[float, float]] = []
         self.failures = 0
+        self.last_n: float | None = None
+        self.last_t: float | None = None
 
     def read(self) -> float | None:
         try:
@@ -321,16 +326,22 @@ class WorkerSampler(threading.Thread):
             self.failures += 1
             return None
 
+    def tick(self, n: float | None, now: float):
+        """Adds a sample: n workers running at now, or None for a scrape
+        that failed, which keeps the last count. A busy Igloo can be slow to
+        answer /metrics now and then; that should not lose the window."""
+        if n is not None:
+            self.samples.append((round(now, 1), n))
+            self.last_n = n
+        if self.counting and self.last_n is not None and self.last_t is not None:
+            self.seconds += self.last_n * (now - self.last_t)
+        self.last_t = now
+
     def run(self):
-        last = time.time()
+        self.last_t = time.time()
         while not self.stop.is_set():
             n = self.read()
-            now = time.time()
-            if n is not None:
-                self.samples.append((round(now, 1), n))
-                if self.counting:
-                    self.seconds += n * (now - last)
-            last = now
+            self.tick(n, time.time())
             self.stop.wait(1)
 
 
@@ -504,7 +515,11 @@ def report(res: dict, hist: list[tuple], args, coord_price: float, worker_price:
     window = res["t1"] - res["t0"]
     hs = history_summary(hist)
     busy = sum(v["worker_busy_seconds"] for k, v in hs.items() if "." not in k)
-    worker_seconds = sampler.seconds if sampler and not sampler.failures else busy
+    metered = bool(sampler and sampler.samples)
+    worker_seconds = sampler.seconds if metered else busy
+    source = "history (statements' workers times duration)"
+    if metered:
+        source = "metrics" + (f" ({sampler.failures} failed scrapes kept the last count)" if sampler.failures else "")
     out = {
         "run_id": args.run_id,
         "label": args.label,
@@ -516,7 +531,7 @@ def report(res: dict, hist: list[tuple], args, coord_price: float, worker_price:
         "history": hs,
         "elt_skipped": res["skipped"],
         "worker_seconds": round(worker_seconds, 1),
-        "worker_seconds_source": "metrics" if sampler and not sampler.failures else "history (busy only)",
+        "worker_seconds_source": source,
         "cost": cost(coord_price, worker_price, window, worker_seconds),
     }
     return out
