@@ -529,6 +529,10 @@ type Server struct {
 	// beforeFill, if set, runs as a staged CREATE TABLE ... AS starts to
 	// fill its table, with the context that ends the fill (for tests).
 	beforeFill func(context.Context)
+	// beforeOverwrite, if set, runs once a full refresh wrote its files
+	// into dir, before it commits them, with the refresh's context; an
+	// error fails the refresh (for tests).
+	beforeOverwrite func(ctx context.Context, dir string) error
 	// splitPairs writes report calls' pair counts as workers split them
 	// (see scanCounts) whether or not they fit workers (pairsFitWorkers),
 	// and unsplitPairs never; preferHybrid answers them as hybrids rather

@@ -487,6 +487,15 @@ name unseen, briefly putting an empty table under it when it is free, and
 fails at once if something does; an admin's `DROP TABLE name`, without `IF
 EXISTS`, releases such a hold, whoever left it.
 
+A full refresh of a materialized view or dynamic table writes the view's
+rows into a directory of their own under its table's data
+(`igloo-refresh-...`), noted the same way, and commits them in place of the
+table's files. One that fails or is canceled deletes its files; one an
+Igloo stopped before the commit leaves them, in no snapshot, and the view's
+next refresh deletes them, as does an erasure request's replacement of the
+view, which does not complete while such a note from before it remains.
+Files a snapshot holds stay, for snapshot expiry to delete.
+
 The turns cost throughput of short queries on a busy replica. On a shared
 18-core test machine, against the same build without them, 8 to 64 sessions
 of point lookups ran 18–25% fewer queries a second (with lower tail

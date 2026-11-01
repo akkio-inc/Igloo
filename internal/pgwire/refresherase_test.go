@@ -2,7 +2,9 @@ package pgwire
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
+	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
@@ -168,5 +170,135 @@ func TestErasureReplacesRefreshedTables(t *testing.T) {
 	}
 	if n := count(t, admin, "SELECT count(*) FROM lake.public.big_visits WHERE email = 'u5@example.com'"); n != 0 {
 		t.Errorf("the projection still holds %d of the second person's rows", n)
+	}
+}
+
+// TestErasureClearsRefreshFiles: an erasure request on the table of a
+// materialized view that full refreshes overwrite completes only once no
+// file the view's refreshes wrote under its table's location holds the
+// person's rows: those of earlier refreshes, which older snapshots hold,
+// and those a refresh stopped before its commit left in no snapshot. The
+// latter go whether or not dropping the old table deletes its files; when
+// it does not, the request waits for the old files at its purge step.
+func TestErasureClearsRefreshFiles(t *testing.T) {
+	t.Parallel()
+	for _, purges := range []bool{true, false} {
+		t.Run(fmt.Sprintf("purge=%v", purges), func(t *testing.T) {
+			t.Parallel()
+			vc := newViewCatalog(t)
+			sched := tasks.NewScheduler(tasks.NewMemoryStore(), tasks.Options{})
+			purge := func(context.Context, string, []string, string, bool) clone.PurgeVerdict {
+				if !purges {
+					return clone.PurgeVerdict{Why: "kept, as for a clone"}
+				}
+				return clone.PurgeVerdict{Purge: true, Release: func() {}}
+			}
+			r := vc.replica(t, func(o *Options) { o.Tasks, o.ClonePurge = sched, purge })
+			r.srv.refreshFraction = 1e-9
+			admin := r.admin(t, pgx.QueryExecModeSimpleProtocol)
+			ctx := context.Background()
+			const person = "u3@example.com"
+			for _, q := range []string{
+				`CREATE TABLE lake.public.visits AS SELECT 'u' || (i % 20) || '@example.com' AS email, i AS spend FROM range(200) AS r(i)`,
+				"CREATE TAG pii",
+				"ALTER TABLE lake.public.visits ALTER COLUMN email SET TAG pii = 'email'",
+				"CREATE MATERIALIZED VIEW lake.public.spenders AS SELECT email, spend FROM lake.public.visits",
+				"REFRESH MATERIALIZED VIEW lake.public.spenders",
+				"INSERT INTO lake.public.visits VALUES ('u7@example.com', 1000)",
+				"REFRESH MATERIALIZED VIEW lake.public.spenders",
+			} {
+				mustExec(t, admin, q)
+			}
+			// A refresh stopped before its commit, by a process gone since.
+			tbl, err := r.objects.LoadTable(ctx, "public", "spenders")
+			if err != nil {
+				t.Fatal(err)
+			}
+			data := filepath.Join(strings.TrimPrefix(tbl.Location(), "file://"), "data")
+			left := filepath.Join(data, overwriteDir+"00000000deadbeef")
+			conn, err := r.eng.Connect(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer conn.Close() //nolint:errcheck
+			if _, err := conn.ExecContext(ctx, "COPY (SELECT '"+person+"' AS email, 3 AS spend) TO "+quoteLiteral(left)+
+				" (FORMAT parquet, FILENAME_PATTERN 'part_{i}', FILE_SIZE_BYTES 1000000)", nil); err != nil {
+				t.Fatal(err)
+			}
+			if err := r.objects.NotePending(ctx, "public", catalog.NewPending(catalog.PendingFiles, left, "spenders")); err != nil {
+				t.Fatal(err)
+			}
+			catalog.Restarted()
+			holding := func() []string {
+				t.Helper()
+				dirs, _ := filepath.Glob(filepath.Join(data, overwriteDir+"*"))
+				var out []string
+				for _, dir := range dirs {
+					files, _ := filepath.Glob(filepath.Join(dir, "*.parquet"))
+					for _, f := range files {
+						if count(t, admin, "SELECT count(*) FROM read_parquet("+quoteLiteral(f)+") WHERE email = '"+person+"'") > 0 {
+							out = append(out, f)
+						}
+					}
+				}
+				return out
+			}
+			if n := len(holding()); n < 3 {
+				t.Fatalf("%d files of refreshes hold the person's rows: the test shows nothing", n)
+			}
+
+			cat, err := catalog.Open(ctx, vc.cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			store := erasure.NewMemoryStore()
+			views := &ViewRebuilder{}
+			views.Bind(r.srv)
+			svc := erasure.New(erasure.Options{Store: store, Catalog: cat, Policies: r.srv.gov.store.Load, Engine: r.eng, Jobs: sched,
+				Key: []byte("an erasure key of thirty-two bytes"), CatalogName: "lake", Schema: "public", Warehouse: vc.cfg.Storage.Location + "/",
+				Views: views, Purger: erasure.NewPurger(store, r.eng, erasure.MemoryCache+"replica", "replica", slog.New(slog.DiscardHandler))})
+			req, err := svc.Submit(ctx, "privacy", []erasure.Wanted{{Tag: "pii", Value: "email", Identifiers: []string{person}}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			var got *erasure.Request
+			// Kept, the old table's files hold the person's rows: the
+			// request waits for them at its purge step, past the views.
+			done := func(r *erasure.Request) bool {
+				return r.Status == erasure.StatusCompleted || !purges && r.Status == erasure.StatusWaiting && r.Step == erasure.StepPurge
+			}
+			for range 10 {
+				_ = svc.Run(ctx, req.ID)
+				if got, err = store.Get(ctx, req.ID); err != nil {
+					t.Fatal(err)
+				}
+				if done(got) {
+					break
+				}
+			}
+			switch {
+			case !done(got):
+				t.Fatalf("request: %s at %s: %s", got.Status, got.Step, got.Error)
+			case purges && (got.Verification == nil || got.Verification.Views != 0):
+				t.Errorf("verification %+v", got.Verification)
+			case purges && len(holding()) > 0:
+				t.Errorf("files of refreshes still hold the person's rows: %q", holding())
+			}
+			if files, _ := filepath.Glob(filepath.Join(left, "*")); len(files) > 0 {
+				t.Errorf("the stopped refresh's files are still there: %q", files)
+			}
+			notes, err := r.objects.PendingNotes(ctx, "public")
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, n := range notes {
+				if n.Kind == catalog.PendingFiles {
+					t.Errorf("a note of a refresh's files is left: %+v", n)
+				}
+			}
+			if n := count(t, admin, "SELECT count(*) FROM lake.public.spenders WHERE email = '"+person+"'"); n != 0 {
+				t.Errorf("the view holds %d of the person's rows", n)
+			}
+		})
 	}
 }

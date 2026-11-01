@@ -97,12 +97,17 @@ func namesTable(text, table string) bool {
 }
 
 // staleView reports whether j's table, or its state, has a snapshot from
-// before since: it may hold what rows erased since gave.
+// before since, or a full refresh of it from before then may have left
+// files (see clearRefreshFiles): they may hold what rows erased since
+// gave.
 func (s *Server) staleView(ctx context.Context, j tasks.Job, since time.Time) (bool, error) {
 	if s.ddl == nil {
 		return false, nil
 	}
 	schema, table, _ := strings.Cut(j.Name, ".")
+	if left, err := s.refreshFilesBefore(ctx, schema, table, since); err != nil || left {
+		return left, err
+	}
 	names := [][2]string{{schema, table}}
 	if st := decodeRefresh(j.Refresh); st.State != "" {
 		names = append(names, [2]string{refreshSchema, st.State})
@@ -247,6 +252,12 @@ func (s *Server) rebuildView(ctx context.Context, j tasks.Job) error {
 		written: []auth.Object{{Schema: schema, Table: table}}, stmtType: duckdb.STATEMENT_TYPE_CREATE})
 	if err != nil {
 		return err
+	}
+	// Files a stopped full refresh wrote under the old table's location,
+	// in none of its snapshots, which dropping it may not have taken. No
+	// refresh of the view runs while the request holds its lease.
+	if err := s.clearRefreshFiles(ctx, schema, table, true); err != nil {
+		return fmt.Errorf("delete the files a stopped refresh of it left: %w", err)
 	}
 	s.dropViewState(ctx, sess, j)
 	st := decodeRefresh(j.Refresh)

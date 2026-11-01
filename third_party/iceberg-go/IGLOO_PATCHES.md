@@ -132,6 +132,18 @@ One addition serves the erasure of a person's data (`internal/erasure`):
   manifests into every later snapshot. Java Iceberg has no such operation
   either; `RewriteManifests` comes closest.
 
+One serves materialized views' full refreshes (`internal/pgwire`, see
+`overwrite.go`):
+
+- `table/igloo_data_files.go` (new): `Transaction.DataFiles` returns the
+  data files of Parquet files another writer wrote, as `AddFiles` would add
+  them (schema checked, metrics from the footers), without committing
+  them. A full refresh writes the view's new rows with DuckDB's `COPY`, with
+  the table's field ids, and commits them with `ReplaceFiles` in one
+  snapshot that also removes every old data and delete file; `AddFiles`
+  and `ReplaceDataFiles` would take two snapshots or leave the delete
+  files.
+
 Two bound the memory that writing Arrow records to Parquet takes, which
 table maintenance (`internal/maintenance`, see `budget.go`) relies on to
 compact large tables within `IGLOO_MAINTENANCE_MEMORY`:

@@ -2296,6 +2296,20 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   (`EXCEPT ALL`). A table with a column named `filename` or
   `file_row_number`, which would hide DuckDB's columns of each row's file
   and position, refreshes in full.
+- A full refresh of a materialized view or dynamic table writes the view's
+  rows as new files and commits them in place of all of its table's files,
+  in one Iceberg commit, rather than deleting every row and inserting the
+  new ones: DuckDB wrote a position delete for each row deleted, so a full
+  refresh of 50 million rows took 23 s where `CREATE TABLE ... AS` of the
+  same rows took 0.58 s, and a count of the view took 5.9 s afterwards,
+  until compaction. It now takes 0.71 s. Readers see the old rows or the
+  new ones, on every replica and through the result cache, which the
+  commit invalidates once. A refresh that fails or is canceled deletes its
+  files; files a stopped one left go at the view's next refresh or an
+  erasure request's replacement of the view, and an erasure request does
+  not complete while any from before it may remain. Partitioned views and
+  views with columns of nested, fixed-length or nanosecond types are
+  written as before.
 - A `CREATE TABLE ... AS` of an aggregate that the memory watch stops while
   it fills its table runs the fill again, its groups a share at a time, as
   it does when DuckDB runs out of memory: the benchmark's copy of a

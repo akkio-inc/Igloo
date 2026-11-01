@@ -755,7 +755,7 @@ func (r *refresher) full(ctx context.Context, why string) (refreshResult, error)
 	p := r.plan
 	if p == nil || p.Reason != "" || r.snaps == nil || r.st.Mode == refreshFull {
 		// Nothing to go on from: the query as it is, and no state.
-		rows, err := r.write(ctx, "DELETE FROM "+r.qualified, "INSERT INTO "+r.qualified+" SELECT * FROM ("+r.query+") AS refresh")
+		rows, err := r.replaceRows(ctx, "SELECT * FROM ("+r.query+") AS refresh")
 		if err != nil {
 			return refreshResult{}, err
 		}
@@ -775,7 +775,7 @@ func (r *refresher) full(ctx context.Context, why string) (refreshResult, error)
 		if err != nil {
 			return refreshResult{}, err
 		}
-		rows, err := r.write(ctx, "DELETE FROM "+r.qualified, "INSERT INTO "+r.qualified+" SELECT * FROM ("+q+") AS refresh")
+		rows, err := r.replaceRows(ctx, "SELECT * FROM ("+q+") AS refresh")
 		if err != nil {
 			return refreshResult{}, err
 		}
@@ -795,7 +795,7 @@ func (r *refresher) full(ctx context.Context, why string) (refreshResult, error)
 		// The state cannot hold these values: the query as it is, until it
 		// changes.
 		r.st.Unkeepable, r.st.UnkeepableReason, r.st.Incremental, r.st.Reason = r.digest, reason, false, reason
-		rows, err := r.write(ctx, "DELETE FROM "+r.qualified, "INSERT INTO "+r.qualified+" SELECT * FROM ("+r.query+") AS refresh")
+		rows, err := r.replaceRows(ctx, "SELECT * FROM ("+r.query+") AS refresh")
 		if err != nil {
 			return refreshResult{}, err
 		}
@@ -813,7 +813,7 @@ func (r *refresher) full(ctx context.Context, why string) (refreshResult, error)
 	if err != nil {
 		return refreshResult{}, err
 	}
-	n, err := r.write(ctx, "DELETE FROM "+r.qualified, "INSERT INTO "+r.qualified+" "+final, "INSERT INTO "+state+" "+rows)
+	n, err := r.replaceRows(ctx, final, "INSERT INTO "+state+" "+rows)
 	if err != nil {
 		return refreshResult{}, err
 	}

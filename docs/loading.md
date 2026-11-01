@@ -387,10 +387,21 @@ new delete files name.
   full; `count(DISTINCT x)` needs integers from 0 to 4,294,967,295 and the
   `rb` extension, which Igloo's image has.
 - **Full refreshes** run the query over every row of its tables, and
-  rebuild the state. Igloo refreshes in full, and says why, when the query
-  has a shape the table above leaves out (a window function, a subquery,
-  `LIMIT`, `UNION`, a `WITH` clause, a view or a table of a connection, a
-  function such as `now()` or `random()`, an aggregate such as `median`);
+  rebuild the state. They write the view's rows as new files, which one
+  commit puts in its table in place of every file it had, so a full
+  refresh takes about what `CREATE TABLE ... AS` of the query does (50
+  million rows: 0.71 s against 0.58 s, where deleting the old rows and
+  inserting the new took 23 s and left reads of the view slow until
+  compaction), and readers, on every replica and through the result cache,
+  see the old rows or the new ones. A refresh that fails or is stopped
+  leaves the old rows (see [operations](operations.md)); a partitioned view,
+  or one with columns of nested, fixed-length or nanosecond types, is
+  written by deleting and inserting, in one transaction. Igloo refreshes
+  in full, and says why,
+  when the query has a shape the table above leaves out (a window
+  function, a subquery, `LIMIT`, `UNION`, a `WITH` clause, a view or a
+  table of a connection, a function such as `now()` or `random()`, an
+  aggregate such as `median`);
   when reading what changed would cost more than 80% of reading the
   tables whole (see the next item); when a table has a column named
   `filename` or `file_row_number`, DuckDB's names for each row's data

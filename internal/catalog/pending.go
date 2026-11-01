@@ -25,6 +25,10 @@ import (
 //   - PendingFill: a table Igloo made under a staging name to fill and then
 //     rename into place, as CREATE TABLE ... AS in steps does, which a stop
 //     leaves behind, visible, half filled.
+//   - PendingFiles: files a full refresh of a materialized view or dynamic
+//     table writes under its table's location, in a directory of their own
+//     (Name), before one commit puts them in the table (Target) in place
+//     of its files. A stop before the commit leaves them, in no snapshot.
 //
 // A note says which process of which host wrote it. A process knows its
 // own notes; one from an earlier process of the same host is dead, as is
@@ -32,6 +36,7 @@ import (
 const (
 	PendingStaged = "staged"
 	PendingFill   = "fill"
+	PendingFiles  = "files"
 
 	// pendingPrefix starts the names of the notes' properties.
 	pendingPrefix = "igloo.pending."
@@ -62,8 +67,9 @@ func Restarted() {
 type Pending struct {
 	// Key is the property's name.
 	Key string
-	// Kind is PendingStaged or PendingFill; Name the table's name; Target,
-	// for a fill, the name it is to be renamed to.
+	// Kind is PendingStaged, PendingFill or PendingFiles; Name the table's
+	// name, or the files' directory; Target, for a fill, the name it is to
+	// be renamed to, and for files, the table they are for.
 	Kind, Name, Target string
 	Host, Process      string
 	At                 time.Time
