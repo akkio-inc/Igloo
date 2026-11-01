@@ -548,6 +548,13 @@ type Server struct {
 	// writesRunning holds the notes' keys of this replica's statements whose
 	// workers write a table's files (see tableWrite).
 	writesRunning sync.Map
+	// lateWrites counts the statements that will look again for what their
+	// tasks still wrote, until lateWritesStop closes (see tableWrite.end);
+	// lateWritesWait, if set, is what they wait for instead of a while.
+	lateWrites     sync.WaitGroup
+	lateWritesStop chan struct{}
+	lateWritesWait func()
+	stopLateWrites sync.Once
 	// beforeWriteCommit, if set, runs before files workers wrote under dir
 	// are committed, and fails the commit with its error (see tableWrite).
 	beforeWriteCommit func(ctx context.Context, dir string) error
@@ -826,6 +833,7 @@ func New(engine Engine, opts Options, log *slog.Logger) (*Server, error) {
 		return nil, err
 	}
 	s.wire = srv
+	s.lateWritesStop = make(chan struct{})
 	return s, nil
 }
 
@@ -842,6 +850,8 @@ func (s *Server) Serve(l net.Listener) error {
 func (s *Server) Shutdown(ctx context.Context) error {
 	s.indexBuilds.stopped.Store(true)
 	err := s.wire.Shutdown(ctx)
+	s.stopLateWrites.Do(func() { close(s.lateWritesStop) })
+	s.lateWrites.Wait()
 	s.idDeferred.stop()
 	if s.analyzer != nil {
 		s.analyzer.close(ctx)

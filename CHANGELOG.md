@@ -678,8 +678,9 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   `IGLOO_WORKER_WRITES`). Before it commits, the replica checks that each file
   is under the attempt's directory, and reads its footer: rows, size and
   schema must be what the worker said. Only the winning attempt's files count,
-  a failed or canceled statement removes what it wrote, the table's next
-  write removes what a stopped process left, and erasure requests treat what is
+  a failed or canceled statement removes what it wrote, and looks again a minute
+  later for what its tasks finished meanwhile, the table's next write removes
+  what a stopped process left, and erasure requests treat what is
   left as the table's orphan files. A worker refused the write leaves it to
   the replica. Tables partitioned by bucket stay with the replica.
 - DuckDB's memory limit, where `IGLOO_DUCKDB_MEMORY_LIMIT` does not set it,

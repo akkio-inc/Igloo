@@ -61,6 +61,14 @@ type tableWrite struct {
 	committed, left bool
 }
 
+// noWorkerWrite logs why a fill, of what, takes a way before workers could
+// write its files.
+func (s *Server) noWorkerWrite(what, why string) {
+	if s.dist != nil {
+		s.log.Debug("workers will not write a table's files", "table", what, "why", why)
+	}
+}
+
 // tableWriter returns how workers would write the rows of a query with
 // columns src into schema.name, in the order of the table's columns, or
 // those of order if set, or nil where they cannot, as it logs: the current
@@ -266,34 +274,74 @@ func (w *tableWrite) begin(ctx context.Context) (*distributed.WriteTarget, error
 
 // end deletes what the statement's tasks wrote and no commit holds: all of
 // it, unless the statement committed, and then what lost attempts wrote, the
-// probe's file and files of no rows. It forgets the note, or leaves both
-// where a commit may hold the files and that cannot be told, for the table's
-// next write to tell.
+// probe's file and files of no rows. Tasks the statement no longer waits for
+// may still finish a file, so it looks again a while later (lateWritesAfter),
+// and only then forgets the note; a process that stops before that leaves the
+// note for the table's next write. It leaves both where a commit may hold the
+// files and that cannot be told, for the table's next write to tell.
 func (w *tableWrite) end(ctx context.Context) {
 	if w.dir == "" {
 		return
 	}
-	s, dir, note := w.s, w.dir, w.note
+	s, schema, name, tbl, dir, note, committed := w.s, w.schema, w.name, w.tbl, w.dir, w.note, w.committed
 	w.dir = ""
-	s.writesRunning.Delete(note.Key)
 	if w.left {
+		s.writesRunning.Delete(note.Key)
 		return
 	}
 	bg := context.WithoutCancel(ctx)
 	var keep []string
-	if w.committed {
+	if committed {
 		keep = w.kept
 	}
-	if err := s.deleteFilesExcept(bg, w.tbl, dir, keep); err != nil {
+	failed := func(err error) {
 		// What a commit holds stays, and the note says what to look at. Files
 		// no snapshot holds are orphans to the table's cleanup and to erasure.
 		s.log.Warn("could not delete the files a write did not commit; the table's next write or its orphan cleanup deletes them",
-			"table", w.schema+"."+w.name, "dir", dir, "err", err)
-		if !w.committed {
+			"table", schema+"."+name, "dir", dir, "err", err)
+	}
+	if err := s.deleteFilesExcept(bg, tbl, dir, keep); err != nil {
+		failed(err)
+		if !committed {
+			s.writesRunning.Delete(note.Key)
 			return
 		}
 	}
-	s.forgetRefreshFiles(bg, w.schema, note)
+	s.lateWrites.Add(1)
+	go func() {
+		defer s.lateWrites.Done()
+		defer s.writesRunning.Delete(note.Key)
+		if !s.waitLateWrites() {
+			return
+		}
+		if err := s.deleteFilesExcept(bg, tbl, dir, keep); err != nil {
+			failed(err)
+			if !committed {
+				return
+			}
+		}
+		s.forgetRefreshFiles(bg, schema, note)
+	}()
+}
+
+// lateWritesAfter is how long after a statement ended it looks for what its
+// tasks still wrote: a task canceled as it finishes a file ends in moments, and
+// one on a worker that seemed dead in about as long as the others took.
+const lateWritesAfter = time.Minute
+
+// waitLateWrites waits until it is time to look for them, and reports false if
+// the server stopped first.
+func (s *Server) waitLateWrites() bool {
+	if wait := s.lateWritesWait; wait != nil {
+		wait()
+		return true
+	}
+	select {
+	case <-time.After(lateWritesAfter):
+		return true
+	case <-s.lateWritesStop:
+		return false
+	}
 }
 
 // checkAdded compares the data files made from footers with what the

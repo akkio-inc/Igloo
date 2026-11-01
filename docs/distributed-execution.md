@@ -386,12 +386,12 @@ statement's rows are in the table when that commit is, or not at all.
   rather than risk its rows twice, and the table's next write tells.
 - **What goes.** When the statement ends, whatever it wrote that no commit
   holds goes: all of it if it failed or was canceled, otherwise what lost
-  attempts wrote. A note in the catalog, as for
+  attempts wrote; and a minute later it looks again, for what tasks it no longer
+  waited for finished meanwhile. A note in the catalog, as for
   [full refreshes](operations.md), says what a process that stopped left, for
   the table's next write, or the `CREATE TABLE ... AS` of its name, to delete;
-  files a worker still wrote after the statement ended are orphan files of the
-  table, for [maintenance](operations.md#table-maintenance) and erasure
-  requests. The partition
+  files a worker wrote later than that are orphan files of the table, for
+  [maintenance](operations.md#table-maintenance) and erasure requests. The partition
   directories are named by a hash, so no value of the table is in a path.
 - **Partitions.** Identity of booleans, integers, dates, timestamps and
   strings, truncate of integers and strings, and year, month, day and hour are

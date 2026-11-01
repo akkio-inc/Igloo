@@ -748,10 +748,10 @@ the warehouse under no table's location, which every request deletes
 Files workers [write for a table](distributed-execution.md#workers-writing-tables)
 are under its location, in directories of their statements. Those a commit
 holds are its data files, which a request searches and rewrites as any
-others. Those no commit holds are its orphan files: what a statement that
-failed leaves goes as it ends; what one that stopped, or a worker that wrote
-on after it ended, leaves is deleted at the table's next write or by the
-request, which waits for those that hold matching rows until they are old
+others. Those no commit holds are its orphan files: what a statement leaves
+goes as it ends, and what its tasks finish meanwhile a minute later; what one
+that stopped leaves, or a worker that wrote on past that, is deleted at the
+table's next write or by the request, which waits for those that hold matching rows until they are old
 enough to tell from a write in progress, and verifies they are gone before
 it completes. A fill during which a request deleted files does not commit
 what its tasks wrote. As with parts of multipart uploads a stopped process

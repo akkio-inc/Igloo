@@ -48,6 +48,8 @@ type writeFault struct {
 	// probe, if set, answers the probes as a worker refused them.
 	probe bool
 	wrote atomic.Int64
+	// busy counts the requests the worker has not answered yet.
+	busy atomic.Int64
 }
 
 type faultAction int
@@ -79,10 +81,18 @@ func (f *writeFault) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 	}
 	if writes && !isProbe && request != nil && request(task) == faultDrop {
 		// The worker goes on with it, and no one hears.
-		go f.forward(context.Background(), r, body) //nolint:errcheck
+		f.busy.Add(1)
+		go func() {
+			defer f.busy.Add(-1)
+			_, _, _ = f.forward(context.Background(), r, body)
+		}()
 		panic(http.ErrAbortHandler)
 	}
-	res, data, err := f.forward(r.Context(), r, body)
+	// A coordinator that stopped waiting does not stop this: what a task goes on
+	// to write is what a statement looks for after it ended.
+	f.busy.Add(1)
+	res, data, err := f.forward(context.WithoutCancel(r.Context()), r, body)
+	f.busy.Add(-1)
 	if err != nil {
 		panic(http.ErrAbortHandler)
 	}
@@ -227,6 +237,12 @@ func startWriteServerWith(t *testing.T, coordinate func(*distributed.Options), c
 	t.Cleanup(func() { env.co.Close() })
 	env.refreshEnv = startRefreshServerOn(t, fake, dir, uri, nil, append([]func(*Options){func(o *Options) { o.Distributed = env.co }}, configure...)...)
 	env.srv.log = writeLog()
+	// Rather than a while, until the workers have done what they were asked.
+	env.srv.lateWritesWait = func() {
+		for env.faults[0].busy.Load()+env.faults[1].busy.Load() > 0 {
+			time.Sleep(5 * time.Millisecond)
+		}
+	}
 	mustExec(t, env.admin, "SET distributed_execution = off")
 	mustExec(t, env.admin, "CREATE TABLE src AS SELECT i AS id, i % 7 AS g, i * 2 AS x, 'name-' || (i % 5) AS name, TIMESTAMP '2026-01-01' + INTERVAL 1 DAY * (i % 40) AS ts FROM range(10000) AS r(i)")
 	for n := 1; n < 4; n++ {
@@ -237,9 +253,11 @@ func startWriteServerWith(t *testing.T, coordinate func(*distributed.Options), c
 	return env
 }
 
-// location returns where table's files are.
+// location returns where table's files are, once statements have looked for
+// what their tasks still wrote.
 func (e *writeEnv) location(t *testing.T, table string) string {
 	t.Helper()
+	e.srv.lateWrites.Wait()
 	tbl, err := e.srv.ddl.LoadTable(context.Background(), "public", table)
 	if err != nil {
 		t.Fatal(err)
@@ -274,6 +292,7 @@ func written(t *testing.T, dir string) []string {
 // is left of the statement's, and that no note of them is left.
 func (e *writeEnv) checkWrote(t *testing.T, table string) {
 	t.Helper()
+	e.srv.lateWrites.Wait()
 	data, deletes := liveFiles(t, e.admin, table)
 	if len(data) == 0 || len(deletes) > 0 {
 		t.Errorf("%s has %d data files and %d delete files", table, len(data), len(deletes))
@@ -294,6 +313,7 @@ func (e *writeEnv) checkWrote(t *testing.T, table string) {
 
 func (e *writeEnv) checkNoNotes(t *testing.T) {
 	t.Helper()
+	e.srv.lateWrites.Wait()
 	if n := filesNotes(t, e.srv); len(n) != 0 {
 		t.Errorf("notes of files left: %+v", n)
 	}
@@ -569,6 +589,12 @@ func TestWorkersWriteRetry(t *testing.T) {
 		mustExec(t, admin, "CREATE TABLE w_goes_on AS SELECT id, x FROM src")
 		check(t, "w_goes_on", nil)
 		env.checkNoNotes(t)
+		data, _ := liveFiles(t, admin, "w_goes_on")
+		for _, f := range written(t, env.location(t, "w_goes_on")) {
+			if !slices.Contains(data, f) {
+				t.Errorf("what the worker went on to write is still there: %s", f)
+			}
+		}
 	})
 }
 
@@ -768,11 +794,6 @@ func TestWorkersWriteCanceled(t *testing.T) {
 			t.Error("no error")
 		}
 		admin = reconnect(t, env)
-		// A task the worker had begun ends in its time.
-		deadline := time.Now().Add(20 * time.Second)
-		for len(written(t, env.location(t, "w_cancel"))) > 0 && time.Now().Before(deadline) {
-			time.Sleep(50 * time.Millisecond)
-		}
 		unchanged(t)
 	})
 }
@@ -836,6 +857,7 @@ func TestWorkersWriteLeftovers(t *testing.T) {
 		}
 	}
 	mustExec(t, admin, "INSERT INTO w_left SELECT id, x FROM src WHERE g = 1")
+	env.srv.lateWrites.Wait()
 	if left := written(t, dir); len(left) != 0 {
 		t.Errorf("files a stopped statement left: %q", left)
 	}
@@ -1065,4 +1087,77 @@ func TestWorkersWriteOff(t *testing.T) {
 			t.Error("no credentials were made")
 		}
 	})
+}
+
+// TestWorkersWriteLate checks that a statement looks again for what its tasks
+// wrote after it ended, committed or not, keeps its note until then, and that
+// a server that stops first leaves the note for the table's next write.
+func TestWorkersWriteLate(t *testing.T) {
+	t.Parallel()
+	env := startWriteServer(t)
+	env.force(t)
+	admin := env.admin
+	var dir atomic.Pointer[string]
+	var fail atomic.Bool
+	env.srv.beforeWriteCommit = func(_ context.Context, d string) error {
+		dir.Store(&d)
+		if fail.Load() {
+			return errors.New("no commit")
+		}
+		return nil
+	}
+	mustExec(t, admin, "CREATE TABLE w_late (id BIGINT, x BIGINT)")
+	late := func(t *testing.T) string {
+		t.Helper()
+		p := filepath.Join(*dir.Load(), "q", "s9-9", "a0", "f", "part_0.parquet")
+		if err := os.MkdirAll(filepath.Dir(p), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte("late"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	for _, c := range []struct {
+		name   string
+		commit bool
+	}{{"committed", true}, {"not committed", false}} {
+		t.Run(c.name, func(t *testing.T) {
+			fail.Store(!c.commit)
+			defer fail.Store(false)
+			release := make(chan struct{})
+			env.srv.lateWritesWait = func() { <-release }
+			mustExec(t, admin, "INSERT INTO w_late SELECT id, x FROM src WHERE g = 1")
+			if notes := filesNotes(t, env.srv); len(notes) != 1 {
+				t.Errorf("notes while tasks may still write: %+v", notes)
+			}
+			p := late(t)
+			close(release)
+			env.srv.lateWrites.Wait()
+			if _, err := os.Stat(p); !errors.Is(err, os.ErrNotExist) {
+				t.Errorf("what a task wrote late is still there: %v", err)
+			}
+			data, _ := liveFiles(t, admin, "w_late")
+			if c.commit && !slices.ContainsFunc(data, func(f string) bool { return strings.HasPrefix(f, *dir.Load()+"/") }) {
+				t.Errorf("the committed files went: %q", data)
+			}
+			for _, f := range data {
+				if _, err := os.Stat(f); err != nil {
+					t.Errorf("a file of the table went: %v", err)
+				}
+			}
+			env.checkNoNotes(t)
+		})
+	}
+}
+
+// TestLateWritesStop checks that a server that stops does not wait a while for
+// a statement to look again: the note stays, for the table's next write.
+func TestLateWritesStop(t *testing.T) {
+	t.Parallel()
+	s := &Server{lateWritesStop: make(chan struct{})}
+	close(s.lateWritesStop)
+	if s.waitLateWrites() {
+		t.Error("it went on with the server stopped")
+	}
 }
