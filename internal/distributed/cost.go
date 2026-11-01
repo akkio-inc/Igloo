@@ -662,7 +662,8 @@ func levels(stages []*Stage) int {
 // exploreWithin times what it took on the other, nor on one machine where
 // its working set should spill (see spillOn), or, after a run on workers
 // far slower than one machine's estimate, where it is far beyond one
-// machine's memory.
+// machine's memory; nor does pick try the large worker where its working
+// set would spill there (see option.unproven).
 //
 // Statements running beside it on the replica (e.others) share its cores:
 // a statement takes 1 + e.others times as long there, up to shareCap + 1

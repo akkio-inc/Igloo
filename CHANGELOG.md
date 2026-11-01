@@ -612,6 +612,13 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   spilling 54 GB until the guard moved it after 145 s. Nor is a statement
   tried on the replica where its working set is four or more times its
   room, however much slower it ran on workers than the replica's estimate.
+- The large worker no longer runs a statement whose working set would
+  spill there before it ran there, while the small workers can run it: at
+  a hundred times the data, a report whose working set was 5.3 times the
+  large worker's room, estimated at 217 s there spilling 2.5 times as
+  long, ran past 1,800 s there, where 16 workers ran it in 729 s. The
+  choice's reason and `EXPLAIN DISTRIBUTED` name the large worker passed
+  over.
 - A heavy statement no longer takes the replica's cores from short ones
   where workers are configured, with nothing to set: auto mode weighs the
   replica's time at as many times as long as the statements running on it

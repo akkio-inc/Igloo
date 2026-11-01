@@ -398,16 +398,29 @@ func abs(n int) int {
 	return n
 }
 
+// unproven says o is the large worker, on which the statement's working
+// set would spill, past slightSpill times its room, and which it has not
+// run on. The spill curve holds for most reports and runs far short for
+// some: a report whose working set was estimated at 5.3 times the large
+// worker's room, 217 s there spilling 2.5 times as long, ran past 1,800 s
+// there, where 16 workers took 729 s; at ten times the data it spilled 11
+// times as long on one machine at 6.6 times its room. The small workers
+// share a working set over their partitions instead (see onFleet).
+func (o option) unproven() bool { return o.large && !o.measured && o.spill.factor > 1 }
+
 // pick chooses among opts, as corrected (see correct): of those that do not
-// run out of memory, the cheapest of those within fleetMargin of the
+// run out of memory, and not the large worker where it is unproven while
+// another would finish, the cheapest of those within fleetMargin of the
 // fastest, the one on fewer workers on a tie (costs within costTie); and
 // says why. No option faster than the one picked and cheaper by more than
 // costTie is passed over: it would be within the margin too. ok is false
 // when none would finish.
 func pick(opts []option, dollars bool) (best option, why string, ok bool) {
+	proven := slices.ContainsFunc(opts, func(o option) bool { return !o.spill.oom && !o.unproven() })
+	eligible := func(o option) bool { return !o.spill.oom && !(proven && o.unproven()) }
 	fastest := -1
 	for i, o := range opts {
-		if !o.spill.oom && (fastest < 0 || o.seconds < opts[fastest].seconds) {
+		if eligible(o) && (fastest < 0 || o.seconds < opts[fastest].seconds) {
 			fastest = i
 		}
 	}
@@ -417,7 +430,7 @@ func pick(opts []option, dollars bool) (best option, why string, ok bool) {
 	limit := opts[fastest].seconds * fleetMargin
 	chosen := fastest
 	for i, o := range opts {
-		if o.spill.oom || o.seconds > limit {
+		if !eligible(o) || o.seconds > limit {
 			continue
 		}
 		c := opts[chosen]
@@ -431,7 +444,7 @@ func pick(opts []option, dollars bool) (best option, why string, ok bool) {
 	// on any number of them.
 	cheapest := opts[chosen].cost
 	for i, o := range opts {
-		if !o.spill.oom && o.seconds <= limit && o.cost <= cheapest*(1+costTie) && o.workers < opts[chosen].workers {
+		if eligible(o) && o.seconds <= limit && o.cost <= cheapest*(1+costTie) && o.workers < opts[chosen].workers {
 			chosen = i
 		}
 	}
@@ -448,7 +461,7 @@ func pick(opts []option, dollars bool) (best option, why string, ok bool) {
 	case len(opts) == 1:
 	case chosen == fastest:
 		b.WriteString(", the fastest")
-		if next, ok := runnerUp(opts, chosen); ok && next.cost > best.cost {
+		if next, ok := runnerUp(opts, chosen, eligible); ok && next.cost > best.cost {
 			fmt.Fprintf(&b, ", for %s of the cost of %s", share(best.cost, next.cost), next)
 		}
 	default:
@@ -456,6 +469,12 @@ func pick(opts []option, dollars bool) (best option, why string, ok bool) {
 	}
 	if best.spill.factor > 1 {
 		fmt.Fprintf(&b, "; spilling, %.1f times as long", best.spill.factor)
+	}
+	// The large worker unproven, where it would have been weighed.
+	for _, o := range opts {
+		if !eligible(o) && !o.spill.oom && o.seconds <= limit {
+			fmt.Fprintf(&b, "; not %s, estimated at %.0f s spilling %.1f times as long, which it has not run on", o, o.seconds, o.spill.factor)
+		}
 	}
 	if !dollars && len(opts) > 1 {
 		b.WriteString(" (prices not set: by worker-seconds)")
@@ -494,12 +513,12 @@ func exploreFleet(opts []option, best option, r runs, now time.Time) (option, bo
 	return out, found
 }
 
-// runnerUp is the fastest option of opts but i that would finish.
-func runnerUp(opts []option, i int) (option, bool) {
+// runnerUp is the fastest option of opts but i that is eligible.
+func runnerUp(opts []option, i int, eligible func(option) bool) (option, bool) {
 	var out option
 	found := false
 	for j, o := range opts {
-		if j != i && !o.spill.oom && (!found || o.seconds < out.seconds) {
+		if j != i && eligible(o) && (!found || o.seconds < out.seconds) {
 			out, found = o, true
 		}
 	}
@@ -534,6 +553,8 @@ func describeOptions(opts []option, dollars bool) string {
 		switch {
 		case o.spill.oom:
 			s += ", runs out of memory"
+		case o.unproven():
+			s += fmt.Sprintf(", spills %.1fx, not run on", o.spill.factor)
 		case o.spill.factor > 1:
 			s += fmt.Sprintf(", spills %.1fx", o.spill.factor)
 		}

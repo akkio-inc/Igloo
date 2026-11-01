@@ -267,15 +267,72 @@ func TestFleetChoice(t *testing.T) {
 		t.Errorf("F4-like at 100x, all running: %d workers (%s)", e.workers, explain(e))
 	}
 	// F1-like at 100x spills on it, 1.5 times as long, 342 s against 16
-	// workers' 314 s: within a fifth, for 79% of their cost.
-	if e := decide(f1At100, withLarge, runs{}, false); !e.large || !strings.Contains(e.fleet, "within a fifth of the fastest, 16 workers") {
+	// workers' 314 s: not before it ran there (see option.unproven). Once
+	// it took 342 s there: within a fifth, for 79% of their cost.
+	if e := decide(f1At100, withLarge, runs{}, false); e.large || e.workers != 16 || !strings.Contains(e.fleet, "not the large worker") {
 		t.Errorf("F1-like at 100x with the large worker: large %v on %d (%s)", e.large, e.workers, explain(e))
+	}
+	if e := decide(f1At100, withLarge, runs{large: 342}, true); !e.large || !strings.Contains(e.fleet, "within a fifth of the fastest, 16 workers") {
+		t.Errorf("F1-like at 100x after 342 s on the large worker: large %v on %d (%s)", e.large, e.workers, explain(e))
 	}
 	// What it took on the large worker corrects the large worker alone:
 	// after 900 s there and 700 s on 16 workers, the fleet.
 	r = runs{large: 900, dist: 700, distWorkers: 16, fleets: map[int]float64{fleetBucket(16): 700}}
 	if e := decide(f4At100, withLarge, r, true); e.large || e.workers < 8 {
 		t.Errorf("F4-like at 100x after 900 s on the large worker and 700 s on 16: large %v on %d (%s)", e.large, e.workers, explain(e))
+	}
+}
+
+// TestUnprovenLarge checks that the large worker does not run a statement
+// whose working set would spill there before it ran there, while the small
+// workers can: F3-like at a hundred times the data, its working set 1.6 TB
+// by its plan, 5.3 times the large worker's room, was estimated at 217 s
+// there, spilling 2.5 times as long, against 1,536 s on 16 workers, which
+// it had taken; it ran past 1,800 s there, and 16 workers ran it in 729 s.
+func TestUnprovenLarge(t *testing.T) {
+	now := time.Now()
+	f3 := features{bytes: 6.81e10, exchanged: 6.81e10, held: 6.81e10, rows: 1.259e11, levels: 7, stages: 35,
+		planned: true, planSet: 1.585e12, planBytes: 6.75e10, planWork: 1791}
+	// The large worker as it ran: 197 DuckDB threads, a limit of 425 GB.
+	l := scaleLarge
+	l.threads, l.memory, l.running = 197, 424_987_013_939, true
+	f := scaleWorkers
+	f.large = &l
+	decide := func(f fleet, r runs, found bool) estimate {
+		t.Helper()
+		e := f3.estimate(scaleCoordinator, f)
+		if found {
+			e.pick(r, f)
+		}
+		return e
+	}
+	explain := func(e estimate) string { return e.fleet + "; " + describeOptions(e.options, e.dollars) }
+	r := runs{dist: 1536, distWorkers: 16, fleets: map[int]float64{fleetBucket(16): 1536}, explored: now}
+	e := decide(f, r, true)
+	large := e.options[len(e.options)-1]
+	if !large.large || large.spill.factor < 2.4 || large.spill.factor > 2.6 || math.Abs(large.seconds-217) > 25 {
+		t.Fatalf("the large worker: %s %.0f s, %s", large, large.seconds, large.spill)
+	}
+	if e.large || e.workers != 16 || !strings.Contains(e.fleet, "not the large worker, estimated at") ||
+		!strings.Contains(describeOptions(e.options, true), "spills 2.5x, not run on") {
+		t.Errorf("after 1,536 s on 16 workers: large %v on %d (%s)", e.large, e.workers, explain(e))
+	}
+	if workers, _, reason := choose(e, r, true, DefaultThreshold, now); !workers || e.large {
+		t.Errorf("after 1,536 s on 16 workers: workers %v (%s)", workers, reason)
+	}
+	// Nor the first time.
+	if e := decide(f, runs{}, false); e.large || e.workers == 0 {
+		t.Errorf("first: large %v on %d (%s)", e.large, e.workers, explain(e))
+	}
+	// Once it ran there, what it took stands.
+	r.large = 900
+	if e := decide(f, r, true); !e.large {
+		t.Errorf("after 900 s on the large worker: large %v on %d (%s)", e.large, e.workers, explain(e))
+	}
+	// Without small workers, the large worker is the way on workers.
+	alone := fleet{large: &l, replicaPrice: 0.8542, replicaCores: 16}
+	if e := decide(alone, runs{}, false); !e.large || e.workers != 1 {
+		t.Errorf("the large worker alone: large %v on %d (%s)", e.large, e.workers, explain(e))
 	}
 }
 

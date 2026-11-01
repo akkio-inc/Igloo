@@ -1130,7 +1130,15 @@ alone. Its estimate is one machine's of its cores and memory, spilling as
 the statement's working set says (see [when](#when)), plus a statement's
 start, 2 seconds a level of its stages, its exchanges staying on its own
 disk, and its own start if it is stopped; a statement that would run out
-of memory there is never run there. Auto mode runs a statement there when
+of memory there is never run there, and one whose working set would spill
+there, past half again its room, runs there only once it ran there, or
+where the small workers cannot run it: the spill curve holds for most
+reports but runs far short for some, and at a hundred times the data a
+report whose working set was 5.3 times the large worker's room, estimated
+at 217 s there, spilling 2.5 times as long, ran past 1,800 s there, where
+16 workers ran it in 729 s (at ten times the data it spilled 11 times as
+long on one machine). The small workers share a working set over their
+partitions instead. Auto mode runs a statement there when
 that estimate is within a fifth of the fastest way and the cheapest of
 those, at the prices the pool gives (see [when](#when)): at a hundred
 times the data, a report whose stages read 49 GB and fed 296 GB of working
