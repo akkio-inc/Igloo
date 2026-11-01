@@ -219,7 +219,7 @@ func NewWorker(opts WorkerOptions, log *slog.Logger) (*Worker, error) {
 	w.slots = semaphore.NewWeighted(int64(w.slotCount))
 	// What its read cache on disk says it was purged through, unless that has
 	// not come yet, which it says only if it was told so: it purges again.
-	if through := opts.Erasure.Through; !through.IsZero() && !through.After(time.Now()) {
+	if through := opts.Erasure.Through; !through.IsZero() && !through.After(opts.Erasure.now()) {
 		w.purged.Store(through.UnixNano())
 		w.admitted.Store(through.UnixNano())
 	}

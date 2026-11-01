@@ -114,6 +114,9 @@ type Options struct {
 	// MemoryBytes is the coordinator's DuckDB memory limit, for estimating
 	// whether a statement fits it (see choose); zero for unknown.
 	MemoryBytes int64
+	// ErasureNow, if set, stands for the clock in what erasure requests say, in
+	// tests (see WorkerErasure.Now).
+	ErasureNow func() time.Time
 	// NoWorkerWrites keeps workers from writing tables' files: the
 	// coordinator writes every table (IGLOO_WORKER_WRITES=off).
 	NoWorkerWrites bool

@@ -466,11 +466,12 @@ func TestFarFutureErasure(t *testing.T) {
 	})
 
 	t.Run("what a status says", func(t *testing.T) {
-		if got := purgedThrough(far.UnixNano()); got != 0 {
+		h := &Coordinator{}
+		if got := h.purgedThrough(far.UnixNano()); got != 0 {
 			t.Errorf("believed a worker purged through %d", got)
 		}
 		soon := time.Now().Add(time.Second).UnixNano()
-		if got := purgedThrough(soon); got != soon {
+		if got := h.purgedThrough(soon); got != soon {
 			t.Errorf("did not allow for a clock ahead: %d", got)
 		}
 	})
