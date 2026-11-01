@@ -420,10 +420,11 @@ Connector/C, the MySQL client library, in the `mysql` extension.
 - **Distribution covers the common big shapes.** A query over a very large
   table runs in parts on [workers](docs/distributed-execution.md) when it
   scans, filters, aggregates, ranks and joins it to other tables. A large
-  table read again in a correlated subquery, large tables joined on different
-  keys in one `SELECT`, aggregates that do not combine (`median`, `string_agg`)
-  and windows over all rows still run on one replica; give it a large
-  memory-optimized machine and fast spill disk for those.
+  table read again in a correlated subquery that is not the join it means
+  (`NOT IN`, a correlation by anything but equal columns), large tables joined
+  on different keys in one `SELECT`, aggregates that do not combine (`median`,
+  `string_agg`) and windows over all rows still run on one replica; give it a
+  large memory-optimized machine and fast spill disk for those.
 - **Grants stop at tables.** Views run with the querying user's privileges,
   and there are no column privileges: use masking policies instead. Table
   and column names are visible to every user through the system catalogs
