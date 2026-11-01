@@ -547,6 +547,12 @@ result's columns must match the prepared statement's, or it falls back.
   of literals, no table by name. The planner never distributes a part that reads another table
   function, a temporary table, a connection's table or an external table,
   or a view that reads one.
+- **Workers write only exchanges and their tasks' directories.** A fill's
+  tasks may write its table's files in a directory of each attempt, with
+  credentials for it alone where the store can make them; the coordinator
+  checks each file's path, reads its footer and commits it itself, so a worker
+  never touches the catalog, and no file of its choosing is committed (see
+  [workers writing tables](../distributed-execution.md#workers-writing-tables)).
 - **No new endpoint is open.** Workers accept tasks only over TLS 1.3 with a
   client certificate whose key is derived (HKDF-SHA256, Ed25519) from
   `IGLOO_WORKER_SECRET`, and coordinators accept results only from servers

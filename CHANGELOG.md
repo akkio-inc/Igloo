@@ -664,6 +664,25 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   history and the fallbacks work as for reads, a fill whose workers run
   out of memory goes on in passes, and a fill from a table with masking
   or row access policies stays on the replica.
+- Workers write tables: where the tasks of such a fill hold its rows, as a
+  copy's do, each writes its own as Parquet with the table's field IDs and
+  partitions, under a directory of the statement's under the table's
+  location, and the replica commits them all in one Iceberg commit, without
+  fetching a row, so auto mode runs a copy where workers write it faster.
+  Credentials limited to a task's directory, with no right to delete, for an
+  hour (STS on S3, `IGLOO_S3_STS_ROLE_ARN`), or on Google Cloud and Azure an
+  identity that can only create files in directories of that name; the Helm
+  chart's `workers.serviceAccount` and the OpenTofu modules now give workers
+  an identity of their own, without write access to tables, and the chart
+  turns worker writes on only then (`workers.writes`,
+  `IGLOO_WORKER_WRITES`). Before it commits, the replica checks that each file
+  is under the attempt's directory, and reads its footer: rows, size and
+  schema must be what the worker said. Only the winning attempt's files count,
+  a failed or canceled statement removes what it wrote, and looks again a minute
+  later for what its tasks finished meanwhile, the table's next write removes
+  what a stopped process left, and erasure requests treat what is
+  left as the table's orphan files. A worker refused the write leaves it to
+  the replica. Tables partitioned by bucket stay with the replica.
 - DuckDB's memory limit, where `IGLOO_DUCKDB_MEMORY_LIMIT` does not set it,
   is what Igloo's memory leaves after the eighth it keeps free before it
   lowers DuckDB's limit, its reserve and an eighth of the limit itself,

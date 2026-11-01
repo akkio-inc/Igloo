@@ -190,7 +190,7 @@ storage type. It is required whenever `IGLOO_CATALOG_URI` is set.
 | `IGLOO_S3_URL_STYLE` | `vhost` | `path` for most self-hosted stores |
 | `IGLOO_S3_USE_SSL` | `true` | |
 | `IGLOO_S3_ACCESS_KEY_ID`, `IGLOO_S3_SECRET_ACCESS_KEY` | | Static keys. Empty uses the AWS credential chain (IAM roles for service accounts, instance profiles, environment): Igloo fetches credentials from it once for the process, and again in the background ahead of their expiry, so statements never wait on the instance metadata service; DuckDB fetches its own, again when a request finds them expired. |
-| `IGLOO_S3_STS_ROLE_ARN` | | IAM role Igloo assumes to hand [other engines](external-engines.md#amazon-s3) credentials limited to one table. Without it, engines on AWS get table metadata but no storage credentials. S3-compatible stores need none: Igloo calls STS on `IGLOO_S3_ENDPOINT` with its own keys. |
+| `IGLOO_S3_STS_ROLE_ARN` | | IAM role Igloo assumes to hand [other engines](external-engines.md#amazon-s3) credentials limited to one table. Without it, engines on AWS get table metadata but no storage credentials. S3-compatible stores need none: Igloo calls STS on `IGLOO_S3_ENDPOINT` with its own keys. Igloo also makes with it the credentials [workers write tables' files](distributed-execution.md#workers-writing-tables) with, limited to a task's directory. |
 
 With static keys, the catalog uses the same keys. Without them it uses its own
 AWS identity; run Lakekeeper with `LAKEKEEPER__ENABLE_AWS_SYSTEM_CREDENTIALS=true`
@@ -279,6 +279,7 @@ to deploy workers. On the Igloo server:
 | `IGLOO_WORKER_START_TIMEOUT` | `3m` | How long a statement waits for workers to start before running on the server |
 | `IGLOO_WORKER_THRESHOLD` | `1m` | In `auto` mode, how long a statement must take on the server alone, by its estimate or its last run there, before it may run on workers (unless it would run short of memory), and then only if workers are estimated, or were measured, to be faster |
 | `IGLOO_EXCHANGES` | `auto` | Where workers write the rows they exchange between a statement's stages: `auto`, their own disks (`IGLOO_DUCKDB_TEMP_DIR`), from which the workers that read them fetch them, when every worker of the statement reports at least 1 GiB of room there and runs outside Kubernetes, and the warehouse's object storage otherwise; `object`, always object storage; or `local`, always their disks (see [exchanges on workers' disks](distributed-execution.md#exchanges-on-workers-disks)). A worker whose disk is short of room writes to object storage instead |
+| `IGLOO_WORKER_WRITES` | `on` | Whether workers [write tables' files](distributed-execution.md#workers-writing-tables) for statements that fill a table from a query, with credentials limited to a task's directory where `IGLOO_S3_STS_ROLE_ARN` or an S3-compatible store's STS can make them, and otherwise with their own identity, as far as it reaches; `off`, or a worker refused, and the server writes them from their results |
 | `IGLOO_WORKER_K8S_DEPLOYMENT`, `IGLOO_WORKER_K8S_NAMESPACE` | | `kubernetes`: the workers' Deployment, and its namespace if not Igloo's |
 | `IGLOO_WORKER_EC2_INSTANCE_IDS` | | `ec2`: the workers' instances, comma separated |
 | `IGLOO_WORKER_START_COMMAND`, `IGLOO_WORKER_STOP_COMMAND` | | `command`: shell commands that start and stop every worker |

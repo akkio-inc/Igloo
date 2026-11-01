@@ -363,8 +363,12 @@ A statement that fills a table from a query runs the query where auto mode
 would run it as a read, by the same estimates, history, grants and
 policies: `CREATE TABLE ... AS` (dbt's table models' `create table ... as
 (...)` too), `CREATE OR REPLACE TABLE ... AS`, `INSERT INTO ... SELECT`, and
-a materialized view's or dynamic table's full refresh. The coordinator
-commits the result to the table. A `count(DISTINCT)` of a
+a materialized view's or dynamic table's full refresh. Where the tasks of
+its last stage hold the rows of its result, each its own, as a copy's and a
+filter's do, [they write the table's files](#workers-writing-tables), and
+the coordinator commits them. Otherwise the coordinator writes the table
+from the workers' results, `INSERT INTO` the table the SQL that combines
+them, as it sends a read's client what it combines. A `count(DISTINCT)` of a
 billion IDs by day and group into a table, which held the replica at its
 memory limit until the memory watch canceled it, sends the replica a
 thousand rows to write.
@@ -372,8 +376,13 @@ thousand rows to write.
 Auto mode counts a fill's writing on each side: about the share of the bytes
 the query reads that its rows are of the rows its scans read, by DuckDB's
 plan (an aggregate's result is taken for a hundredth of its rows at most, as
-DuckDB takes its groups for all of them). So a fill runs on workers only where
-they are faster by the margin auto mode asks of any statement.
+DuckDB takes its groups for all of them), written at 3.75 MB of files a
+second a core of whichever writes them, the replica's or, where tasks write
+them, the workers', with what a coordinator that writes them fetches from
+the workers at 400 MB/s. So a copy workers write runs there where they are
+faster, and one the coordinator would write takes about as long either way
+and stays on the replica unless workers are faster still by the margin auto
+mode asks of any statement.
 Fills keep their own history, apart from reads of the same query. A fill
 auto mode runs on the replica is guarded as a read is (see [when](#when)):
 past its time, or once it runs out of memory there, its query runs on
@@ -385,6 +394,55 @@ stays on the replica, as reads of it do. `query_history.placement` says
 where the fill's query ran, and a refresh's detail says so where it ran
 on workers. Fills of tables of member columns of ID domains, sorted
 writes and fills in a transaction block run on the replica, as before.
+
+### Workers writing tables
+
+Each task of a fill's last stage writes its rows as Parquet, with the table's
+field IDs and partitions, and says which files it wrote. The coordinator
+reads each file's footer and commits them all in one Iceberg commit, an
+append, or for a full refresh one that replaces the table's files. The
+statement's rows are in the table when that commit is, or not at all.
+
+- **Where.** Under one directory of the statement's under the table's
+  location, `data/igloo-write-<random>/`, and in it one for its query, for
+  each task and for each attempt of a task. Committed files stay there.
+- **Retries.** A worker that dies or does not answer has its task run again
+  elsewhere, in a directory of its own. Only files of the attempt the
+  coordinator heard from are committed, so rows are not lost or written twice.
+  A commit another commit got ahead of goes again on the new snapshot, with
+  the files as read. One whose answer was lost is read back: if the table
+  holds its files, it was made; if that cannot be told, the statement fails
+  rather than risk its rows twice, and the table's next write tells.
+- **What goes.** When the statement ends, whatever it wrote that no commit
+  holds goes: all of it if it failed or was canceled, otherwise what lost
+  attempts wrote; and a minute later it looks again, for what tasks it no longer
+  waited for finished meanwhile. A note in the catalog, as for
+  [full refreshes](operations.md), says what a process that stopped left, for
+  the table's next write, or the `CREATE TABLE ... AS` of its name, to delete;
+  files a worker wrote later than that are orphan files of the table, for
+  [maintenance](operations.md#table-maintenance) and erasure requests. The partition
+  directories are named by a hash, so no value of the table is in a path.
+- **Partitions.** Identity of booleans, integers, dates, timestamps and
+  strings, truncate of integers and strings, and year, month, day and hour are
+  written by workers, one file per partition per task until compaction merges
+  them. So a table of many partitions gets many small files at first.
+- **On the coordinator's way instead**, as the log says at debug level: tables
+  partitioned by bucket, or identity of decimals, whose partition values
+  cannot be read from a file's bounds or written to its manifest; tables with
+  an Iceberg sort order (Igloo keeps [its own as a property](sql.md));
+  nested, fixed, nanosecond and format-version-1 columns; a query that sorts,
+  limits or groups in its last step; a fill estimated at less than 256 MiB in
+  auto mode, which would make small files; `INSERT ... BY NAME`, and an
+  `INSERT` without every column of the table; a partitioned view's refresh.
+  So do fills of ID domains' member tables, sorted writes and fills in a
+  transaction block, on the replica, and fills from tables with policies. A
+  commit that fails after workers wrote runs the fill on the replica, unless
+  the commit may have been made.
+
+An erasure request that deleted files since the fill began discards what its
+tasks wrote, and the fill runs on the replica, reading the tables as they are
+then; tasks of statements from before a deletion are refused and canceled as
+for reads ([Erasure requests](#erasure-requests)).
 
 ### Window functions
 
@@ -956,6 +1014,33 @@ give the workers more memory.
   `IGLOO_EXCHANGES=auto`), or with `IGLOO_EXCHANGES=local`, they are instead
   files on the workers' disks, which workers send each other over the task
   port: see [exchanges on workers' disks](#exchanges-on-workers-disks).
+- **Workers write only a statement's directory.** A worker refuses a task
+  that writes anywhere but a directory named `igloo-write-<hex>` in the
+  warehouse or `IGLOO_ALLOWED_LOCATIONS`. Where the coordinator can make
+  credentials limited to it (S3 with `IGLOO_S3_STS_ROLE_ARN`, and S3-compatible
+  stores whose STS honors session policies, which Igloo checks first), each
+  attempt of a task carries its own: its own directory, read and write, no
+  delete, an hour at most, and its DuckDB uses them for that directory alone.
+  The workers' own identity then needs no write access to tables at all, and
+  the OpenTofu module for AWS gives it none. Google Cloud and Azure have nothing
+  DuckDB could use of the kind: their modules give workers an identity that
+  can only create files under `_igloo_shuffle/` and directories of that name
+  under tables' locations, and delete none. A worker told no gets the
+  statement planned again, the coordinator writing the table
+  (`IGLOO_WORKER_WRITES=off` always does), and no worker is asked for ten
+  minutes.
+- **A worker's word is not taken.** Before it commits a file, the coordinator
+  checks that the attempt's answer names it under the directory it gave that
+  attempt, plainly (no `..`, no escapes, no query), and adds up to the rows
+  it says; then it reads the footer itself, with its own credentials, so the
+  file must exist, match the table's schema by field ID, and hold the rows and
+  bytes the worker said. The data file committed is made from what it read.
+  Any mismatch commits nothing of the statement, which then runs on the
+  replica, and logs an error. A compromised worker can put wrong rows in a
+  table it is writing, as it can return wrong rows to any read, and until its
+  credentials expire it can overwrite the files of its own attempt, committed
+  ones too; but it cannot get a file outside its directory committed, nor
+  write outside it with those credentials.
 - **Pools are kept apart by secret and network.** Each compute pool's
   workers have a secret of their own (the Helm chart generates one per
   pool), so one pool's igloo pods cannot use another's workers; the
@@ -1147,8 +1232,15 @@ ideally, a disk for the [read cache](operations.md#read-cache). They need no
 catalog, database or users.
 
 Their object storage identity needs to read the warehouse and to write
-`_igloo_shuffle/` in it. Give it no more than that, and do not share the
-server's.
+`_igloo_shuffle/` in it. To [write tables' files](#workers-writing-tables), set
+`IGLOO_S3_STS_ROLE_ARN` on the server (on AWS; the role must be able to write
+the warehouse, and the server to assume it), or otherwise let the identity
+create objects in directories named `igloo-write-*` under tables' locations
+(`arn:aws:s3:::BUCKET/warehouse/*/data/igloo-write-*/*`). Give it no more than
+that, and do not share the server's: without one or the other, a worker is
+refused, and the coordinator writes the table. With the server's own
+identity, workers can write the whole warehouse, whatever they are asked; the
+Helm chart turns worker writes off then unless `workers.writes` says otherwise.
 
 ### Lifecycle rule
 
@@ -1342,6 +1434,7 @@ On the Igloo server:
 | `IGLOO_WORKER_START_TIMEOUT` | `3m` | How long a statement waits for workers to start before it runs on the server instead |
 | `IGLOO_WORKER_THRESHOLD` | `1m` | In `auto` mode, how long a statement must take on the server alone before it may run on workers (see [when](#when)) |
 | `IGLOO_EXCHANGES` | `auto` | Where workers exchange rows: `auto`, their disks where every worker has room and runs outside Kubernetes, object storage otherwise; `object` storage; or `local` disks (see [exchanges on workers' disks](#exchanges-on-workers-disks)) |
+| `IGLOO_WORKER_WRITES` | `on` | Whether workers [write tables' files](#workers-writing-tables) for statements that fill a table from a query; `off`: the coordinator writes them from their results |
 | `IGLOO_WORKER_K8S_DEPLOYMENT`, `IGLOO_WORKER_K8S_NAMESPACE` | | `kubernetes`: the workers' Deployment, and its namespace if not the server's |
 | `IGLOO_WORKER_EC2_INSTANCE_IDS` | | `ec2`: the workers' instances |
 | `IGLOO_WORKER_START_COMMAND`, `IGLOO_WORKER_STOP_COMMAND` | | `command`: shell commands that start and stop all workers |

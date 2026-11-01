@@ -244,6 +244,12 @@ class](https://cloud.google.com/kubernetes-engine/docs/concepts/about-custom-com
 `igloo-workers`, and the chart's worker pods select it
 (`cloud.google.com/compute-class: igloo-workers`):
 
+Workers have a Google service account and HMAC key of their own: they read the
+warehouse, and may only create objects under `_igloo_shuffle/` and in
+statements' directories (`igloo-write-*` under a table's `data/`), by an IAM
+Condition, with no overwrite or delete, as they
+[write tables' files](../../docs/distributed-execution.md#workers-writing-tables).
+
 ```yaml
 apiVersion: cloud.google.com/v1
 kind: ComputeClass
