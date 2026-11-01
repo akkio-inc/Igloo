@@ -22,11 +22,11 @@ the choices behind it and the measurements.
                                                     object storage (S3, GCS, ADLS)
 ```
 
-## Heavy reports finish in under 10 minutes at 25 billion rows
+## Heavy reports finish in under 10 minutes, on up to 19 billion rows
 
-Two heavy reports ran on about 25 billion rows of synthetic data in Amazon S3.
-Both join, unnest and compute window aggregates. Igloo chose by itself to run
-them on its 16 workers.
+Two heavy reports ran on synthetic tables that total about 25 billion rows, in
+Amazon S3. Both join, unnest and compute window aggregates. Igloo chose by
+itself to run them on its 16 workers.
 
 | Rows in the tables it reads | Time | Cost |
 |---|---|---|
