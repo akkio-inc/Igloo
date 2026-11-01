@@ -196,6 +196,10 @@ func runWith(t *testing.T, f *fixture, co *distributed.Coordinator, ledger distr
 // the request completes. A worker deregistered is no longer waited for.
 func TestRequestPurgesWorkers(t *testing.T) {
 	f := newFixture(t)
+	// The request's clock, which run moves on, stays behind the workers': they
+	// purge through no later than their now.
+	past := time.Now().Add(-2 * time.Hour)
+	f.svc.now = func() time.Time { return past }
 	alerts := f.alerts()
 	f.people("crm.people", [][]any{ann, subject, carl})
 	f.tag(policy.ColumnTag{Schema: "crm", Table: "people", Column: "email", Value: "email"})
