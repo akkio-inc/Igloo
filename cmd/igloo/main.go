@@ -76,6 +76,11 @@ const (
 	// for its tasks.
 	spotPoll   = 5 * time.Second
 	spotMargin = 10 * time.Second
+	// drainTimeout is how long a worker a signal stops finishes its tasks
+	// and serves the exchange files on its disk (see distributed's
+	// Worker.Drain): what a Spot Instance's two-minute interruption notice
+	// leaves it, as when a Spot node is drained before it is reclaimed.
+	drainTimeout = 2*time.Minute - spotMargin
 	// peakSampleEvery is how often the workload controller reads what
 	// DuckDB holds for running statements; a statement shorter than that
 	// may fall between two reads, and is learned by what it allocated.

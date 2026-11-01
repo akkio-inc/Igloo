@@ -1380,16 +1380,21 @@ statements, which a reclaimed Spot node would end.
 
 AWS says two minutes ahead that it is taking a Spot Instance back; a
 worker on EC2 watches for that (instance metadata, IMDSv2), and from then
-on takes no more tasks, which coordinators send to other workers, and
-finishes those it runs until ten seconds before the time AWS gave. A worker
+on takes no more tasks, which coordinators send to other workers,
+finishes those it runs, and serves the exchange files on its disk until
+the statements that read them end, until ten seconds before the time AWS
+gave: the statements run on, rather than run again the parts whose files
+it holds, as for a worker lost. A worker stopped by a signal
+(SIGTERM) does the same for up to 110 seconds, and one with nothing
+running and no files stops at once. A worker
 in a container reaches the metadata service only with host networking or
 the instance's hop limit at 2 (`HttpPutResponseHopLimit`); without it, it
 logs that it is not watching, and a Spot Instance taken back fails its
 tasks over as a lost worker's. The AWS module's node groups keep the hop
 limit at 1, so pods cannot take the node's credentials, and rely on EKS
 draining the node. On Kubernetes, where a Spot node is drained first, a stopping
-worker finishes its tasks for up to 30 seconds, within the pod's grace
-period (`workers.terminationGracePeriodSeconds`, 45 by default). Ask for
+worker so drains for up to 110 seconds, within the pod's grace period
+(`workers.terminationGracePeriodSeconds`, 125 by default). Ask for
 several instance types and zones, so that capacity one lacks another has.
 
 ## Limitations

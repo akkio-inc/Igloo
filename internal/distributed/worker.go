@@ -120,6 +120,9 @@ type Worker struct {
 	// retiring says a coordinator retired the worker: it takes no more
 	// tasks and is not ready, so that it is stopped alone (see Retiring).
 	retiring atomic.Bool
+	// draining says it is stopping (see Drain): it takes no more tasks,
+	// and says it is retiring, whatever a coordinator asks.
+	draining atomic.Bool
 
 	// slots bound the tasks that run at once (see taskSlots), of which a
 	// task takes one or more (taskRequest.Slots), and slotCount is how
@@ -256,13 +259,50 @@ func (w *Worker) Shutdown(ctx context.Context) error {
 	return w.srv.Shutdown(ctx)
 }
 
+// drainCheck is how often Drain checks what the worker still runs and
+// holds; a variable for tests.
+var drainCheck = 250 * time.Millisecond
+
+// Drain readies the worker to stop, as on a SIGTERM or a Spot Instance's
+// interruption notice: it takes no more tasks, which coordinators run on
+// other workers, finishes those it runs, and serves the exchange files on
+// its disk until the statements that read them remove them, as they do
+// when they end, or ctx ends. Shutdown then stops it. A worker that
+// stopped serving its files at once left readers of them nothing but to
+// run the parts that wrote them again, as if it had been lost. It returns
+// ctx's error if ctx ended first.
+func (w *Worker) Drain(ctx context.Context) error {
+	w.draining.Store(true)
+	t := time.NewTicker(drainCheck)
+	defer t.Stop()
+	logged := false
+	for {
+		tasks, _ := w.activity.Snapshot()
+		statements := w.local.statements()
+		if tasks == 0 && statements == 0 {
+			return nil
+		}
+		if !logged {
+			w.log.Info("stopping once the tasks running end and the statements reading this worker's exchange files remove them",
+				"tasks", tasks, "statements", statements)
+			logged = true
+		}
+		select {
+		case <-ctx.Done():
+			w.log.Warn("stopping with tasks running or exchange files that statements may still read", "tasks", tasks, "statements", statements)
+			return ctx.Err()
+		case <-t.C:
+		}
+	}
+}
+
 func (w *Worker) serveStatus(rw http.ResponseWriter, _ *http.Request) {
 	w.hear()
 	running, idle := w.activity.Snapshot()
 	rw.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(rw).Encode(workerStatus{
 		ID: w.opts.ID, Version: w.opts.Version, Cores: w.opts.Cores, MemoryBytes: w.opts.MemoryBytes, Threads: w.opts.Threads, Slots: w.slotCount,
-		InstanceType: w.opts.InstanceType, Region: w.opts.Region, Spot: w.opts.Spot, Instance: w.opts.Instance, Retiring: w.retiring.Load(),
+		InstanceType: w.opts.InstanceType, Region: w.opts.Region, Spot: w.opts.Spot, Instance: w.opts.Instance, Retiring: w.retiring.Load() || w.draining.Load(),
 		Boot:    w.boot,
 		Running: int(running), IdleSeconds: idle.Seconds(),
 		LocalRoom: w.localRoom(), Kubernetes: os.Getenv("KUBERNETES_SERVICE_HOST") != "",
@@ -285,10 +325,10 @@ func (w *Worker) serveRetire(rw http.ResponseWriter, r *http.Request) {
 	w.serveStatus(rw, r)
 }
 
-// Retiring reports whether a coordinator retired the worker: its
-// readiness fails, so that Kubernetes, scaling its Deployment down, stops
-// it rather than a worker running tasks.
-func (w *Worker) Retiring() bool { return w.retiring.Load() }
+// Retiring reports whether a coordinator retired the worker, or it is
+// stopping: its readiness fails, so that Kubernetes, scaling its
+// Deployment down, stops it rather than a worker running tasks.
+func (w *Worker) Retiring() bool { return w.retiring.Load() || w.draining.Load() }
 
 // localRoom is the room the worker's disk has for exchanges: the share of
 // its exchange directory's free space a task may take, within
@@ -396,8 +436,9 @@ func (w *Worker) begin(t *runningTask) func() {
 
 func (w *Worker) serveTask(rw http.ResponseWriter, r *http.Request) {
 	w.hear()
-	if w.retiring.Load() {
-		// Retired: the coordinator runs the task on another worker.
+	if w.retiring.Load() || w.draining.Load() {
+		// Retired, or stopping: the coordinator runs the task on another
+		// worker.
 		http.Error(rw, "this worker is retiring", http.StatusServiceUnavailable)
 		return
 	}

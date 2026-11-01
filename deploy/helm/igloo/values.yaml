@@ -450,8 +450,11 @@ workers:
   # Empty: prefer one worker per node.
   affinity: {}
   # A worker told to stop (scale-down, a node drained, as before a Spot node
-  # is reclaimed) finishes its running tasks for up to 30s; keep this above.
-  terminationGracePeriodSeconds: 45
+  # is reclaimed) takes no more tasks, finishes those running and serves the
+  # exchange files on its disk until the statements reading them end, for
+  # up to 110s, what a Spot node's two-minute notice leaves; keep this above.
+  # A worker with nothing running or held stops at once.
+  terminationGracePeriodSeconds: 125
   # What one worker's machine costs an hour, e.g. 0.31 for a Spot node, for
   # auto mode's cost estimates -> IGLOO_WORKER_PRICE_PER_HOUR. 0: unknown,
   # when the list price of instanceType stands for it (on Spot with spot),
@@ -502,7 +505,7 @@ workers:
     nodeSelector: {}
     tolerations: []
     affinity: {}
-    terminationGracePeriodSeconds: 45
+    terminationGracePeriodSeconds: 125
 
 # Prometheus metrics are served on port 8080 at /metrics, through the
 # <fullname>-metrics ClusterIP Service (never through the SQL Service), and the

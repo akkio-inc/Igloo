@@ -150,7 +150,9 @@ func serveWorker() error {
 
 	// On a Spot Instance, AWS says two minutes ahead that it takes the
 	// instance back: the worker takes no more tasks from then on, which
-	// coordinators run elsewhere, and finishes those it has until then.
+	// coordinators run elsewhere, finishes those it has and serves the
+	// exchange files on its disk until then (see Worker.Drain), as it does
+	// for drainTimeout when a signal stops it.
 	notices := make(chan spot.Notice, 1)
 	if cfg.Workers.SpotNotice {
 		go func() {
@@ -165,7 +167,7 @@ func serveWorker() error {
 			}
 		}()
 	}
-	grace := shutdownTimeout
+	grace := drainTimeout
 	var reclaimed time.Time
 	select {
 	case err := <-errc:
@@ -177,13 +179,19 @@ func serveWorker() error {
 			"action", n.Action, "at", n.Time, "grace", grace.Round(time.Second))
 	}
 	stopping.Store(true)
-	log.Info("shutting down")
+	log.Info("shutting down: taking no more tasks, finishing those running and serving the exchange files on this worker's disk",
+		"for_at_most", grace.Round(time.Second))
 	shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), grace)
 	defer cancelShutdown()
+	_ = w.Drain(shutdownCtx)
+	// What is left of the grace, at least a moment to end the connections.
+	deadline, _ := shutdownCtx.Deadline()
+	stopCtx, cancelStop := context.WithTimeout(context.Background(), max(time.Until(deadline), time.Second))
+	defer cancelStop()
 	if httpSrv != nil {
-		_ = httpSrv.Shutdown(shutdownCtx)
+		_ = httpSrv.Shutdown(stopCtx)
 	}
-	err = w.Shutdown(shutdownCtx)
+	err = w.Shutdown(stopCtx)
 	if !reclaimed.IsZero() {
 		// Exiting now, the worker would be started again by its supervisor
 		// and take tasks it cannot finish: it stays down until AWS has

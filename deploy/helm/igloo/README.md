@@ -550,7 +550,7 @@ workers:
 | `workers.resources` | requests `4` CPU / `16Gi`, limit `16Gi` | Worker container |
 | `workers.podLabels`, `podAnnotations`, `nodeSelector`, `tolerations` | | Worker pods |
 | `workers.affinity` | `{}` | Empty: prefer one worker per node |
-| `workers.terminationGracePeriodSeconds` | `45` | A stopping worker finishes its running tasks for up to 30s, as when a Spot node is drained before it is reclaimed |
+| `workers.terminationGracePeriodSeconds` | `125` | A stopping worker takes no more tasks, finishes those running and serves the exchange files on its disk until the statements reading them end, for up to 110s, as when a Spot node is drained before it is reclaimed |
 | `workers.pricePerHour` | `0` | `IGLOO_WORKER_PRICE_PER_HOUR`: what one worker's machine costs an hour, for auto mode's estimates; `0` is unknown |
 | `workers.large.enabled` | `false` | [A large worker](#a-large-worker): `<fullname>-workers-large`, one pod; needs `workers.enabled` |
 | `workers.large.pricePerHour` | `0` | `IGLOO_LARGE_WORKER_PRICE_PER_HOUR`: what the large worker's machine costs an hour |

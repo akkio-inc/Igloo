@@ -213,6 +213,16 @@ func (l *localExchanges) drop(qid string) {
 	}
 }
 
+// statements counts the statements whose exchange files the worker holds.
+func (l *localExchanges) statements() int {
+	if l == nil {
+		return 0
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return len(l.queries)
+}
+
 // hold counts n bytes more, or fewer, of files fetched to the disk.
 func (l *localExchanges) hold(n int64) {
 	l.mu.Lock()

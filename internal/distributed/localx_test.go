@@ -427,6 +427,77 @@ func TestLostExchange(t *testing.T) {
 	}
 }
 
+// TestDrainServesExchanges checks a worker told to stop after its writing
+// stages ran, before the stages that read what they wrote, as on a Spot
+// interruption notice: it takes no more tasks, which the other workers
+// run, says it is retiring, and serves its exchange files to the readers,
+// so that the statement runs on without running any part again and returns
+// what one machine does; once the statement removed its files, the drain
+// ends. A worker with nothing to drain stops at once, and one whose files
+// no statement removes stops when its deadline passes.
+func TestDrainServesExchanges(t *testing.T) {
+	h := localHarness(t, 3)
+	var ran, again atomic.Int32
+	drained := make(chan error, 1)
+	hook := func(r slog.Record) {
+		if strings.HasPrefix(r.Message, "a worker holding exchanged rows on its disk was lost") {
+			again.Add(1)
+		}
+		if r.Message != "ran a stage" || !strings.Contains(attr(r, "stage"), " to exchange ") {
+			return
+		}
+		if ran.Add(1) == 2 {
+			go func() {
+				ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+				defer cancel()
+				drained <- h.workers[2].Drain(ctx)
+			}()
+			for !h.workers[2].Retiring() {
+				time.Sleep(time.Millisecond)
+			}
+		}
+	}
+	h.hook.Store(&hook)
+	want, _, err := h.query(context.Background(), exchangeQuery)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, _, _, _, err := h.run(context.Background(), exchangeQuery, ModeOn)
+	if err != nil {
+		t.Fatalf("a worker drained: %v", err)
+	}
+	if msg := compareRows(want, got, true); msg != "" {
+		t.Errorf("a worker drained: %s", msg)
+	}
+	if again.Load() != 0 {
+		t.Errorf("ran the statement's parts again %d times without the drained worker", again.Load())
+	}
+	select {
+	case err := <-drained:
+		if err != nil {
+			t.Errorf("drain: %v", err)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatalf("the drain did not end once the statement had ended; it holds files of %d statements", h.workers[2].local.statements())
+	}
+	if st, err := h.co.pool.status(context.Background(), h.lns[2].Addr().String()); err != nil || !st.Retiring {
+		t.Errorf("a drained worker's status: retiring %v, %v", st.Retiring, err)
+	}
+
+	// Nothing to drain: at once. Files no statement removes: until the
+	// deadline.
+	start := time.Now()
+	if err := h.workers[1].Drain(context.Background()); err != nil || time.Since(start) > time.Second {
+		t.Errorf("a worker with nothing to drain: %v after %s", err, time.Since(start))
+	}
+	h.workers[0].local.register("orphaned", map[string]int64{"s1/0/a0/__b=0/data_0.parquet": 1})
+	ctx, cancel := context.WithTimeout(context.Background(), 600*time.Millisecond)
+	defer cancel()
+	if err := h.workers[0].Drain(ctx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("a worker holding files no statement removes: %v", err)
+	}
+}
+
 // TestLocalRefs checks the references to exchange files on workers' disks
 // that readers are given, and that a reader takes nothing else for one.
 func TestLocalRefs(t *testing.T) {

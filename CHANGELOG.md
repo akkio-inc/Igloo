@@ -2124,6 +2124,16 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
 
 ### Fixed
 
+- A worker told to stop, by a Spot Instance's interruption notice or by
+  SIGTERM, keeps serving the exchange files on its disk until the
+  statements that read them end, or its deadline passes (ten seconds
+  before the time AWS gave; 110 seconds after a SIGTERM), while it takes
+  no more tasks and finishes those it runs. It stopped serving them at
+  once, so that the statements reading them ran again the parts that
+  wrote them, as for a worker lost, and draining saved nothing. Its status
+  says it is retiring meanwhile, so that coordinators send it nothing. The
+  Helm chart gives workers 125 seconds to stop
+  (`workers.terminationGracePeriodSeconds`).
 - A statement's rows reach its client as DuckDB computes them, rather than
   once it has computed them all: every result was held whole in memory
   first, so that every row of a table of hundreds of millions, ordered by
