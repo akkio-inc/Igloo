@@ -360,6 +360,14 @@ func sessionPolicy(partition, bucket, prefix string, access Access, kms bool) (s
 			Condition: map[string]map[string][]string{"StringLike": {"s3:prefix": {prefix + "/*"}}}},
 		{Effect: "Allow", Action: []string{"s3:GetBucketLocation"}, Resource: []string{bucketARN}},
 	}
+	if access != ReadFiles {
+		// Keys a path could not be, which S3 takes as they are: nothing Igloo writes,
+		// and of no use but to whoever would confuse what lists them. A bucket-wide
+		// pattern, as a session policy is short: what else it allows is under prefix.
+		statements = append(statements, statement{Effect: "Deny", Action: []string{"s3:PutObject"}, Resource: []string{
+			bucketARN + "/*..*", bucketARN + "/*/./*", bucketARN + "/*//*", bucketARN + "/*/.", bucketARN + "/*/",
+		}})
+	}
 	if kms {
 		// The role's own policy names the key, if any.
 		statements = append(statements, statement{Effect: "Allow", Action: keys, Resource: []string{"*"}})

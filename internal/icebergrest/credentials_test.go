@@ -179,6 +179,15 @@ func TestStatementDirectoryPolicy(t *testing.T) {
 	if !strings.Contains(policy, `"arn:aws:s3:::b/`+prefix+`/*"`) || !strings.Contains(policy, `"`+prefix+`/*"`) || strings.Count(policy, "warehouse/") != 2 {
 		t.Errorf("reaches more than the directory: %s", policy)
 	}
+	if !strings.Contains(policy, `"Effect":"Deny","Action":["s3:PutObject"],"Resource":["arn:aws:s3:::b/*..*"`) {
+		t.Errorf("may write keys with .. in them: %s", policy)
+	}
+	// As long as a statement's attempt's directory gets, in a long bucket's name: STS
+	// takes at most 2,048 characters.
+	long := "warehouse/01a198da-29a4-7ef0-b1d4-615134765204/data/igloo-write-0123456789abcdef/0123456789abcdef0123456789abcdef-2/s12-3456/a12/f"
+	if policy, err := sessionPolicy("aws", strings.Repeat("b", 63), long, AddFiles, true); err != nil || len(policy) > 2048 {
+		t.Errorf("%d characters of policy, %v", len(policy), err)
+	}
 }
 
 func TestS3VendorOnAWS(t *testing.T) {
