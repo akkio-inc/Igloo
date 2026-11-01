@@ -1907,7 +1907,7 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   allocated, started beside the heavy ones next time and spilled. Runs
   cancelled after ten seconds or more count as needing all the memory.
 - A `FLATTEN` of a column takes the form DuckDB's estimates point to, then
-  whichever form its shape's latest run took less CPU time in (see
+  whichever form its shape's latest runs took the less CPU time in at best (see
   [Snowflake SQL](docs/snowflake-sql.md)): two dashboard queries over tens
   of millions of rows took 88 seconds and take 56 and 40.
 - A statement's shape includes the session's search path and database, so
