@@ -667,7 +667,7 @@ func (st *statement) runFinal(ctx context.Context, conn *duckdb.Conn, query stri
 		!slices.EqualFunc(fin.columns, st.columns, func(a, b wire.Column) bool { return a.Name == b.Name && a.Oid == b.Oid }) {
 		return errors.New("the combined result does not match the statement's columns")
 	}
-	fin.stmtType, fin.query = st.stmtType, st.query
+	fin.stmtType, fin.query, fin.readsOnce = st.stmtType, st.query, len(merged) > 0
 	return fin.run(ctx, args, w)
 }
 

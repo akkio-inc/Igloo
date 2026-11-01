@@ -535,6 +535,13 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
 
 ### Distributed execution
 
+- A statement that fails as its rows stream no longer reports that it was
+  canceled when nothing canceled it. DuckDB's thread that reads the rows can
+  report an interrupt in place of another thread's failure, which clients saw
+  as SQLSTATE 57014 and Igloo as a cancel. Before a row has gone out, a
+  statement that only reads runs again, read whole, which reports the real
+  error, or returns the rows if it does not fail again. After that, it fails
+  with SQLSTATE XX000 and says that it was not canceled.
 - DuckDB's freed buffers go back to the system: Igloo fixes glibc's `mmap`
   threshold at 128 KiB, where it had risen to as much as 32 MiB with the
   largest allocation freed. After a sort that returned its rows a process kept

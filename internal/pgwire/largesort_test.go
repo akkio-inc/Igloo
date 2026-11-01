@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -18,6 +19,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgproto3"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
@@ -219,6 +221,58 @@ func TestLargeSortInRuns(t *testing.T) {
 		if got := sorts() - before; got != 0 {
 			t.Errorf("%s: sorted in runs", q)
 		}
+	}
+}
+
+// TestLargeSortFalseInterrupt checks a read in runs whose merge fails as it
+// streams, DuckDB reporting an interrupt when nothing asked for one. Before a
+// row went out it sorts at once, as a merge cannot be read twice, and the
+// client gets every row; after, the client gets an internal error.
+func TestLargeSortFalseInterrupt(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	spill := t.TempDir()
+	file := filepath.Join(dir, "rows.parquet")
+	largeSortFile(t, file, 2_000_000)
+	metrics := NewMetrics(prometheus.NewRegistry())
+	ts := startServerWithConfig(t, config.Config{
+		DuckDB:  config.DuckDB{TempDir: spill, MemoryLimit: "400MiB", Threads: 4, ExtensionDir: os.Getenv("IGLOO_TEST_EXTENSION_DIR")},
+		Storage: config.Storage{AllowedLocations: []string{dir + "/"}},
+	}, func(o *Options) { o.Metrics = metrics })
+	conn := ts.admin(t, pgx.QueryExecModeSimpleProtocol)
+	query := "SELECT id, ts, k, secs, n AS sort_stream FROM read_parquet('" + file + "') ORDER BY sort_stream"
+
+	interruptStreams(t, "sort_stream", 0, 1)
+	rows, err := conn.Query(context.Background(), query)
+	if err != nil {
+		t.Fatal(err)
+	}
+	n := int64(0)
+	for rows.Next() {
+		vals, err := rows.Values()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if vals[4].(int64) != n {
+			t.Fatalf("row %d: %v", n, vals)
+		}
+		n++
+	}
+	if err := rows.Err(); err != nil || n != 2_000_000 {
+		t.Fatalf("after %d rows: %v, want all of them", n, err)
+	}
+	if got := testutil.ToFloat64(metrics.largeSorts); got != 0 {
+		t.Errorf("counted %v reads in runs that ended sorted at once", got)
+	}
+
+	interruptStreams(t, "sort_stream", 1000, 1)
+	sent, err := drainRows(conn, query)
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) || pgErr.Code != "XX000" || !strings.Contains(pgErr.Message, "was not canceled") || sent < 1000 {
+		t.Fatalf("after %d rows: %v, want the internal error", sent, err)
+	}
+	if left := largeSortDirs(t, spill); len(left) > 0 {
+		t.Errorf("left in the spill directory: %v", left)
 	}
 }
 

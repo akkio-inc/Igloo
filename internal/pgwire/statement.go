@@ -8,6 +8,7 @@ import (
 	"io"
 	"slices"
 	"strconv"
+	"strings"
 
 	"github.com/duckdb/duckdb-go/v2"
 	"github.com/jackc/pgx/v5/pgtype"
@@ -44,6 +45,9 @@ type statement struct {
 	params   []uint32
 	// clientOIDs are the parameter types the client declared.
 	clientOIDs []uint32
+	// readsOnce says running it twice would not read the same rows: it reads
+	// a merge as it is made (see runFinal).
+	readsOnce bool
 	// access is set when grants allowed the statement (see access.go).
 	access *access
 	// bitmaps says it counts distinct IDs in roaring bitmaps, prepared and
@@ -351,15 +355,73 @@ func (st *statement) run(ctx context.Context, args []driver.NamedValue, w wire.D
 		return st.runArrow(ctx, args, w, aw)
 	}
 
-	query := st.stmt.QueryContext
-	if drains(w) {
-		// DuckDB computes the rows as the client reads them, rather than
-		// all of them first: a sort of hundreds of millions of rows held
-		// every one in memory, past the server's, before its client got
-		// the first. Nothing else runs on the session's connection until
-		// the client has them all.
-		query = st.stmt.QueryStreamContext
+	if !drains(w) {
+		return st.readRows(ctx, st.stmt.QueryContext, args, w)
 	}
+	// DuckDB computes the rows as the client reads them, rather than all of
+	// them first: a sort of hundreds of millions of rows held every one in
+	// memory, past the server's, before its client got the first. Nothing
+	// else runs on the session's connection until the client has them all.
+	stream := st.stmt.QueryStreamContext
+	if wrapStream != nil {
+		stream = func(ctx context.Context, args []driver.NamedValue) (driver.Rows, error) {
+			rows, err := st.stmt.QueryStreamContext(ctx, args)
+			if err != nil {
+				return nil, err
+			}
+			return wrapStream(ctx, st, w, rows), nil
+		}
+	}
+	err := st.readRows(ctx, stream, args, w)
+	if !errors.Is(err, duckdb.ErrFalseInterrupt) {
+		return err
+	}
+	return st.afterFalseInterrupt(ctx, args, w)
+}
+
+// wrapStream, if set, wraps the rows of a statement that streams, for tests.
+var wrapStream func(ctx context.Context, st *statement, w wire.DataWriter, rows driver.Rows) driver.Rows
+
+// streamFailed is the error of a statement that failed as its rows streamed
+// with no way to tell why (see afterFalseInterrupt), of written rows sent.
+func streamFailed(written uint32) error {
+	return pgerror.WithCode(fmt.Errorf("the statement failed as its rows streamed, after %d rows were sent: it was not canceled, "+
+		"and DuckDB did not report why; run it again to see the error", written), codes.Internal)
+}
+
+// afterFalseInterrupt ends a statement DuckDB reported interrupted as its
+// rows streamed, when no cancel request, timeout or memory watch had ended
+// its context: one of its threads failed (see duckdb.ErrFalseInterrupt), and
+// the failure's error is gone with the query. It must not reach the client,
+// or anything in Igloo that goes by the error, as a cancel. Before a row has
+// gone out, a statement that only reads runs again, its rows read whole,
+// which reports the thread's error as it is, for whatever goes by that: out
+// of memory, a race for a block of the read cache. If it does not fail again,
+// the client gets its rows. Otherwise the error says what is known: rows may
+// have gone out, the statement may have written, or the transaction block it
+// ran in is aborted, which keeps it from running again.
+func (st *statement) afterFalseInterrupt(ctx context.Context, args []driver.NamedValue, w wire.DataWriter) error {
+	if w.Written() > 0 || !st.onlyReads() || st.readsOnce || writesSequence(st.prepared) {
+		return streamFailed(w.Written())
+	}
+	err := st.readRows(ctx, st.stmt.QueryContext, args, w)
+	var de *duckdb.Error
+	if errors.As(err, &de) && de.Type == duckdb.ErrorTypeTransaction && strings.Contains(de.Msg, "aborted") {
+		return streamFailed(0)
+	}
+	return err
+}
+
+// writesSequence reports whether a statement that reads may advance a
+// sequence, which running it again would do twice.
+func writesSequence(query string) bool {
+	lower := strings.ToLower(query)
+	return strings.Contains(lower, "nextval") || strings.Contains(lower, "setval")
+}
+
+// readRows runs the statement through query and sends its rows to w.
+func (st *statement) readRows(ctx context.Context, query func(context.Context, []driver.NamedValue) (driver.Rows, error),
+	args []driver.NamedValue, w wire.DataWriter) error {
 	rows, err := query(ctx, args)
 	if err != nil {
 		return err
