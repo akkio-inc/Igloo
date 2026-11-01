@@ -458,6 +458,9 @@ const (
 	// nothing that long-running fills would notice, and most reads stop early.
 	partitionSample     = 1 << 20
 	partitionSampleTime = 3 * time.Second
+	// parquetRowGroupRows are the rows of a row group DuckDB's Parquet writer gathers
+	// where nothing bounds it.
+	parquetRowGroupRows = 122_880
 )
 
 // partitionsOf estimates the partitions of a fill of rows rows from a sample of
@@ -496,12 +499,21 @@ func (co *Coordinator) fillPartitions(ctx context.Context, env Env, query string
 	return partitionsOf(half, all, sampled, x.rows)
 }
 
+// replicaHoldsParts reports whether a replica of memory and threads holds what it
+// writes of parts partitions: a row group of each partition on each thread. 128
+// partitions of 16 columns took a replica of 5.5 GiB on 4 threads out of memory, where
+// workers wrote them.
+func (x features) replicaHoldsParts(parts float64, memory int64, threads int) bool {
+	return memory <= 0 || parts*parquetRowGroupRows*x.rowBytes()*float64(max(threads, 1)) <= float64(memory)
+}
+
 // partitionFilesFit reports whether the files workers would write of a fill of parts
 // partitions are worth writing there: its tasks each write a file of each partition,
 // so that a table of many gets many small files, and of more than a worker's task
 // can keep open they first sort the rows, which is more than a read of them takes.
+// Better those than a statement that fails on a replica without the memory for it.
 func (co *Coordinator) partitionFilesFit(parts float64, x features, f fleet) bool {
-	if parts == 0 {
+	if parts == 0 || !x.replicaHoldsParts(parts, co.opts.MemoryBytes, max(co.opts.Threads, co.opts.Cores)) {
 		return true
 	}
 	tasks := writeTasks(x.bytes, f)
