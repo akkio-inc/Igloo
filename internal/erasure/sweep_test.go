@@ -318,6 +318,67 @@ func TestSweepWaitsForRecentFilesUnread(t *testing.T) {
 	}
 }
 
+// TestRecheckIn checks that a request looks again soon for what has just been made,
+// and at least every hour for the rest.
+func TestRecheckIn(t *testing.T) {
+	for age, want := range map[time.Duration]time.Duration{
+		time.Second:      time.Minute,
+		time.Minute:      time.Minute,
+		10 * time.Minute: 5 * time.Minute,
+		time.Hour:        30 * time.Minute,
+		70 * time.Hour:   recheckWait,
+	} {
+		if got := recheckIn(age); got != want {
+			t.Errorf("at %v: in %v, want %v", age, got, want)
+		}
+	}
+}
+
+// TestWaitEndsWhenFileGoes checks that a request waiting for a recent file with the
+// person's rows, under a table, goes on once the file has gone, as soon as it looks,
+// rather than after the three days it would have waited; and that while the file is
+// there, however often it looks, it does not complete.
+func TestWaitEndsWhenFileGoes(t *testing.T) {
+	f := newFixture(t)
+	f.people("crm.people", [][]any{ann, subject})
+	f.tag(policy.ColumnTag{Schema: "crm", Table: "people", Column: "email", Value: "email"})
+	young := filepath.Join(f.load("crm.people").Location(), "data", "in-progress.parquet")
+	f.eng.exec(t, fmt.Sprintf("COPY (SELECT 9 AS id, '%s' AS email) TO '%s' (FORMAT parquet)", storedEmail, young))
+	jobs := tasks.NewMemoryStore()
+	f.svc.opts.Jobs = tasks.NewScheduler(jobs, tasks.Options{})
+	r, err := f.svc.Submit(f.ctx, "privacy", []Wanted{byEmail})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waits := func() {
+		t.Helper()
+		if err := f.svc.Run(f.ctx, r.ID); err != nil {
+			t.Fatal(err)
+		}
+		got, _ := f.store.Get(f.ctx, r.ID)
+		if got.Status != StatusWaiting || got.Step != StepPurge || got.WaitUntil.Before(time.Now().Add(70*time.Hour)) {
+			t.Fatalf("%s at %s until %v: %q", got.Status, got.Step, got.WaitUntil, got.Error)
+		}
+		job, err := jobs.Job(f.ctx, JobKind, r.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if job.NextRun.After(time.Now().Add(2 * time.Minute)) {
+			t.Fatalf("looks again at %v", job.NextRun)
+		}
+	}
+	waits()
+	waits()
+	if !exists(young) {
+		t.Fatal("the file went while it was recent")
+	}
+	f.svc.opts.Jobs = nil
+	if err := os.Remove(young); err != nil {
+		t.Fatal(err)
+	}
+	f.completed(f.run(r.ID))
+}
+
 // A waiting request runs again at its recheck, if that comes before what
 // it waits for.
 func TestNextRun(t *testing.T) {
