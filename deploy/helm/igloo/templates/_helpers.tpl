@@ -103,7 +103,17 @@ Images and service accounts
 {{/* on or off, for IGLOO_WORKER_WRITES: see workers.writes in values.yaml. */}}
 {{- define "igloo.workerWrites" -}}
 {{- $w := .Values.workers.writes | toString | lower -}}
-{{- $own := or .Values.workers.serviceAccount.create .Values.workers.serviceAccount.name .Values.workers.storage.s3.existingSecret .Values.workers.storage.gcs.existingSecret .Values.workers.storage.azure.existingSecret -}}
+{{- $s := .Values.storage -}}
+{{- $ws := .Values.workers.storage -}}
+{{- /* A key of the igloo pods' that workers get too: the bundled store's, or a Secret they have no other for. */ -}}
+{{- $sharedKey := or .Values.objectStorage.enabled
+    (and $s.s3.existingSecret (or (not $ws.s3.existingSecret) (eq $ws.s3.existingSecret $s.s3.existingSecret)))
+    (and $s.gcs.existingSecret (or (not $ws.gcs.existingSecret) (eq $ws.gcs.existingSecret $s.gcs.existingSecret)))
+    (and $s.azure.existingSecret (or (not $ws.azure.existingSecret) (eq $ws.azure.existingSecret $s.azure.existingSecret))) -}}
+{{- $sameAccount := eq (include "igloo.workerServiceAccountName" .) (include "igloo.serviceAccountName" .) -}}
+{{- /* An account of their own, or keys of their own on an account that gives them nothing of the igloo pods'. */ -}}
+{{- $identity := or (not $sameAccount) (and (or $ws.s3.existingSecret $ws.gcs.existingSecret $ws.azure.existingSecret) (not .Values.serviceAccount.annotations)) -}}
+{{- $own := and (not $sharedKey) $identity -}}
 {{- if or (eq $w "true") (eq $w "on") (and (eq $w "auto") $own) -}}on{{- else if or (eq $w "false") (eq $w "off") (eq $w "auto") -}}off{{- else -}}
 {{- fail (printf "workers.writes must be auto, true or false, got %q" $w) -}}
 {{- end -}}

@@ -1233,8 +1233,9 @@ create objects in directories named `igloo-write-*` under tables' locations
 (`arn:aws:s3:::BUCKET/warehouse/*/data/igloo-write-*/*`). Give it no more than
 that, and do not share the server's: without one or the other, a worker is
 refused, and the coordinator writes the table. With the server's own
-identity, workers can write the whole warehouse, whatever they are asked; the
-Helm chart turns worker writes off then unless `workers.writes` says otherwise.
+identity or keys, workers can write the whole warehouse, whatever they are
+asked; the Helm chart turns worker writes off then, as with its bundled store,
+unless `workers.writes` says otherwise.
 
 ### Lifecycle rule
 
