@@ -66,6 +66,9 @@ type workloadState struct {
 	sampled bool
 	// meter reads what each statement used; nil without one.
 	meter *engine.Meter
+	// backgroundUsed is what the latest statement used, if it ran in the
+	// second DuckDB, whose connection has a meter of its own.
+	backgroundUsed *audit.Resources
 	// controller holds statements back for their limits.
 	controller *workload.Controller
 }
@@ -105,6 +108,11 @@ func (sess *session) queuedTimeout() time.Duration {
 // DDL do not count, and neither does a result the cache sends (see
 // fromCache), which uses nothing.
 func countsOnReplica(sess *session, st *statement) bool {
+	if st.stmtType == duckdb.STATEMENT_TYPE_CREATE && st.staged != nil {
+		// CREATE TABLE ... AS, carried out in steps that hold the catalog
+		// only to create and rename (see runStagedCreate).
+		return !sess.inTx
+	}
 	if st.listsCatalog || st.changesIceberg {
 		return false
 	}
@@ -112,10 +120,6 @@ func countsOnReplica(sess *session, st *statement) bool {
 	case duckdb.STATEMENT_TYPE_SELECT, duckdb.STATEMENT_TYPE_INSERT, duckdb.STATEMENT_TYPE_UPDATE,
 		duckdb.STATEMENT_TYPE_DELETE, statementTypeMergeInto, duckdb.STATEMENT_TYPE_COPY:
 		return true
-	case duckdb.STATEMENT_TYPE_CREATE:
-		// CREATE TABLE ... AS, carried out in steps that hold the catalog
-		// only to create and rename (see runStagedCreate).
-		return st.staged != nil && !sess.inTx
 	}
 	return false
 }
@@ -215,6 +219,11 @@ func statementShape(text string) string {
 
 // measure returns what DuckDB measured of st, which just ran.
 func (sess *session) measure(st *statement) *audit.Resources {
+	if u := sess.wl.backgroundUsed; u != nil {
+		// It ran in the second DuckDB (see background.go).
+		sess.wl.backgroundUsed = nil
+		return u
+	}
 	return sess.wl.meter.Last(st.prepared)
 }
 

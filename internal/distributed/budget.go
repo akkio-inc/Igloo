@@ -1,7 +1,9 @@
 package distributed
 
 import (
+	"cmp"
 	"context"
+	"fmt"
 	"log/slog"
 	"math"
 	"slices"
@@ -151,6 +153,53 @@ func (s *planShapes) planned(shape, key string) {
 		s.keys = map[string]string{}
 	}
 	s.keys[shape] = key
+}
+
+// staysHere says why a statement of shape runs on this replica without planning
+// it for workers: planning a report of 28 stages took 15 s, where the report ran in
+// 10 s here, and auto mode then chose here all the same. So where its last plan's
+// history already decides that (see chooseShared), as its run here under the
+// threshold or runs on workers no better than here, nothing more is asked of the
+// session. Its first run pays for planning, and a run that goes far past what it
+// took is guarded as any other, after which it plans again. nil where planning has
+// a say: a fill, which times its write too; a statement that ran short of memory or
+// was guarded; one that may yet do better on many more workers than it ran on.
+func (co *Coordinator) staysHere(shape string, env Env, workers int) *errUnsupported {
+	key, ok := co.shapes.key(shape)
+	if !ok || strings.HasSuffix(key, "-fill") {
+		return nil
+	}
+	r, ok := co.history.get(key)
+	if !ok {
+		return nil
+	}
+	r = comparable(r, co.opts.MemoryBytes, co.pool.lastMemory(), co.largeMemory())
+	if r.local <= 0 || r.outOfMemory || r.guarded || r.large > 0 {
+		return nil
+	}
+	others := 0
+	if le, ok := env.(Loads); ok {
+		others = le.Others()
+	}
+	share := float64(1 + min(max(others, 0), shareCap))
+	var reason string
+	switch {
+	case r.dist > 0 && r.distWorkers > 0:
+		if r.dist < riskyWithin*r.local*share || 2*r.distWorkers <= max(workers, co.opts.Pool.MaxWorkers) {
+			return nil
+		}
+		reason = fmt.Sprintf("it ran in %.0f s on one machine and %.0f s on workers", r.local, r.dist)
+	case r.local*share >= cmp.Or(co.opts.Threshold, DefaultThreshold).Seconds():
+		return nil
+	default:
+		reason = fmt.Sprintf("it ran in %.0f s on one machine, under %.0f s", r.local, cmp.Or(co.opts.Threshold, DefaultThreshold).Seconds()/share)
+	}
+	co.log.Info("chose where a statement runs", "on", "one machine", "reason", reason, "key", key, "one_machine_seconds", math.Round(r.local), "planned", false)
+	u := &errUnsupported{reason: "auto mode chose one machine: " + reason, key: key, oneMachine: r.local}
+	if r.dist > 0 {
+		u.onWorkers = r.dist
+	}
+	return u
 }
 
 // expectedLocal is how many seconds the statement of shape is expected to

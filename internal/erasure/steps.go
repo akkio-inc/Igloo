@@ -155,6 +155,11 @@ func (s *Service) gone(ctx context.Context, r *Request, t *Table) error {
 	if err != nil {
 		return err
 	}
+	if ident != nil && t.StagingOf != "" && strings.EqualFold(tableName(ident), t.StagingOf) {
+		// Its fill ended, and it is what the request's tagged table is now.
+		t.Gone = true
+		return s.save(ctx, r)
+	}
 	if ident != nil {
 		return s.block(ctx, r, t, fmt.Errorf("%s %w: it was renamed to %s while the request ran; tag it under its new name, "+
 			"and make a new request for it", t.Name, errGone, tableName(ident)))
@@ -237,6 +242,11 @@ func (s *Service) tables(ctx context.Context, r *Request) ([]loaded, error) {
 			out = append(out, loaded{t, tbl})
 		case !blocking(err):
 			return nil, err
+		case t.StagingOf != "" && errors.Is(err, errGone):
+			// Its fill ended, or what was left of one was cleared.
+			if err := s.gone(ctx, r, t); err != nil {
+				return nil, err
+			}
 		case !deleting(r) && errors.Is(err, errGone):
 			return nil, terminal(fmt.Errorf("%w: it was dropped or renamed while the request ran; if it was renamed, tag it "+
 				"under its new name, and make the request again", err))
@@ -278,7 +288,9 @@ func (s *Service) find(ctx context.Context, r *Request) error {
 		}
 	}
 	for _, t := range r.Tables {
-		if t.Remote {
+		// A table being made is a copy of one the hold looks at, and may
+		// have few of its rows yet.
+		if t.Remote || t.StagingOf != "" {
 			continue
 		}
 		// What other recent requests matched in the table is gone from it
@@ -385,6 +397,11 @@ func (s *Service) discover(ctx context.Context, r *Request) error {
 				"tag it under its new name; if it was dropped, unset its tags", t.Name)
 		}
 	}
+	staging, err := s.stagingTables(ctx, r)
+	if err != nil {
+		return err
+	}
+	r.Tables = append(r.Tables, staging...)
 	sources, err := s.tables(ctx, r)
 	if err != nil {
 		return err
@@ -1517,6 +1534,9 @@ func (s *Service) purge(ctx context.Context, r *Request) error {
 	if err := s.delete(ctx, r, tables, keep(gone, kept)); err != nil {
 		return err
 	}
+	if err := s.abortUploads(ctx, r, tables); err != nil {
+		return err
+	}
 	for _, l := range tables {
 		l.t.done(StepPurge, s.now())
 	}
@@ -2331,6 +2351,12 @@ func (s *Service) verify(ctx context.Context, r *Request) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	staging, err := s.stagingTables(ctx, r)
+	if err != nil {
+		return "", err
+	}
+	r.Tables = append(r.Tables, staging...)
+	v.Staging = int64(len(staging))
 	tables, referenced, kept, err := s.referenced(ctx, r)
 	if err != nil {
 		return "", err
@@ -2368,6 +2394,9 @@ func (s *Service) verify(ctx context.Context, r *Request) (string, error) {
 	}
 	u.leave(refs, append(slices.Clone(kept), more...))
 	v.Orphans += int64(len(u.all()))
+	if v.Uploads, err = s.uploadsRemaining(ctx, r, tables); err != nil {
+		return "", err
+	}
 	for _, f := range files {
 		if f.Deleted.IsZero() {
 			continue
@@ -2425,13 +2454,13 @@ func (s *Service) verify(ctx context.Context, r *Request) (string, error) {
 
 	next := StepDone
 	switch {
-	case v.Rows > 0 || v.Files > 0 || v.Bounds > 0 || v.Statistics > 0:
+	case v.Rows > 0 || v.Files > 0 || v.Bounds > 0 || v.Statistics > 0 || v.Staging > 0:
 		next = StepDelete
 	case v.Views > 0:
 		next = StepViews
 	case v.IDSets > 0:
 		next = StepExpire
-	case v.Storage > 0 || v.Orphans > 0:
+	case v.Storage > 0 || v.Orphans > 0 || v.Uploads > 0:
 		next = StepPurge
 	case v.Sharing > 0:
 		next = StepSharing
@@ -2443,6 +2472,16 @@ func (s *Service) verify(ctx context.Context, r *Request) (string, error) {
 		next = StepCache
 	}
 	if next == StepDone {
+		filling, err := s.fillsUnderWay(ctx, r)
+		if err != nil {
+			return "", err
+		}
+		if len(filling) > 0 {
+			r.Error = "waiting: statements that began before the request deleted its rows are filling tables to replace its tables, " +
+				"and may write those rows: " + strings.Join(filling, ", ")
+			r.wait(s.now().Add(stagedRecheck))
+			return StepVerify, nil
+		}
 		// A table whose files purge keeps, while a table that may
 		// reference them cannot be read, is not verified.
 		for _, lt := range tables {
@@ -2538,7 +2577,8 @@ func (v *Verification) String() string {
 		what string
 	}{
 		{v.Rows, "rows"}, {v.Files, "files"}, {v.Bounds, "manifest bounds"}, {v.Statistics, "Parquet statistics"},
-		{v.Storage, "deleted files in storage"}, {v.Orphans, "recent orphan files"}, {v.Sharing, "sharing copies"},
+		{v.Staging, "tables being made"},
+		{v.Storage, "deleted files in storage"}, {v.Orphans, "recent orphan files"}, {v.Uploads, "unfinished uploads"}, {v.Sharing, "sharing copies"},
 		{v.History, "history records"}, {v.Derived, "derived entries"}, {v.Models, "models or their old blobs"},
 		{v.IDSets, "sets of ids"}, {v.Views, "materialized views or dynamic tables"}, {int64(v.Workers), "workers that have not purged"},
 	} {

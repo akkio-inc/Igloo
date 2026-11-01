@@ -76,10 +76,13 @@ values the workers found) and runs the rest of the statement: `HAVING`,
 subqueries. A statement that ranks the groups with `ROW_NUMBER()`, `RANK()`
 or `DENSE_RANK()` and keeps the first few of each partition (`WHERE rank <=
 10`) has the workers send only the groups that may rank so. Queries without aggregation are divided the same way when they
-keep few rows: `SELECT DISTINCT`, `ORDER BY ... LIMIT` of up to a
+keep few rows: `SELECT DISTINCT`, whose groups workers complete as a `GROUP
+BY`'s, `ORDER BY ... LIMIT` of up to a
 million rows, and a `SELECT ... WHERE` that filters the large table by a
 column equal to a constant, in a list, or equal to a subquery's value (`WHERE
-account_id = 42`), as the statement or as a subquery or common table
+account_id = 42`), or looks up three characters or more of a column's text
+(`WHERE note LIKE '%refund%'`, `contains(note, 'refund')`), as the statement or
+as a subquery or common table
 expression whose rows the coordinator reads to run the rest (a window over
 all of them, say); and every row of a table, filtered or not, ordered by
 `ORDER BY` without `LIMIT` by an order the coordinator merges by (below):
@@ -203,8 +206,8 @@ person, to an exchange that both branches of the `UNION ALL` fill, and
 partition the media events by person as well; then each worker joins one
 partition of both and counts its people per genre and cohort, which no
 other partition holds, and so for the cohorts' sizes, and a last round adds
-up each genre and cohort's counts. The coordinator gets a row per genre and
-cohort, and runs the final join itself. A
+up each genre and cohort's counts, and joins them by cohort. The coordinator
+gets the result's rows. A
 common table expression is computed once, however many parts read it,
 and a part the coordinator runs that reads it too reads what the workers
 wrote. One that only one part reads and that only filters tables is read
@@ -236,15 +239,23 @@ In detail, a part runs distributed when:
   `x IN (SELECT y ...)` is a semi join to a relation workers compute,
   partitioned by `y`, and a subquery of one row
   (`ver = (SELECT max(ver) FROM t WHERE ...)`) one that every task reads.
+  A correlated subquery over a large table is the join it means, where its
+  `WHERE` only makes its columns equal to the statement's and otherwise
+  filters its own rows: `EXISTS` a semi join, `NOT EXISTS` an anti join, and a
+  scalar subquery of `min`, `max`, `sum`, `avg` (or arithmetic on them) or a
+  count a `LEFT JOIN` to its groups, in `WHERE` or in a select list that does
+  not group.
   It may also read relations workers compute: common table expressions
   and subqueries in `FROM` that are themselves such `SELECT`s, with
   grouping and `DISTINCT` but no `ORDER BY` or `LIMIT`, and no window
   functions but aggregates over all their rows (`min(day) OVER ()`) or
   windows that all partition their rows by the same columns (see
   [window functions](#window-functions)), or a `UNION ALL` of them, or a
-  `UNION` of distinct rows, whose branches write their rows partitioned by
-  all of their columns and whose last stage keeps each partition's
-  distinct rows.
+  `UNION` of distinct rows, an `INTERSECT` or an `EXCEPT`, whose branches
+  write their rows partitioned by all of their columns and whose last stage
+  computes it over each partition's rows. Those three run so as a statement
+  too, with the coordinator reading what they keep, and sorting or limiting
+  it. Joins are read by their conditions, `USING` and `NATURAL` among them.
   An `ORDER BY` without `LIMIT` in such a subquery or common table
   expression counts for nothing where what reads it sorts again,
   aggregates, or takes distinct rows, as a report's last `SELECT` sorts
@@ -333,7 +344,9 @@ partitioned by the groups so that each worker computes whole groups;
 aggregates over `DISTINCT` values of unrelated
 expressions in one `SELECT` (`count(DISTINCT a), count(DISTINCT b)`),
 window functions over rows but those of the next section, a large table read again in a correlated
-subquery expression (`EXISTS`, a scalar subquery: TPC-H Q17, Q20, Q21),
+subquery expression of another shape (`NOT IN`, whose rows depend on whether
+any of its subquery's is `NULL`; a correlation by anything but equal columns;
+a scalar subquery of another aggregate, or that gives a value over no rows),
 subqueries in `GROUP BY`, samples of a number of rows,
 large tables joined on different keys in one `SELECT`, statements that call user-defined macros
 or session functions (`getvariable`, `current_setting`), tables with
@@ -405,7 +418,11 @@ statement's rows are in the table when that commit is, or not at all.
 
 - **Where.** Under one directory of the statement's under the table's
   location, `data/igloo-write-<random>/`, and in it one for its query, for
-  each task and for each attempt of a task. Committed files stay there.
+  each task and for each attempt of a task. The coordinator copies the files of
+  the attempts it heard from, within the store, to `data/igloo-sealed-<random>/`,
+  reads them there and commits those. So a commit takes one copy a file, at most
+  32 at a time, and for that while the table's new files take twice their space.
+  S3's copy stops at 5 GB a file, past which the replica writes the table.
 - **Retries.** A worker that dies or does not answer has its task run again
   elsewhere, in a directory of its own. Only files of the attempt the
   coordinator heard from are committed, so rows are not lost or written twice.
@@ -422,6 +439,14 @@ statement's rows are in the table when that commit is, or not at all.
   files a worker wrote later than that are orphan files of the table, for
   [maintenance](operations.md#table-maintenance) and erasure requests. The partition
   directories are named by a hash, so no value of the table is in a path.
+- **Memory.** A task bounds what its writer holds by its share of the worker's
+  memory: row groups of at most 128 MiB, an eighth of its share over its threads
+  or the partitions' files it keeps open, which rows of many kilobytes need on a
+  small worker. Auto mode takes rows wider than a task could hold (at least two
+  vectors of 2,048 rows a thread, by what its scans read a row) to this replica
+  where it has the room. A fill that still runs out of memory on workers, after
+  the retries with smaller tasks, runs on the replica if it has the room for the
+  query, or else with the replica writing the table from the workers' results.
 - **Partitions.** Identity of booleans, integers, dates, timestamps and
   strings, truncate of integers and strings, and year, month, day and hour are
   written by workers, one file per partition per task until compaction merges
@@ -430,10 +455,10 @@ statement's rows are in the table when that commit is, or not at all.
   partitioned by bucket, or identity of decimals, whose partition values
   cannot be read from a file's bounds or written to its manifest; tables with
   an Iceberg sort order (Igloo keeps [its own as a property](sql.md));
-  nested, fixed, nanosecond and format-version-1 columns; a query that sorts,
+  fixed, nanosecond and format-version-1 columns; a query that sorts,
   limits or groups in its last step; a fill estimated at less than 256 MiB in
-  auto mode, which would make small files; `INSERT ... BY NAME`, and an
-  `INSERT` without every column of the table; a partitioned view's refresh.
+  auto mode, which would make small files; an `INSERT` that leaves out a column
+  with a default.
   So do fills of ID domains' member tables, sorted writes and fills in a
   transaction block, on the replica, and fills from tables with policies. A
   commit that fails after workers wrote runs the fill on the replica, unless
@@ -507,9 +532,11 @@ The other side of a join need not be bucketed:
 
 Both apply to a key of one column, the column itself on the table's side, of
 an integer type, `VARCHAR` without a collation, `DATE`, `TIMESTAMP`,
-`TIMESTAMPTZ` or `DECIMAL`. A key computed from the column (`upper(person)`,
-`id + 1`), a `UUID` (whose bucket DuckDB's function does not compute as
-Iceberg's spec does, so that a table another engine wrote would not meet it), a
+`TIMESTAMPTZ`, `UUID` or `DECIMAL`. DuckDB hashes `UUID`s otherwise than
+Iceberg's spec, so a table's bucket of a `UUID` depends on the engine that wrote
+it: its files' bounds tell which, rows are written to its buckets by that hash,
+and tables written by different engines, or whose files do not tell, are
+exchanged. A key computed from the column (`upper(person)`, `id + 1`), a
 join on two columns, bucket counts that do not divide or columns of types
 that hash apart are exchanged as before, by the hash of the key.
 
@@ -859,6 +886,10 @@ distributed, but only on workers already running and on no more of them
 than the automatic decision would use; it never starts a worker. So no user can
 start a fleet of machines, or keep one busy, by repeating a query.
 
+A statement whose last runs already decide that it stays on the replica, as
+one that took under the threshold there, does not plan for workers again: its
+first run pays for that, and a run far past what it took plans again.
+
 Planning a statement for workers ends with the session's
 `statement_timeout` and a cancel request, which end `EXPLAIN DISTRIBUTED`
 as they end any statement; a part whose relations workers compute nest
@@ -1025,7 +1056,7 @@ give the workers more memory.
   the OpenTofu module for AWS gives it none. Google Cloud and Azure have nothing
   DuckDB could use of the kind: their modules give workers an identity that
   can only create files under `_igloo_shuffle/` and directories of that name
-  under tables' locations, and delete none. A worker told no gets the
+  under tables' locations, with no overwrite, move or delete. A worker told no gets the
   statement planned again, the coordinator writing the table
   (`IGLOO_WORKER_WRITES=off` always does), and no worker is asked for ten
   minutes.
@@ -1037,10 +1068,15 @@ give the workers more memory.
   bytes the worker said. The data file committed is made from what it read.
   Any mismatch commits nothing of the statement, which then runs on the
   replica, and logs an error. A compromised worker can put wrong rows in a
-  table it is writing, as it can return wrong rows to any read, and until its
-  credentials expire it can overwrite the files of its own attempt, committed
-  ones too; but it cannot get a file outside its directory committed, nor
-  write outside it with those credentials.
+  table it is writing, as it can return wrong rows to any read, and its wrong
+  rows can come with statistics that hide them: a file's partition and column
+  bounds come from the statistics in its footer, which the worker wrote, so a
+  filter on such a column, a `DELETE`'s too, can pass them over. Erasure requests
+  hash every row's values, and no statistic hides a row from those. Until its
+  credentials expire it can overwrite the files of its own attempt. Nothing
+  reads those by then: what is checked and committed is the coordinator's
+  copy, in a directory no worker's grant names. It cannot get a file outside
+  its directory committed, nor write outside it with those credentials.
 - **Pools are kept apart by secret and network.** Each compute pool's
   workers have a secret of their own (the Helm chart generates one per
   pool), so one pool's igloo pods cannot use another's workers; the
@@ -1239,8 +1275,9 @@ create objects in directories named `igloo-write-*` under tables' locations
 (`arn:aws:s3:::BUCKET/warehouse/*/data/igloo-write-*/*`). Give it no more than
 that, and do not share the server's: without one or the other, a worker is
 refused, and the coordinator writes the table. With the server's own
-identity, workers can write the whole warehouse, whatever they are asked; the
-Helm chart turns worker writes off then unless `workers.writes` says otherwise.
+identity or keys, workers can write the whole warehouse, whatever they are
+asked; the Helm chart turns worker writes off then, as with its bundled store,
+unless `workers.writes` says otherwise.
 
 ### Lifecycle rule
 
@@ -1617,9 +1654,14 @@ several instance types and zones, so that capacity one lacks another has.
 - The large inputs of one `SELECT` are partitioned by one key. Large tables
   joined on different keys need a step each: a common table expression or
   subquery per key. A large table read again in a correlated subquery
-  expression (`EXISTS`, a scalar subquery) runs on one machine; written as
-  a join to a common table expression, it runs distributed. Give the
-  machines that run such statements a lot of memory and fast spill disk.
+  expression that is not the join it means (`NOT IN`, a correlation by
+  anything but equal columns) runs on one machine; written as a join to a
+  common table expression, it runs distributed. Give the machines that run
+  such statements a lot of memory and fast spill disk.
+- `ROLLUP`, `CUBE` and `GROUPING SETS` run on workers up to the finest groups
+  of their sets, and the coordinator, or in a subquery or common table
+  expression one task, computes the sets from those groups: its memory grows
+  with them, as a plain `GROUP BY`'s does not.
 - On Kubernetes, or with `IGLOO_EXCHANGES=object`, partitioned joins,
   aggregations and every step of a multi-stage plan write what they exchange
   to object storage and read it back: that costs

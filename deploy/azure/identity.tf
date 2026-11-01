@@ -58,25 +58,38 @@ resource "azurerm_role_assignment" "catalog_storage" {
 }
 
 # Workers (with workers_enabled): an identity of their own, which reads the
-# warehouse and may change only the rows they exchange and statements'
-# directories of table files, named igloo-write-<hex> under a table's data/.
-# It may delete nothing. Azure has no credentials limited to one statement's
-# directory that DuckDB could use, so Igloo checks every file a worker says it
-# wrote before it commits it (docs/distributed-execution.md#security).
+# warehouse and may only create files, and only those they exchange and those in
+# statements' directories of table files, named igloo-write-<hex> under a table's
+# data/. It can overwrite, move or delete no file, nor touch a container: a role
+# of its own holds that one action, as a built-in role with a condition would leave
+# it the role's container actions, and a path condition would leave it renames.
+# Azure has no credentials limited to one statement's directory that DuckDB could
+# use, so Igloo checks every file a worker says it wrote, on its own copy
+# (docs/distributed-execution.md#security).
 locals {
   worker_subject = "system:serviceaccount:${var.namespace}:${var.worker_service_account_name}"
 
   blob_action = "Microsoft.Storage/storageAccounts/blobServices/containers/blobs"
   blob_path   = "@Resource[${local.blob_action}:path]"
   worker_write_condition = join(" ", [
-    "(!(ActionMatches{'${local.blob_action}/delete'}))",
-    "AND",
-    "(",
-    "(!(ActionMatches{'${local.blob_action}/write'}) AND !(ActionMatches{'${local.blob_action}/add/action'}) AND !(ActionMatches{'${local.blob_action}/move/action'}))",
+    "(!(ActionMatches{'${local.blob_action}/add/action'}))",
     "OR",
     "(${local.blob_path} StringLike 'warehouse/_igloo_shuffle/*' OR ${local.blob_path} StringLike 'warehouse/*/data/igloo-write-*')",
-    ")",
   ])
+}
+
+resource "azurerm_role_definition" "worker_write" {
+  count = var.workers_enabled ? 1 : 0
+
+  name        = "${var.name}-igloo-worker-create"
+  scope       = azurerm_resource_group.this.id
+  description = "Creates blobs, with a condition on where. Igloo's workers: no overwrite, move, delete or container action."
+
+  permissions {
+    data_actions = ["${local.blob_action}/add/action"]
+  }
+
+  assignable_scopes = [azurerm_resource_group.this.id]
 }
 
 resource "azurerm_user_assigned_identity" "worker" {
@@ -110,12 +123,12 @@ resource "azurerm_role_assignment" "worker_read" {
 resource "azurerm_role_assignment" "worker_write" {
   count = var.workers_enabled ? 1 : 0
 
-  scope                = local.filesystem_scope
-  role_definition_name = "Storage Blob Data Contributor"
-  principal_id         = azurerm_user_assigned_identity.worker[0].principal_id
-  principal_type       = "ServicePrincipal"
-  condition_version    = "2.0"
-  condition            = local.worker_write_condition
+  scope              = local.filesystem_scope
+  role_definition_id = azurerm_role_definition.worker_write[0].role_definition_resource_id
+  principal_id       = azurerm_user_assigned_identity.worker[0].principal_id
+  principal_type     = "ServicePrincipal"
+  condition_version  = "2.0"
+  condition          = local.worker_write_condition
 }
 
 # Lakekeeper vends user-delegation SAS tokens, which requires requesting a

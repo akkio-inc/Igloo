@@ -179,11 +179,26 @@ func (s *Server) fillOnWorkers(ctx context.Context, sess *session, src *statemen
 			s.log.Info("an erasure request deleted files during a fill; its query runs again here", "user", user.Name)
 			return 0, distParts{release: s.dist.Keep()}, false, nil
 		}
+		// And again at the last moment, reading every file's footer done, on what
+		// the requests' ledger says then.
+		writer.gate = func(ctx context.Context) error {
+			switch erased, err := r.ex.ErasedNow(ctx); {
+			case err != nil:
+				return fmt.Errorf("read the latest deletion of erasure requests: %w", err)
+			case erased:
+				return errErasedBeforeCommit
+			}
+			return nil
+		}
 		rows, err = writer.commit(ctx, r.ex.Written())
 		if err != nil && writer.left {
 			// Whether a commit holds its rows cannot be told: written again
 			// here, they could be there twice.
 			return 0, r.parts, true, err
+		}
+		if errors.Is(err, errErasedBeforeCommit) {
+			s.log.Info("an erasure request deleted files as a fill was about to commit; its query runs again here", "user", user.Name)
+			return 0, distParts{release: s.dist.Keep()}, false, nil
 		}
 	} else {
 		rows, err = s.fillFrom(ctx, sess, src, r, from)
@@ -198,6 +213,10 @@ func (s *Server) fillOnWorkers(ctx context.Context, sess *session, src *statemen
 	s.log.Warn("could not fill a table from a distributed query's results; filling it here", "user", user.Name, "err", err)
 	return 0, distParts{release: s.dist.Keep()}, false, nil
 }
+
+// errErasedBeforeCommit says an erasure request deleted files that a fill's tasks
+// may have read, as it was about to commit what they wrote.
+var errErasedBeforeCommit = errors.New("an erasure request deleted files during the statement")
 
 // errFillColumns says the SQL combining workers' results does not have
 // the columns of the query a table is filled from.

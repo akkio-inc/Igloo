@@ -23,6 +23,26 @@ import (
 // context's cancellation interrupts the query until the rows are closed,
 // and an error DuckDB meets while it streams the rows is what Next returns.
 
+// ErrFalseInterrupt is the error of a streaming query that DuckDB reports
+// interrupted while its context lasts. A thread of a query that fails records
+// its error and marks the query interrupted, for the query's other threads to
+// stop. The thread reading a streaming result looks for that mark first, and
+// reports an interrupt in place of the error, which ends with the query: a
+// statement that failed, which nothing canceled. Read whole, the same
+// statement reports the thread's error.
+var ErrFalseInterrupt = errors.New("DuckDB reported a streaming query interrupted, and nothing interrupted it")
+
+// streamError is the error of a streaming query under ctx that DuckDB ended
+// with msg.
+func streamError(ctx context.Context, msg string) error {
+	err := getDuckDBError(msg)
+	var de *Error
+	if ctx.Err() == nil && errors.As(err, &de) && de.Type == ErrorTypeInterrupt {
+		return ErrFalseInterrupt
+	}
+	return errors.Join(ctx.Err(), err)
+}
+
 // QueryStreamContext is QueryContext with DuckDB streaming the result.
 func (s *Stmt) QueryStreamContext(ctx context.Context, nargs []driver.NamedValue) (driver.Rows, error) {
 	cleanupCtx := s.conn.setContext(ctx)
@@ -70,7 +90,7 @@ func (s *Stmt) executeBoundStreaming(ctx context.Context) (*mapping.Result, erro
 	}
 	var res mapping.Result
 	if mapping.ExecutePending(pendingRes, &res) == mapping.StateError {
-		err := errors.Join(ctx.Err(), getDuckDBError(mapping.ResultError(&res)))
+		err := streamError(ctx, mapping.ResultError(&res))
 		mapping.DestroyResult(&res)
 		return nil, err
 	}
@@ -94,7 +114,7 @@ func (r *streamRows) Next(dst []driver.Value) error {
 		return err
 	}
 	if msg := mapping.ResultError(&r.res); msg != "" {
-		return errors.Join(r.ctx.Err(), getDuckDBError(msg))
+		return streamError(r.ctx, msg)
 	}
 	return io.EOF
 }

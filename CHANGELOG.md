@@ -397,7 +397,10 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   is read at the snapshot the refresh records. Anything else refreshes in
   full, and `SHOW MATERIALIZED VIEWS` and the run's `detail` in
   `igloo.task_history` say why (see [incremental
-  refresh](docs/loading.md#incremental-refresh)).
+  refresh](docs/loading.md#incremental-refresh)). What these read may be a
+  `WITH` clause, a subquery in `FROM` or a `UNION ALL`; a query that filters
+  and computes from one aggregate's rows is that aggregate, and `UNION` is
+  `SELECT DISTINCT` over `UNION ALL`.
 - Snowflake's dynamic tables: `CREATE [OR REPLACE] DYNAMIC TABLE ...
   TARGET_LAG = '...' | DOWNSTREAM WAREHOUSE = ... [REFRESH_MODE = AUTO |
   FULL | INCREMENTAL] [INITIALIZE = ...] AS query`, `ALTER DYNAMIC TABLE
@@ -535,6 +538,43 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
 
 ### Distributed execution
 
+- `ROLLUP`, `CUBE` and `GROUPING SETS` in a subquery or common table expression
+  run on workers, as they do in a statement, where they left it to the
+  coordinator.
+- Workers read nothing ahead unless their `IGLOO_PREFETCH` says `true`. On a fleet
+  reading cold, each task its share of the files on many threads, reading ahead
+  saved no time beyond what runs differ by, and nearly half of what it fetched
+  went unread. One machine still reads ahead by default, where it helps.
+- Reads in order larger than memory sort in runs also with parameters, for a
+  client that reads a few rows at a time through a portal (JDBC's fetch size),
+  by expressions, and with columns the merge cannot compare or pass on, as
+  `HUGEINT`, `UUID`, `INTERVAL`, lists, structs and maps. Arrow Flight results
+  stream, computed as the client takes them, where they were held whole first.
+  See [reads in order larger than
+  memory](docs/operations.md#reads-in-order-larger-than-memory).
+- Tables bucketed by `UUID` columns stay in place too, and those written by
+  different engines no longer meet by bucket. DuckDB hashes a `UUID` otherwise
+  than Iceberg's spec, so a table's files hold it in a bucket by the hash of the
+  engine that wrote them, which their bounds tell.
+- More shapes of statement run on workers, and return the rows of one machine.
+  A correlated subquery over a large table is the join it means, by partition:
+  `EXISTS` a semi join, `NOT EXISTS` an anti join, a scalar subquery of `min`,
+  `max`, `sum`, `avg` or a count a `LEFT JOIN` to its groups. `INTERSECT`,
+  `EXCEPT` and `UNION` of distinct rows compute partition by partition rather
+  than on the coordinator, also in a subquery. `SELECT DISTINCT` completes its
+  groups on workers. `USING` and `NATURAL` joins are read by the columns they
+  name, outer ones among them, which left their largest side to the coordinator.
+  A join inside a subquery on a column other than the statement's key is a
+  relation. A scan that looks up three characters or more of a column's text
+  (`LIKE '%word%'`, `contains`) runs on workers, as one by a constant does.
+  See [what runs on workers](docs/distributed-execution.md).
+- A statement that fails as its rows stream no longer reports that it was
+  canceled when nothing canceled it. DuckDB's thread that reads the rows can
+  report an interrupt in place of another thread's failure, which clients saw
+  as SQLSTATE 57014 and Igloo as a cancel. Before a row has gone out, a
+  statement that only reads runs again, read whole, which reports the real
+  error, or returns the rows if it does not fail again. After that, it fails
+  with SQLSTATE XX000 and says that it was not canceled.
 - DuckDB's freed buffers go back to the system: Igloo fixes glibc's `mmap`
   threshold at 128 KiB, where it had risen to as much as 32 MiB with the
   largest allocation freed. After a sort that returned its rows a process kept
@@ -682,7 +722,12 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   later for what its tasks finished meanwhile, the table's next write removes
   what a stopped process left, and erasure requests treat what is
   left as the table's orphan files. A worker refused the write leaves it to
-  the replica. Tables partitioned by bucket stay with the replica.
+  the replica. Tables partitioned by bucket stay with the replica. A task
+  bounds its row groups by its share of the worker's memory: rows of 10.8 KB,
+  which row groups of 122,880 rows took a worker of 1 GB out of memory with, now
+  take about a third of it. Auto mode takes rows too wide for a task to the replica, and a
+  fill that runs out of memory on workers runs there, or with the replica writing,
+  rather than fail.
 - DuckDB's memory limit, where `IGLOO_DUCKDB_MEMORY_LIMIT` does not set it,
   is what Igloo's memory leaves after the eighth it keeps free before it
   lowers DuckDB's limit, its reserve and an eighth of the limit itself,
@@ -1521,6 +1566,15 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   `history.expire.max-snapshot-age-ms` of Java's `Long.MAX_VALUE`
   ("forever") as forever; it overflowed into a negative age that dropped
   every branch and tag.
+- A schema's `igloo.*` properties can no longer be set or removed through the
+  Iceberg REST catalog, by anyone: a writer could note a directory of another
+  table's as what a stopped write of theirs left, which the next write deleted.
+  A note whose directory is not its table's own now deletes nothing.
+- Erasure requests erase from the tables being made to replace their tagged
+  tables (`name__igloo_new_...`), which a stopped `CREATE OR REPLACE TABLE`
+  left, committed rows and files of workers alike, and which no request
+  found: tags stay with names. A verification looks again, and a request
+  does not complete while such a fill that began before its deletes runs.
 - Erasure requests train models again. A model records the tables its
   training read, through views and other models' predictions too; a
   request on any of them, once the rows are gone, trains it again from its
@@ -1748,6 +1802,14 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
 
 ### Performance and cost
 
+- With no workers, a replica runs statements known to be heavy (their shape last
+  used 5 seconds of all its cores) in a second DuckDB of its process, whose
+  threads give way to the first's, and a read not yet known to be heavy starts
+  again there when it runs long beside others. Beside one analyst's long reports
+  a dashboard's statement had little more than its own thread: over a billion
+  rows their p95 rose from 10 s to 245 s. Nothing needs setting, and
+  `IGLOO_HEAVY_IN_BACKGROUND=false` runs everything in the first (see [heavy
+  statements beside short ones](docs/workload-management.md#heavy-statements-beside-short-ones)).
 - The result cache sends a dashboard's repeated queries again more often:
   it compares statements without their comments and spacing, which BI
   tools vary per run; shares a result between users when no policy
@@ -2399,8 +2461,13 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   files; files a stopped one left go at the view's next refresh or an
   erasure request's replacement of the view, and an erasure request does
   not complete while any from before it may remain. Partitioned views and
-  views with columns of nested, fixed-length or nanosecond types are
-  written as before.
+  views with columns of nested, fixed-length or nanosecond types go the same
+  way, their files written by DuckDB's `INSERT`, whose commit the catalog
+  proxy keeps from the catalog. An incremental refresh that writes an
+  aggregating view whole, of one row of no group or whose rows do not show
+  their groups, overwrites it too, where it deleted every row: a refresh
+  stopped between the view's commit and its state's is followed by a full
+  one, so no change is counted twice.
 - A `CREATE TABLE ... AS` of an aggregate that the memory watch stops while
   it fills its table runs the fill again, its groups a share at a time, as
   it does when DuckDB runs out of memory: the benchmark's copy of a

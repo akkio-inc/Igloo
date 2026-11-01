@@ -421,12 +421,18 @@ came after 6 seconds. The files and runs take what the spill directory takes
 for such a sort; a read whose estimate passes `IGLOO_SORT_SPILL_BUDGET` sorts
 at once and is stopped as before. `igloo_large_sorts_total` counts these reads.
 
-Only an `ORDER BY` of the result's columns, by name, alias or position, of
-types the merge compares as DuckDB orders them (numbers, text without a
-collation, binary, dates and times, booleans), without `LIMIT` or `GROUP BY`,
-sorts this way. A statement with parameters, or one whose client reads a few rows
-at a time through a portal, sorts at once. So does any read if a step before
-its first row fails, with a warning in the log.
+An `ORDER BY` without `LIMIT` or `GROUP BY` sorts this way, with or without
+parameters. One of the result's columns, by name, alias or position, of types
+the merge compares as DuckDB orders them (numbers, text without a collation,
+binary, dates and times, booleans), is merged by those columns; an order by an
+expression or by other types by a column of its sort key, and columns of types
+the files would not pass on unchanged (`HUGEINT`, `UUID`, `INTERVAL`, lists, structs
+and maps) go through them as text. A client that reads a few rows at a time
+through a portal, as JDBC's fetch size has it do, gets them from a merge on a
+connection of its own, so it may run other statements between its reads. An
+order with a subquery or a collation in it, or of `UNION`, `ENUM`, `BIT` or
+`BIGNUM` columns, sorts at once. So does any read if a step before its first
+row fails, with a warning in the log.
 
 ### When one machine is not enough
 
@@ -521,11 +527,14 @@ ago) proves what is under its name is Igloo's own: the next `CREATE TABLE
 fills anything, `CREATE TABLE ... AS` checks that nothing else holds the
 name unseen, briefly putting an empty table under it when it is free, and
 fails at once if something does; an admin's `DROP TABLE name`, without `IF
-EXISTS`, releases such a hold, whoever left it.
+EXISTS`, releases such a hold, whoever left it. The [Iceberg REST
+catalog](external-engines.md) refuses everyone a schema's `igloo.*`
+properties, and a note whose directory is not its table's own deletes
+nothing.
 
 A full refresh of a materialized view or dynamic table writes the view's
 rows into a directory of their own under its table's data
-(`igloo-refresh-...`, or `igloo-write-...` where [workers write them](distributed-execution.md#workers-writing-tables)), noted the same way, and commits them in place of the
+(`igloo-refresh-...`, or `igloo-write-...` where [workers write them](distributed-execution.md#workers-writing-tables), with `igloo-sealed-...` the copies it commits), noted the same way, and commits them in place of the
 table's files. One that fails or is canceled deletes its files; one an
 Igloo stopped before the commit leaves them, in no snapshot, and the view's
 next refresh deletes them, as does an erasure request's replacement of the
@@ -647,7 +656,10 @@ how fast a cold scan reads follows the threads, which Igloo caps by memory
 the blocks of the data files a statement's scans are about to read, with
 `IGLOO_PREFETCH_CONCURRENCY` (256) requests in flight for all statements
 together, which take them in turn; DuckDB then reads the blocks from local
-disk. `IGLOO_PREFETCH=false` turns it off. Against an object store
+disk. `IGLOO_PREFETCH=false` turns it off, and workers read nothing ahead
+unless their own says `true`: a fleet of workers reading cold, each task its
+share of the files, saved no time by it beyond what runs differ by, and nearly
+half of what it fetched went unread. Against an object store
 answering in 20 ms at 90 MB/s a connection, as S3 does, a cold scan of
 three columns of a 4 GB table took 2.4 s rather than 11.3 s on 16 cores,
 and 2.4 s rather than 6.6 s on three workers sharing them, fetching 1 to 3%
@@ -699,9 +711,9 @@ more than DuckDB alone.
 - It reads ahead for queries and for the queries of `CREATE TABLE ... AS`
   and `INSERT ... SELECT` that read catalog tables, other than tables that
   policies or a clean room protect, when the statement runs on the replica:
-  for a statement [workers](distributed-execution.md) run, they read ahead
-  each task's table files, as their own `IGLOO_PREFETCH` says, and the
-  replica reads nothing ahead; exchanges' files, which the read cache
+  for a statement [workers](distributed-execution.md) run, the replica reads
+  nothing ahead, and they each task's table files only if their own
+  `IGLOO_PREFETCH` is `true`; exchanges' files, which the read cache
   leaves out, are not read ahead. The scans are those distributed
   execution would plan. A session turns it off for itself with
   `SET igloo_prefetch = off` (`RESET`, `SHOW igloo_prefetch`).
@@ -709,7 +721,7 @@ more than DuckDB alone.
   writes blocks as the cache's extension does. At startup the log says
   `prefetch on`, or why it is off. The Helm chart gives its igloo pods and
   its workers a cache volume (`cacheVolume`, `workers.cacheVolume`), so
-  both read ahead.
+  both can read ahead.
 
 ## Result cache
 
@@ -967,6 +979,7 @@ Igloo's metrics, besides the standard Go and process metrics:
 | `igloo_snowflake_implicit_conversions_total` | | Statements in [Snowflake's dialect](snowflake-sql.md#implicit-conversions) that DuckDB could bind only with Snowflake's implicit conversions, which Igloo then made |
 | `igloo_sorted_writes_total` | | Writes of rows in order too large to sort at once within `IGLOO_SORT_SPILL_BUDGET`, which Igloo sorted [a range of the order at a time](sql.md#writing-rows-in-order) |
 | `igloo_large_sorts_total` | | [Reads in order larger than memory](#reads-in-order-larger-than-memory) that Igloo sorted in runs and merged |
+| `igloo_background_statements_total` | | Heavy statements run in the second DuckDB of the process, whose threads give way to the first's ([heavy statements beside short ones](workload-management.md#heavy-statements-beside-short-ones)) |
 | `igloo_aggregate_passes_total` | | Tables `CREATE TABLE ... AS` filled in passes over its aggregate's groups, which would not have fit in memory in one ([aggregates too large for memory](sql.md#aggregates-too-large-for-memory)) |
 | `igloo_result_cache_total` | `outcome` = `hit`, `joined`, `missed`, `kept`, `unprepared` | Queries the [result cache](#result-cache) answered, answered with the result of the same query another session was running, or could not answer, and results it kept; `unprepared` counts the hits and joins answered before preparing the statement |
 | `igloo_result_cache_bytes` | | Memory the result cache's results take, as Igloo estimates it |
@@ -1459,6 +1472,7 @@ and the catalog runs its database migrations before it serves. Read
 | SQLSTATE `40001`, `CatalogCommitConflicts` | Two writers committed to the same table at once inside explicit transactions. Retry the transaction. |
 | SQLSTATE `40003`, `CommitStateUnknownException` | The catalog did not answer whether a write was applied ([writes when the catalog fails](#writes-when-the-catalog-fails)). Check the table's snapshots before running the write again, and the catalog's health. |
 | SQLSTATE `57014` | The statement was canceled, by the client or by `statement_timeout`. |
+| SQLSTATE `XX000`, `the statement failed as its rows streamed ... it was not canceled` | The statement failed after rows went to the client, and DuckDB did not report why. Nothing canceled it. Run it again to see the error. Before a row goes out, a statement that only reads runs again by itself, and reports the error. |
 | SQLSTATE `57014`, `statement queued timeout: it waited 30s to start, behind the limit of 4 statements at once for role analysts` | The statement waited for its [role limits](workload-management.md#role-limits), or [the replica's](workload-management.md#the-replicas-limit), until its `statement_queued_timeout`. Run fewer statements at once, raise the limit, or give the team a compute pool. |
 | SQLSTATE `42501`, `ST_Read goes through GDAL` | GDAL-based readers and writers are refused; load spatial data as GeoParquet, shapefiles or GeoJSON ([media analytics](media-analytics.md#loading-boundaries)). |
 | `CREATE TABLE` fails with `schema: data did not match any variant` | The table has a column the catalog cannot store, such as a `GEOMETRY`; store `ST_AsWKB(geom)` instead ([media analytics](media-analytics.md#loading-boundaries)). |

@@ -18,6 +18,8 @@
 package io
 
 import (
+	"context"
+	goio "io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -39,6 +41,29 @@ func (LocalFS) Create(name string) (FileWriter, error) {
 	}
 
 	return os.Create(filename)
+}
+
+// Copy copies the file at src to dst.
+func (fsys LocalFS) Copy(_ context.Context, src, dst string) (err error) {
+	from, err := fsys.Open(src)
+	if err != nil {
+		return err
+	}
+	defer from.Close()
+
+	to, err := fsys.Create(dst)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if cerr := to.Close(); err == nil {
+			err = cerr
+		}
+	}()
+
+	_, err = goio.Copy(to, from)
+
+	return err
 }
 
 func (LocalFS) WriteFile(name string, content []byte) error {

@@ -494,6 +494,16 @@ func TestPrefetchSetting(t *testing.T) {
 	if _, err := Load(env(map[string]string{"IGLOO_ADMIN_PASSWORD": "password", "IGLOO_PREFETCH": "sometimes"})); err == nil {
 		t.Error("IGLOO_PREFETCH=sometimes should be refused")
 	}
+
+	// A worker reads ahead only if told to.
+	worker := map[string]string{"IGLOO_WAREHOUSE_LOCATION": "s3://b/w", "IGLOO_WORKER_SECRET": "a-secret-of-enough-characters-for-it", "IGLOO_DUCKDB_TEMP_DIR": "/tmp/x"}
+	if cfg, err = LoadWorker(env(worker)); err != nil || cfg.Prefetch.Enabled {
+		t.Fatalf("a worker by default: %v %v", cfg.Prefetch.Enabled, err)
+	}
+	worker["IGLOO_PREFETCH"] = "true"
+	if cfg, err = LoadWorker(env(worker)); err != nil || !cfg.Prefetch.Enabled {
+		t.Fatalf("a worker told to: %v %v", cfg.Prefetch.Enabled, err)
+	}
 }
 
 // IGLOO_EXCHANGES says where workers exchange rows: auto (their disks

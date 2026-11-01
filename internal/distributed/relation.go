@@ -188,8 +188,23 @@ func identity(n node) uintptr { return reflect.ValueOf(n).Pointer() }
 // read the rest partitioned by x. A candidate that does not qualify puts
 // the statement back as it was.
 func (pl *planner) semiJoins(sel node, ctes cteScope) error {
+	if !hasClass(child(sel, "where_clause"), "SUBQUERY") {
+		return nil
+	}
+	from, where := sel["from_table"], sel["where_clause"]
+	pl.undo = append(pl.undo, func() { sel["from_table"], sel["where_clause"] = from, where })
 	var keep, ins []node
+	joined := false
 	for _, cond := range conjuncts(child(sel, "where_clause")) {
+		// A correlated EXISTS or NOT EXISTS (see correlated.go).
+		ok, err := pl.existsJoin(sel, cond, ctes)
+		if err != nil {
+			return err
+		}
+		if ok {
+			joined = true
+			continue
+		}
 		if str(cond["class"]) == "SUBQUERY" && str(cond["subquery_type"]) == "ANY" &&
 			str(cond["comparison_type"]) == "COMPARE_EQUAL" && str(child(cond, "child")["class"]) == "COLUMN_REF" {
 			q := subqueryNode(cond)
@@ -203,11 +218,9 @@ func (pl *planner) semiJoins(sel node, ctes cteScope) error {
 		}
 		keep = append(keep, cond)
 	}
-	if len(ins) == 0 {
+	if len(ins) == 0 && !joined {
 		return nil
 	}
-	from, where := sel["from_table"], sel["where_clause"]
-	pl.undo = append(pl.undo, func() { sel["from_table"], sel["where_clause"] = from, where })
 	switch len(keep) {
 	case 0:
 		sel["where_clause"] = nil
@@ -838,8 +851,9 @@ func (pl *planner) opaque(sel node) string {
 // say, and plans the stages that write it. A common table expression's
 // rows are written once: an exchange keyed otherwise is partitioned again
 // rather than computed again. buckets, if not 0, is the Iceberg buckets of
-// its one key it is written to (see Exchange.Buckets).
-func (pl *planner) relationExchange(r *relUse, keys, casts []string, buckets int) (*Exchange, error) {
+// its one key it is written to, and uuidHash how they hash UUIDs (see
+// Exchange.Buckets).
+func (pl *planner) relationExchange(r *relUse, keys, casts []string, buckets int, uuidHash string) (*Exchange, error) {
 	if err := pl.budget(); err != nil {
 		return nil, err
 	}
@@ -851,7 +865,7 @@ func (pl *planner) relationExchange(r *relUse, keys, casts []string, buckets int
 		}
 		xkeys[i] = r.columns[j].Name
 	}
-	sig := strings.Join(xkeys, "\x00") + "\x01" + strings.Join(casts, "\x00") + "\x01" + strconv.Itoa(buckets)
+	sig := strings.Join(xkeys, "\x00") + "\x01" + strings.Join(casts, "\x00") + "\x01" + strconv.Itoa(buckets) + "\x01" + uuidHash
 	if d := r.def; d != nil {
 		if x := d.outs[sig]; x != nil {
 			r.out = x
@@ -861,7 +875,7 @@ func (pl *planner) relationExchange(r *relUse, keys, casts []string, buckets int
 			// Partitioned otherwise: partition it again. (Written whole, it
 			// is small, and computed again.)
 			x := pl.exchange("relation", xkeys, casts)
-			x.Buckets = buckets
+			x.Buckets, x.UUIDHash = buckets, uuidHash
 			f, err := pl.p.parse("SELECT * FROM " + quoteIdent("__igloo_r"))
 			if err != nil {
 				return nil, err
@@ -891,7 +905,7 @@ func (pl *planner) relationExchange(r *relUse, keys, casts []string, buckets int
 		return nil, unsupported("relations nest more than %d deep", maxRelationDepth)
 	}
 	x := pl.exchange("relation", xkeys, casts)
-	x.Buckets = buckets
+	x.Buckets, x.UUIDHash = buckets, uuidHash
 	if err := pl.produce(r.q, r.scope, x, r.columns, nil); err != nil {
 		return nil, err
 	}
@@ -920,11 +934,15 @@ func (pl *planner) relationOut(r *relUse, x *Exchange) {
 func (pl *planner) produce(q node, scope cteScope, out *Exchange, cols []Column, wraps []*wrapper) error {
 	switch str(q["type"]) {
 	case "SET_OPERATION_NODE":
-		if str(q["setop_type"]) != "UNION" {
-			return unsupported("%s in a relation", strings.ToLower(str(q["setop_type"])))
+		t := str(q["setop_type"])
+		if t != "UNION" && t != "INTERSECT" && t != "EXCEPT" {
+			return unsupported("%s in a relation", strings.ToLower(t))
 		}
 		if len(list(q, "modifiers")) > 0 {
 			return unsupported("ORDER BY or LIMIT in a relation")
+		}
+		if t != "UNION" {
+			return pl.produceSetOp(q, scope, out, cols, wraps)
 		}
 		if q["setop_all"] != true {
 			return pl.produceUnion(q, scope, out, cols, wraps)
@@ -997,6 +1015,132 @@ func (pl *planner) produceUnion(q node, scope cteScope, out *Exchange, cols []Co
 	}
 	pl.stage(&Stage{fragment: f, Columns: names(have), Inputs: []Input{{View: "__igloo_r", Exchange: rows, Partitioned: true}}, Out: out})
 	return nil
+}
+
+// produceSetOp plans the stages that write the rows of q, an INTERSECT or an
+// EXCEPT, to out: each side writes its rows to an exchange partitioned by all
+// of their columns, so that equal rows meet in one partition, and a last stage
+// computes the set operation of each partition's rows, applying wraps.
+func (pl *planner) produceSetOp(q node, scope cteScope, out *Exchange, cols []Column, wraps []*wrapper) error {
+	if collation, err := pl.collation(); err != nil || collation != "" {
+		// Text equal under a collation hashes apart.
+		return unsupported("%s under a collation in a relation", strings.ToLower(str(q["setop_type"])))
+	}
+	casts := make([]string, len(cols))
+	for i, c := range cols {
+		if slices.Contains(intTypes, c.Type) {
+			casts[i] = "BIGINT"
+		}
+	}
+	sc := scope.with(q)
+	var inputs []Input
+	for side, view := range map[string]string{"left": "__igloo_l", "right": "__igloo_r"} {
+		rows := pl.exchange("relation", names(cols), casts)
+		if err := pl.produce(child(q, side), sc, rows, cols, nil); err != nil {
+			return err
+		}
+		inputs = append(inputs, Input{View: view, Exchange: rows, Partitioned: true})
+	}
+	slices.SortFunc(inputs, func(a, b Input) int { return strings.Compare(a.View, b.View) })
+	op := str(q["setop_type"])
+	if q["setop_all"] == true {
+		op += " ALL"
+	}
+	f, err := pl.p.parse("SELECT * FROM " + quoteIdent("__igloo_l") + " " + op + " SELECT * FROM " + quoteIdent("__igloo_r"))
+	if err != nil {
+		return err
+	}
+	have := cols
+	for _, w := range wraps {
+		if f, err = pl.conform(w.apply(f, have), w.have, w.want); err != nil {
+			return err
+		}
+		have = w.want
+	}
+	if len(wraps) > 0 {
+		if err := pl.checkFragment(f); err != nil {
+			return err
+		}
+	}
+	pl.stage(&Stage{fragment: f, Columns: names(have), Inputs: inputs, Out: out})
+	return nil
+}
+
+// setOperationJob plans a statement's or subquery's UNION of distinct rows,
+// INTERSECT or EXCEPT as a job that reads it as a relation (see produce), so
+// that workers compute it partition by partition, rather than the coordinator
+// over all the rows of its branches. It returns nil if that is not to be.
+func (pl *planner) setOperationJob(n node, top bool, ctes cteScope) (node, error) {
+	switch str(n["setop_type"]) {
+	case "INTERSECT", "EXCEPT":
+	case "UNION":
+		if n["setop_all"] == true {
+			return nil, nil
+		}
+	default:
+		return nil, nil
+	}
+	if collation, err := pl.collation(); err != nil || collation != "" {
+		return nil, nil
+	}
+	for _, m := range list(n, "modifiers") {
+		if t := str(m.(node)["type"]); t != "ORDER_MODIFIER" && t != "LIMIT_MODIFIER" {
+			return nil, nil
+		}
+	}
+	sel, err := pl.p.parse("SELECT * FROM (SELECT 1) AS __igloo_s")
+	if err != nil {
+		return nil, err
+	}
+	sub := clone(n).(node)
+	sub["modifiers"] = []any{}
+	child(child(sel, "from_table"), "subquery")["node"] = sub
+	sel["modifiers"] = clone(n["modifiers"])
+	if pl.gathers == nil {
+		pl.gathers = map[uintptr]bool{}
+	}
+	pl.gathers[identity(sel)] = true
+	return pl.job(sel, top, ctes)
+}
+
+// distinctGroups returns a SELECT DISTINCT of expressions as the GROUP BY it
+// means, ORDER BY and LIMIT and all, for workers to complete its groups by
+// partition as any aggregation's (see aggregate.go), rather than the coordinator
+// over what each task kept; or nil if it is not one.
+func (pl *planner) distinctGroups(sel node) node {
+	if !hasModifier(sel, "DISTINCT_MODIFIER") || hasModifier(sel, "LIMIT_MODIFIER") && !hasModifier(sel, "ORDER_MODIFIER") ||
+		len(list(sel, "group_expressions")) > 0 || str(sel["aggregate_handling"]) != "STANDARD_HANDLING" ||
+		child(sel, "having") != nil || child(sel, "qualify") != nil || pl.hasAggregate(sel["select_list"]) || hasClass(sel["select_list"], "WINDOW") {
+		return nil
+	}
+	out := clone(sel).(node)
+	var mods []any
+	for _, m := range list(out, "modifiers") {
+		mod := m.(node)
+		if str(mod["type"]) != "DISTINCT_MODIFIER" {
+			mods = append(mods, m)
+		} else if len(list(mod, "distinct_on_targets")) > 0 {
+			return nil
+		}
+	}
+	var groups, set []any
+	for _, item := range list(out, "select_list") {
+		e := item.(node)
+		switch str(e["class"]) {
+		case "STAR", "CONSTANT", "SUBQUERY":
+			return nil
+		}
+		set = append(set, jsonInt(len(groups)))
+		groups = append(groups, bare(e))
+	}
+	if len(groups) == 0 {
+		return nil
+	}
+	if mods == nil {
+		mods = []any{}
+	}
+	out["modifiers"], out["group_expressions"], out["group_sets"] = mods, groups, []any{set}
+	return out
 }
 
 // allBranches makes the UNIONs in a set operation, and those within it,

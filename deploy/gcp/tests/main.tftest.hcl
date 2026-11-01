@@ -76,8 +76,13 @@ run "defaults" {
   }
 
   assert {
-    condition     = google_storage_bucket.warehouse.versioning[0].enabled == false && length(google_storage_bucket.warehouse.lifecycle_rule) == 0
-    error_message = "Versioning is off by default, with no lifecycle rule."
+    condition     = google_storage_bucket.warehouse.versioning[0].enabled == false && length(google_storage_bucket.warehouse.lifecycle_rule) == 1
+    error_message = "Versioning is off by default, with no lifecycle rule for old versions."
+  }
+
+  assert {
+    condition     = google_storage_bucket.warehouse.lifecycle_rule[0].action[0].type == "AbortIncompleteMultipartUpload" && google_storage_bucket.warehouse.lifecycle_rule[0].condition[0].age == 1
+    error_message = "Unfinished uploads hold rows, so a rule aborts them after a day."
   }
 
   assert {
@@ -692,7 +697,7 @@ run "production_options" {
   assert {
     condition = (
       google_storage_bucket.warehouse.versioning[0].enabled &&
-      length(google_storage_bucket.warehouse.lifecycle_rule) == 1
+      length(google_storage_bucket.warehouse.lifecycle_rule) == 2
     )
     error_message = "Versioning must be on, with a rule expiring old versions."
   }

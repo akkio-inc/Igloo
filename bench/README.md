@@ -282,6 +282,13 @@ window cost:
   `--elt-every` seconds, run by `--elt-streams` sessions; a job still
   running when it is due again is skipped, as Igloo's schedules do, and
   the report counts the skips.
+- **Heavy reports:** `--heavy-sessions` sessions running long reports over
+  every impression one after another, their result cache off, as an
+  analyst's session beside the dashboards.
+- **Probes:** `--probes` runs a statement of each kind once a second, to
+  tell where a dashboard waits: `ping` takes Igloo's path and no DuckDB
+  task, `cpu` only DuckDB's threads, `catalog` also loads a table from the
+  catalog and reads its one small file.
 
 ```sh
 python bench/mixed.py setup --rows 2000000                    # synthetic schema "mixed"

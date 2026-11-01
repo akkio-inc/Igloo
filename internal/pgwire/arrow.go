@@ -3,10 +3,13 @@ package pgwire
 import (
 	"context"
 	"database/sql/driver"
+	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
+	"github.com/duckdb/duckdb-go/v2"
 	"github.com/jackc/pgx/v5/pgtype"
 	wire "github.com/jeroenrinzema/psql-wire"
 	"github.com/jeroenrinzema/psql-wire/codes"
@@ -56,19 +59,53 @@ func arrowWriterOf(w wire.DataWriter) ArrowWriter {
 // runArrow runs a statement that returns rows and sends its result to aw
 // as DuckDB's record batches.
 func (st *statement) runArrow(ctx context.Context, args []driver.NamedValue, w wire.DataWriter, aw ArrowWriter) error {
-	rdr, err := st.stmt.QueryArrowContext(ctx, args)
+	// DuckDB computes the batches as the writer takes them, rather than all of
+	// them first: the session is the statement's until they are sent.
+	n, err := st.sendRecords(ctx, st.stmt.QueryArrowStreamContext, args, aw)
+	countArrowRows(w, n)
+	if errors.Is(err, duckdb.ErrFalseInterrupt) {
+		// See afterFalseInterrupt.
+		if n > 0 || !st.onlyReads() || st.readsOnce || writesSequence(st.prepared) {
+			return streamFailed(uint32(n))
+		}
+		n, err = st.sendRecords(ctx, st.stmt.QueryArrowContext, args, aw)
+		countArrowRows(w, n)
+		var de *duckdb.Error
+		if errors.As(err, &de) && de.Type == duckdb.ErrorTypeTransaction && strings.Contains(de.Msg, "aborted") {
+			return streamFailed(0)
+		}
+	}
 	if err != nil {
 		return err
+	}
+	return w.Complete(commandTag(st.stmtType, st.query, n))
+}
+
+// countArrowRows counts rows sent as record batches among those w has written:
+// what runs a statement again, once it failed, goes by that to tell whether a
+// client has any of its rows, as it now may before a failure.
+func countArrowRows(w wire.DataWriter, n int64) {
+	if tw, ok := w.(*tagWriter); ok {
+		w = tw.DataWriter
+	}
+	if ew, ok := w.(*embeddedWriter); ok {
+		ew.written += uint32(n)
+	}
+}
+
+// sendRecords runs the statement through query and sends its record batches
+// to aw, and returns how many rows it sent.
+func (st *statement) sendRecords(ctx context.Context, query func(context.Context, []driver.NamedValue) (array.RecordReader, error),
+	args []driver.NamedValue, aw ArrowWriter) (int64, error) {
+	rdr, err := query(ctx, args)
+	if err != nil {
+		return 0, err
 	}
 	if st.names != nil {
 		rdr = &renamedReader{RecordReader: rdr, schema: renameSchema(rdr.Schema(), st.names)}
 	}
 	defer rdr.Release()
-	n, err := aw.Records(rdr)
-	if err != nil {
-		return err
-	}
-	return w.Complete(commandTag(st.stmtType, st.query, n))
+	return aw.Records(rdr)
 }
 
 // TextSchema is the Arrow schema of a result Igloo produces itself, whose

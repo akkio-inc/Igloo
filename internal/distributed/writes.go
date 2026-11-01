@@ -38,7 +38,8 @@ import (
 //     files count only if the coordinator hears from that attempt. The
 //     coordinator refuses files outside it (checkWritten), and reads each
 //     file's footer itself before it commits: what is committed is what it
-//     read, not what a worker said (see pgwire's tableWrite).
+//     read, not what a worker said (see pgwire's tableWrite). It reads and
+//     commits its own copy of each, under SealedDirMark.
 //   - Where the coordinator can have credentials made for it
 //     (Options.WriteCredentials: on S3, STS with a session policy), each
 //     attempt carries credentials that reach its directory and nothing else,
@@ -57,10 +58,33 @@ import (
 // workers write.
 const WriteDirMark = "igloo-write-"
 
-// WriteColumn is a column of a table's files: its field ID, by name.
+// SealedDirMark starts the names of the directories the coordinator copies those
+// files to, and commits them from. No worker's grant names it, as it may name
+// WriteDirMark, so that what is committed is out of its reach, whatever it can
+// still do to its own attempt's files with credentials that cannot be revoked.
+const SealedDirMark = "igloo-sealed-"
+
+// WriteColumn is a column of a table's files: its field ID, by name, and those
+// of what it holds, if nested: a struct's fields, a list's element and a map's key
+// and value, by those names.
 type WriteColumn struct {
-	Name string `json:"name"`
-	ID   int    `json:"id"`
+	Name   string        `json:"name"`
+	ID     int           `json:"id"`
+	Fields []WriteColumn `json:"fields,omitempty"`
+}
+
+// copyFieldIDs is COPY's FIELD_IDS option of columns.
+func copyFieldIDs(columns []WriteColumn) string {
+	ids := make([]string, len(columns))
+	for i, c := range columns {
+		ids[i] = quoteLiteral(c.Name) + ": "
+		if len(c.Fields) == 0 {
+			ids[i] += strconv.Itoa(c.ID)
+			continue
+		}
+		ids[i] += "{__duckdb_field_id: " + strconv.Itoa(c.ID) + ", " + strings.TrimSuffix(strings.TrimPrefix(copyFieldIDs(c.Fields), "{"), "}") + "}"
+	}
+	return "{" + strings.Join(ids, ", ") + "}"
 }
 
 // WriteCredentials reach an attempt's directory and nothing else, for the
@@ -198,6 +222,65 @@ func (w *Worker) checkWriteRequest(wr *writeRequest) error {
 	return nil
 }
 
+// What a task's COPY holds. DuckDB's Parquet writer gathers rows until a row
+// group has 122,880 of them, on each of its threads and for each partition:
+// rows of 10.8 KB, 1.3 GB a group, took a worker's DuckDB of 953 MB out of
+// memory, whatever the retries. Bounded by bytes, two threads held 345 MiB at
+// 64 MiB a group, 188 at 32 and 110 at 16, in the same time and the same files;
+// below that, about two vectors of 2,048 rows a thread (writeVectorRows). Over
+// partitions it also gathers 524,288 rows a thread before it hands them to the
+// partitions' writers: 64 partitions of those rows ran out of memory, and held
+// 240 MiB at 16,384 rows and 2 MiB a group. Narrow rows took 10% longer at 16,384
+// rows, and half as long again at 4,096.
+const (
+	// mostWriteRowGroup is Iceberg's own default of a row group's bytes, and
+	// leastWriteRowGroup as few as a row group's bytes get: what is written in
+	// groups this small on a small worker, compaction merges.
+	mostWriteRowGroup  = 128 << 20
+	leastWriteRowGroup = 1 << 20
+	// mostWriteFiles and leastWriteFiles bound the partitions' files a task
+	// keeps open. Past them, DuckDB closes one and later opens another.
+	mostWriteFiles, leastWriteFiles = maxPartitions, 8
+	// wideWriteRow is the width of rows a task's partitioned COPY allows for
+	// before it hands them on: types do not say what a string takes.
+	wideWriteRow = 16 << 10
+)
+
+// writeRowGroup is the bytes of a row group of each of writers, on a worker
+// of memory in shares tasks at once: all of them within an eighth of its share,
+// for what the writer holds beside them (about 2.7 times the group) and the
+// rest of the task.
+func writeRowGroup(memory int64, shares, writers int) int64 {
+	if memory <= 0 {
+		return mostWriteRowGroup
+	}
+	return min(max(memory/int64(max(shares, 1))/8/int64(max(writers, 1)), leastWriteRowGroup), mostWriteRowGroup)
+}
+
+// writeFilesOpen is how many partitions' files a task keeps open, each with
+// an upload's buffer where it writes to object storage (see uploadBuffer):
+// those within a quarter of its share of the worker's memory.
+func writeFilesOpen(memory int64, shares int, uploads bool) int {
+	if memory <= 0 {
+		return 100
+	}
+	if !uploads {
+		return mostWriteFiles
+	}
+	n := memory / int64(max(shares, 1)) / 4 / uploadBuffer
+	return int(min(max(n, leastWriteFiles), mostWriteFiles))
+}
+
+// writeFlush is how many rows each of a task's threads gathers before it hands
+// them to the partitions' writers: as shuffleFlush, but at wideWriteRow.
+func writeFlush(memory int64, shares, threads int) int64 {
+	const most, least = 524_288, 4_096
+	if memory <= 0 {
+		return most
+	}
+	return min(max(memory/int64(max(shares, 1))/4/int64(max(threads, 1))/wideWriteRow, least), most)
+}
+
 // writeFiles writes the rows of query, in Parquet with field IDs, under the
 // attempt's directory, and lists the files.
 func (w *Worker) writeFiles(ctx context.Context, conn *duckdb.Conn, req *taskRequest, query string, cols []Column) (*taskResult, error) {
@@ -221,7 +304,8 @@ func (w *Worker) writeFiles(ctx context.Context, conn *duckdb.Conn, req *taskReq
 		defer drop()
 	}
 	// No order to keep: a statement with one keeps to the coordinator (see
-	// rowWise), and its threads need not wait for each other.
+	// rowWise), and its threads need not wait for each other; DuckDB bounds a
+	// row group's bytes only then.
 	if _, err := conn.ExecContext(ctx, "SET SESSION preserve_insertion_order = false", nil); err != nil {
 		return nil, err
 	}
@@ -234,17 +318,27 @@ func (w *Worker) writeFiles(ctx context.Context, conn *duckdb.Conn, req *taskReq
 	for i, c := range cols {
 		names[i] = quoteIdent(c.Name)
 	}
-	ids := make([]string, len(wr.Columns))
-	for i, c := range wr.Columns {
-		ids[i] = quoteLiteral(c.Name) + ": " + strconv.Itoa(c.ID)
-	}
-	opts := []string{"FORMAT parquet", "FIELD_IDS {" + strings.Join(ids, ", ") + "}", "RETURN_STATS true", "FILENAME_PATTERN 'part_{i}'"}
+	opts := []string{"FORMAT parquet", "FIELD_IDS " + copyFieldIDs(wr.Columns), "RETURN_STATS true", "FILENAME_PATTERN 'part_{i}'"}
+	// The task's share of the worker's memory is that of one of shares tasks
+	// at once.
+	shares := max(w.slotCount/w.taskSlots(req.Slots), 1)
+	threads := threadsOf(ctx, conn)
+	writers := threads
 	if len(wr.Partitions) > 0 {
 		// DuckDB cannot bound a partition's files by their size.
 		opts = append(opts, "PARTITION_BY ("+strings.Join(wr.Partitions, ", ")+")")
+		writers = writeFilesOpen(w.opts.MemoryBytes, shares, uploadsInParts(to))
+		if _, err := conn.ExecContext(ctx, fmt.Sprintf("SET SESSION partitioned_write_max_open_files = %d", writers), nil); err != nil {
+			return nil, err
+		}
+		if _, err := conn.ExecContext(ctx, fmt.Sprintf("SET SESSION partitioned_write_flush_threshold = %d",
+			writeFlush(w.opts.MemoryBytes, shares, threads)), nil); err != nil {
+			return nil, err
+		}
 	} else if wr.FileBytes > 0 {
 		opts = append(opts, "FILE_SIZE_BYTES "+strconv.FormatInt(wr.FileBytes, 10))
 	}
+	opts = append(opts, "ROW_GROUP_SIZE_BYTES "+strconv.FormatInt(writeRowGroup(w.opts.MemoryBytes, shares, writers), 10))
 	if wr.RowGroup > 0 {
 		opts = append(opts, "ROW_GROUP_SIZE "+strconv.FormatInt(wr.RowGroup, 10))
 	}
@@ -337,12 +431,17 @@ func checkWritten(dir string, files []shuffleFile, rows int64) error {
 	return nil
 }
 
+// writtenName is what a path may hold below an attempt's directory, which is
+// all a task's COPY writes (see writeFiles): no glob character, which DuckDB
+// would take for a pattern when it reads the file, no escape, no query.
+var writtenName = regexp.MustCompile(`^[A-Za-z0-9._=/-]+$`)
+
 // UnderDir reports whether p is strictly under dir, as a plain path: no
-// segment that leads elsewhere, however it is spelled, no query, nothing a
-// store or a client would read otherwise than as written.
+// segment that leads elsewhere, however it is spelled, nothing a store or a
+// client would read otherwise than as written.
 func UnderDir(p, dir string) bool {
 	rest, ok := strings.CutPrefix(p, strings.TrimSuffix(dir, "/")+"/")
-	if !ok || rest == "" || strings.ContainsAny(p, "?#\\\x00") || strings.Contains(p, "%") {
+	if !ok || !writtenName.MatchString(rest) {
 		return false
 	}
 	for _, seg := range strings.Split(rest, "/") {
@@ -374,6 +473,24 @@ func (ex *Execution) Written() []WrittenFile { return ex.written }
 // statement began, which its tasks may have read: its rows are not to be
 // committed (see erasure.go).
 func (ex *Execution) ErasedSince() bool { return ex.co != nil && ex.co.erased.Load() > ex.erased }
+
+// ErasedNow is ErasedSince as the requests' ledger says at this moment, where
+// the coordinator's own idea can be erasureEvery behind: for just before a commit.
+func (ex *Execution) ErasedNow(ctx context.Context) (bool, error) {
+	if ex.co == nil {
+		return false, nil
+	}
+	if l := ex.co.ledger.Load(); l != nil {
+		latest, err := (*l).LatestDeletion(ctx)
+		if err != nil {
+			return false, err
+		}
+		if !latest.IsZero() {
+			ex.co.noteErased(latest.UnixNano())
+		}
+	}
+	return ex.ErasedSince(), nil
+}
 
 // workersMayWrite says workers may be asked to write tables' files.
 func (co *Coordinator) workersMayWrite() bool {
@@ -469,6 +586,12 @@ func (pl *planner) markWrites(final node) {
 		last = s
 	}
 	if last == nil || last.placeholder == "" || last.merge != nil || last.enough > 0 || !pl.rowWise(final, last) {
+		return
+	}
+	// What a fragment may not hold, a combine step that runs as one may not
+	// either: a session's function, a user's, or a parameter. On a worker,
+	// current_schema() is main and a session's variable is NULL.
+	if hasClass(final, "PARAMETER") || pl.checkFunctions(final) != nil {
 		return
 	}
 	sql, err := pl.p.print(final)

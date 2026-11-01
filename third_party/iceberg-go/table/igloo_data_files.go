@@ -21,9 +21,11 @@ package table
 
 import (
 	"context"
+	"fmt"
 	"runtime"
 
 	"github.com/apache/iceberg-go"
+	iceio "github.com/apache/iceberg-go/io"
 )
 
 // DataFiles returns the data files of the Parquet files at paths as
@@ -39,4 +41,50 @@ func (t *Transaction) DataFiles(ctx context.Context, paths []string) ([]iceberg.
 	}
 
 	return filesToDataFiles(ctx, fs, t.meta, paths, runtime.GOMAXPROCS(0))
+}
+
+// DataFilesFrom is DataFiles of files another engine wrote as it could, reading
+// their footers from fsys, for a caller that checks what its parser is to read. A
+// column the table requires may be optional in a file, as COPY writes them all: the
+// caller is to check that the file's null counts for it are none.
+func (t *Transaction) DataFilesFrom(ctx context.Context, fsys iceio.IO, paths []string) ([]iceberg.DataFile, error) {
+	spec, err := t.meta.CurrentSpec()
+	if err != nil || spec == nil {
+		return nil, fmt.Errorf("%w: cannot add files without a current spec", err)
+	}
+	schema := t.meta.CurrentSchema()
+	fields := schema.Fields()
+	for i := range fields {
+		fields[i] = optionalField(fields[i])
+	}
+
+	return filesToDataFilesOf(ctx, fsys, iceberg.NewSchema(schema.ID, fields...), *spec, t.meta.defaultSortOrderID, t.meta.props, paths, runtime.GOMAXPROCS(0))
+}
+
+// optionalField is field with it and all it holds optional.
+func optionalField(field iceberg.NestedField) iceberg.NestedField {
+	field.Required = false
+	field.Type = optionalType(field.Type)
+
+	return field
+}
+
+func optionalType(t iceberg.Type) iceberg.Type {
+	switch t := t.(type) {
+	case *iceberg.StructType:
+		fields := make([]iceberg.NestedField, len(t.FieldList))
+		for i, f := range t.FieldList {
+			fields[i] = optionalField(f)
+		}
+
+		return &iceberg.StructType{FieldList: fields}
+	case *iceberg.ListType:
+		return &iceberg.ListType{ElementID: t.ElementID, Element: optionalType(t.Element), ElementRequired: false}
+	case *iceberg.MapType:
+		return &iceberg.MapType{
+			KeyID: t.KeyID, KeyType: t.KeyType, ValueID: t.ValueID, ValueType: optionalType(t.ValueType), ValueRequired: false,
+		}
+	}
+
+	return t
 }

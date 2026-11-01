@@ -142,7 +142,13 @@ One serves materialized views' full refreshes (`internal/pgwire`, see
   the table's field ids, and commits them with `ReplaceFiles` in one
   snapshot that also removes every old data and delete file; `AddFiles`
   and `ReplaceDataFiles` would take two snapshots or leave the delete
-  files.
+  files. `Transaction.DataFilesFrom` reads the footers through a store the
+  caller gives it, as Igloo does for files workers wrote, whose footers it
+  checks before anything parses them (`internal/pgwire/distfooter.go`).
+  `Copy` on the blob and local stores copies a file server-side, which a commit of
+  files workers wrote does first, to where they cannot write. Files by way of
+  `DataFilesFrom` may have columns optional that the table requires, whose null
+  counts Igloo checks.
 
 Two bound the memory that writing Arrow records to Parquet takes, which
 table maintenance (`internal/maintenance`, see `budget.go`) relies on to

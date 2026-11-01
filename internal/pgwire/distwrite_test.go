@@ -47,6 +47,10 @@ type writeFault struct {
 	request func(task map[string]any) faultAction
 	// probe, if set, answers the probes as a worker refused them.
 	probe bool
+	// memory, if set, answers the tasks that write as a worker out of memory.
+	memory bool
+	// short counts those answers.
+	short atomic.Int64
 	wrote atomic.Int64
 	// busy counts the requests the worker has not answered yet.
 	busy atomic.Int64
@@ -71,8 +75,15 @@ func (f *writeFault) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 	writes := task["write"] != nil
 	isProbe := writes && task["task"] == float64(-1)
 	f.mu.Lock()
-	request, answer, probe := f.request, f.answer, f.probe
+	request, answer, probe, memory := f.request, f.answer, f.probe, f.memory
 	f.mu.Unlock()
+	if writes && !isProbe && memory {
+		f.short.Add(1)
+		rw.Header().Set("Content-Type", "application/json")
+		rw.WriteHeader(http.StatusUnprocessableEntity)
+		_, _ = rw.Write([]byte(`{"error":{"message":"Out of Memory Error: of a test","out_of_memory":true}}` + "\n"))
+		return
+	}
 	if isProbe && probe {
 		rw.Header().Set("Content-Type", "application/json")
 		rw.WriteHeader(http.StatusUnprocessableEntity)
@@ -185,6 +196,21 @@ func startWriteServer(t *testing.T, configure ...func(*Options)) *writeEnv {
 // coordinate leaves them.
 func startWriteServerWith(t *testing.T, coordinate func(*distributed.Options), configure ...func(*Options)) *writeEnv {
 	t.Helper()
+	return startWriteServerOn(t, writeWorkers{cores: 8, memory: 4 << 30, claim: 300 << 20}, coordinate, configure...)
+}
+
+// writeWorkers says what workers a writeEnv has: of cores, taking their memory
+// for memory, and with a DuckDB of limit, if set; and what size every table
+// claims, if set.
+type writeWorkers struct {
+	cores         int
+	memory, claim int64
+	limit         string
+}
+
+// startWriteServerOn is startWriteServerWith on such workers.
+func startWriteServerOn(t *testing.T, workers writeWorkers, coordinate func(*distributed.Options), configure ...func(*Options)) *writeEnv {
+	t.Helper()
 	ext := os.Getenv("IGLOO_TEST_EXTENSION_DIR")
 	if ext == "" {
 		t.Skip("IGLOO_TEST_EXTENSION_DIR not set")
@@ -205,7 +231,7 @@ func startWriteServerWith(t *testing.T, coordinate func(*distributed.Options), c
 	}
 	var addrs []string
 	for i := range 2 {
-		addr, _, _ := startTestWorkerCores(t, dir, i, env.gate, "", 8)
+		addr, _, _ := startTestWorkerLimited(t, dir, i, env.gate, "", workers.cores, workers.memory, workers.limit)
 		f := &writeFault{target: addr, client: &http.Transport{TLSClientConfig: clientTLS, ForceAttemptHTTP2: true}}
 		srv := httptest.NewUnstartedServer(f)
 		srv.TLS = serverTLS.Clone()
@@ -223,7 +249,7 @@ func startWriteServerWith(t *testing.T, coordinate func(*distributed.Options), c
 		t.Fatal(err)
 	}
 	opts := distributed.Options{
-		Source: sizedSource{distributed.NewIceberg(cat), 300 << 20}, Secret: testWorkerSecret, Version: "test", Cores: 1,
+		Source: sizedSource{distributed.NewIceberg(cat), workers.claim}, Secret: testWorkerSecret, Version: "test", Cores: 1,
 		TempDir: filepath.Join(dir, "coordinator"), Warehouse: dir + "/", Threshold: time.Second, MinWorkerWrite: 1,
 		Storage: distributed.NewStorage(icebergio.LocalFS{}), Pool: distributed.PoolOptions{Addresses: addrs},
 	}
@@ -276,7 +302,7 @@ func written(t *testing.T, dir string) []string {
 			}
 			return err
 		}
-		if !d.IsDir() && strings.Contains(p, "/"+distributed.WriteDirMark) {
+		if !d.IsDir() && (strings.Contains(p, "/"+distributed.WriteDirMark) || strings.Contains(p, "/"+distributed.SealedDirMark)) {
 			out = append(out, p)
 		}
 		return nil
@@ -298,8 +324,8 @@ func (e *writeEnv) checkWrote(t *testing.T, table string) {
 		t.Errorf("%s has %d data files and %d delete files", table, len(data), len(deletes))
 	}
 	for _, f := range data {
-		if !strings.Contains(f, "/"+distributed.WriteDirMark) {
-			t.Errorf("%s's file %s is not of a statement's directory", table, f)
+		if !strings.Contains(f, "/"+distributed.SealedDirMark) {
+			t.Errorf("%s's file %s is not a copy of a statement's", table, f)
 		}
 	}
 	left := written(t, e.location(t, table))
@@ -415,7 +441,8 @@ func TestWorkersWrite(t *testing.T) {
 	})
 
 	t.Run("materialized view", func(t *testing.T) {
-		mv := "WITH o AS (SELECT * FROM lake.public.src) SELECT id, x FROM o WHERE g < 5"
+		// Its column renamed in FROM, it is refreshed in full.
+		mv := "SELECT i AS id, x FROM lake.public.src AS o(i) WHERE g < 5"
 		mustExec(t, admin, "CREATE MATERIALIZED VIEW w_mv AS "+mv)
 		mustExec(t, admin, "REFRESH MATERIALIZED VIEW w_mv")
 		if _, detail, _, _ := viewRefresh(t, admin, "public.w_mv"); !strings.Contains(detail, "its query ran on") {
@@ -427,6 +454,22 @@ func TestWorkersWrite(t *testing.T) {
 		defer mustExec(t, admin, "DELETE FROM src WHERE id = -1")
 		mustExec(t, admin, "REFRESH MATERIALIZED VIEW w_mv")
 		same(t, "w_mv", mv)
+		env.checkNoNotes(t)
+	})
+
+	t.Run("partitioned materialized view", func(t *testing.T) {
+		mv := "SELECT i AS id, g, x FROM lake.public.src AS o(i) WHERE g < 5"
+		mustExec(t, admin, "CREATE MATERIALIZED VIEW w_mv_parts AS "+mv)
+		mustExec(t, admin, "ALTER TABLE lake.public.w_mv_parts SET PARTITIONED BY (g)")
+		mustExec(t, admin, "REFRESH MATERIALIZED VIEW w_mv_parts")
+		same(t, "w_mv_parts", mv)
+		env.checkWrote(t, "w_mv_parts")
+		if data, _ := liveFiles(t, admin, "w_mv_parts"); len(data) < 2 {
+			t.Errorf("the rows of a partitioned view are in %d files", len(data))
+		}
+		if got, want := env.local(t, "SELECT count(*) FROM w_mv_parts WHERE g = 2"), env.local(t, "SELECT count(*) FROM src WHERE g = 2"); got != want {
+			t.Errorf("a partition holds %s rows, want %s", got, want)
+		}
 		env.checkNoNotes(t)
 	})
 }
@@ -475,7 +518,7 @@ func TestWorkersWritePartitions(t *testing.T) {
 				t.Errorf("rows differ:\n%.300s\nwant\n%.300s", got, want)
 			}
 			data, _ := liveFiles(t, admin, table)
-			inDir := func(f string) bool { return strings.Contains(f, "/"+distributed.WriteDirMark) }
+			inDir := func(f string) bool { return strings.Contains(f, "/"+distributed.SealedDirMark) }
 			if c.workers {
 				if !slices.ContainsFunc(data, inDir) {
 					t.Fatalf("workers did not write it: %d files", len(data))
@@ -483,7 +526,7 @@ func TestWorkersWritePartitions(t *testing.T) {
 				env.checkWrote(t, table)
 				for _, f := range data {
 					// No value of the table in a path.
-					if _, rest, _ := strings.Cut(f, "/"+distributed.WriteDirMark); strings.ContainsAny(rest, "% ") || strings.Contains(rest, "name-") {
+					if _, rest, _ := strings.Cut(f, "/"+distributed.SealedDirMark); strings.ContainsAny(rest, "% ") || strings.Contains(rest, "name-") {
 						t.Errorf("path %s", f)
 					}
 				}
@@ -639,7 +682,7 @@ func TestWorkersWriteRefused(t *testing.T) {
 			if slices.ContainsFunc(data, func(f string) bool { return slices.Contains(foreign, f) }) {
 				t.Errorf("the other table's file is in this one: %q", data)
 			}
-			if slices.ContainsFunc(data, func(f string) bool { return strings.Contains(f, "/"+distributed.WriteDirMark) }) {
+			if slices.ContainsFunc(data, func(f string) bool { return strings.Contains(f, "/"+distributed.SealedDirMark) }) {
 				t.Errorf("a suspect worker's statement committed files of workers: %q", data)
 			}
 			if got := env.local(t, "SELECT count(*) FROM w_secret"); got != "10" {
@@ -840,11 +883,7 @@ func TestWorkersWriteLeftovers(t *testing.T) {
 	data, _ := liveFiles(t, admin, "w_left")
 	dir := leave("w_left", "w_left", "0123456789abcdef")
 	// The note of files a statement committed and stopped before it forgot it.
-	held := filepath.Dir(data[0])
-	for !strings.HasPrefix(filepath.Base(filepath.Dir(held)), distributed.WriteDirMark) && held != "/" {
-		held = filepath.Dir(held)
-	}
-	held = filepath.Dir(held)
+	held := filepath.Join(filepath.Dir(filepath.Dir(data[0])), distributed.WriteDirMark+strings.TrimPrefix(filepath.Base(filepath.Dir(data[0])), distributed.SealedDirMark))
 	if err := env.srv.ddl.NotePending(ctx, "public", catalog.NewPending(catalog.PendingFiles, held, "w_left")); err != nil {
 		t.Fatal(err)
 	}
@@ -912,7 +951,7 @@ func TestWorkersWriteDenied(t *testing.T) {
 		t.Errorf("%s, want %s", got, want)
 	}
 	data, _ := liveFiles(t, admin, "w_denied")
-	if slices.ContainsFunc(data, func(f string) bool { return strings.Contains(f, "/"+distributed.WriteDirMark) }) {
+	if slices.ContainsFunc(data, func(f string) bool { return strings.Contains(f, "/"+distributed.SealedDirMark) }) {
 		t.Errorf("workers wrote it: %q", data)
 	}
 	if left := written(t, env.location(t, "w_denied")); len(left) != 0 {
@@ -929,6 +968,90 @@ func TestWorkersWriteDenied(t *testing.T) {
 	}
 }
 
+// TestWorkersSessionFunctions checks that what a fill's last step computes from
+// the session is computed here, where workers would take another branch or read
+// their own settings: its rows are those this replica computes, whatever else
+// of the statement may run on workers. Statement time is the same on all of them.
+func TestWorkersSessionFunctions(t *testing.T) {
+	t.Parallel()
+	env := startWriteServer(t)
+	env.force(t)
+	ctx := context.Background()
+	mustExec(t, env.admin, "SET VARIABLE sess_var = 'from-the-session'")
+	shapes := map[string]string{
+		"grouped":  "SELECT id, count(DISTINCT x) AS n, %s AS v FROM src GROUP BY id",
+		"plain":    "SELECT id, 1 AS n, %s AS v FROM (SELECT id FROM src) s",
+		"filtered": "SELECT id, 1 AS n, 'kept' AS v FROM (SELECT id FROM src) s WHERE (%s) IS NOT NULL",
+	}
+	exprs := []string{
+		"current_schema()",
+		"current_database()",
+		"getvariable('sess_var')",
+		"CASE WHEN getvariable('sess_var') = 'from-the-session' THEN 'masked' ELSE 'UNMASKED' END",
+		"current_setting('temp_directory')",
+		"current_setting('threads')",
+		"version()",
+		"has_table_privilege('src', 'select')",
+		"pg_table_is_visible(0)",
+		"current_connection_id() > 0",
+	}
+	n := 0
+	for shape, q := range shapes {
+		for _, e := range exprs {
+			n++
+			name := fmt.Sprintf("sess_%d", n)
+			query := fmt.Sprintf(q, e)
+			if _, err := env.admin.Exec(ctx, "CREATE TABLE "+name+" AS "+query); err != nil {
+				t.Errorf("%s, %s: %v", shape, e, err)
+				continue
+			}
+			data, _ := liveFiles(t, env.admin, name)
+			if i := slices.IndexFunc(data, func(p string) bool { return strings.Contains(p, "/igloo-write-") }); i >= 0 {
+				t.Errorf("%s, %s: workers wrote %s", shape, e, data[i])
+			}
+			check := "SELECT count(*), min(CAST(v AS VARCHAR)), max(CAST(v AS VARCHAR)) FROM "
+			got := env.local(t, check+name)
+			if want := env.local(t, check+"("+query+") q"); got != want {
+				t.Errorf("%s, %s: committed %s, this replica computes %s", shape, e, got, want)
+			}
+		}
+	}
+
+	// Statement time is fixed before the plan, so workers may compute it, and
+	// every file of a statement holds the same.
+	mustExec(t, env.admin, "CREATE TABLE sess_time AS SELECT id, count(DISTINCT x) AS n, CAST(now() AS VARCHAR) AS v FROM src GROUP BY id")
+	env.checkWrote(t, "sess_time")
+	if got := env.local(t, "SELECT count(DISTINCT v) FROM sess_time"); got != "1" {
+		t.Errorf("a statement's rows hold %s times", got)
+	}
+}
+
+// TestWorkersWriteNamedColumns checks that workers write an INSERT of some of a
+// table's columns, in any order or by name, as DuckDB's would: NULL for the others.
+func TestWorkersWriteNamedColumns(t *testing.T) {
+	t.Parallel()
+	env := startWriteServer(t)
+	env.force(t)
+	admin := env.admin
+	for _, c := range []struct{ name, insert, want string }{
+		{"some", "INSERT INTO w_named (id, x) SELECT id, x FROM src", "SELECT id, x, NULL AS name, NULL AS g FROM src"},
+		{"reordered", "INSERT INTO w_named (x, g, name, id) SELECT x, g, name, id FROM src", "SELECT id, x, name, g FROM src"},
+		{"some reordered", "INSERT INTO w_named (name, id) SELECT name, id FROM src", "SELECT id, NULL AS x, name, NULL AS g FROM src"},
+		{"by name", "INSERT INTO w_named BY NAME SELECT g, id, name, x FROM src", "SELECT id, x, name, g FROM src"},
+		{"some by name", "INSERT INTO w_named BY NAME SELECT x, id FROM src", "SELECT id, x, NULL AS name, NULL AS g FROM src"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			mustExec(t, admin, "DROP TABLE IF EXISTS w_named")
+			mustExec(t, admin, "CREATE TABLE w_named (id BIGINT, x BIGINT, name VARCHAR, g BIGINT)")
+			mustExec(t, admin, c.insert)
+			if got, want := env.local(t, "SELECT * FROM w_named ORDER BY ALL"), env.local(t, "SELECT * FROM ("+c.want+") ORDER BY ALL"); got != want {
+				t.Errorf("rows differ from those of %s", c.want)
+			}
+			env.checkWrote(t, "w_named")
+		})
+	}
+}
+
 // TestWorkersDoNotWrite checks that a fill stays with this replica's writes
 // inside a transaction block, and over a source with a policy.
 func TestWorkersDoNotWrite(t *testing.T) {
@@ -936,7 +1059,7 @@ func TestWorkersDoNotWrite(t *testing.T) {
 	env := startWriteServer(t)
 	env.force(t)
 	admin := env.admin
-	inDir := func(f string) bool { return strings.Contains(f, "/"+distributed.WriteDirMark) }
+	inDir := func(f string) bool { return strings.Contains(f, "/"+distributed.SealedDirMark) }
 	mustExec(t, admin, "CREATE TABLE w_tx (id BIGINT, x BIGINT)")
 	mustExec(t, admin, "BEGIN")
 	mustExec(t, admin, "INSERT INTO w_tx SELECT id, x FROM src")
@@ -971,6 +1094,61 @@ func (erasedLedger) WorkerSeen(context.Context, string, string, string, time.Tim
 }
 func (erasedLedger) Emptied(context.Context, string, time.Time, string) error { return nil }
 
+// lateLedger says of the latest deletion what it was last told.
+type lateLedger struct {
+	erasedLedger
+	at atomic.Int64
+}
+
+func (l *lateLedger) LatestDeletion(context.Context) (time.Time, error) {
+	if n := l.at.Load(); n > 0 {
+		return time.Unix(0, n), nil
+	}
+	return time.Time{}, nil
+}
+
+// TestWorkersWriteErasedAtCommit checks that a deletion in the ledger stops a
+// commit about to land, though the coordinator would have heard of it only up to
+// 15 s later: the statement's query runs here on the tables as they are.
+func TestWorkersWriteErasedAtCommit(t *testing.T) {
+	t.Parallel()
+	env := startWriteServer(t)
+	env.force(t)
+	admin := env.admin
+	inDir := func(f string) bool { return strings.Contains(f, "/"+distributed.SealedDirMark) }
+	ledger := &lateLedger{}
+	ctx, stop := context.WithCancel(context.Background())
+	watched := make(chan struct{})
+	go func() {
+		defer close(watched)
+		env.co.WatchErasures(ctx, ledger)
+	}()
+	defer func() {
+		stop()
+		<-watched
+	}()
+	// The first statement commits: nothing has been deleted.
+	mustExec(t, admin, "CREATE TABLE w_gate AS SELECT id, x FROM src")
+	data, _ := liveFiles(t, admin, "w_gate")
+	if !slices.ContainsFunc(data, inDir) {
+		t.Fatalf("workers did not write it: %q", data)
+	}
+	mustExec(t, admin, "CREATE TABLE w_gated (id BIGINT, x BIGINT)")
+	env.srv.beforeWriteCommit = func(context.Context, string) error {
+		ledger.at.Store(time.Now().UnixNano())
+		return nil
+	}
+	defer func() { env.srv.beforeWriteCommit = nil }()
+	mustExec(t, admin, "INSERT INTO w_gated SELECT id, x FROM src")
+	if data, _ := liveFiles(t, admin, "w_gated"); slices.ContainsFunc(data, inDir) {
+		t.Errorf("files tasks wrote were committed: %q", data)
+	}
+	if got, want := env.local(t, "SELECT count(*), sum(x) FROM w_gated"), env.local(t, "SELECT count(*), sum(x) FROM src"); got != want {
+		t.Errorf("%s, want %s", got, want)
+	}
+	env.checkNoNotes(t)
+}
+
 // TestWorkersWriteErased checks that what tasks wrote is not committed when an
 // erasure request deleted files after they began: it runs here, and holds the
 // rows as they are now.
@@ -998,7 +1176,7 @@ func TestWorkersWriteErased(t *testing.T) {
 		t.Errorf("%s, want %s", got, want)
 	}
 	data, _ := liveFiles(t, admin, "w_erased")
-	if slices.ContainsFunc(data, func(f string) bool { return strings.Contains(f, "/"+distributed.WriteDirMark) }) {
+	if slices.ContainsFunc(data, func(f string) bool { return strings.Contains(f, "/"+distributed.SealedDirMark) }) {
 		t.Errorf("files tasks wrote were committed: %q", data)
 	}
 	if left := written(t, env.location(t, "w_erased")); len(left) != 0 {
@@ -1042,8 +1220,9 @@ func TestWorkersWriteOtherTargets(t *testing.T) {
 	if got, want := env.local(t, "SELECT count(*) FROM w_required"), env.local(t, "SELECT count(*) FROM src WHERE g = 1"); got != want {
 		t.Errorf("%s rows, want %s", got, want)
 	}
-	if left := written(t, env.location(t, "w_required")); len(left) != 0 {
-		t.Errorf("files of workers: %q", left)
+	env.checkWrote(t, "w_required")
+	if data, _ := liveFiles(t, admin, "w_required"); len(data) == 0 {
+		t.Error("no file holds its rows")
 	}
 	env.checkNoNotes(t)
 }
@@ -1138,7 +1317,7 @@ func TestWorkersWriteLate(t *testing.T) {
 				t.Errorf("what a task wrote late is still there: %v", err)
 			}
 			data, _ := liveFiles(t, admin, "w_late")
-			if c.commit && !slices.ContainsFunc(data, func(f string) bool { return strings.HasPrefix(f, *dir.Load()+"/") }) {
+			if c.commit && !slices.ContainsFunc(data, func(f string) bool { return strings.HasPrefix(f, sealedDir(*dir.Load())+"/") }) {
 				t.Errorf("the committed files went: %q", data)
 			}
 			for _, f := range data {
@@ -1160,4 +1339,248 @@ func TestLateWritesStop(t *testing.T) {
 	if s.waitLateWrites() {
 		t.Error("it went on with the server stopped")
 	}
+}
+
+// TestWorkersWriteSealed checks that a commit holds copies of what tasks wrote, out
+// of their directories, and that overwriting what a task wrote, as its credentials
+// allow for a while yet, changes nothing of the table, nor does anything that
+// leaves the copies out.
+func TestWorkersWriteSealed(t *testing.T) {
+	t.Parallel()
+	env := startWriteServer(t)
+	env.force(t)
+	admin := env.admin
+	var wrote []string
+	for _, f := range env.faults {
+		f.set(func(f *writeFault) {
+			f.answer = func(_, head map[string]any) faultAction {
+				files, _ := head["files"].([]any)
+				for _, x := range files {
+					p, _ := x.(map[string]any)["path"].(string)
+					wrote = append(wrote, p)
+				}
+				return faultNone
+			}
+		})
+	}
+	mustExec(t, admin, "CREATE TABLE w_sealed (id BIGINT, x BIGINT)")
+	mustExec(t, admin, "INSERT INTO w_sealed SELECT id, x FROM src")
+	if len(wrote) == 0 {
+		t.Fatal("no task wrote")
+	}
+	env.checkWrote(t, "w_sealed")
+	for _, p := range wrote {
+		if _, err := os.Stat(p); !errors.Is(err, fs.ErrNotExist) {
+			t.Errorf("what a task wrote is still there: %s, %v", p, err)
+		}
+		// Written again by a worker with its attempt's credentials.
+		if err := os.MkdirAll(filepath.Dir(p), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte("tampered"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got, want := env.local(t, "SELECT count(*), sum(x) FROM w_sealed"), env.local(t, "SELECT count(*), sum(x) FROM src"); got != want {
+		t.Errorf("%s, want %s", got, want)
+	}
+}
+
+// TestForgedNoteDeletesNothing: a note of what a stopped write left, as whoever
+// reaches the catalog itself can write one, deletes files only in a directory
+// of the table it names, as Igloo makes them. Any other is left, and the note
+// goes.
+func TestForgedNoteDeletesNothing(t *testing.T) {
+	env := startWriteServer(t)
+	env.force(t)
+	admin := env.admin
+	ctx := context.Background()
+	mustExec(t, admin, "CREATE TABLE w_victim (id BIGINT, x BIGINT)")
+	mustExec(t, admin, "INSERT INTO w_victim SELECT id, x FROM src")
+	mustExec(t, admin, "CREATE TABLE w_mine (id BIGINT, x BIGINT)")
+	loc := env.location(t, "w_victim")
+	before := written(t, loc)
+	if len(before) == 0 {
+		t.Fatal("workers wrote none of the victim's files: the test shows nothing")
+	}
+	base := strings.TrimSuffix(strings.TrimPrefix(loc, "file://"), "/") + "/data/"
+	// The victim's own statement's directory, as its note named it.
+	own := strings.Replace(regexp.MustCompile(".*/"+distributed.SealedDirMark+"[0-9a-f]+").FindString(before[0]), distributed.SealedDirMark, distributed.WriteDirMark, 1)
+	for _, dir := range []string{base + distributed.WriteDirMark + "*", own} {
+		note := catalog.Pending{Key: "igloo.pending.forged", Kind: catalog.PendingFiles, Name: dir, Target: "w_mine", Host: "gone", Process: "gone",
+			At: time.Now().Add(-2 * catalog.PendingStale)}
+		if err := env.srv.ddl.NotePending(ctx, "public", note); err != nil {
+			t.Fatal(err)
+		}
+		mustExec(t, admin, "INSERT INTO w_mine SELECT id, x FROM src")
+		env.srv.lateWrites.Wait()
+		if n := len(filesNotes(t, env.srv)); n != 0 {
+			t.Errorf("%s: %d notes left", dir, n)
+		}
+		if after := written(t, loc); !slices.Equal(after, before) {
+			t.Errorf("a note of %s deleted the victim's files: %d left of %d", dir, len(after), len(before))
+		}
+	}
+	if got := count(t, admin, "SELECT count(*) FROM w_victim"); got != count(t, admin, "SELECT count(*) FROM src") {
+		t.Errorf("the victim holds %d rows", got)
+	}
+
+	// What a stopped write of its own left goes.
+	left := strings.TrimSuffix(strings.TrimPrefix(env.location(t, "w_mine"), "file://"), "/") + "/data/" + distributed.WriteDirMark + "0123456789abcdef"
+	conn, err := env.srv.engine.Connect(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close() //nolint:errcheck
+	if _, err := conn.ExecContext(ctx, "COPY (SELECT 1 AS id, 2 AS x) TO "+quoteLiteral(left)+" (FORMAT parquet, FILENAME_PATTERN 'part_{i}', FILE_SIZE_BYTES 1000000)", nil); err != nil {
+		t.Fatal(err)
+	}
+	note := catalog.Pending{Key: "igloo.pending.stopped", Kind: catalog.PendingFiles, Name: left, Target: "w_mine", Host: "gone", Process: "gone",
+		At: time.Now().Add(-2 * catalog.PendingStale)}
+	if err := env.srv.ddl.NotePending(ctx, "public", note); err != nil {
+		t.Fatal(err)
+	}
+	mustExec(t, admin, "INSERT INTO w_mine SELECT id, x FROM src")
+	env.srv.lateWrites.Wait()
+	if n := filesIn(t, left); n != 0 {
+		t.Errorf("%d files a stopped write left are still there", n)
+	}
+}
+
+// wideRows are rows of about 10.8 KB, 432 MB of them: row groups as DuckDB
+// gathers them hold them all.
+const wideRows = "SELECT id, g, x, repeat(name, 1800) AS c FROM src"
+
+// checkWide checks that table holds what wideRows does.
+func (e *writeEnv) checkWide(t *testing.T, table string) {
+	t.Helper()
+	sum := "SELECT count(*), sum(length(c)), sum(x), bit_xor(hash(id, c)) FROM "
+	if got, want := e.local(t, sum+table), e.local(t, sum+"("+wideRows+")"); got != want {
+		t.Errorf("%s: %s, want %s", table, got, want)
+	}
+}
+
+// TestWorkersWriteWideRows checks that workers of a DuckDB of 256 MB write rows
+// a row group of 122,880 of which would take 1.3 GB: the task bounds its row
+// groups by the bytes it has, partitioned or not, in auto mode and when forced.
+func TestWorkersWriteWideRows(t *testing.T) {
+	t.Parallel()
+	env := startWriteServerOn(t, writeWorkers{cores: 2, memory: 256 << 20, limit: "256MB"}, nil)
+	admin := env.admin
+	t.Run("forced", func(t *testing.T) {
+		env.force(t)
+		mustExec(t, admin, "CREATE TABLE w_wide AS "+wideRows)
+		env.checkWide(t, "w_wide")
+		env.checkWrote(t, "w_wide")
+	})
+	t.Run("partitioned", func(t *testing.T) {
+		env.force(t)
+		mustExec(t, admin, "CREATE TABLE w_wide_p AS "+wideRows+" LIMIT 0")
+		mustExec(t, admin, "ALTER TABLE w_wide_p SET PARTITIONED BY (g)")
+		mustExec(t, admin, "INSERT INTO w_wide_p "+wideRows)
+		env.checkWide(t, "w_wide_p")
+		env.checkWrote(t, "w_wide_p")
+	})
+	t.Run("auto", func(t *testing.T) {
+		mustExec(t, admin, "RESET distributed_execution")
+		mustExec(t, admin, "CREATE TABLE w_wide_auto AS "+wideRows)
+		env.checkWide(t, "w_wide_auto")
+		env.checkNoNotes(t)
+	})
+}
+
+// TestWorkersOutOfMemoryOnWrite checks that a fill that runs out of memory on
+// workers, after its retries with smaller tasks, runs on this replica, on every
+// way a table is filled: here with workers that do not know their memory is
+// 64 MB, so that no task bounds what it holds, and whose out of memory is real.
+// (At 128 MB, the retries with smaller tasks succeed.)
+func TestWorkersOutOfMemoryOnWrite(t *testing.T) {
+	t.Parallel()
+	env := startWriteServerOn(t, writeWorkers{cores: 2, memory: 0, limit: "64MB"}, nil)
+	env.force(t)
+	admin := env.admin
+	inDir := func(f string) bool { return strings.Contains(f, "/"+distributed.SealedDirMark) }
+	leftAlone := func(t *testing.T, table string) {
+		t.Helper()
+		env.checkWide(t, table)
+		data, _ := liveFiles(t, admin, table)
+		if slices.ContainsFunc(data, inDir) {
+			t.Errorf("workers wrote it: %q", data)
+		}
+		if left := written(t, env.location(t, table)); len(left) != 0 {
+			t.Errorf("files left: %q", left)
+		}
+		env.checkNoNotes(t)
+	}
+	t.Run("create", func(t *testing.T) {
+		mustExec(t, admin, "CREATE TABLE w_oom AS "+wideRows)
+		leftAlone(t, "w_oom")
+	})
+	t.Run("replace", func(t *testing.T) {
+		mustExec(t, admin, "CREATE OR REPLACE TABLE w_oom AS "+wideRows)
+		leftAlone(t, "w_oom")
+	})
+	t.Run("insert", func(t *testing.T) {
+		mustExec(t, admin, "CREATE TABLE w_oom_i AS "+wideRows+" LIMIT 0")
+		mustExec(t, admin, "INSERT INTO w_oom_i "+wideRows)
+		leftAlone(t, "w_oom_i")
+	})
+	t.Run("materialized view", func(t *testing.T) {
+		mustExec(t, admin, "CREATE MATERIALIZED VIEW w_oom_mv AS SELECT i AS id, g, x, repeat(name, 1800) AS c FROM lake.public.src AS o(i)")
+		mustExec(t, admin, "REFRESH MATERIALIZED VIEW w_oom_mv")
+		env.checkWide(t, "w_oom_mv")
+		env.checkNoNotes(t)
+	})
+}
+
+// TestWorkersShortOfMemoryWriting checks what follows tasks that run out of
+// memory only as they write. A statement this replica has the room for runs
+// here. One it does not, by its estimates, runs on workers again, with this
+// replica writing the table from their results.
+func TestWorkersShortOfMemoryWriting(t *testing.T) {
+	t.Parallel()
+	short := func(env *writeEnv) {
+		for _, f := range env.faults {
+			f.set(func(f *writeFault) { f.memory = true })
+		}
+	}
+	shortAnswers := func(env *writeEnv) int64 { return env.faults[0].short.Load() + env.faults[1].short.Load() }
+	inDir := func(f string) bool { return strings.Contains(f, "/"+distributed.SealedDirMark) }
+	t.Run("room here", func(t *testing.T) {
+		t.Parallel()
+		env := startWriteServer(t)
+		env.force(t)
+		short(env)
+		mustExec(t, env.admin, "CREATE TABLE w_short AS SELECT id, x FROM src")
+		if shortAnswers(env) == 0 {
+			t.Fatal("no task wrote")
+		}
+		if got, want := env.local(t, "SELECT count(*), sum(x) FROM w_short"), env.local(t, "SELECT count(*), sum(x) FROM src"); got != want {
+			t.Errorf("%s, want %s", got, want)
+		}
+		if data, _ := liveFiles(t, env.admin, "w_short"); slices.ContainsFunc(data, inDir) {
+			t.Errorf("files of tasks: %q", data)
+		}
+		env.checkNoNotes(t)
+	})
+	t.Run("no room here", func(t *testing.T) {
+		t.Parallel()
+		// By the estimates: this replica's 1 MB would not hold what the
+		// exchange's stage reads.
+		env := startWriteServerWith(t, func(o *distributed.Options) { o.MemoryBytes = 1 << 20 })
+		env.force(t)
+		short(env)
+		query := "SELECT a.id, b.x FROM src AS a JOIN src AS b ON a.id = b.id"
+		mustExec(t, env.admin, "CREATE TABLE w_short AS "+query)
+		if shortAnswers(env) == 0 {
+			t.Fatal("no task wrote")
+		}
+		if got, want := env.local(t, "SELECT count(*), sum(x) FROM w_short"), env.local(t, "SELECT count(*), sum(b.x) FROM src AS a JOIN src AS b ON a.id = b.id"); got != want {
+			t.Errorf("%s, want %s", got, want)
+		}
+		if data, _ := liveFiles(t, env.admin, "w_short"); slices.ContainsFunc(data, inDir) {
+			t.Errorf("files of tasks: %q", data)
+		}
+		env.checkNoNotes(t)
+	})
 }

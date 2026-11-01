@@ -1188,6 +1188,19 @@ func TestNamespaces(t *testing.T) {
 	if w := h.request("POST", "/v1/namespaces/team/properties", nora, map[string]any{"updates": map[string]string{"owner": "me"}}); w.Code != 403 {
 		t.Errorf("schema properties as none: %d %s", w.Code, w.Body)
 	}
+	// Igloo's own, which say what it may delete: nobody's through here.
+	for _, who := range []string{walt, h.login("ada", "ada-password")} {
+		if w := h.request("POST", "/v1/namespaces/sales/properties", who, map[string]any{"updates": map[string]string{"igloo.pending.x": "files"}}); w.Code != 403 {
+			t.Errorf("a note of what Igloo may delete: %d %s", w.Code, w.Body)
+		}
+		if w := h.request("POST", "/v1/namespaces/sales/properties", who, map[string]any{"removals": []string{"IGLOO.pending.x"}}); w.Code != 403 {
+			t.Errorf("removing a note of what Igloo may delete: %d %s", w.Code, w.Body)
+		}
+		if w := h.request("POST", "/v1/namespaces", who, map[string]any{"namespace": []string{"noted"},
+			"properties": map[string]string{"igloo.pending.x": "files"}}); w.Code != 403 {
+			t.Errorf("a schema made with a note of what Igloo may delete: %d %s", w.Code, w.Body)
+		}
+	}
 	if w := h.request("GET", "/v1/namespaces/team", nora, nil); w.Code != 200 {
 		t.Errorf("load a schema with CREATE on it: %d", w.Code)
 	}

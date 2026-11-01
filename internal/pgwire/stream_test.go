@@ -2,15 +2,28 @@ package pgwire
 
 import (
 	"context"
+	"database/sql/driver"
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/duckdb/duckdb-go/v2"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgproto3"
+	wire "github.com/jeroenrinzema/psql-wire"
+	"github.com/jeroenrinzema/psql-wire/codes"
+	pgerror "github.com/jeroenrinzema/psql-wire/errors"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/testutil"
+
+	"github.com/akkio-inc/igloo/internal/catalogproxy"
+	"github.com/akkio-inc/igloo/internal/distributed"
+	"github.com/akkio-inc/igloo/internal/prefetch"
 )
 
 // TestResultsStream sends a statement's rows as DuckDB computes them, not
@@ -33,11 +46,12 @@ func TestResultsStream(t *testing.T) {
 				n++
 			}
 			rows.Close()
-			// A failing thread marks the statement interrupted, and the thread
-			// reading the rows, seeing the mark before it looks for an error,
-			// may report that instead: on one run in many, all DuckDB says of
-			// the failure.
-			if err := rows.Err(); err == nil || !strings.Contains(err.Error(), "a late failure") && !strings.Contains(err.Error(), "Interrupted!") {
+			// DuckDB's error, or what is left of it (see afterFalseInterrupt),
+			// after rows went out. Nothing canceled it.
+			err = rows.Err()
+			var pgErr *pgconn.PgError
+			if !errors.As(err, &pgErr) || pgErr.Code == "57014" ||
+				!strings.Contains(pgErr.Message, "a late failure") && !(pgErr.Code == "XX000" && strings.Contains(pgErr.Message, "was not canceled")) {
 				t.Fatalf("after %d rows: %v, want the late failure", n, err)
 			}
 			if n == 0 {
@@ -49,6 +63,283 @@ func TestResultsStream(t *testing.T) {
 				t.Fatalf("after the failure: %d, %v", one, err)
 			}
 		})
+	}
+}
+
+// falseInterrupt interrupts DuckDB on a session's connection, as a thread's
+// failure does, once a statement whose text holds marker has streamed at
+// rows, on its first times runs: its context lasts.
+type falseInterrupt struct {
+	marker string
+	at     uint32
+	times  atomic.Int32
+	// report has the stream report the false interrupt itself, for what DuckDB
+	// does not stream, and an interrupt would not reach.
+	report bool
+}
+
+var falseInterrupts sync.Map
+
+func interruptStreams(t *testing.T, marker string, at uint32, times int32) {
+	t.Helper()
+	f := &falseInterrupt{marker: marker, at: at}
+	f.times.Store(times)
+	falseInterrupts.Store(marker, f)
+	t.Cleanup(func() { falseInterrupts.Delete(marker) })
+}
+
+func init() {
+	wrapStream = func(ctx context.Context, st *statement, w wire.DataWriter, rows driver.Rows) driver.Rows {
+		var found *falseInterrupt
+		falseInterrupts.Range(func(k, v any) bool {
+			if strings.Contains(st.query, k.(string)) {
+				found = v.(*falseInterrupt)
+			}
+			return found == nil
+		})
+		if found == nil || found.times.Add(-1) < 0 {
+			return rows
+		}
+		return &interruptedRows{Rows: rows, ctx: ctx, w: w, at: found.at, report: found.report}
+	}
+}
+
+// interruptedRows are rows whose query is interrupted once w has sent at.
+type interruptedRows struct {
+	driver.Rows
+	ctx  context.Context
+	w    wire.DataWriter
+	at   uint32
+	done bool
+	// report says to return the error rather than interrupt the query.
+	report bool
+}
+
+func (r *interruptedRows) Next(dest []driver.Value) error {
+	if !r.done && r.w.Written() >= r.at {
+		r.done = true
+		if r.report {
+			return duckdb.ErrFalseInterrupt
+		}
+		sessionFrom(r.ctx).conn.Interrupt()
+	}
+	return r.Rows.Next(dest)
+}
+
+// TestStreamFailsBeforeRows checks a statement that fails before a row went
+// out, DuckDB reporting an interrupt for the thread's failure, when nothing
+// asked for one: the client gets the real error. So it does however the
+// threads race, and one that fails no more gets its rows.
+func TestStreamFailsBeforeRows(t *testing.T) {
+	ts := startServer(t)
+	for name, mode := range modes {
+		t.Run(name, func(t *testing.T) {
+			conn := ts.admin(t, mode)
+			ctx := context.Background()
+			mustFail := func(q string) {
+				t.Helper()
+				n, err := drainRows(conn, q)
+				var pgErr *pgconn.PgError
+				if !errors.As(err, &pgErr) || !strings.Contains(pgErr.Message, "an early failure") || pgErr.Code == "57014" || n != 0 {
+					t.Fatalf("after %d rows: %v, want the failure", n, err)
+				}
+			}
+			const failing = `SELECT CASE WHEN i < 10 THEN i ELSE error('an early failure') END AS %s FROM range(100000) t(i)`
+			for range 25 {
+				mustFail(fmt.Sprintf(failing, "i"))
+			}
+			marker := "failing_" + name
+			interruptStreams(t, marker, 0, 1)
+			mustFail(fmt.Sprintf(failing, marker))
+
+			// It does not fail again: every row, once.
+			marker = "passing_" + name
+			interruptStreams(t, marker, 0, 1)
+			rows, err := conn.Query(ctx, "SELECT i AS "+marker+" FROM range(5000) t(i) ORDER BY i")
+			if err != nil {
+				t.Fatal(err)
+			}
+			n := 0
+			for rows.Next() {
+				vals, err := rows.Values()
+				if err != nil {
+					t.Fatal(err)
+				}
+				if vals[0].(int64) != int64(n) {
+					t.Fatalf("row %d: %v", n, vals)
+				}
+				n++
+			}
+			if err := rows.Err(); err != nil || n != 5000 {
+				t.Fatalf("after %d rows: %v, want 5000 rows", n, err)
+			}
+		})
+	}
+}
+
+// TestStreamFailsAfterRows checks a statement that fails after rows went out,
+// DuckDB reporting an interrupt, when nothing asked for one: an internal
+// error says so, and not that it was canceled, and the session goes on. So
+// does one that may write, which must not run twice, and one in a transaction
+// block, which the failure aborted, before a row went out.
+func TestStreamFailsAfterRows(t *testing.T) {
+	metrics := NewMetrics(prometheus.NewRegistry())
+	ts := startServer(t, func(o *Options) { o.Metrics = metrics })
+	conn := ts.admin(t, pgx.QueryExecModeSimpleProtocol)
+	ctx := context.Background()
+	wantFailed := func(q string, atLeast int) {
+		t.Helper()
+		n, err := drainRows(conn, q)
+		var pgErr *pgconn.PgError
+		if !errors.As(err, &pgErr) || pgErr.Code != "XX000" || !strings.Contains(pgErr.Message, "was not canceled") {
+			t.Fatalf("after %d rows: %v, want the internal error", n, err)
+		}
+		if n < atLeast {
+			t.Fatalf("%d rows reached the client, want at least %d", n, atLeast)
+		}
+	}
+	one := func() {
+		t.Helper()
+		var v int
+		if err := conn.QueryRow(ctx, "SELECT 1").Scan(&v); err != nil || v != 1 {
+			t.Fatalf("after the failure: %d, %v", v, err)
+		}
+	}
+
+	interruptStreams(t, "mid_stream", 1000, 1)
+	wantFailed("SELECT i AS mid_stream FROM range(10000000) t(i)", 1000)
+	one()
+	if got := testutil.ToFloat64(metrics.queries.WithLabelValues("canceled")); got != 0 {
+		t.Errorf("counted as canceled %v times", got)
+	}
+	if got := testutil.ToFloat64(metrics.queries.WithLabelValues("error")); got != 1 {
+		t.Errorf("counted as failed %v times, want once", got)
+	}
+
+	// A statement that writes runs once.
+	mustExec(t, conn, "CREATE TEMP TABLE stream_written (i BIGINT)")
+	interruptStreams(t, "written_stream", 0, 1)
+	f, _ := falseInterrupts.Load("written_stream")
+	f.(*falseInterrupt).report = true
+	wantFailed("INSERT INTO stream_written SELECT i FROM range(5000) t(i) RETURNING i AS written_stream", 0)
+	one()
+	var n int64
+	if err := conn.QueryRow(ctx, "SELECT count(*) FROM stream_written").Scan(&n); err != nil || n != 5000 {
+		t.Errorf("after the failure, the table holds %d rows, want those of one run: %v", n, err)
+	}
+
+	// One that advances a sequence runs once too.
+	mustExec(t, conn, "CREATE TEMP SEQUENCE stream_sequence")
+	interruptStreams(t, "sequence_stream", 0, 1)
+	wantFailed("SELECT nextval('stream_sequence') AS sequence_stream FROM range(5000) t(i)", 0)
+	one()
+
+	// The block is aborted, as any failure leaves it, and the statement cannot
+	// run again in it.
+	mustExec(t, conn, "BEGIN")
+	interruptStreams(t, "block_stream", 0, 1)
+	wantFailed("SELECT i AS block_stream FROM range(5000) t(i)", 0)
+	if _, err := conn.Exec(ctx, "SELECT 1"); err == nil {
+		t.Error("the transaction block runs on after a statement failed in it")
+	}
+	mustExec(t, conn, "ROLLBACK")
+	one()
+}
+
+// drainRows reads q's rows, and returns how many reached the client and how
+// they ended.
+func drainRows(conn *pgx.Conn, q string) (int, error) {
+	rows, err := conn.Query(context.Background(), q)
+	if err != nil {
+		return 0, err
+	}
+	n := 0
+	for rows.Next() {
+		n++
+	}
+	rows.Close()
+	return n, rows.Err()
+}
+
+// TestStreamInterruptsAskedFor checks that what does end a statement as its
+// rows stream is reported as what it is, as a thread's failure must not be:
+// the memory watch, as a statement out of memory. A cancel request and the
+// statement timeout are in TestStreamedResultCanceled.
+func TestStreamInterruptsAskedFor(t *testing.T) {
+	ts := startServer(t)
+	conn := ts.admin(t, pgx.QueryExecModeSimpleProtocol)
+	ctx := context.Background()
+	rows, err := conn.Query(ctx, "SELECT i, repeat('x', 100) AS pad FROM range(1000000000) t(i)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	n := 0
+	for rows.Next() {
+		if n++; n == 100000 {
+			if !ts.srv.ShedMemory(1 << 20) {
+				t.Fatal("nothing to shed")
+			}
+		}
+	}
+	rows.Close()
+	var pgErr *pgconn.PgError
+	if !errors.As(rows.Err(), &pgErr) || pgErr.Code != "53200" {
+		t.Fatalf("after %d rows of a billion and the memory watch: %v, want out of memory", n, rows.Err())
+	}
+}
+
+// TestStreamFailureClassified checks that nothing in Igloo that goes by a
+// statement's error takes the error of one that failed as its rows streamed
+// for anything it is not: not a cancel, not a statement out of memory, which
+// would run again elsewhere; not a failure in the data or of a block's read,
+// not a commit conflict, not bitmaps that did not fit.
+func TestStreamFailureClassified(t *testing.T) {
+	err := streamFailed(7)
+	if got := pgerror.GetCode(pgError(err)); got != codes.Internal {
+		t.Errorf("SQLSTATE %s, want internal", got)
+	}
+	if got := queryOutcome(err); got != "error" {
+		t.Errorf("outcome %s, want error", got)
+	}
+	sess := &session{}
+	if sess.ranOutOfMemory(context.Background(), err) || isOutOfMemory(err) || distributed.OutOfMemory(err) {
+		t.Error("taken for running out of memory")
+	}
+	if distributed.DataError(err) || distributed.IsUnsupported(err) || prefetch.BlockRace(err) || commitConflict(err) || bitmapsDidNotFit(err) ||
+		catalogproxy.RefusedShared(err.Error()) {
+		t.Error("taken for another failure")
+	}
+}
+
+// TestParameterInResult checks a statement whose result's columns DuckDB cannot
+// tell before it has an untyped parameter's value: it fails with a code that
+// says so, where it took the session's statement down with a panic, and the
+// session goes on. Cast, it runs.
+func TestParameterInResult(t *testing.T) {
+	ts := startServer(t)
+	conn := ts.admin(t, pgx.QueryExecModeExec)
+	ctx := context.Background()
+	rows, err := conn.Query(ctx, "SELECT i, i + $1 AS m FROM range(10) t(i) ORDER BY i", int64(5))
+	if err == nil {
+		for rows.Next() {
+		}
+		rows.Close()
+		err = rows.Err()
+	}
+	if code := pgCode(err); code != "42P18" {
+		t.Fatalf("%v, want SQLSTATE 42P18", err)
+	}
+	rows, err = conn.Query(ctx, "SELECT i, i + $1::BIGINT AS m FROM range(10) t(i) ORDER BY i", int64(5))
+	if err != nil {
+		t.Fatal(err)
+	}
+	n := 0
+	for rows.Next() {
+		n++
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil || n != 10 {
+		t.Fatalf("cast: %d rows, %v", n, err)
 	}
 }
 
@@ -228,5 +519,63 @@ func TestSortedRowsFromWorkers(t *testing.T) {
 				t.Fatalf("after it: %d, %v", one, err)
 			}
 		})
+	}
+}
+
+// TestStreamFailsReadingMerge checks a statement whose merge of workers'
+// sorted rows fails as it streams, DuckDB reporting an interrupt. Before a row
+// went out it runs again on this replica, as a merge cannot be read twice, and
+// the client gets every row; that streams too, and fails the same way, and
+// then runs again read whole. After rows went out, the internal error.
+func TestStreamFailsReadingMerge(t *testing.T) {
+	t.Parallel()
+	ds := startDistServer(t, 2)
+	mustExec(t, ds.catalogServer.admin, "INSERT INTO lake.public.orders SELECT i, i % 97 FROM range(2000, 60000) t(i)")
+	conn := ds.testServer.admin(t, pgx.QueryExecModeSimpleProtocol)
+	ctx := context.Background()
+	mustExec(t, conn, "SET search_path = 'lake.public,memory.main'")
+	read := func(query string) (string, error) {
+		rows, err := conn.Query(ctx, query)
+		if err != nil {
+			return "", err
+		}
+		var b strings.Builder
+		for rows.Next() {
+			vals, err := rows.Values()
+			if err != nil {
+				return "", err
+			}
+			fmt.Fprintln(&b, vals...)
+		}
+		return b.String(), rows.Err()
+	}
+	query := "SELECT id AS merge_stream, amount FROM orders ORDER BY amount DESC, id"
+	mustExec(t, conn, "SET distributed_execution = off")
+	want, err := read(query)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustExec(t, conn, "SET distributed_execution = on")
+	if got, err := read(query); err != nil || got != want {
+		t.Fatalf("on workers: %v, %d bytes, want %d", err, len(got), len(want))
+	}
+	if q := lastRun(t, ds.history, query); q.Workers != 2 {
+		t.Fatalf("%d workers ran it, want 2", q.Workers)
+	}
+	for _, times := range []int32{1, 2} {
+		interruptStreams(t, "merge_stream", 0, times)
+		if got, err := read(query); err != nil || got != want {
+			t.Fatalf("interrupted %d times: %v, %d bytes, want %d", times, err, len(got), len(want))
+		}
+	}
+	interruptStreams(t, "merge_stream", 1000, 1)
+	_, err = read(query)
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) || pgErr.Code != "XX000" || !strings.Contains(pgErr.Message, "was not canceled") {
+		t.Fatalf("after rows went out: %v, want the internal error", err)
+	}
+	var one int
+	if err := conn.QueryRow(ctx, "SELECT 1").Scan(&one); err != nil || one != 1 {
+		t.Fatalf("after it: %d, %v", one, err)
 	}
 }

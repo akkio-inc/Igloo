@@ -98,6 +98,19 @@ class SummarizeTest(unittest.TestCase):
         self.assertEqual(h["elt"]["worker_busy_seconds"], 40.0)
 
 
+class HeavyTest(unittest.TestCase):
+    def test_heavy_and_probes_run_until_the_window_ends(self):
+        log, lock = [], threading.Lock()
+        args = mixed.parse(["run", "--dashboard-users", "0", "--elt-streams", "0", "--heavy-sessions", "2", "--probes",
+                            "--duration", "0.2", "--warmup", "0", "--run-id", "t"])
+        res = mixed.run(args, lambda cls: FakeConn(log, lock, delay=0.01))
+        names = {(r["class"], r["name"]) for r in res["records"]}
+        self.assertLessEqual({("heavy", n) for n in mixed.HEAVY}, names)
+        self.assertLessEqual({("probe", n) for n in mixed.PROBES}, names)
+        self.assertTrue(any("/* mixed t heavy households */" in q for q in log))
+        self.assertTrue(any("/* mixed t probe ping */" in q for q in log))
+
+
 class CostTest(unittest.TestCase):
     def test_cost(self):
         c = mixed.cost(1.0, 0.5, 1800, 7200)

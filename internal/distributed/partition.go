@@ -43,8 +43,10 @@ type keyed struct {
 	bucketed bool
 	bucket   int
 	// into, for an input read beside tables read by bucket, is the buckets
-	// its exchange writes its rows to, the smallest count of theirs.
-	into int
+	// its exchange writes its rows to, the smallest count of theirs, and
+	// intoUUID how their files hash UUIDs.
+	into     int
+	intoUUID string
 	// through, for a table in a subquery read by bucket, says how the
 	// subquery passes its columns on: item is the subquery's, and keys are
 	// its columns (see bucket.go).
@@ -409,8 +411,14 @@ func (pl *planner) keyInputs(c *candidate) error {
 			sc, item = c.scope, th.item
 		}
 		if !(u.splittable || u.semi || u.outer || th != nil) || !inScope(sc) {
-			if (u.splittable || u.outerSub) && u.scope != nil && u.scope.ref != nil {
+			switch {
+			case (u.splittable || u.outerSub) && u.scope != nil && u.scope.ref != nil:
 				c.tooDeep = u
+			case (u.splittable || u.outer || u.semi) && u.scope == c.scope && len(c.keyed) > 0 && c.keyed[0].use != nil && c.keyed[0].through == nil && c.keyScope.ref != nil:
+				// The inputs keyed so far are joined in a subquery of this
+				// FROM, as it passes on none of their keys: the subquery is
+				// the relation, joined to this table.
+				c.tooDeep = c.keyed[0].use
 			}
 			return unsupported("%s, too large for every worker to read, is read where its rows cannot be divided", u.table)
 		}

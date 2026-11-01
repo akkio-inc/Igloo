@@ -367,6 +367,9 @@ type planner struct {
 	noInline  bool
 	grouped   int
 	noGrouped bool
+	// gathers are the SELECTs that read a set operation workers compute,
+	// whose rows the coordinator reads as they are (see setOperationJob).
+	gathers map[uintptr]bool
 	// fused numbers the views of stages fusePartitions took out.
 	fused int
 	// reasons say why candidates were not distributed, for logs.
@@ -606,6 +609,12 @@ func (pl *planner) skip(err error) {
 func (pl *planner) query(n node, top bool, ctes cteScope) (node, error) {
 	switch str(n["type"]) {
 	case "SELECT_NODE":
+		if work := pl.distinctGroups(n); work != nil {
+			replaced, err := pl.job(work, top, ctes)
+			if err != nil || replaced != nil {
+				return replaced, err
+			}
+		}
 		replaced, err := pl.job(n, top, ctes)
 		if err != nil || replaced != nil {
 			return replaced, err
@@ -622,6 +631,10 @@ func (pl *planner) query(n node, top bool, ctes cteScope) (node, error) {
 			return nil, err
 		}
 	case "SET_OPERATION_NODE":
+		replaced, err := pl.setOperationJob(n, top, ctes)
+		if err != nil || replaced != nil {
+			return replaced, err
+		}
 		// Its branches, which read its common table expressions, then them.
 		inner := ctes.with(n)
 		for _, side := range []string{"left", "right"} {
@@ -1013,6 +1026,9 @@ func (pl *planner) analyze(c *candidate, ctes cteScope) error {
 	if err := pl.semiJoins(sel, ctes); err != nil {
 		return err
 	}
+	if err := pl.scalarJoins(sel, ctes); err != nil {
+		return err
+	}
 	if child(sel, "sample") != nil {
 		return unsupported("USING SAMPLE")
 	}
@@ -1275,24 +1291,27 @@ func (pl *planner) from(ref node, splittable bool, ctes cteScope, sc *scope, rd 
 		if err != nil {
 			return err
 		}
-		uses0, rels0 := len(rd.uses), len(rd.rels)
+		uses0, rels0, items0 := len(rd.uses), len(rd.rels), len(sc.items)
 		if err := pl.from(child(ref, "left"), splittable && left, ctes, sc, rd); err != nil {
 			return err
 		}
-		uses, rels := len(rd.uses), len(rd.rels)
+		uses, rels, items := len(rd.uses), len(rd.rels), len(sc.items)
 		if err := pl.from(child(ref, "right"), splittable && right, ctes, sc, rd); err != nil {
 			return err
 		}
+		conds := append(conjuncts(child(ref, "condition")), usingConds(ref, sc.items[items0:items], sc.items[items:])...)
 		if splittable {
-			sc.addOuterJoin(ref, rd, [3]int{uses0, uses, len(rd.uses)}, [3]int{rels0, rels, len(rd.rels)})
+			sc.addOuterJoin(ref, rd, conds, [3]int{uses0, uses, len(rd.uses)}, [3]int{rels0, rels, len(rd.rels)})
 		}
+		jt := str(ref["join_type"])
 		switch {
-		case str(ref["join_type"]) == "INNER" && str(ref["ref_type"]) != "ASOF":
-			sc.conds = append(sc.conds, conjuncts(child(ref, "condition"))...)
-		case str(ref["join_type"]) == "SEMI" && str(ref["ref_type"]) == "REGULAR" && splittable:
+		case jt == "INNER" && str(ref["ref_type"]) != "ASOF":
+			sc.conds = append(sc.conds, conds...)
+		case (jt == "SEMI" || jt == "ANTI") && str(ref["ref_type"]) == "REGULAR" && splittable:
 			// Its right side's rows may be partitioned by the join's key: a
-			// row on the left meets all of its matches in one partition.
-			sc.semiConds = append(sc.semiConds, conjuncts(child(ref, "condition"))...)
+			// row on the left meets all of its matches in one partition, and
+			// is kept, or not, by them.
+			sc.semiConds = append(sc.semiConds, conds...)
 			for _, u := range rd.uses[uses:] {
 				u.semi = true
 			}
@@ -2263,18 +2282,18 @@ func (pl *planner) emit(j *job, b *jobBuild, out *Exchange) (*Stage, error) {
 			// A stage per partitioned table, writing its rows to an exchange
 			// keyed by its side of the join key.
 			x = pl.exchange("join", k.keys, k.casts)
-			x.Buckets = k.into
+			x.Buckets, x.UUIDHash = k.into, k.intoUUID
 			pl.stage(&Stage{fragment: k.stage, Inputs: []Input{{View: k.view, Table: k.use.table, Split: true}}, Out: x})
 		} else {
 			var err error
-			if x, err = pl.relationExchange(k.rel, k.keys, k.casts, k.into); err != nil {
+			if x, err = pl.relationExchange(k.rel, k.keys, k.casts, k.into, k.intoUUID); err != nil {
 				return nil, err
 			}
 		}
 		last.Inputs = append(last.Inputs, Input{View: k.view, Exchange: x, Partitioned: true})
 	}
 	for _, w := range j.whole {
-		x, err := pl.relationExchange(w.rel, nil, nil, 0)
+		x, err := pl.relationExchange(w.rel, nil, nil, 0, "")
 		if err != nil {
 			return nil, err
 		}
@@ -2605,7 +2624,7 @@ func passesKey(s *Stage, x *Exchange) bool {
 		keyed = in
 		ix := in.Exchange
 		if len(ix.Keys) != len(x.Keys) || len(ix.Casts) != len(ix.Keys) || !strings.EqualFold(ix.Keys[i], parts[len(parts)-1]) ||
-			ix.Casts[i] != "" || x.Casts[i] != "" || ix.Buckets != x.Buckets {
+			ix.Casts[i] != "" || x.Casts[i] != "" || ix.Buckets != x.Buckets || ix.UUIDHash != x.UUIDHash {
 			return false
 		}
 	}
@@ -2686,6 +2705,7 @@ var timeFunctions = map[string]string{
 	"today": "DATE", "current_date": "DATE",
 	"current_time": "TIME WITH TIME ZONE", "get_current_time": "TIME WITH TIME ZONE",
 	"localtime": "TIME", "localtimestamp": "TIMESTAMP",
+	"current_localtime": "TIME", "current_localtimestamp": "TIMESTAMP",
 }
 
 // fixTime replaces the statement's calls of now() and its relatives with
@@ -2807,7 +2827,23 @@ var sessionFunctions = map[string]bool{
 	"has_function_privilege": true, "has_language_privilege": true, "has_schema_privilege": true,
 	"has_sequence_privilege": true, "has_server_privilege": true, "has_table_privilege": true,
 	"has_tablespace_privilege": true, "pg_has_role": true, "version": true, "igloo_ml_score": true,
+	// The rest of what DuckDB says is not consistent (duckdb_functions()'s
+	// stability), or reads the session's connection or catalog.
+	"ago": true, "current_connection_id": true, "current_query_id": true, "current_transaction_id": true,
+	"get_block_size": true, "stats": true, "write_log": true, "has_foreign_data_wrapper_privilege": true,
+	"inet_client_addr": true, "inet_client_port": true, "inet_server_addr": true, "inet_server_port": true,
+	"pg_conf_load_time": true, "pg_postmaster_start_time": true, "pg_is_other_temp_schema": true,
+	"pg_my_temp_schema": true, "pg_collation_is_visible": true, "pg_conversion_is_visible": true,
+	"pg_function_is_visible": true, "pg_opclass_is_visible": true, "pg_operator_is_visible": true,
+	"pg_opfamily_is_visible": true, "pg_table_is_visible": true, "pg_ts_config_is_visible": true,
+	"pg_ts_dict_is_visible": true, "pg_ts_parser_is_visible": true, "pg_ts_template_is_visible": true,
+	"pg_type_is_visible": true, "pg_get_constraintdef": true, "pg_get_expr": true, "pg_get_viewdef": true,
+	"col_description": true, "obj_description": true, "shobj_description": true,
 }
+
+// SessionFunction says a function of that name, in lower case, depends on
+// the session or the machine it runs on.
+func SessionFunction(name string) bool { return sessionFunctions[name] }
 
 // checkFunctions refuses a fragment that calls a function workers would
 // evaluate differently from the coordinator: one tied to the session, or

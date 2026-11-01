@@ -113,6 +113,69 @@ func TestCheapStatementGivesUpPlanning(t *testing.T) {
 	}
 }
 
+// TestStaysHereWithoutPlanning checks that a statement whose runs already decide
+// that it stays on this replica does not plan again: planning a report of many
+// stages took longer than the report. It plans where planning has a say: a first
+// run, a run past the threshold, a run guarded or short of memory, a fill, forced,
+// and one on far fewer workers than it could run on.
+func TestStaysHereWithoutPlanning(t *testing.T) {
+	h := householdHarness(t)
+	for _, name := range []string{"households", "people"} {
+		h.tables[name].Bytes = 2 << 40
+	}
+	ctx := context.Background()
+	var described int
+	env := slowEnv{harnessEnv: harnessEnv{h}, describes: &described}
+	plan := func(mode Mode) (error, int) {
+		before := described
+		_, err := h.co.Plan(ctx, householdReport, env, mode)
+		return err, described - before
+	}
+	first, _, err := h.co.plan(ctx, householdReport, env, ModeAuto, false, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if described == 0 {
+		t.Fatal("its first run described nothing")
+	}
+	key := first.Key
+	h.co.Observe(key, 0, 10*time.Second)
+	err, n := plan(ModeAuto)
+	if n != 0 || !IsUnsupported(err) || !strings.Contains(err.Error(), "it ran in 10 s on one machine") {
+		t.Errorf("after a run of 10 s here: %d describes, %v", n, err)
+	}
+	if PlanKey(err) != key {
+		t.Errorf("its key: %q, want %q", PlanKey(err), key)
+	}
+	if d, ok := LocalEstimate(err); !ok || d != 10*time.Second {
+		t.Errorf("the guard's estimate: %s, %v", d, ok)
+	}
+	if _, n = plan(ModeOn); n == 0 {
+		t.Error("forced, it did not plan")
+	}
+	// Past the threshold, planning has a say again.
+	h.co.history.update(key, func(r *runs) { r.local = 90 })
+	if _, n = plan(ModeAuto); n == 0 {
+		t.Error("after a run of 90 s here it did not plan")
+	}
+	reset := func(r *runs) { r.local, r.dist, r.distWorkers, r.outOfMemory, r.guarded = 10, 0, 0, false, false }
+	for name, change := range map[string]func(r *runs){
+		"short of memory":                        func(r *runs) { r.outOfMemory = true },
+		"guarded":                                func(r *runs) { r.guarded = true },
+		"no slower on workers":                   func(r *runs) { r.dist, r.distWorkers = 11, 8 },
+		"measured on far fewer workers than now": func(r *runs) { r.dist, r.distWorkers = 60, 1 },
+	} {
+		h.co.history.update(key, func(r *runs) { reset(r); change(r) })
+		if _, n = plan(ModeAuto); n == 0 {
+			t.Errorf("%s: it did not plan", name)
+		}
+	}
+	h.co.history.update(key, func(r *runs) { reset(r); r.dist, r.distWorkers = 60, h.co.opts.Pool.MaxWorkers+8 })
+	if err, n = plan(ModeAuto); n != 0 || !IsUnsupported(err) || !strings.Contains(err.Error(), "on one machine and 60 s on workers") {
+		t.Errorf("slower on as many workers: %d describes, %v", n, err)
+	}
+}
+
 // longReport is a report of a chain of n common table expressions, each
 // grouping the households of the one before and joining them to the
 // people, which the planner computes on workers stage after stage.

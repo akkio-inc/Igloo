@@ -150,6 +150,21 @@ var refreshShapes = []struct {
 	{"expressions", "SELECT upper(g) || '!' AS k, sum(x) * 2 AS sx2, sum(x) / count(*) AS ratio FROM f GROUP BY g", true, ""},
 	{"aliases", "SELECT coalesce(g, '?') AS grp, sum(amount) AS total FROM f GROUP BY grp HAVING total > 0 OR total IS NULL", true, ""},
 	{"self_join", "SELECT a.g, count(*) AS pairs, sum(b.x) AS sx FROM f AS a JOIN f AS b ON a.id = b.id + 1 GROUP BY a.g", true, ""},
+	{"cte", "WITH big AS (SELECT id, g, x FROM f WHERE x > 5) SELECT id, g FROM big", false, ""},
+	{"cte_of_cte", "WITH a AS (SELECT id, g, x FROM f), b(i, grp) AS (SELECT id, g FROM a WHERE x > 5) SELECT i, grp FROM b", false, ""},
+	{"cte_report", "WITH t AS (SELECT g, sum(x) AS sx, count(*) AS n FROM f GROUP BY g) SELECT g, sx * 2 AS d, n FROM t WHERE n > 1", true, ""},
+	{"cte_report_all", "WITH t AS (SELECT g, count(*) AS n FROM f GROUP BY ALL) SELECT * FROM t ORDER BY 1", true, ""},
+	{"cte_twice", "WITH c AS (SELECT id, g, x FROM f) SELECT a.g, count(*) AS pairs, sum(b.x) AS sx FROM c AS a JOIN c AS b ON a.id = b.id + 1 GROUP BY a.g", true, ""},
+	{"subquery_join", "SELECT s.id, d.name FROM (SELECT id, g FROM f WHERE x % 2 = 0) AS s JOIN d ON s.g = d.g", false, "INCREMENTAL"},
+	{"subquery_groups", "SELECT k, sum(v) AS sv, count(*) AS n FROM (SELECT coalesce(g, '?') AS k, x + 1 AS v FROM f WHERE x > 3) AS s GROUP BY k", true, ""},
+	{"nested_stars", "SELECT g, count(*) AS n, sum(x) AS sx FROM (SELECT * FROM (SELECT * FROM f) AS a WHERE x > 10) AS b GROUP BY g", true, ""},
+	{"union_all", "SELECT id, g FROM f WHERE x > 50 UNION ALL SELECT id, g FROM f WHERE y = 1 UNION ALL SELECT -1, 'constant'", false, ""},
+	{"union_distinct", "SELECT g FROM f WHERE x > 50 UNION SELECT g FROM f WHERE y = 1", true, ""},
+	{"union_tables", "SELECT g FROM f UNION SELECT g FROM d", true, "INCREMENTAL"},
+	{"union_sums", "SELECT g, sum(x) AS sx, count(*) AS n, min(1) AS m FROM (SELECT g, x FROM f WHERE x > 50 UNION ALL SELECT g, y FROM f) AS u GROUP BY g", false, ""},
+	{"union_counts", "SELECT g, sum(x) AS sx, count(*) AS n FROM (SELECT g, x FROM f WHERE x > 50 UNION ALL SELECT g, y FROM f) AS u GROUP BY g", true, ""},
+	{"union_join", "SELECT u.g, d.name, count(*) AS n FROM (SELECT g FROM f UNION ALL SELECT g FROM f WHERE x > 50) AS u JOIN d ON u.g = d.g GROUP BY u.g, d.name", true, "INCREMENTAL"},
+	{"union_left", "SELECT f.id, u.name FROM f LEFT JOIN (SELECT g, name FROM d UNION ALL SELECT g, 'fact' FROM f WHERE x = -1) AS u ON f.g = u.g", false, "FULL"},
 }
 
 // TestIncrementalRefresh refreshes views of every shape after random
@@ -252,7 +267,7 @@ func TestIncrementalRefresh(t *testing.T) {
 			switch {
 			case kind == "nothing" && !strings.HasPrefix(a, "NO_DATA"):
 				t.Errorf("round %d, %s, nothing changed: %s", round, s.name, a)
-			case kind == "append" && !strings.HasPrefix(a, "INCREMENTAL") && s.name != "left":
+			case kind == "append" && !strings.HasPrefix(a, "INCREMENTAL") && s.name != "left" && s.name != "union_left":
 				t.Errorf("round %d, %s, rows appended: %s", round, s.name, a)
 			case (kind == "delete" || kind == "update") && s.deletes && !strings.HasPrefix(a, "INCREMENTAL"):
 				t.Errorf("round %d, %s, rows %sd: %s", round, s.name, kind, a)

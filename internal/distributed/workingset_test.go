@@ -197,13 +197,13 @@ func TestPlanShapes(t *testing.T) {
 	if w := got["WINDOW"]; w.rows != 157e6 || math.Abs(w.bytes-157e6*(32+4+64+64+32+hashEntryBytes)) > 1 {
 		t.Errorf("F3-like window: %+v, want every event, buffered once", w)
 	}
-	if d := got["HASH_GROUP_BY DISTINCT"]; d.rows != 6*157e6 {
-		t.Errorf("F3-like distinct pairs: %+v, want six for each event", d)
+	if d := got["HASH_GROUP_BY DISTINCT"]; d.rows != 6*unnestValues*157e6 {
+		t.Errorf("F3-like distinct pairs: %+v, want six objects of what an unnest makes for each event", d)
 	}
 	if g := got["HASH_GROUP_BY"]; g.rows > 31.4e6*24 {
 		t.Errorf("F3-like groups: %+v, no more than DuckDB's for each thread", g)
 	}
-	if p.set < 100e9 || p.set > 300e9 {
+	if p.set < 100e9 || p.set > 400e9 {
 		t.Errorf("F3-like: %.0f GB", p.set/1e9)
 	}
 
@@ -314,6 +314,26 @@ func TestMemoryScale(t *testing.T) {
 	}
 }
 
+// TestGroupEntries checks what groupings hold against what DuckDB was seen to
+// hold, on 16 threads.
+func TestGroupEntries(t *testing.T) {
+	for _, c := range []struct{ in, groups, min, max float64 }{
+		{16e6, 2000, 0, 2e6},
+		{64e6, 10_000, 0, 2e6},
+		{16e6, 50_000, 13e6, 16e6},
+		{64e6, 50_000, 14e6, 17e6},
+		{64e6, 200_000, 19e6, 22e6},
+		{16e6, 200_000, 15e6, 16e6},
+		{64e6, 500_000, 55e6, 64e6},
+		{64e6, 4e6, 55e6, 64e6},
+		{1e6, 500_000, 1e6, 1e6},
+	} {
+		if got := groupEntries(c.in, c.groups, 16); got < c.min || got > c.max {
+			t.Errorf("%.0f rows of %.0f groups: %.1f million held, want %.1f to %.1f", c.in, c.groups, got/1e6, c.min/1e6, c.max/1e6)
+		}
+	}
+}
+
 // TestWorkingSetCalibration checks the working sets DuckDB's plans give
 // against what DuckDB was seen holding, sampled as the server samples it,
 // over joins, groupings, distinct counts, sorts and windows of 16 million
@@ -349,6 +369,7 @@ func TestWorkingSetCalibration(t *testing.T) {
 		`SELECT max(r) FROM (SELECT row_number() OVER (PARTITION BY g ORDER BY v) AS r FROM facts)`,
 		`SELECT sum(x) FROM (SELECT k, v, s FROM facts ORDER BY v, s) t(k, x, s)`,
 		`SELECT g, count(*) FROM facts GROUP BY g`,
+		`SELECT s, sum(v) FROM facts GROUP BY s`,
 	} {
 		plan, err := harnessEnv{h}.Explain(ctx, q)
 		if err != nil {
@@ -385,9 +406,8 @@ func TestWorkingSetCalibration(t *testing.T) {
 // everyone, a window over them all, FLATTEN's cross product with four
 // lists and their values unnested, people counted distinct per value.
 // DuckDB's plan took the join to keep a fifth of the events and each to
-// make one row, a working set of a tenth of what it held; corrected, the
-// estimate is within a factor of two (the unnest's values, three a list,
-// are not counted).
+// make one row, a working set of a tenth of what it held. Corrected, and
+// counting about what the unnest makes, the estimate is within a third of it.
 func TestWorkingSetFlatten(t *testing.T) {
 	if testing.Short() {
 		t.Skip("writes and reads 4 million rows")
@@ -429,7 +449,7 @@ func TestWorkingSetFlatten(t *testing.T) {
 	}
 	peak := heldPeak(t, h, q)
 	t.Logf("held %.0f MB, estimated %.0f MB", peak/1e6, est/1e6)
-	if est < peak/2 || est > 2*peak {
+	if est < peak*2/3 || est > peak*4/3 {
 		t.Errorf("held %.0f MB, estimated %.0f MB", peak/1e6, est/1e6)
 	}
 }

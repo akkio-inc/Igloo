@@ -262,7 +262,15 @@ func (pl *planner) relationAggregate(c *candidate) (*jobBuild, error) {
 	if q := qualifyTopK(c.sel, func(e node) (node, error) { return a.rewrite(e, "select") }); q != nil {
 		combine["qualify"] = q
 	}
-	return &jobBuild{fragment: fragment, second: &secondStage{fragment: combine, keys: a.groupColumns(), whole: len(a.groups) == 0}}, nil
+	// Without groups, or of grouping sets, whose groups no partition holds
+	// whole: its one task computes them over every partial result.
+	return &jobBuild{fragment: fragment, second: &secondStage{fragment: combine, keys: a.groupColumns(), whole: len(a.groups) == 0 || !a.singleSet()}}, nil
+}
+
+// singleSet reports whether the aggregation groups by all of its groups, once:
+// no grouping sets.
+func (a *aggregation) singleSet() bool {
+	return len(a.sets) == 0 || (len(a.sets) == 1 && len(a.sets[0].([]any)) == len(a.groups))
 }
 
 // wholeGroups reports whether the partitions the candidate's stage reads
@@ -693,7 +701,7 @@ func partialArgs(name string, args int) error {
 func (a *aggregation) choose() error {
 	// One grouping set of every group expression, or none: grouping sets
 	// are applied by the coordinator, over the finest groups.
-	single := len(a.sets) == 0 || (len(a.sets) == 1 && len(a.sets[0].([]any)) == len(a.groups))
+	single := a.singleSet()
 	additive := true
 	for _, ac := range a.aggs {
 		if ac.distinct >= 0 && !additiveDistinct[ac.name] {
@@ -726,11 +734,8 @@ func (a *aggregation) choose() error {
 	case a.c.relation:
 		// The coordinator's combine step runs on workers, over whole groups.
 		a.mode = aggGather
-		if len(a.distincts) > 0 && additive && a.inPlace() {
+		if single && len(a.distincts) > 0 && additive && a.inPlace() {
 			a.mode = aggInPlace
-		}
-		if !single {
-			return unsupported("grouping sets in a relation")
 		}
 		return nil
 	case collation != "":
@@ -1935,6 +1940,41 @@ func (pl *planner) cast(e node, typ string) (node, error) {
 // limits. It is only worth it when that cuts the rows down: with a WHERE
 // clause, DISTINCT, or LIMIT, with ORDER BY or not (any rows, which its
 // stage stops sending once it has enough: see Stage.enough).
+// searchesText reports whether a WHERE clause looks a column's text up by a
+// pattern or a part of it of at least minSearch characters (x LIKE '%word%',
+// contains(x, 'word')), as scans of long text do, which keep few rows: workers
+// read the text, and the coordinator what they keep. A pattern of a character
+// or two may keep most of them, which would cross for nothing.
+func searchesText(where node) bool {
+	for _, c := range conjuncts(where) {
+		if str(c["class"]) != "FUNCTION" {
+			continue
+		}
+		switch strings.ToLower(str(c["function_name"])) {
+		case "~~", "~~*", "contains", "starts_with", "prefix", "suffix", "ends_with", "regexp_matches":
+		default:
+			continue
+		}
+		args := list(c, "children")
+		if len(args) != 2 {
+			continue
+		}
+		col, pattern := args[0].(node), args[1].(node)
+		if str(col["class"]) != "COLUMN_REF" || str(pattern["class"]) != "CONSTANT" {
+			continue
+		}
+		v := child(pattern, "value")
+		text := strings.NewReplacer("%", "", "_", "").Replace(str(v["value"]))
+		if str(child(v, "type")["id"]) == "VARCHAR" && len(text) >= minSearch {
+			return true
+		}
+	}
+	return false
+}
+
+// minSearch is the fewest characters of a search that searchesText counts.
+const minSearch = 3
+
 func (pl *planner) rowsJob(c *candidate) (*jobBuild, error) {
 	sel := c.sel
 	if (hasClass(sel["select_list"], "WINDOW") || child(sel, "qualify") != nil || hasClass(sel["modifiers"], "WINDOW")) && c.window == nil {
@@ -1961,7 +2001,10 @@ func (pl *planner) rowsJob(c *candidate) (*jobBuild, error) {
 	// a column equal to a constant, in a list or equal to a subquery's
 	// value, as auto mode's estimates take it (filtersSelectively): workers
 	// read the table, and the coordinator what they keep.
-	selective := c.split != nil && child(sel, "where_clause") != nil && filtersSelectively(node{"where_clause": child(sel, "where_clause")}, c.split.table)
+	selective := c.split != nil && child(sel, "where_clause") != nil && (filtersSelectively(node{"where_clause": child(sel, "where_clause")}, c.split.table) || searchesText(child(sel, "where_clause")))
+	// And so do those of what workers compute as a whole, to be read as it
+	// is (see setOperationJob).
+	selective = selective || pl.gathers[identity(sel)]
 	// And so do those of a subquery whose rows the coordinator reads to run
 	// the rest, as a window over all of them, where they are fewer than
 	// the table's, by its filters or its columns: workers read the table in

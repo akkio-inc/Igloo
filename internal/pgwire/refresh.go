@@ -218,7 +218,8 @@ func (r *refresher) rebuild(ctx context.Context) (int64, error) {
 
 // rebuildWriter returns how workers would write the view's rows, in place
 // of the table's files, or nil: where the refresh could not overwrite them
-// itself (see overwritePlan), as a partitioned view's.
+// itself (see overwritePlan). Workers write a partitioned view's as a table's,
+// where the refresh's own COPY could not.
 func (r *refresher) rebuildWriter(ctx context.Context, src *statement) *tableWrite {
 	o, err := r.overwritePlan(ctx)
 	if err != nil {
@@ -688,9 +689,9 @@ func (r *refresher) incremental(ctx context.Context) (refreshResult, string, err
 			case k > i:
 				pins[k], err = r.pinAt(ctx, other.Table(), oc.From)
 			case oc.AppendOnly():
-				pins[k].View = views[other.Table()][0]
+				pins[k].View, pins[k].Changed = views[other.Table()][0], true
 			default:
-				pins[k].View, sign = views[other.Table()][2], other.Alias
+				pins[k].View, pins[k].Changed, pins[k].Signed, sign = views[other.Table()][2], true, true, other.Outer
 			}
 			if err != nil {
 				return refreshResult{}, "", err
@@ -753,15 +754,16 @@ func (r *refresher) mergeGroups(ctx context.Context, input, detail string) (refr
 	}
 	stateCols := r.stateColumns()
 	alive := "SELECT " + stateCols + " FROM __igloo_merged AS m WHERE " + p.Alive("m")
+	// whole is the view's rows when it is written whole, by overwrite (see
+	// replaceRows), and stmts otherwise what changes them.
+	var whole string
 	var stmts []string
 	cols, keyed := p.KeyColumns()
 	switch {
 	case p.Global:
-		final, err := p.Final(ctx, alive)
-		if err != nil {
+		if whole, err = p.Final(ctx, alive); err != nil {
 			return refreshResult{}, "", err
 		}
-		stmts = append(stmts, "DELETE FROM "+r.qualified, "INSERT INTO "+r.qualified+" "+final)
 	case keyed:
 		names, err := r.viewColumns(ctx)
 		if err != nil {
@@ -780,20 +782,25 @@ func (r *refresher) mergeGroups(ctx context.Context, input, detail string) (refr
 	default:
 		// The view's rows do not show their groups: it is written whole,
 		// from the state, which the delta's groups replace.
-		final, err := p.Final(ctx, "SELECT "+stateCols+" FROM "+state+" AS s WHERE NOT EXISTS (SELECT 1 FROM __igloo_delta AS d WHERE "+
+		whole, err = p.Final(ctx, "SELECT "+stateCols+" FROM "+state+" AS s WHERE NOT EXISTS (SELECT 1 FROM __igloo_delta AS d WHERE "+
 			p.Match("s", "d")+") UNION ALL "+alive)
 		if err != nil {
 			return refreshResult{}, "", err
 		}
-		stmts = append(stmts, "DELETE FROM "+r.qualified, "INSERT INTO "+r.qualified+" "+final)
 	}
+	var stateStmts []string
 	if p.Global {
-		stmts = append(stmts, "DELETE FROM "+state)
+		stateStmts = append(stateStmts, "DELETE FROM "+state)
 	} else {
-		stmts = append(stmts, "DELETE FROM "+state+" AS s WHERE EXISTS (SELECT 1 FROM __igloo_delta AS d WHERE "+p.Match("s", "d")+")")
+		stateStmts = append(stateStmts, "DELETE FROM "+state+" AS s WHERE EXISTS (SELECT 1 FROM __igloo_delta AS d WHERE "+p.Match("s", "d")+")")
 	}
-	stmts = append(stmts, "INSERT INTO "+state+" "+alive)
-	rows, err := r.write(ctx, stmts...)
+	stateStmts = append(stateStmts, "INSERT INTO "+state+" "+alive)
+	var rows int64
+	if whole != "" {
+		rows, err = r.replaceRows(ctx, whole, stateStmts...)
+	} else {
+		rows, err = r.write(ctx, append(stmts, stateStmts...)...)
+	}
 	if err != nil {
 		return refreshResult{}, "", err
 	}

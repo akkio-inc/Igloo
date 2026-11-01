@@ -247,6 +247,14 @@ func tableKey(ns []string, name string) string {
 	return strings.ToLower(strings.Join(ns, "\x1f") + "/" + name)
 }
 
+// loadKeyOf is loadKey of a load's table, "" for what is not one.
+func loadKeyOf(table string) string {
+	if table == "" {
+		return ""
+	}
+	return loadKey(table)
+}
+
 // loadKey is the tableKey of a load's table, whose path is as tableLoad
 // has it.
 func loadKey(path string) string {

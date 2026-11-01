@@ -274,7 +274,7 @@ func (o *orderedQuery) orderBy() string {
 // orderedQueryOf reads query, or returns nil when it has no ORDER BY of its
 // result's columns alone, or a result that would not pass through Parquet
 // files unchanged.
-func orderedQueryOf(ctx context.Context, sess *session, query string) *orderedQuery {
+func orderedQueryOf(ctx context.Context, sess *session, query string, args ...driver.NamedValue) *orderedQuery {
 	query = strings.TrimRight(query, "; \t\r\n")
 	pos := topLevelKeyword(query, "ORDER", "BY")
 	if pos < 0 || topLevelKeyword(query[pos+len("ORDER"):], "ORDER", "BY") >= 0 {
@@ -296,7 +296,7 @@ func orderedQueryOf(ctx context.Context, sess *session, query string) *orderedQu
 		return nil
 	}
 	var err error
-	if o.cols, err = describeTable(ctx, sess, "SELECT * FROM (\n"+o.query+"\n) AS "+sortSource); err != nil || !sortableColumns(o.cols) {
+	if o.cols, err = describeWith(ctx, sess, "SELECT * FROM (\n"+o.query+"\n) AS "+sortSource, args); err != nil || !sortableColumns(o.cols) {
 		return nil
 	}
 	defaultOrder, err := settingValue(ctx, sess.conn, "default_order")
@@ -375,38 +375,49 @@ func sortKeysOf(node map[string]any, orders []any, cols []columnType, defaultDes
 		if i < 0 {
 			return nil, false
 		}
-		k := sortKey{column: cols[i].name, desc: defaultDesc}
-		switch str(item["type"]) {
-		case "ASCENDING":
-			k.desc = false
-		case "DESCENDING":
-			k.desc = true
-		case "ORDER_DEFAULT", "":
-		default:
-			return nil, false
-		}
-		switch strings.ReplaceAll(str(item["null_order"]), "_", " ") {
-		case "NULLS FIRST":
-			k.nullsFirst = true
-		case "NULLS LAST":
-		case "ORDER DEFAULT", "":
-			switch strings.ToUpper(nullOrder) {
-			case "NULLS_FIRST":
-				k.nullsFirst = true
-			case "NULLS_LAST":
-			case "NULLS_FIRST_ON_ASC_LAST_ON_DESC":
-				k.nullsFirst = !k.desc
-			case "NULLS_LAST_ON_ASC_FIRST_ON_DESC":
-				k.nullsFirst = k.desc
-			default:
-				return nil, false
-			}
-		default:
+		k := sortKey{column: cols[i].name}
+		if !k.setOrder(item, defaultDesc, nullOrder) {
 			return nil, false
 		}
 		keys = append(keys, k)
 	}
 	return keys, true
+}
+
+// setOrder sets k's direction and where its NULLs go from item, an item of
+// an ORDER BY in DuckDB's parse, under the session's defaults; false if it
+// does not know them.
+func (k *sortKey) setOrder(item map[string]any, defaultDesc bool, nullOrder string) bool {
+	k.desc = defaultDesc
+	switch str(item["type"]) {
+	case "ASCENDING", "ORDER_ASCENDING":
+		k.desc = false
+	case "DESCENDING", "ORDER_DESCENDING":
+		k.desc = true
+	case "ORDER_DEFAULT", "":
+	default:
+		return false
+	}
+	switch strings.ReplaceAll(str(item["null_order"]), "_", " ") {
+	case "NULLS FIRST":
+		k.nullsFirst = true
+	case "NULLS LAST":
+	case "ORDER DEFAULT", "":
+		switch strings.ToUpper(nullOrder) {
+		case "NULLS_FIRST":
+			k.nullsFirst = true
+		case "NULLS_LAST":
+		case "NULLS_FIRST_ON_ASC_LAST_ON_DESC":
+			k.nullsFirst = !k.desc
+		case "NULLS_LAST_ON_ASC_FIRST_ON_DESC":
+			k.nullsFirst = k.desc
+		default:
+			return false
+		}
+	default:
+		return false
+	}
+	return true
 }
 
 // jsonNumber reads a number of DuckDB's parse.
@@ -534,8 +545,8 @@ func (s *Server) sortSpillBudget(ctx context.Context, sess *session) int64 {
 
 // estimatedRows is how many rows DuckDB's plan of query estimates it
 // gives.
-func estimatedRows(ctx context.Context, sess *session, query string) (int64, error) {
-	rows, err := sess.conn.QueryContext(ctx, "EXPLAIN (FORMAT JSON) "+query, nil)
+func estimatedRows(ctx context.Context, sess *session, query string, args ...driver.NamedValue) (int64, error) {
+	rows, err := sess.conn.QueryContext(ctx, "EXPLAIN (FORMAT JSON) "+query, args)
 	if err != nil {
 		return 0, err
 	}

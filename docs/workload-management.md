@@ -216,9 +216,46 @@ statements sharing it, up to four; and the guard moves a heavy statement
 that runs on the replica to workers once it has run its estimate while
 others run beside it, rather than three times it (see [beside other
 statements](distributed-execution.md#when)). `IGLOO_WORKER_THRESHOLD`
-sets how long a statement must take for workers to be worth it. Without
-workers, the replica's limit below and roles' limits hold heavy statements
-back.
+sets how long a statement must take for workers to be worth it.
+
+Without workers, nothing needs setting either, on Linux. DuckDB runs every
+statement on one pool of threads, and a thread stays with a statement's
+pipeline until that ends, so beside one session's long reports a dashboard's
+statement had little more than its own thread. The operating system can
+prefer one thread to another, though, so a heavy statement runs in a second
+DuckDB of the replica's process, opened at the first heavy statement, whose
+threads give way to the first's (a nice value of 10). Alone it takes about
+what it takes in the first; beside others it gets the cores they leave idle,
+and about a tenth of those they use.
+
+The two share the memory limit. A heavy statement alone may use it all, the
+first's caches giving way to it. While the first reads tables it keeps what
+it holds, up to three quarters of the limit, for its statements not to read
+their files again, and the heavy statement has what is left and spills.
+
+A statement is heavy if the last statement of its shape, its text with the
+literals masked, used 5 seconds of all the replica's cores
+(`cpu_time_ms` in the [history](#resources-in-the-history)). A read not seen
+before runs in the first DuckDB; if it runs long enough to be heavy beside
+the others running, 5 seconds for each statement sharing the cores, within
+its first minute and before it sends the client a row, it starts again in
+the second. A statement alone stays where it is. A write (`INSERT`,
+`UPDATE`, `DELETE`, `MERGE`, the fill of `CREATE TABLE ... AS`) never starts
+again, so runs in the second from the first run after one that was heavy,
+and commits as another replica's would.
+
+Only what gives the same result there runs there: a statement outside a
+transaction block, of what the catalog holds, on which no masking or row
+access policy applies, in a session with no temporary tables or views and
+none of the settings tasks do not take over, calling no function tied to the
+session, and not one that fills ID domains' ids; a statement the second
+DuckDB cannot bind, such as one of a connection's tables or a view not yet
+copied there, runs in the first. Materialized views' refreshes run in the
+first. `placement` in the history says which reads ran there, and
+`igloo_background_statements_total` counts them.
+`IGLOO_HEAVY_IN_BACKGROUND=false` runs everything in the first. Without
+workers, the replica's limit below and roles' limits hold back heavy
+statements beyond that.
 
 ### The replica's limit
 

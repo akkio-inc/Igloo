@@ -47,6 +47,8 @@ type testWorker struct {
 	// isolated is how long it goes without hearing from a coordinator
 	// before it empties its cache by itself.
 	isolated time.Duration
+	// now is the request's clock, which these tests run ahead.
+	now func() time.Time
 }
 
 func (tw *testWorker) cacheDir() string { return filepath.Join(tw.dir, "cache") }
@@ -66,7 +68,7 @@ func (tw *testWorker) start() {
 	w, err := distributed.NewWorker(distributed.WorkerOptions{
 		Engine: tw.eng, Secret: workerSecret, Version: "test", ID: tw.name, TempDir: filepath.Join(tw.dir, "tmp"),
 		Locations: []string{tw.dir}, Cores: 1, MemoryBytes: 1 << 30,
-		Erasure: distributed.WorkerErasure{Cache: tw.cache, Through: through,
+		Erasure: distributed.WorkerErasure{Cache: tw.cache, Through: through, Now: tw.now,
 			Purge: func(context.Context) error {
 				if err := os.RemoveAll(tw.cacheDir()); err != nil {
 					return err
@@ -134,7 +136,7 @@ func startWorkers(t *testing.T, f *fixture, n int) ([]*testWorker, *distributed.
 	var addrs []string
 	for i := range n {
 		name := fmt.Sprintf("worker-%d", i)
-		tw := &testWorker{t: t, name: name, dir: filepath.Join(f.dir, name), eng: f.eng, cache: WorkerCache(name, "disk:"+name, true, 0)}
+		tw := &testWorker{t: t, name: name, dir: filepath.Join(f.dir, name), eng: f.eng, cache: WorkerCache(name, "disk:"+name, true, 0), now: func() time.Time { return f.svc.now() }}
 		tw.start()
 		t.Cleanup(tw.stop)
 		ws = append(ws, tw)
@@ -146,7 +148,7 @@ func startWorkers(t *testing.T, f *fixture, n int) ([]*testWorker, *distributed.
 // newCoordinator is a coordinator of the workers at addrs.
 func newCoordinator(t *testing.T, f *fixture, name string, addrs ...string) *distributed.Coordinator {
 	t.Helper()
-	co, err := distributed.NewCoordinator(distributed.Options{Secret: workerSecret, Version: "test", TempDir: filepath.Join(f.dir, name),
+	co, err := distributed.NewCoordinator(distributed.Options{Secret: workerSecret, Version: "test", TempDir: filepath.Join(f.dir, name), ErasureNow: func() time.Time { return f.svc.now() },
 		Warehouse: f.warehouse(), Storage: distributed.NewStorage(icebergio.LocalFS{}), Pool: distributed.PoolOptions{Addresses: addrs}},
 		slog.New(slog.DiscardHandler))
 	if err != nil {
@@ -287,7 +289,7 @@ func TestIsolatedWorker(t *testing.T) {
 	f := newFixture(t)
 	f.people("crm.people", [][]any{ann, subject, carl})
 	f.tag(policy.ColumnTag{Schema: "crm", Table: "people", Column: "email", Value: "email"})
-	tw := &testWorker{t: t, name: "pod-0", dir: filepath.Join(f.dir, "pod-0"), eng: f.eng, isolated: 300 * time.Millisecond}
+	tw := &testWorker{t: t, name: "pod-0", dir: filepath.Join(f.dir, "pod-0"), eng: f.eng, now: func() time.Time { return f.svc.now() }, isolated: 300 * time.Millisecond}
 	tw.cache = WorkerCache(tw.name, "memory:pod-0", false, time.Second)
 	tw.start()
 	t.Cleanup(tw.stop)

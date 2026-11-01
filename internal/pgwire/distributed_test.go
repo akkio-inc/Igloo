@@ -214,6 +214,13 @@ func startTestWorkerRB(t *testing.T, dir string, i int, gate *taskGate, rb strin
 // for auto mode's estimates.
 func startTestWorkerCores(t *testing.T, dir string, i int, gate *taskGate, rb string, cores int) (string, *distributed.Worker, func()) {
 	t.Helper()
+	return startTestWorkerLimited(t, dir, i, gate, rb, cores, 1<<30, "")
+}
+
+// startTestWorkerLimited is startTestWorkerCores with a worker that takes its
+// memory for memory, and a DuckDB limited to limit, on two threads, if set.
+func startTestWorkerLimited(t *testing.T, dir string, i int, gate *taskGate, rb string, cores int, memory int64, limit string) (string, *distributed.Worker, func()) {
+	t.Helper()
 	tmp := filepath.Join(t.TempDir(), "worker")
 	if err := os.MkdirAll(tmp, 0o700); err != nil {
 		t.Fatal(err)
@@ -231,6 +238,9 @@ func startTestWorkerCores(t *testing.T, dir string, i int, gate *taskGate, rb st
 	setup, err := c.Connect(context.Background())
 	if err != nil {
 		t.Fatal(err)
+	}
+	if limit != "" {
+		load = append(load, "SET memory_limit = "+quoteLiteral(limit), "SET threads = 2", "SET temp_directory = "+quoteLiteral(filepath.Join(tmp, "spill")))
 	}
 	for _, stmt := range append(load,
 		"SET allowed_directories = ["+quoteLiteral(dir+"/")+", "+quoteLiteral(tmp+"/")+"]",
@@ -251,7 +261,7 @@ func startTestWorkerCores(t *testing.T, dir string, i int, gate *taskGate, rb st
 	}
 	w, err := distributed.NewWorker(distributed.WorkerOptions{
 		Engine: workerEngine{c, gate}, Secret: testWorkerSecret, Version: "test", ID: fmt.Sprintf("w%d", i), TempDir: tmp,
-		Locations: []string{dir}, Cores: cores, MemoryBytes: 1 << 30,
+		Locations: []string{dir}, Cores: cores, MemoryBytes: memory,
 	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
 		t.Fatal(err)

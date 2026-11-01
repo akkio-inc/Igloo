@@ -102,6 +102,23 @@ type Engine struct {
 	// bitmaps says the rb extension is loaded (see loadRB).
 	bitmaps bool
 	log     *slog.Logger
+	// cfg is what it was opened with, and isBackground says it is the
+	// second DuckDB of a process, for heavy statements (see background.go);
+	// bg is that one, opened at its first use, and the rest its upkeep.
+	cfg          config.Config
+	isBackground bool
+	bgMu         sync.Mutex
+	bg           *Engine
+	bgErr        error
+	bgAt         time.Time
+	bgStop       chan struct{}
+	bgUsers      atomic.Int64
+	bgWake       chan struct{}
+	balanceMu    sync.Mutex
+	// limit is the memory limit memlimit gives it, for the two together;
+	// current what it is now set to; fgRead when a statement that reads
+	// tables last ran in it, in Unix nanoseconds.
+	limit, current, fgRead atomic.Int64
 }
 
 // OpenPartitionFiles is how many files of a partitioned write DuckDB keeps
@@ -133,7 +150,8 @@ func Open(ctx context.Context, cfg config.Config, log *slog.Logger, opts ...Opti
 		return nil, err
 	}
 
-	e := &Engine{connector: connector, parser: p, releaseTempDir: release, log: log}
+	e := &Engine{connector: connector, parser: p, releaseTempDir: release, log: log, cfg: cfg, isBackground: o.background,
+		bgWake: make(chan struct{}, 1)}
 	if err := e.setup(ctx, cfg, log, o); err != nil {
 		p.close()
 		err = errors.Join(err, connector.Close())
@@ -143,7 +161,8 @@ func Open(ctx context.Context, cfg config.Config, log *slog.Logger, opts ...Opti
 		release()
 		return nil, err
 	}
-	if e.cache != nil {
+	if e.cache != nil && !e.isBackground {
+		// The first DuckDB keeps the cache they share to its size.
 		e.startCache(log)
 	}
 
@@ -625,15 +644,33 @@ func (e *Engine) SetCatalogGuard(g catalogproxy.Guard) {
 	}
 }
 
+// HoldCommit holds schema.name's next commit from the catalog, and has DuckDB
+// write its files under dir (see catalogproxy.CommitHold). It returns nil if
+// another hold has the table, or there is no catalog.
+func (e *Engine) HoldCommit(schema, name, dir string) *catalogproxy.CommitHold {
+	if e.proxy == nil {
+		return nil
+	}
+	return e.proxy.HoldCommit([]string{schema}, name, dir)
+}
+
 // Close shuts DuckDB down. Sessions must be closed first: DuckDB's database
 // closes, deleting its spill files, as the last connection to it closes.
 func (e *Engine) Close() error {
+	var err error
+	e.bgMu.Lock()
+	if e.bg != nil {
+		close(e.bgStop)
+		err = e.bg.Close()
+		e.bg = nil
+	}
+	e.bgMu.Unlock()
 	if e.prefetcher != nil {
 		e.prefetcher.Close()
 	}
 	e.stopCache()
 	e.parser.close()
-	err := e.connector.Close()
+	err = errors.Join(err, e.connector.Close())
 	if e.proxy != nil {
 		err = errors.Join(err, e.proxy.Close())
 	}
@@ -666,33 +703,38 @@ func (e *Engine) setup(ctx context.Context, cfg config.Config, log *slog.Logger,
 	if e.local, err = queryString(ctx, conn, "SELECT current_database()"); err != nil {
 		return fmt.Errorf("read database name: %w", err)
 	}
-	if err := e.registerCatalog(ctx); err != nil {
-		return fmt.Errorf("register the catalog functions: %w", err)
-	}
-	if err := e.registerHistory(ctx); err != nil {
-		return fmt.Errorf("register query history: %w", err)
-	}
-	if err := e.registerJobHistory(ctx); err != nil {
-		return fmt.Errorf("register task and load history: %w", err)
-	}
-	if err := e.registerAlertHistory(ctx); err != nil {
-		return fmt.Errorf("register alert history: %w", err)
-	}
 	e.locations = loadLocations(cfg)
-	if err := e.registerPolicies(ctx); err != nil {
-		return fmt.Errorf("register policy references: %w", err)
-	}
-	if err := e.registerErasure(ctx); err != nil {
-		return fmt.Errorf("register erasure requests: %w", err)
-	}
-	if err := e.registerAI(ctx); err != nil {
-		return fmt.Errorf("register the AI functions: %w", err)
-	}
-	if err := e.setupModels(ctx, cfg, true); err != nil {
-		return fmt.Errorf("register model functions: %w", err)
-	}
-	if err := e.setupForecasting(ctx, cfg); err != nil {
-		return fmt.Errorf("register forecasting functions: %w", err)
+	// Functions over Igloo's own state, which the background DuckDB does
+	// not hold: a statement that calls one fails to bind there, and runs in
+	// the first (see background.go).
+	if !o.background {
+		if err := e.registerCatalog(ctx); err != nil {
+			return fmt.Errorf("register the catalog functions: %w", err)
+		}
+		if err := e.registerHistory(ctx); err != nil {
+			return fmt.Errorf("register query history: %w", err)
+		}
+		if err := e.registerJobHistory(ctx); err != nil {
+			return fmt.Errorf("register task and load history: %w", err)
+		}
+		if err := e.registerAlertHistory(ctx); err != nil {
+			return fmt.Errorf("register alert history: %w", err)
+		}
+		if err := e.registerPolicies(ctx); err != nil {
+			return fmt.Errorf("register policy references: %w", err)
+		}
+		if err := e.registerErasure(ctx); err != nil {
+			return fmt.Errorf("register erasure requests: %w", err)
+		}
+		if err := e.registerAI(ctx); err != nil {
+			return fmt.Errorf("register the AI functions: %w", err)
+		}
+		if err := e.setupModels(ctx, cfg, true); err != nil {
+			return fmt.Errorf("register model functions: %w", err)
+		}
+		if err := e.setupForecasting(ctx, cfg); err != nil {
+			return fmt.Errorf("register forecasting functions: %w", err)
+		}
 	}
 
 	if cfg.Catalog.URI == "" {

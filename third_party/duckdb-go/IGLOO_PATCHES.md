@@ -48,7 +48,12 @@ were removed; the code is otherwise unchanged except for these patches:
   DuckDB's error at their end. Upstream materializes every result before it
   returns the first row, as Igloo's clients' results were: a sort of
   hundreds of millions of rows without `LIMIT` held every row in memory,
-  past the server's, before the client saw one.
+  past the server's, before the client saw one. `ErrFalseInterrupt` is what
+  such a query fails with when DuckDB reports it interrupted while its
+  context lasts: the thread reading the rows saw the mark another thread's
+  failure left, and reported that instead of the failure.
+  `Stmt.QueryArrowStreamContext` in `igloo_arrow.go` reads such a result as
+  Arrow record batches.
 - `igloo_chunk.go` (new): `DataChunk.ChunkColumn`, for a table function's
   `FillChunk` to write a column at a time: the vector's memory, for values
   of a fixed size copied in bulk, NULLs set in the validity mask, strings of

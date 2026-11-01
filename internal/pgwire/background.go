@@ -1,0 +1,443 @@
+package pgwire
+
+import (
+	"context"
+	"database/sql/driver"
+	"runtime"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/duckdb/duckdb-go/v2"
+	wire "github.com/jeroenrinzema/psql-wire"
+
+	"github.com/akkio-inc/igloo/internal/ddl"
+	"github.com/akkio-inc/igloo/internal/distributed"
+	"github.com/akkio-inc/igloo/internal/engine"
+	"github.com/akkio-inc/igloo/internal/sqllex"
+)
+
+// Heavy statements in the background. On a replica with no workers, one
+// session's long reports took the cores from every dashboard beside them
+// (see engine's background.go for what was measured). DuckDB cannot run one
+// statement at a lower priority than another, but the operating system can
+// run one DuckDB at a lower priority than another: reads that are heavy run
+// in a second DuckDB of this process whose threads give way to the first's.
+// Alone, they run as fast as they would have in the first.
+//
+// A statement is heavy if statements of its shape, its text with the
+// literals masked, last took heavySeconds of all the machine's cores. One
+// not yet seen runs in the first DuckDB; if it has run long enough to be
+// heavy by what it can have used beside the others running, and has sent the
+// client nothing, it starts again in the second, once, within
+// heavyMoveWithin. So a report's first run costs it at most a few seconds
+// more, and dashboards see its later ones only as the cores they leave idle.
+//
+// Only what would give the same rows there runs there: a read outside a
+// transaction block, of what the catalog holds, with no policies on it, no
+// temporary objects or settings of the session's that the other DuckDB has
+// not got, and no function tied to the session. Anything else that the
+// second DuckDB cannot bind, as Igloo's functions over its own state, a
+// connection's tables or a view not yet copied there, fails as it is
+// prepared, and runs in the first.
+//
+// A write of the catalog's tables known to be heavy (INSERT, UPDATE, DELETE,
+// MERGE and the fill of CREATE TABLE ... AS) runs there too, under the same
+// conditions and through its own proxy, with the same guard. It commits as a
+// replica would, and the first DuckDB finds the new snapshot as it finds
+// another replica's. A write is never started again, so one not yet known to
+// be heavy runs to its end in the first.
+
+// heavySeconds is how long of all the machine's cores makes a statement
+// heavy. A dashboard's statement takes a fraction of that: on 12 cores, one
+// over a billion rows used 30 to 40 s of CPU, and a report over them 700.
+const heavySeconds = 5
+
+// maxHeavyShapes bounds the shapes remembered; they are forgotten all at
+// once, and learned again.
+const maxHeavyShapes = 4096
+
+// heavyMoveWithin is how long a statement that turned out heavy may have run
+// and still start again in the background. Past it, starting again would
+// cost it more than it is likely to cost the others.
+var heavyMoveWithin = 60 * time.Second
+
+// heavyHistory is what statements of each shape last took.
+type heavyHistory struct {
+	mu sync.Mutex
+	// heavy says what statements of each seen shape are.
+	shapes map[string]bool
+	// cpu is how much CPU time makes a statement heavy, and after how long
+	// it starts again in the background, per statement sharing the cores.
+	cpu   time.Duration
+	after time.Duration
+}
+
+func newHeavyHistory() *heavyHistory {
+	return &heavyHistory{shapes: map[string]bool{}, cpu: heavySeconds * time.Second * time.Duration(runtime.GOMAXPROCS(0)), after: heavySeconds * time.Second}
+}
+
+// observe learns what a run of shape took. A statement goes back to being
+// light only well under the line, so that one that sits on it does not go
+// back and forth.
+func (h *heavyHistory) observe(shape string, cpu time.Duration) {
+	if shape == "" {
+		return
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if len(h.shapes) >= maxHeavyShapes {
+		h.shapes = map[string]bool{}
+	}
+	switch {
+	case cpu >= h.cpu:
+		h.shapes[shape] = true
+	case cpu < h.cpu/2:
+		h.shapes[shape] = false
+	default:
+		if _, seen := h.shapes[shape]; !seen {
+			h.shapes[shape] = false
+		}
+	}
+}
+
+// heavy says whether the last run of shape was heavy.
+func (h *heavyHistory) heavy(shape string) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.shapes[shape]
+}
+
+// moveAfter is how long a statement not known to be heavy runs before it
+// could have used that much, sharing the cores with others.
+func (h *heavyHistory) moveAfter(others int) time.Duration {
+	return h.after * time.Duration(1+min(others, 7))
+}
+
+// backgroundLane is the second DuckDB as this server uses it.
+type backgroundLane struct {
+	once sync.Mutex
+	eng  *engine.Engine
+	// views keeps the local copies of the catalog's views there.
+	views *ddl.Manager
+	stop  context.CancelFunc
+	wg    sync.WaitGroup
+}
+
+// backgroundOpener is the engine that can open the second DuckDB.
+type backgroundOpener interface {
+	Background(ctx context.Context) (*engine.Engine, error)
+	UsingBackground(ctx context.Context) func()
+	ForegroundRead()
+}
+
+// backgroundEngine returns the second DuckDB, opening it and starting its
+// copies of the catalog's views if this is its first use.
+func (s *Server) backgroundEngine(ctx context.Context) (*engine.Engine, backgroundOpener, error) {
+	opener, ok := s.engine.(backgroundOpener)
+	if !ok {
+		return nil, nil, engine.ErrNoBackground
+	}
+	l := &s.lane
+	l.once.Lock()
+	defer l.once.Unlock()
+	if l.eng != nil {
+		return l.eng, opener, nil
+	}
+	eng, err := opener.Background(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	if eng.LocalDatabase() != s.engine.LocalDatabase() {
+		// Statements may name the first's local database.
+		return nil, nil, engine.ErrNoBackground
+	}
+	// Its writes reach the catalog through a proxy of its own, under the
+	// same rules.
+	eng.SetCatalogGuard(s)
+	if s.ddl != nil {
+		views, err := s.ddl.For(ctx, eng)
+		if err != nil {
+			return nil, nil, err
+		}
+		runCtx, stop := context.WithCancel(context.Background())
+		l.views, l.stop = views, stop
+		l.wg.Go(func() { views.Run(runCtx) })
+	}
+	l.eng = eng
+	return eng, opener, nil
+}
+
+// closeBackground stops what keeps the second DuckDB's views up to date, so
+// that the engine can close it.
+func (s *Server) closeBackground() error {
+	l := &s.lane
+	l.once.Lock()
+	defer l.once.Unlock()
+	if l.stop != nil {
+		l.stop()
+		l.wg.Wait()
+		l.stop = nil
+	}
+	if l.views != nil {
+		err := l.views.Close()
+		l.views = nil
+		return err
+	}
+	return nil
+}
+
+// backgroundConn is a session's connection to the second DuckDB.
+type backgroundConn struct {
+	conn  *duckdb.Conn
+	meter *engine.Meter
+}
+
+// closeBackgroundConn closes the session's connection to the second DuckDB,
+// if it opened one.
+func (sess *session) closeBackgroundConn() error {
+	if bc := sess.bgConn.Swap(nil); bc != nil {
+		return bc.meter.Close()
+	}
+	return nil
+}
+
+// interruptBackground interrupts what the session runs in the second DuckDB.
+func (sess *session) interruptBackground() {
+	if bc := sess.bgConn.Load(); bc != nil {
+		bc.conn.Interrupt()
+	}
+}
+
+// backgroundConnOf returns the session's connection to eng, with the
+// session's settings and search path, opening it if need be, with what a
+// statement may call in any session.
+func (s *Server) backgroundConnOf(ctx context.Context, sess *session, eng *engine.Engine) (*backgroundConn, error) {
+	bc := sess.bgConn.Load()
+	if bc == nil {
+		conn, meter, err := eng.ConnectMetered(ctx)
+		if err != nil {
+			return nil, err
+		}
+		conn.SetBindHold(eng.CatalogShare)
+		for _, stmt := range sessionCatalogSetup(sess.user.Name, false, s.version, eng.BitmapsLoaded()) {
+			// The macros. Views of Igloo's own relations have no place here,
+			// and one macro that cannot be defined fails only the statements
+			// that call it, which then run in the first DuckDB.
+			if strings.Contains(stmt[:min(len(stmt), 40)], " MACRO ") {
+				_, _ = conn.ExecContext(ctx, stmt, nil)
+			}
+		}
+		bc = &backgroundConn{conn: conn, meter: meter}
+		sess.bgConn.Store(bc)
+	}
+	settings, err := s.distributedSettings(ctx, sess)
+	if err != nil {
+		return nil, err
+	}
+	for _, set := range settings {
+		if _, err := bc.conn.ExecContext(ctx, "SET SESSION "+quoteIdent(set.Name)+" = "+quoteLiteral(set.Value), nil); err != nil {
+			return nil, err
+		}
+	}
+	path, err := settingValue(ctx, sess.conn, "search_path")
+	if err != nil {
+		return nil, err
+	}
+	if _, err := bc.conn.ExecContext(ctx, "SET SESSION search_path = "+quoteLiteral(path), nil); err != nil {
+		return nil, err
+	}
+	return bc, nil
+}
+
+// mayRunInBackground says whether st could give the same rows in the second
+// DuckDB, as far as a look at it can tell (see above); what it does not
+// tell, preparing it there does.
+func (s *Server) mayRunInBackground(sess *session, st *statement, tw *tagWriter, parts *distParts) bool {
+	return s.heavy != nil && sess.wl.shape != "" && st.stmtType == duckdb.STATEMENT_TYPE_SELECT && st.kind == returnsRows &&
+		!sess.inTx && len(st.loads) > 0 && !st.ai && len(st.indexPins) == 0 && st.idCounts == nil && parts.local == 0 &&
+		tw.Written() == 0 && policyReason(st) == ""
+}
+
+// sameInBackground looks closer, as only a statement that will run there
+// need: at the functions it calls and the session's temporary objects, which
+// a name in it might mean.
+func (s *Server) sameInBackground(ctx context.Context, sess *session, st *statement) bool {
+	for _, w := range sqllex.CodeWords(st.prepared) {
+		if distributed.SessionFunction(strings.ToLower(w)) {
+			return false
+		}
+	}
+	if sess.ddlCount == 0 {
+		// Only DDL makes temporary objects (see names).
+		return true
+	}
+	release := s.holdCatalog(sess)
+	defer release()
+	temp, err := queryStrings(ctx, sess, `SELECT system.main.lower(table_name) FROM system.main.duckdb_tables() WHERE temporary AND NOT internal
+		UNION ALL SELECT system.main.lower(view_name) FROM system.main.duckdb_views() WHERE temporary AND NOT internal`)
+	if err != nil {
+		return false
+	}
+	for _, t := range temp {
+		if !setupTempViews[t] {
+			return false
+		}
+	}
+	return true
+}
+
+// runPlaced runs st on this replica, in whichever of its DuckDBs it belongs.
+func (s *Server) runPlaced(ctx, outer context.Context, sess *session, st *statement, args []driver.NamedValue, tw *tagWriter, parts *distParts) error {
+	if !s.mayRunInBackground(sess, st, tw, parts) {
+		s.foregroundRead(st)
+		return s.runHere(ctx, sess, st, args, tw)
+	}
+	if s.heavy.heavy(sess.wl.shape) {
+		if ran, err := s.runInBackground(ctx, sess, st, args, tw, parts); ran {
+			return err
+		}
+		s.foregroundRead(st)
+		return s.runHere(ctx, sess, st, args, tw)
+	}
+	s.foregroundRead(st)
+	// It may turn out heavy, beside others.
+	start := time.Now()
+	guard := guardLocalBy(ctx, func() time.Duration {
+		others := s.othersRunning(sess)
+		if others == 0 || time.Since(start) > heavyMoveWithin {
+			return time.Hour
+		}
+		return s.heavy.moveAfter(others)
+	}, tw)
+	err := s.runHere(guard.ctx, sess, st, args, tw)
+	fired, ran := guard.stop(tw)
+	if !fired || ctx.Err() != nil || outer.Err() != nil {
+		return err
+	}
+	s.log.Debug("a statement turned out heavy beside others; starting it again in the background", "ran", ran.Round(time.Millisecond))
+	if bgRan, err := s.runInBackground(ctx, sess, st, args, tw, parts); bgRan {
+		return err
+	}
+	return s.runHere(ctx, sess, st, args, tw)
+}
+
+// foregroundRead tells the engine a statement that reads tables runs in the
+// first DuckDB, whose caches it wants (see engine's background.go).
+func (s *Server) foregroundRead(st *statement) {
+	if s.heavy != nil && len(st.loads) > 0 {
+		if o, ok := s.engine.(backgroundOpener); ok {
+			o.ForegroundRead()
+		}
+	}
+}
+
+// writesInBackground says whether st, a write or the fill of one, runs in
+// the second DuckDB: if statements of its shape are known to be heavy, and it
+// would write and read the same there.
+func (s *Server) writesInBackground(ctx context.Context, sess *session, st *statement) bool {
+	return s.heavy != nil && sess.wl.shape != "" && s.heavy.heavy(sess.wl.shape) && !sess.inTx && st.ids == nil && !st.ai &&
+		policyReason(st) == "" && s.sameInBackground(ctx, sess, st)
+}
+
+// runWriteInBackground runs st, if it is a write that belongs there, in the
+// second DuckDB. ran false says it did not, and nothing was written.
+func (s *Server) runWriteInBackground(ctx context.Context, sess *session, st *statement, args []driver.NamedValue, w wire.DataWriter) (ran bool, err error) {
+	switch st.stmtType {
+	case duckdb.STATEMENT_TYPE_INSERT, duckdb.STATEMENT_TYPE_UPDATE, duckdb.STATEMENT_TYPE_DELETE, statementTypeMergeInto:
+	default:
+		return false, nil
+	}
+	if st.kind != command || !s.writesInBackground(ctx, sess, st) {
+		return false, nil
+	}
+	fin, bc, end := s.prepareInBackground(ctx, sess, st.query, st.clientOIDs)
+	if fin == nil {
+		return false, nil
+	}
+	defer end()
+	defer fin.close() //nolint:errcheck
+	if !sameShape(fin, st, st.original == "") {
+		return false, nil
+	}
+	fin.stmtType, fin.query = st.stmtType, st.query
+	if err := fin.run(ctx, args, w); err != nil {
+		return true, err
+	}
+	sess.wl.backgroundUsed = bc.meter.Last(fin.prepared)
+	return true, nil
+}
+
+// fillInBackground runs q, an INSERT that fills a table for f's statement,
+// in the second DuckDB. ran false says it did not, and nothing was written.
+func (f *stagedFill) fillInBackground(ctx context.Context, q string) (n int64, ran bool, err error) {
+	fin, bc, end := f.s.prepareInBackground(ctx, f.sess, q, nil)
+	if fin == nil {
+		return 0, false, nil
+	}
+	defer end()
+	defer fin.close() //nolint:errcheck
+	res, err := fin.stmt.QueryContext(ctx, nil)
+	if err == nil {
+		n, err = countOf(res)
+	}
+	if used := bc.meter.Last(fin.prepared); used != nil && err == nil {
+		f.cpu += used.CPUTime
+	}
+	return n, true, err
+}
+
+// prepareInBackground prepares query in the second DuckDB, opening it and
+// the session's connection to it if need be, and gives the statement its
+// room; end says it has ended. The statement is nil if it cannot run there.
+func (s *Server) prepareInBackground(ctx context.Context, sess *session, query string, oids []uint32) (fin *statement, bc *backgroundConn, end func()) {
+	eng, opener, err := s.backgroundEngine(ctx)
+	if err != nil {
+		return nil, nil, nil
+	}
+	if bc, err = s.backgroundConnOf(ctx, sess, eng); err != nil {
+		s.log.Debug("a heavy statement runs in the first DuckDB", "err", err)
+		return nil, nil, nil
+	}
+	if fin, err = prepare(ctx, bc.conn, query, oids); err != nil {
+		s.log.Debug("a heavy statement runs in the first DuckDB", "err", err)
+		return nil, nil, nil
+	}
+	s.metrics.backgroundStatement()
+	return fin, bc, opener.UsingBackground(ctx)
+}
+
+// runInBackground runs st in the second DuckDB. ran false says it did not,
+// and nothing was sent: it runs in the first.
+func (s *Server) runInBackground(ctx context.Context, sess *session, st *statement, args []driver.NamedValue, tw *tagWriter, parts *distParts) (ran bool, err error) {
+	if !s.sameInBackground(ctx, sess, st) {
+		return false, nil
+	}
+	fin, bc, end := s.prepareInBackground(ctx, sess, st.query, st.clientOIDs)
+	if fin == nil {
+		return false, nil
+	}
+	defer end()
+	defer fin.close() //nolint:errcheck
+	if !sameShape(fin, st, st.original == "") {
+		s.log.Debug("a heavy statement runs in the first DuckDB: its result differs in the second")
+		return false, nil
+	}
+	fin.stmtType, fin.query = st.stmtType, st.query
+	// On this thread, which works on the statement's tasks too, at the
+	// default priority: one core's worth of it. The client's writer cannot
+	// be called from another goroutine.
+	err = fin.run(ctx, args, tw)
+	if err == nil {
+		sess.wl.backgroundUsed = bc.meter.Last(fin.prepared)
+		parts.placement = "this replica, in the background: it is heavy, and gives way to the other statements here"
+		return true, nil
+	}
+	// Whatever failed there, unless the statement was canceled, the first
+	// DuckDB may do better, if the client has seen nothing yet.
+	if ctx.Err() != nil || tw.Written() > 0 || distributed.DataError(err) {
+		return true, err
+	}
+	s.log.Debug("a heavy statement failed in the second DuckDB; running it in the first", "err", err)
+	return false, nil
+}

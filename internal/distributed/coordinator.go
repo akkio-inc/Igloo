@@ -114,6 +114,9 @@ type Options struct {
 	// MemoryBytes is the coordinator's DuckDB memory limit, for estimating
 	// whether a statement fits it (see choose); zero for unknown.
 	MemoryBytes int64
+	// ErasureNow, if set, stands for the clock in what erasure requests say, in
+	// tests (see WorkerErasure.Now).
+	ErasureNow func() time.Time
 	// NoWorkerWrites keeps workers from writing tables' files: the
 	// coordinator writes every table (IGLOO_WORKER_WRITES=off).
 	NoWorkerWrites bool
@@ -177,6 +180,8 @@ type Coordinator struct {
 	// erased is the latest deletion of erasure requests it knows of, in
 	// Unix nanoseconds, which statements' tasks carry (see erasure.go).
 	erased atomic.Int64
+	// ledger is where WatchErasures reads requests' deletions, for ErasedNow.
+	ledger atomic.Pointer[ErasureLedger]
 	// writeDeniedUntil is when workers may be asked to write tables' files
 	// again after one was refused (see noteWriteDenied), in Unix nanoseconds.
 	writeDeniedUntil atomic.Int64
@@ -510,6 +515,9 @@ func (co *Coordinator) planOn(ctx context.Context, query string, env Env, mode M
 	shape := ""
 	if mode == ModeAuto && !dry && sizes == nil && onLarge == nil {
 		shape = planKey(stmt, nil)
+		if u := co.staysHere(shape, env, len(ws)); u != nil {
+			return nil, nil, u
+		}
 	}
 	ctx = withDescribes(ctx)
 	values, err := co.computedValues(ctx, env, stmt)
@@ -611,6 +619,14 @@ func (co *Coordinator) planOn(ctx context.Context, query string, env Env, mode M
 	// enough to be worth their files.
 	x.workersWrite = opts.writes && slices.ContainsFunc(plan.Stages, func(s *Stage) bool { return s.writeSQL != "" }) &&
 		(opts.force || x.fillOut() >= co.minWorkerWrite())
+	if x.fill && !x.writeFits(f) {
+		// Rows as wide as these are more than a task of theirs holds, in a file
+		// of the table's or of its results; this replica, if it has the room.
+		x.workersWrite = false
+		if mode == ModeAuto && co.opts.MemoryBytes >= f.memory {
+			return nil, nil, unsupported("its rows take about %d KB each, more than a task on a worker of %d MiB holds", int64(x.rowBytes())>>10, f.memory>>20)
+		}
+	}
 	plan.writes = x.workersWrite
 	e := x.estimate(m, f)
 	e.others = others
@@ -1662,6 +1678,28 @@ func (co *Coordinator) watchTask(ctx context.Context, addr string, stop context.
 	}
 }
 
+// mostTaskHead bounds the line that heads a task's answer: what it did and the
+// files it wrote, of a few hundred bytes each.
+const mostTaskHead = 64 << 20
+
+// errHeadTooLong is a worker's answer whose head has no end in sight.
+var errHeadTooLong = fmt.Errorf("it is longer than %d bytes", mostTaskHead)
+
+// readHeadLine reads the line that heads a task's answer, up to mostTaskHead.
+func readHeadLine(br *bufio.Reader) ([]byte, error) {
+	var line []byte
+	for {
+		part, err := br.ReadSlice('\n')
+		if len(line)+len(part) > mostTaskHead {
+			return nil, errHeadTooLong
+		}
+		line = append(line, part...)
+		if !errors.Is(err, bufio.ErrBufferFull) {
+			return line, err
+		}
+	}
+}
+
 // fetchTask is fetch without the watch.
 func (co *Coordinator) fetchTask(ctx context.Context, w *worker, body []byte, path string, sp *spool) (*taskResult, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://"+w.addr+tasksPath, bytes.NewReader(body))
@@ -1720,7 +1758,10 @@ func (co *Coordinator) fetchTask(ctx context.Context, w *worker, body []byte, pa
 		}
 		return nil, res.Error
 	}
-	line, err := br.ReadBytes('\n')
+	line, err := readHeadLine(br)
+	if errors.Is(err, errHeadTooLong) {
+		return nil, fmt.Errorf("read result header from %s: %w", w.addr, err)
+	}
 	if err != nil {
 		return nil, &transportError{fmt.Errorf("read result header: %w", err)}
 	}

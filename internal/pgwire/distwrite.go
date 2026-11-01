@@ -14,10 +14,12 @@ import (
 
 	"github.com/apache/iceberg-go"
 	"github.com/apache/iceberg-go/table"
+	"golang.org/x/sync/errgroup"
 
 	"github.com/akkio-inc/igloo/internal/catalog"
 	"github.com/akkio-inc/igloo/internal/ddl"
 	"github.com/akkio-inc/igloo/internal/distributed"
+	"github.com/akkio-inc/igloo/internal/uploads"
 )
 
 // Workers writing a fill's rows (see distributed's writes.go, and fillOn).
@@ -47,17 +49,20 @@ type tableWrite struct {
 	schema, name string
 	tbl          *table.Table
 	overwrite    *overwritePlan
+	// gate, if set, may stop the commit once every file's footer has been read,
+	// which can take long.
+	gate func(context.Context) error
 	// sel is the target's Select, and columns its Columns; partitions the
 	// names of Select's partition columns.
 	sel        string
 	columns    []distributed.WriteColumn
 	partitions []string
 	// dir is the statement's directory while a run of it writes there, and
-	// note its note in the catalog; committed says a commit holds kept, its
-	// files, and left that whether one does cannot be told.
-	dir             string
+	// note its note in the catalog; sealed is where the files to commit were
+	// copied to, of which the note speaks too; committed says a commit holds
+	// them, and left that whether one does cannot be told.
+	dir, sealed     string
 	note            catalog.Pending
-	kept            []string
 	committed, left bool
 }
 
@@ -102,6 +107,8 @@ func (s *Server) newTableWrite(ctx context.Context, sess *session, schema, name 
 	if tbl.Metadata().Version() < 2 {
 		return nil, "the table is of Iceberg format version 1", nil
 	}
+	// DuckDB refuses an INSERT into such a table as it prepares it, so that no
+	// fill of one comes here but a view's.
 	if so := tbl.SortOrder(); !so.IsUnsorted() {
 		return nil, "the table has an Iceberg sort order", nil
 	}
@@ -117,17 +124,23 @@ func (s *Server) newTableWrite(ctx context.Context, sess *session, schema, name 
 	for _, c := range described {
 		types[c.name] = c.typ
 	}
-	// Which of the query's columns is each of the table's.
+	// Which of the query's columns is each of the table's: -1 for one it does
+	// not write, which holds NULL.
 	source := make([]int, len(fields))
 	switch {
 	case len(order) > 0:
-		if len(order) != len(fields) || n != len(fields) {
-			return nil, "the statement does not write every column of the table", nil
+		if n != len(order) {
+			return nil, "the query's columns are not those the statement names", nil
 		}
 		for i, f := range fields {
 			source[i] = slices.IndexFunc(order, func(c string) bool { return strings.EqualFold(c, f.Name) })
-			if source[i] < 0 {
-				return nil, "the statement does not write every column of the table", nil
+			if source[i] < 0 && (f.Required || f.WriteDefault != nil) {
+				return nil, "the statement does not write column " + f.Name + ", which has a default or is NOT NULL", nil
+			}
+		}
+		for _, c := range order {
+			if !slices.ContainsFunc(fields, func(f iceberg.NestedField) bool { return strings.EqualFold(c, f.Name) }) {
+				return nil, "the statement names a column the table does not have", nil
 			}
 		}
 	case n != len(fields):
@@ -145,20 +158,20 @@ func (s *Server) newTableWrite(ctx context.Context, sess *session, schema, name 
 	casts := make([]string, len(fields))
 	outer := make([]string, 0, len(fields))
 	for i, f := range fields {
-		if !overwritable(f.Type) {
+		if !taskWrites(f.Type) {
 			return nil, fmt.Sprintf("column %s is of type %s, whose Parquet a task's COPY would not write as Iceberg's", f.Name, f.Type), nil
-		}
-		if f.Required {
-			// COPY checks no NOT NULL, and writes the column as optional.
-			return nil, "column " + f.Name + " is NOT NULL", nil
 		}
 		typ, ok := types[f.Name]
 		if !ok {
 			return nil, "column " + f.Name + " does not show in the table's description", nil
 		}
-		casts[i] = "CAST(" + aliases[source[i]] + " AS " + typ + ") AS " + quoteIdent(f.Name)
+		value := "NULL"
+		if source[i] >= 0 {
+			value = aliases[source[i]]
+		}
+		casts[i] = "CAST(" + value + " AS " + typ + ") AS " + quoteIdent(f.Name)
 		outer = append(outer, quoteIdent(f.Name))
-		w.columns = append(w.columns, distributed.WriteColumn{Name: f.Name, ID: f.ID})
+		w.columns = append(w.columns, writeColumn(f.Name, f.ID, f.Type))
 	}
 	spec := tbl.Spec()
 	for _, field := range spec.Fields() {
@@ -272,56 +285,113 @@ func (w *tableWrite) begin(ctx context.Context) (*distributed.WriteTarget, error
 	return t, nil
 }
 
-// end deletes what the statement's tasks wrote and no commit holds: all of
-// it, unless the statement committed, and then what lost attempts wrote, the
-// probe's file and files of no rows. Tasks the statement no longer waits for
-// may still finish a file, so it looks again a while later (lateWritesAfter),
-// and only then forgets the note; a process that stops before that leaves the
-// note for the table's next write. It leaves both where a commit may hold the
-// files and that cannot be told, for the table's next write to tell.
+// end deletes what the statement's tasks wrote, which no commit holds, and the
+// copies of it if the statement did not commit them. Tasks the statement no
+// longer waits for may still finish a file, so it looks again a while later
+// (lateWritesAfter), and only then forgets the note; a process that stops before
+// that leaves the note for the table's next write. It leaves both where a commit
+// may hold the files and that cannot be told, for the table's next write to tell.
 func (w *tableWrite) end(ctx context.Context) {
 	if w.dir == "" {
 		return
 	}
-	s, schema, name, tbl, dir, note, committed := w.s, w.schema, w.name, w.tbl, w.dir, w.note, w.committed
-	w.dir = ""
+	s, schema, name, tbl, dir, sealed, note, committed := w.s, w.schema, w.name, w.tbl, w.dir, w.sealed, w.note, w.committed
+	w.dir, w.sealed = "", ""
 	if w.left {
 		s.writesRunning.Delete(note.Key)
 		return
 	}
 	bg := context.WithoutCancel(ctx)
-	var keep []string
-	if committed {
-		keep = w.kept
-	}
 	failed := func(err error) {
-		// What a commit holds stays, and the note says what to look at. Files
-		// no snapshot holds are orphans to the table's cleanup and to erasure.
+		// The note says what to look at. Files no snapshot holds are orphans to
+		// the table's cleanup and to erasure.
 		s.log.Warn("could not delete the files a write did not commit; the table's next write or its orphan cleanup deletes them",
 			"table", schema+"."+name, "dir", dir, "err", err)
 	}
-	if err := s.deleteFilesExcept(bg, tbl, dir, keep); err != nil {
-		failed(err)
-		if !committed {
-			s.writesRunning.Delete(note.Key)
-			return
+	remove := func(dirs ...string) bool {
+		for _, d := range dirs {
+			if err := s.deleteRefreshFiles(bg, tbl, d); err != nil {
+				failed(err)
+				return false
+			}
 		}
+		s.abortUploads(bg, tbl, dir)
+		return true
+	}
+	dirs := []string{dir}
+	if sealed != "" && !committed {
+		dirs = append(dirs, sealed)
+	}
+	if !remove(dirs...) {
+		s.writesRunning.Delete(note.Key)
+		return
 	}
 	s.lateWrites.Add(1)
 	go func() {
 		defer s.lateWrites.Done()
 		defer s.writesRunning.Delete(note.Key)
-		if !s.waitLateWrites() {
+		if !s.waitLateWrites() || !remove(dir) {
 			return
-		}
-		if err := s.deleteFilesExcept(bg, tbl, dir, keep); err != nil {
-			failed(err)
-			if !committed {
-				return
-			}
 		}
 		s.forgetRefreshFiles(bg, schema, note)
 	}()
+}
+
+// abortUploads ends what tasks had uploaded under dir and not finished, as a
+// worker killed in its COPY leaves, which no listing of files shows: a directory
+// of no use to anyone, and files of the table's rows that could still be made.
+func (s *Server) abortUploads(ctx context.Context, tbl *table.Table, dir string) {
+	fsys, err := tbl.FS(ctx)
+	if err == nil {
+		var store uploads.Store
+		if store, err = uploads.For(fsys, dir, s.uploadKeys); err == nil {
+			var n int
+			if n, err = uploads.AbortUnder(ctx, store, dir+"/", time.Time{}); n > 0 {
+				s.log.Info("aborted uploads a statement's tasks did not finish", "dir", dir, "uploads", n)
+			}
+		}
+	}
+	if err != nil {
+		s.log.Warn("could not abort uploads a statement's tasks did not finish; the bucket's lifecycle rule or an erasure request does", "dir", dir, "err", err)
+	}
+}
+
+// sealCopies is how many files a statement copies at a time.
+const sealCopies = 32
+
+// sealedDir is the directory the coordinator copies the files of a statement's
+// directory to.
+func sealedDir(dir string) string {
+	parent, name := splitDir(dir)
+	return parent + "/" + distributed.SealedDirMark + strings.TrimPrefix(name, distributed.WriteDirMark)
+}
+
+// seal copies files out of their tasks' directories, in the store, and returns
+// them as copied: what a worker can still do with its credentials to the files
+// it wrote, for up to an hour on S3, does not reach what is read and committed
+// from here on. A copy takes what the file holds at that moment, so that nothing
+// has to be held against what a worker said of it.
+func (w *tableWrite) seal(ctx context.Context, files []distributed.WrittenFile) ([]distributed.WrittenFile, error) {
+	fsys, err := w.tbl.FS(ctx)
+	if err != nil {
+		return nil, err
+	}
+	store, ok := fsys.(interface {
+		Copy(ctx context.Context, src, dst string) error
+	})
+	if !ok {
+		return nil, fmt.Errorf("the store of %s.%s cannot copy a file", w.schema, w.name)
+	}
+	w.sealed = sealedDir(w.dir)
+	out := make([]distributed.WrittenFile, len(files))
+	g, ctx := errgroup.WithContext(ctx)
+	g.SetLimit(sealCopies)
+	for i, f := range files {
+		out[i] = f
+		out[i].Path = w.sealed + "/part_" + strconv.Itoa(i) + ".parquet"
+		g.Go(func() error { return store.Copy(ctx, f.Path, out[i].Path) })
+	}
+	return out, g.Wait()
 }
 
 // lateWritesAfter is how long after a statement ended it looks for what its
@@ -342,6 +412,23 @@ func (s *Server) waitLateWrites() bool {
 	case <-s.lateWritesStop:
 		return false
 	}
+}
+
+// checkRequired checks that no file holds a NULL in a column the table requires.
+// COPY checks no NOT NULL and writes every column as optional, so its files' null
+// counts say. The statement then runs on this replica, where DuckDB refuses them.
+func checkRequired(schema *iceberg.Schema, added []iceberg.DataFile) error {
+	for _, field := range schema.Fields() {
+		if !field.Required {
+			continue
+		}
+		for _, df := range added {
+			if n, ok := df.NullValueCounts()[field.ID]; !ok || n > 0 {
+				return fmt.Errorf("%w: %s may hold NULLs in the NOT NULL column %s", distributed.ErrWriteRefused, df.FilePath(), field.Name)
+			}
+		}
+	}
+	return nil
 }
 
 // checkAdded compares the data files made from footers with what the
@@ -402,11 +489,30 @@ func (w *tableWrite) commit(ctx context.Context, files []distributed.WrittenFile
 			kept = append(kept, f)
 		}
 	}
-	w.kept = paths
-	check := func(added []iceberg.DataFile, spec iceberg.PartitionSpec) error { return checkAdded(kept, added, spec) }
+	if len(paths) > 0 {
+		var err error
+		if kept, err = w.seal(ctx, kept); err != nil {
+			return 0, fmt.Errorf("copy the files workers wrote: %w", err)
+		}
+		for i, f := range kept {
+			paths[i] = f.Path
+		}
+	}
+	check := func(added []iceberg.DataFile, spec iceberg.PartitionSpec) error {
+		if err := checkAdded(kept, added, spec); err != nil {
+			return err
+		}
+		if err := checkRequired(w.tbl.Schema(), added); err != nil {
+			return err
+		}
+		if w.gate != nil {
+			return w.gate(ctx)
+		}
+		return nil
+	}
 	var err error
 	if w.overwrite != nil {
-		w.left, err = w.overwrite.commitAt(ctx, w.dir, paths, check)
+		w.left, err = w.overwrite.commitAt(ctx, w.sealed, paths, nil, check)
 		w.committed = err == nil
 	} else if len(paths) > 0 {
 		err = w.add(ctx, paths, check)
@@ -423,6 +529,73 @@ func (w *tableWrite) commit(ctx context.Context, files []distributed.WrittenFile
 	return rows, nil
 }
 
+// readWritten returns the data files of the files at paths, which workers wrote,
+// by footers it checks first (see distfooter.go), of at most what the table has.
+func readWritten(ctx context.Context, tx *table.Transaction, tbl *table.Table, paths []string) ([]iceberg.DataFile, error) {
+	fsys, err := tbl.FS(ctx)
+	if err != nil {
+		return nil, err
+	}
+	columns, depth := 0, 0
+	for _, f := range tbl.Schema().Fields() {
+		e, d := parquetShape(f.Type)
+		columns, depth = columns+e, max(depth, d)
+	}
+	return tx.DataFilesFrom(ctx, &writtenFooters{IO: fsys, columns: columns, depth: depth + 1}, paths)
+}
+
+// parquetShape is how many elements of a Parquet schema a value of type t takes,
+// and how many levels of groups: a list and a map a group and a repeated group
+// around what they hold, and a struct a group.
+func parquetShape(t iceberg.Type) (elements, depth int) {
+	switch t := t.(type) {
+	case *iceberg.StructType:
+		for _, f := range t.FieldList {
+			e, d := parquetShape(f.Type)
+			elements, depth = elements+e, max(depth, d)
+		}
+		return elements + 1, depth + 1
+	case *iceberg.ListType:
+		e, d := parquetShape(t.Element)
+		return e + 2, d + 2
+	case *iceberg.MapType:
+		ke, kd := parquetShape(t.KeyType)
+		ve, vd := parquetShape(t.ValueType)
+		return ke + ve + 2, max(kd, vd) + 2
+	}
+	return 1, 0
+}
+
+// taskWrites says a task's COPY writes values of type t as Iceberg has them, with
+// their field IDs however they nest.
+func taskWrites(t iceberg.Type) bool {
+	switch t := t.(type) {
+	case *iceberg.StructType:
+		return !slices.ContainsFunc(t.FieldList, func(f iceberg.NestedField) bool { return !taskWrites(f.Type) })
+	case *iceberg.ListType:
+		return taskWrites(t.Element)
+	case *iceberg.MapType:
+		return taskWrites(t.KeyType) && taskWrites(t.ValueType)
+	}
+	return overwritable(t)
+}
+
+// writeColumn is the column of a task's files of a field.
+func writeColumn(name string, id int, t iceberg.Type) distributed.WriteColumn {
+	c := distributed.WriteColumn{Name: name, ID: id}
+	switch t := t.(type) {
+	case *iceberg.StructType:
+		for _, f := range t.FieldList {
+			c.Fields = append(c.Fields, writeColumn(f.Name, f.ID, f.Type))
+		}
+	case *iceberg.ListType:
+		c.Fields = []distributed.WriteColumn{writeColumn("element", t.ElementID, t.Element)}
+	case *iceberg.MapType:
+		c.Fields = []distributed.WriteColumn{writeColumn("key", t.KeyID, t.KeyType), writeColumn("value", t.ValueID, t.ValueType)}
+	}
+	return c
+}
+
 // add commits the files at paths to the table. A conflict with another
 // commit, which said so, tries again on the commit's table; one whose answer
 // was lost may have been made, which it reads back rather than add them
@@ -435,7 +608,7 @@ func (w *tableWrite) add(ctx context.Context, paths []string, check func([]icebe
 		tx := tbl.NewTransaction()
 		if added == nil {
 			var err error
-			if added, err = tx.DataFiles(ctx, paths); err != nil {
+			if added, err = readWritten(ctx, tx, tbl, paths); err != nil {
 				return fmt.Errorf("read the files workers wrote: %w", err)
 			}
 			if err := check(added, spec); err != nil {
@@ -456,7 +629,7 @@ func (w *tableWrite) add(ctx context.Context, paths []string, check func([]icebe
 			held := false
 			if lerr == nil {
 				w.tbl = latest
-				held, lerr = holdsFiles(bg, latest, w.dir)
+				held, lerr = holdsFiles(bg, latest, w.sealed)
 			}
 			switch {
 			case lerr != nil:
@@ -514,8 +687,12 @@ func (s *Server) clearStoppedWrites(ctx context.Context, schema, name string) er
 // insertWriter returns how workers would write the rows of src, the query
 // of an INSERT of p, into its table, or nil.
 func (s *Server) insertWriter(ctx context.Context, sess *session, p parsedInsert, src *statement) *tableWrite {
+	order := p.columns
 	if p.byName {
-		return nil
+		order = make([]string, len(src.columns))
+		for i, c := range src.columns {
+			order[i] = c.Name
+		}
 	}
 	sc := &scanner{s: p.target}
 	name, ok := sc.name()
@@ -540,5 +717,5 @@ func (s *Server) insertWriter(ctx context.Context, sess *session, p parsedInsert
 			return nil
 		}
 	}
-	return s.tableWriter(ctx, sess, target.Schema, target.Table, src, p.columns)
+	return s.tableWriter(ctx, sess, target.Schema, target.Table, src, order)
 }

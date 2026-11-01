@@ -253,7 +253,10 @@ if [ "${got:-0}" -ge 1 ]; then pass "and runs on workers"; else fail "a clone ra
 echo "snapshot isolation"
 # A statement reads one snapshot of each table, on the workers and in the
 # part the coordinator runs itself (the scalar subquery), while another
-# session deletes rows and adds a column.
+# session deletes rows and adds a column. The commit must land while the
+# statement is reading, so it waits for a task of the statement to end: a commit
+# that lands first, as a fixed wait lets it on a loaded machine, is one the
+# statement rightly reads, on this replica, its columns having changed.
 {
   echo "CREATE TABLE iso AS SELECT * FROM orders WHERE false;"
   for part in 0 1 2 3 4 5; do echo "INSERT INTO iso SELECT * FROM orders WHERE hash(o_orderkey) % 6 = $part;"; done
@@ -261,9 +264,14 @@ echo "snapshot isolation"
 iso="SELECT x.o_orderstatus, x.n, x.s, (SELECT count(*) FROM iso) AS total FROM
   (SELECT o_orderstatus, count(*) AS n, sum(length(repeat(o_comment, 5000))) AS s FROM iso GROUP BY 1) AS x ORDER BY 1"
 want="$(psql_admin -c "SET distributed_execution = 'off'" -c "$iso" | grep -v '^SET$')"
+tasks_ended() { curl -fsS "http://127.0.0.1:$http_port/metrics" 2>/dev/null | sed -n 's/^igloo_distributed_tasks_total{result="ok"} //p'; }
+before="$(tasks_ended)"
 psql_admin -c "SET distributed_execution = 'on'" -c "/* iso */ $iso" | grep -v '^SET$' >"$work/iso" &
 query=$!
-sleep 1
+deadline=$((SECONDS + 180))
+while [ "$(tasks_ended)" = "$before" ] && kill -0 "$query" 2>/dev/null && [ "$SECONDS" -lt "$deadline" ]; do
+  sleep 0.1
+done
 psql_admin -c "DELETE FROM iso WHERE o_orderkey % 2 = 0" -c "ALTER TABLE iso ADD COLUMN extra INTEGER" >/dev/null
 wait "$query" || true
 if [ "$(cat "$work/iso")" = "$want" ]; then
@@ -530,7 +538,7 @@ wrote_by_workers() {
   got="$(psql_admin -c "SET distributed_execution = 'off'" -c "SELECT count(*), count(DISTINCT l_orderkey), sum(l_extendedprice) FROM $2" | grep -v '^SET$')"
   want="$(psql_admin -c "SET distributed_execution = 'off'" -c "SELECT count(*), count(DISTINCT l_orderkey), sum(l_extendedprice) FROM ($3)" | grep -v '^SET$')"
   if [ -n "$want" ] && [ "$got" = "$want" ]; then pass "$1: the same rows"; else fail "$1: [$got], want [$want]"; fi
-  if [ -n "$(files_of "$2")" ] && [ -z "$(files_of "$2" | grep -v '/igloo-write-')" ]; then
+  if [ -n "$(files_of "$2")" ] && [ -z "$(files_of "$2" | grep -v '/igloo-sealed-')" ]; then
     pass "$1: its files are of a statement's directory"
   else
     fail "$1: its files: $(files_of "$2" | head -3)"
@@ -555,8 +563,37 @@ fi
 # policy is refused, which S3Vendor checks against this store first.
 expect_refused="$(compose logs --no-color igloo | grep -c 'does not limit STS credentials' || true)"
 if [ "$expect_refused" = 0 ]; then pass "the store limits them to their policy"; else fail "the store ignores session policies"; fi
+# Rows of about 10.8 KB, 6.5 GB of them, which row groups of 122,880 rows would
+# hold in a worker's 1 GB: workers write them, a task bounding its row groups by
+# what it has; in auto mode, wherever it runs them.
+slow_copy="SELECT l_orderkey, l_extendedprice, repeat(l_comment, 400) AS c FROM lineitem"
+wide_sum="count(*), sum(length(c)), sum(l_extendedprice), bit_xor(hash(l_orderkey, c))"
+wide_want="$(psql_admin -c "SET distributed_execution = 'off'" -c "SELECT $wide_sum FROM ($slow_copy)" | grep -v '^SET$')"
+# wide_rows NAME TABLE: TABLE holds the wide rows.
+wide_rows() {
+  local got
+  got="$(psql_admin -c "SET distributed_execution = 'off'" -c "SELECT $wide_sum FROM $2" 2>&1 | grep -v '^SET$' || true)"
+  if [ -n "$wide_want" ] && [ "$got" = "$wide_want" ]; then pass "$1: the same rows"; else fail "$1: [$got], want [$wide_want]"; fi
+}
+psql_admin -c "SET distributed_execution = 'on'" -c "CREATE TABLE written_wide AS $slow_copy" >/dev/null 2>&1 || true
+wide_rows "wide rows, forced onto workers of 1 GB" written_wide
+if [ -n "$(files_of written_wide)" ] && [ -z "$(files_of written_wide | grep -v '/igloo-sealed-')" ]; then
+  pass "and workers wrote them"
+else
+  fail "wide rows: its files: $(files_of written_wide | head -3)"
+fi
+psql_admin -c "CREATE TABLE written_wide_auto AS $slow_copy" >/dev/null 2>&1 || true
+wide_rows "wide rows, wherever auto mode runs them" written_wide_auto
+psql_admin -c "SET distributed_execution = 'off'" -c "CREATE TABLE written_wide_parts AS $slow_copy LIMIT 0" \
+  -c "ALTER TABLE written_wide_parts SET PARTITIONED BY (truncate(10000, l_orderkey))" >/dev/null
+psql_admin -c "SET distributed_execution = 'on'" -c "INSERT INTO written_wide_parts $slow_copy" >/dev/null 2>&1 || true
+wide_rows "wide rows in partitions, forced onto workers" written_wide_parts
+if [ -z "$(files_of written_wide_parts | grep -v '/igloo-sealed-')" ]; then
+  pass "and workers wrote them"
+else
+  fail "wide rows in partitions: its files: $(files_of written_wide_parts | head -3)"
+fi
 # A worker dies while it writes: the statement finishes with each row once.
-slow_copy="SELECT l_orderkey, l_extendedprice, repeat(l_comment, 40) AS c FROM lineitem"
 start=$SECONDS
 psql_admin -c "SET distributed_execution = 'on'" -c "CREATE TABLE written_killed AS $slow_copy" >"$work/written_killed" 2>&1 &
 query=$!
@@ -564,14 +601,31 @@ sleep 1
 victim="$(docker ps -q --filter "label=com.docker.compose.project=$project" --filter "label=com.docker.compose.service=worker" | head -1)"
 docker kill "$victim" >/dev/null
 wait "$query" || true
-got="$(psql_admin -c "SET distributed_execution = 'off'" -c "SELECT count(*), count(DISTINCT c), sum(l_extendedprice) FROM written_killed" 2>&1 | grep -v '^SET$' || true)"
-want="$(psql_admin -c "SET distributed_execution = 'off'" -c "SELECT count(*), count(DISTINCT c), sum(l_extendedprice) FROM ($slow_copy)" | grep -v '^SET$')"
-if [ -n "$want" ] && [ "$got" = "$want" ]; then
+got="$(psql_admin -c "SET distributed_execution = 'off'" -c "SELECT $wide_sum FROM written_killed" 2>&1 | grep -v '^SET$' || true)"
+if [ -n "$wide_want" ] && [ "$got" = "$wide_want" ]; then
   pass "a worker killed while writing: each row once, in $((SECONDS - start))s"
 else
-  fail "after a worker died writing: [$got], want [$want]; $(tail -3 "$work/written_killed")"
+  fail "after a worker died writing: [$got], want [$wide_want]; $(tail -3 "$work/written_killed")"
 fi
 compose up -d --wait worker >/dev/null 2>&1 || compose up -d --wait --scale worker="$workers" >/dev/null
+# What the killed worker had uploaded goes with the statement, though no listing
+# of files shows it, and tasks' last writes a minute after that.
+s3_uploads() {
+  docker run --rm --network "$network" curlimages/curl:8.22.0 -sS \
+    --aws-sigv4 "aws:amz:$(grep '^S3_REGION=' "$env_file" | cut -d= -f2):s3" \
+    --user "$(grep '^S3_ACCESS_KEY_ID=' "$env_file" | cut -d= -f2):$(grep '^S3_SECRET_ACCESS_KEY=' "$env_file" | cut -d= -f2)" \
+    "http://storage:9000/$(grep '^S3_BUCKET=' "$env_file" | cut -d= -f2)?uploads&prefix=warehouse/"
+}
+deadline=$((SECONDS + 90))
+until ! s3_uploads | grep -q '<Key>[^<]*igloo-write-' || [ "$SECONDS" -ge "$deadline" ]; do
+  sleep 3
+done
+got="$(s3_uploads)"
+if grep -q '<Key>[^<]*igloo-write-' <<<"$got"; then
+  fail "uploads of a statement that ended: $(head -c 500 <<<"$got")"
+else
+  pass "what the worker had uploaded went with the statement"
+fi
 
 echo "after table maintenance"
 # Compaction rewrites the small files loaded above, and gives every table

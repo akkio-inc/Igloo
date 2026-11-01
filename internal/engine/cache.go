@@ -142,7 +142,9 @@ func (e *Engine) setupCache(exec func(string) error, cfg config.Config, log *slo
 	} else {
 		log.Warn("read cache paused: its disk is almost full", "dir", dir, "disk_free", avail)
 	}
-	e.setupPrefetch(cfg, dir, log)
+	if !e.isBackground {
+		e.setupPrefetch(cfg, dir, log)
+	}
 	return nil
 }
 

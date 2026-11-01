@@ -55,6 +55,7 @@ import (
 	"github.com/akkio-inc/igloo/internal/sqllex"
 	"github.com/akkio-inc/igloo/internal/tasks"
 	"github.com/akkio-inc/igloo/internal/tsforecast"
+	"github.com/akkio-inc/igloo/internal/uploads"
 	"github.com/akkio-inc/igloo/internal/workload"
 )
 
@@ -206,6 +207,9 @@ type Options struct {
 	// plans aggregates in passes against (see aggpasses.go); 0 runs none
 	// in passes.
 	QueryMemory int64
+	// HeavyInBackground runs heavy reads in a second DuckDB of this process
+	// whose threads give way to the first's (see background.go).
+	HeavyInBackground bool
 	// ResultCacheSize is IGLOO_RESULT_CACHE_SIZE: the memory the results
 	// the server keeps of queries may take (see resultcache.go); 0 keeps
 	// none.
@@ -261,6 +265,9 @@ type Options struct {
 	// reportFallback, when set, hears of each recognized statement that
 	// failed, which then ran as written (for tests).
 	reportFallback func(recognized string, err error)
+	// UploadKeys are what it takes to see the store's unfinished uploads, which
+	// a statement's end aborts under its directories.
+	UploadKeys uploads.Keys
 	// AllowedLocations are where users other than admins may read files
 	// from while tables have policies (IGLOO_ALLOWED_LOCATIONS), and
 	// Warehouse is the warehouse's location, whose files they may not.
@@ -526,9 +533,18 @@ type Server struct {
 	// starts to be prepared, with the context that ends its preparing (for
 	// tests).
 	beforePrepare func(ctx context.Context, text string)
+	// heavy says which statements run in the second DuckDB (see
+	// background.go), and lane is that DuckDB; heavy is nil to run all in
+	// the first.
+	heavy *heavyHistory
+	lane  backgroundLane
 	// beforeFill, if set, runs as a staged CREATE TABLE ... AS starts to
 	// fill its table, with the context that ends the fill (for tests).
 	beforeFill func(context.Context)
+	// afterOverwrite, if set, runs once a refresh's overwrite is committed,
+	// before it writes the view's state; an error fails the refresh (for
+	// tests).
+	afterOverwrite func(ctx context.Context) error
 	// beforeOverwrite, if set, runs once a full refresh wrote its files
 	// into dir, before it commits them, with the refresh's context; an
 	// error fails the refresh (for tests).
@@ -555,6 +571,8 @@ type Server struct {
 	lateWritesStop chan struct{}
 	lateWritesWait func()
 	stopLateWrites sync.Once
+	// uploadKeys is Options.UploadKeys.
+	uploadKeys uploads.Keys
 	// beforeWriteCommit, if set, runs before files workers wrote under dir
 	// are committed, and fails the commit with its error (see tableWrite).
 	beforeWriteCommit func(ctx context.Context, dir string) error
@@ -753,6 +771,9 @@ func New(engine Engine, opts Options, log *slog.Logger) (*Server, error) {
 	}
 	s.deleteTargets = deletefiles.NewTargets()
 	s.queryMemory = opts.QueryMemory
+	if opts.HeavyInBackground {
+		s.heavy = newHeavyHistory()
+	}
 	s.scanner, s.prefetcher = opts.Scanner, opts.Prefetcher
 	s.bitmaps, s.bitmapMinRows, s.bitmapIndexesOn = opts.Bitmaps, opts.BitmapMinRows, opts.BitmapIndexes
 	s.reportRewrite.Store(opts.ReportRewrite)
@@ -771,6 +792,7 @@ func New(engine Engine, opts Options, log *slog.Logger) (*Server, error) {
 	s.idFillRewriteRows = cmp.Or(opts.idFillRewriteRows, idFillRewriteRows)
 	s.reportOutcomes, s.reportFallback = opts.reportOutcomes, opts.reportFallback
 	s.reportRewriteAnyPath = opts.reportRewriteAnyPath
+	s.uploadKeys = opts.UploadKeys
 	if s.idDomains == nil {
 		s.idDomains = iddomain.NewMemoryStore()
 	}
@@ -852,6 +874,7 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	err := s.wire.Shutdown(ctx)
 	s.stopLateWrites.Do(func() { close(s.lateWritesStop) })
 	s.lateWrites.Wait()
+	err = errors.Join(err, s.closeBackground())
 	s.idDeferred.stop()
 	if s.analyzer != nil {
 		s.analyzer.close(ctx)
@@ -900,6 +923,9 @@ type session struct {
 	// name, whether EXECUTE of it holds the catalog lock (see
 	// executeHolds).
 	sqlPrepared map[string]bool
+	// bgConn is its connection to the second DuckDB, once a heavy statement
+	// has run there (see background.go).
+	bgConn atomic.Pointer[backgroundConn]
 	// outer is the context runCancelable runs the statement's steps under,
 	// which a shed by the memory watch does not end, while it runs.
 	outer context.Context
@@ -1187,6 +1213,7 @@ func (s *Server) closeSession(ctx context.Context) error {
 	for ps := range sess.open {
 		errs = append(errs, sess.release(ps))
 	}
+	errs = append(errs, sess.closeBackgroundConn())
 	return errors.Join(append(errs, sess.wl.meter.Close())...)
 }
 
@@ -1514,6 +1541,7 @@ func (s *Server) ShedMemory(available int64) bool {
 			return true
 		}
 		stuck.conn.Interrupt()
+		stuck.interruptBackground()
 		s.log.Warn("a statement canceled for memory has not stopped; interrupted it again", "available", memlimit.Format(available),
 			"user", stuck.user.Name, "pid", stuck.pid, "canceled_for", time.Since(stuckSince).Round(time.Millisecond))
 		acted = true
@@ -2103,7 +2131,7 @@ func (s *Server) preparedQuery(ctx context.Context, sess *session, user auth.Use
 		// limit of statements at once, if there is one.
 		sess.wl.counted = countsOnReplica(sess, st)
 		sess.wl.shape = ""
-		if sess.wl.counted {
+		if sess.wl.counted || st.staged != nil {
 			sess.wl.shape = s.workloadShape(ctx, sess, st.prepared)
 		}
 		shape := sess.wl.shape
@@ -2131,7 +2159,7 @@ func (s *Server) preparedQuery(ctx context.Context, sess *session, user auth.Use
 						return s.afterGuard(ctx, sess, st, args, tw, &parts, ran)
 					}
 				} else {
-					err = s.runHere(ctx, sess, st, args, tw)
+					err = s.runPlaced(ctx, outer, sess, st, args, tw, &parts)
 					stopPrefetch()
 				}
 				if (st.bitmaps || len(st.indexPins) > 0) && bitmapsDidNotFit(err) {
@@ -2201,6 +2229,10 @@ func (s *Server) preparedQuery(ctx context.Context, sess *session, user auth.Use
 			s.flattens.observe(tr.flattenKey, tr.flattenLists, used.CPUTime)
 		}
 		peak, sampled := sess.wl.peak, sess.wl.sampled
+		if used != nil && parts.workers == 0 && s.heavy != nil {
+			// Which of this replica's DuckDBs the next like it runs in.
+			s.heavy.observe(shape, used.CPUTime)
+		}
 		switch {
 		case parts.workers > 0:
 			// One that ran on workers held most of its memory there.

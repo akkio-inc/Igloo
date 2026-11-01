@@ -285,7 +285,7 @@ Igloo while a request has work to do.
 
 | Step | What it does |
 |---|---|
-| `find` | Lists the tables with columns tagged with the request's tag values; the tables that share data files with them ([clones](#clones)); and the tables that the query history and the definitions of materialized views and tasks say were written from them. Tagged tables of [connections](federation.md) are listed, but nothing is erased from them. Counts their rows and those that match, and holds a request that would delete much of a table. |
+| `find` | Lists the tables with columns tagged with the request's tag values; the tables being made to replace them ([below](#what-is-left-of-dropped-tables)); the tables that share data files with them ([clones](#clones)); and the tables that the query history and the definitions of materialized views and tasks say were written from them. Tagged tables of [connections](federation.md) are listed, but nothing is erased from them. Counts their rows and those that match, and holds a request that would delete much of a table. |
 | `delete` | Deletes the matching rows, as a `DELETE` would: queries no longer see them. Last, it deletes from each [ID domain](sql.md#id-domains)'s dictionary once more, holding the domain's lease and having noted the erasure, which a write giving values new ids checks under the lease: one that found the person's value in rows this step then deleted adds no entry for it, so no erased value comes back into a dictionary. Before its first `DELETE`, and again under the lease just before that last delete, it looks up the ids the dictionaries gave the person's values, and keeps them sealed under the erasure key with the identifiers, for the sets derived from ids (below). |
 | `rewrite` | On every branch and tag of every table, writes each data file that holds matching rows again with its deletes applied, leaving out the rows that match, or setting columns tagged `:null` to NULL in them, in the same commit that replaces the file: rows that arrived since the delete step go too. Equality delete files that hold matches go with the files they apply to, or at once if they apply to none; a position delete file goes only when every file it deletes rows of is replaced or gone, so rows deleted from files the commit keeps stay deleted. Then writes again the manifests that still list the old files: a manifest keeps a removed file's entry, with column bounds that can hold the value itself. Every branch but main is rewritten with its head's own schema, and a tag with its snapshot's, as they are read (Igloo's `AT (BRANCH => ...)`, PyIceberg), so a column dropped since stays in them; main, with the table's current schema. Each file is written again with its own partition spec or, if the schema it is read with lacks a column that spec partitions by, with the table's default spec or another whose columns it has. A tag is rewritten on a branch of the request's (`igloo-erasure-...`), and moved to the result, if it still points where it did: a tag moved meanwhile is rewritten where it points now, and the branch of a tag dropped meanwhile goes. Branches keep their unpublished rows. A position delete file that carries the rows it deletes, as the spec allows, and holds the person's, goes too, with the files it deletes rows of rewritten so that it can, or at once if none of them is live any more, as after another engine rewrote them copy-on-write. |
 | `views` | Replaces every [materialized view and dynamic table](loading.md#materialized-views) whose query reads one of the request's tables, or a table history says was written from them, or such a view, whose table or state has a snapshot from before the step began: upstream views first, each made again from its query, as its owner, as `CREATE OR REPLACE TABLE ... AS` would (grants kept), which deletes the old table's files, older snapshots and all, and the files a full refresh of the view stopped before its commit left ([operations](operations.md)); its state for incremental refreshes (`igloo_refresh`), which can hold a group's ids in a bitmap, dropped; and what its last refresh read forgotten, so its next refresh is full. It holds the view's job while it does, so no refresh runs meanwhile; one that runs makes it try again a minute later. A view it cannot replace, because its owner is gone, is disabled or may no longer read its tables, keeps the request `blocked`, with an alert naming the view and why; it goes on once the view can be replaced or is dropped. |
@@ -295,7 +295,7 @@ Igloo while a request has work to do.
 | `history` | Replaces the identifiers in the query history (statements, query tags, application names and the locations outside the catalog statements read), the login history's application names, and the errors of the load history and of task runs, with `***`: as they are, as SQL quotes them in a string (`o''brien@...`), and as URLs and paths escape them (`o%27brien%40...`). Then it purges what [AI functions](ai-functions.md#the-cache) cached from the request's tables and from those history says were written from them, every answer derived from them, the person's or not, and any answer of a statement that read what Igloo could not name, such as a file; and from then on no statement that began before the purge keeps anything more, since it may have read the person's rows. This step runs after `expire`, so a statement that begins after it reads no snapshot that holds them. |
 | `models` | Trains again every [model](ml-functions.md#where-models-live) whose training read one of the request's tables, or one history says was written from them, directly, through a view or through another model's predictions; every model whose training read what Igloo could not name, such as a file; and every model created before Igloo recorded what models read. Each is trained from its `CREATE` statement, as its owner, with the search path and dialect it was created with, as `CREATE OR REPLACE` would, grants kept; oldest first, so a model trained on another's predictions is trained after it; and only if it is still the model the request read, not one its owner replaced or dropped meanwhile. First the step moves the models' erasure epoch on, once a round: a `CREATE` that read its training data before, which may have read the person's rows, stores nothing and fails, asking to be run again. Then it deletes from object storage the blobs the models had, unless a model has the same, and has every replica drop the models and methods' results it holds in memory (see `cache`), the models `ai_predict_class` and `ai_predict_value` trained among them: a statement prepared before then, which names them, fails with a message to prepare it again. A model it cannot train again, because its owner is gone or may no longer create models in its schema or read its input, or its input no longer runs, keeps the request `blocked`, with an alert naming the model and why; it goes on once the model can be trained again or is dropped. |
 | `cache` | Waits until every running replica has emptied its [read cache](operations.md#read-cache), on disk and in memory, since the request deleted files or trained models again; the replica drops the models it holds in memory, and the [query results it keeps](operations.md#result-cache), with it. A cache is emptied whole: it may also hold blocks of files deleted before, by maintenance or another engine. A replica that is not running empties its cache when it starts. It waits for every running [worker](distributed-execution.md) of distributed execution too, which coordinators have purge within 15 seconds of a deletion ([below](#workers)), and for those no coordinator reaches until they have had time to purge by themselves; it is `blocked`, with an alert naming them, while a worker whose read cache outlives it does not run and has not purged, or a worker does not say what it keeps. |
-| `verify` | Looks for the identifiers in what is left: the tables' rows; every data and delete file any snapshot references, deleted rows included; the bounds of every manifest entry, live or not; the Parquet statistics of every data file; recent orphan files; the warehouse's files under no table's or view's location; sharing copies; history; AI functions' cached answers derived from the tables by statements that began before the purge; the sets derived from ID domains' ids; models trained from the tables that the `models` step has not trained again, and the old blobs of those it did that object storage still has; materialized views and dynamic tables made from the tables whose table or state has a snapshot from before the `views` step; workers whose read caches outlive them that do not run and have not purged. Anything found sends the request back to the step that removes it. |
+| `verify` | Looks for tables being made for the tagged tables since it last looked, and then for the identifiers in what is left: the tables' rows; every data and delete file any snapshot references, deleted rows included; the bounds of every manifest entry, live or not; the Parquet statistics of every data file; recent orphan files; the warehouse's files under no table's or view's location; sharing copies; history; AI functions' cached answers derived from the tables by statements that began before the purge; the sets derived from ID domains' ids; models trained from the tables that the `models` step has not trained again, and the old blobs of those it did that object storage still has; materialized views and dynamic tables made from the tables whose table or state has a snapshot from before the `views` step; workers whose read caches outlive them that do not run and have not purged. Anything found sends the request back to the step that removes it. |
 
 A failed run is tried again after a minute, then 2, 4 and so on up to an
 hour. Before its first `DELETE`, a request fails for good (`failed`) when
@@ -357,6 +357,14 @@ for a table replaced under its name, as `CREATE OR REPLACE TABLE` does:
 the request erases from the new table. A table renamed rather than
 dropped still holds its rows, and is set aside for someone to tag it
 under its new name.
+
+`CREATE TABLE ... AS` and `CREATE OR REPLACE TABLE` fill a table under a
+temporary name (`name__igloo_new_...`) and rename it to the name. While
+they run, and if Igloo stops part way, that table holds a copy of the
+tagged table's rows, and its location the files workers wrote for it. It
+joins the request with the tagged table's columns, those it has, at the
+`find` step and at each verification, for those made since, and goes
+through every step as any other table.
 
 What would fail the
 request itself, as verification that sends it back more than five times
@@ -687,6 +695,12 @@ REQUEST`) once what it could not erase has been erased otherwise.
   does, is erased from too, and a request for that tag value is refused
   while no table has it. Unset the dropped table's tags (`ALTER TABLE t
   ALTER COLUMN c UNSET TAG pii`), or make the table again.
+- **A `CREATE TABLE ... AS` or `CREATE OR REPLACE TABLE` of a tagged table
+  that began before the request's deletes**, which may write the rows it
+  read: the request waits for it at the `verify` step, looking again every
+  10 minutes, and erases from the table it made. Its note says it is
+  running ([operations](operations.md#concurrency-on-a-replica)); a note of a
+  stopped process of another host counts for a day.
 - **A table or view the catalog cannot load**: which of the warehouse's
   files are whose cannot be told, so a request that has begun deleting
   does not complete until it loads; its error names it. Repair or drop
@@ -754,10 +768,19 @@ that stopped leaves, or a worker that wrote on past that, is deleted at the
 table's next write or by the request, which waits for those that hold matching rows until they are old
 enough to tell from a write in progress, and verifies they are gone before
 it completes. A fill during which a request deleted files does not commit
-what its tasks wrote. As with parts of multipart uploads a stopped process
-abandoned, on S3, which no one can list or read and which the bucket's
-lifecycle rule removes (the OpenTofu module for AWS sets one), a request sees
-no file there; give your bucket such a rule.
+what its tasks wrote.
+
+What a process that stopped had uploaded of a file is in no listing of files,
+but it can be recovered: on S3 and GCS whoever may write can list the parts of a
+multipart upload and complete it, and on Azure can commit a blob's staged blocks.
+A statement's end aborts those under its directories. A request aborts those
+that began by five minutes after the latest deletion under its tables' locations,
+under no table's location and among exchanges, and does not complete while it
+finds one or cannot look: `s3:ListBucketMultipartUploads` on AWS, and a GCS HMAC
+key that may list them. The buckets of the OpenTofu modules for AWS and Google
+Cloud, and the one of the single-VM deployment, also abort them after a day; give your
+bucket such a rule. A DFS write on an Azure filesystem leaves a file of no length,
+which is a file like the others to all of this.
 
 A worker cannot reach the metadata database, so coordinators keep it up
 with requests:

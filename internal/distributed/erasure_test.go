@@ -369,3 +369,110 @@ func TestWorkerPurgesAlone(t *testing.T) {
 		t.Errorf("%d blocks cached; status %+v", caches[0].cached(), st)
 	}
 }
+
+// TestFarFutureErasure checks that nothing holding the worker secret can have
+// workers and coordinators skip the deletions to come by naming a time yet to
+// come: a purge sent to a peer, a task carrying such a time, a worker's refusal
+// or what its read cache on disk says. A later deletion is purged, and recorded
+// only once it is, and a fill that began before it sees it.
+func TestFarFutureErasure(t *testing.T) {
+	far := time.Now().Add(100 * 365 * 24 * time.Hour)
+	ctx := context.Background()
+
+	t.Run("a purge from a peer", func(t *testing.T) {
+		h := newHarness(t, 0.01, 4, 2)
+		caches := withErasure(t, h)
+		for i := range h.lns {
+			st, err := h.co.pool.purge(ctx, h.lns[i].Addr().String(), far.UnixNano())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if st.Erased > time.Now().UnixNano() {
+				t.Errorf("worker %d says it was purged through %v", i, time.Unix(0, st.Erased))
+			}
+		}
+		time.Sleep(time.Millisecond)
+		for _, c := range caches {
+			c.cache(t)
+			c.mu.Lock()
+			c.events = nil
+			c.mu.Unlock()
+		}
+		latest := time.Now().UTC().Round(time.Microsecond)
+		ledger := &fakeLedger{latest: latest}
+		if err := h.co.PurgeWorkers(ctx, ledger); err != nil {
+			t.Fatal(err)
+		}
+		for i, c := range caches {
+			if c.cached() != 0 {
+				t.Errorf("worker %d still holds blocks after a deletion", i)
+			}
+			c.mu.Lock()
+			if !slices.Contains(c.events, "purge") {
+				t.Errorf("worker %d purged nothing: %v", i, c.events)
+			}
+			c.mu.Unlock()
+		}
+		if len(ledger.emptied) != len(caches) {
+			t.Errorf("recorded as emptied: %v", ledger.emptied)
+		}
+		for cache, at := range ledger.emptied {
+			if !at.Equal(latest) {
+				t.Errorf("%s emptied through %v, the deletion was at %v", cache, at, latest)
+			}
+		}
+	})
+
+	t.Run("an answer to a task", func(t *testing.T) {
+		h := newHarness(t, 0.01, 4, 1)
+		h.co.noteErased(far.UnixNano())
+		if h.co.erased.Load() > time.Now().UnixNano() {
+			t.Fatalf("the coordinator's latest deletion is %v", time.Unix(0, h.co.erased.Load()))
+		}
+		ex := &Execution{co: h.co, erased: h.co.erased.Load()}
+		time.Sleep(time.Millisecond)
+		if err := h.co.PurgeWorkers(ctx, &fakeLedger{latest: time.Now().UTC().Round(time.Microsecond)}); err != nil {
+			t.Fatal(err)
+		}
+		if !ex.ErasedSince() {
+			t.Error("a fill does not see a deletion after the answer")
+		}
+	})
+
+	t.Run("a task's time", func(t *testing.T) {
+		h := newHarness(t, 0.01, 4, 1)
+		withErasure(t, h)
+		w := h.workers[0]
+		done, err := w.admit(ctx, &runningTask{query: "q", task: 1, started: time.Now(), cancel: func(error) {}, done: make(chan struct{}), erased: far.UnixNano()})
+		if err != nil {
+			t.Fatal(err)
+		}
+		done()
+		if w.purged.Load() > time.Now().UnixNano() || w.admitted.Load() > time.Now().UnixNano() {
+			t.Errorf("purged through %v, admitting from %v", time.Unix(0, w.purged.Load()), time.Unix(0, w.admitted.Load()))
+		}
+	})
+
+	t.Run("what a cache on disk says", func(t *testing.T) {
+		h := newHarness(t, 0.01, 4, 1)
+		caches := withErasure(t, h)
+		if err := os.WriteFile(caches[0].mark(), []byte(far.Format(time.RFC3339Nano)), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		h.restartWorker(0)
+		if got := h.workers[0].purged.Load(); got != 0 {
+			t.Errorf("a worker restarted believes it was purged through %v", time.Unix(0, got))
+		}
+	})
+
+	t.Run("what a status says", func(t *testing.T) {
+		h := &Coordinator{}
+		if got := h.purgedThrough(far.UnixNano()); got != 0 {
+			t.Errorf("believed a worker purged through %d", got)
+		}
+		soon := time.Now().Add(time.Second).UnixNano()
+		if got := h.purgedThrough(soon); got != soon {
+			t.Errorf("did not allow for a clock ahead: %d", got)
+		}
+	})
+}

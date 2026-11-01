@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -17,7 +18,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgproto3"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
@@ -62,9 +65,9 @@ func largeSortDirs(t testing.TB, dir string) []string {
 // fit in memory, sorted in runs and merged: every row, in the order of one
 // machine's sort, descending and ascending, NULLs first and last, by a
 // result's columns by name and position, in every protocol, leaving nothing
-// in the spill directory. A statement that would not fit, but that keeps
-// few rows, orders by an expression, has parameters, or that its client
-// reads a few rows at a time, sorts at once, as does one that fits.
+// in the spill directory; by expressions, with parameters, and of types the
+// merge does not compare or pass on. A statement that would not fit, but that
+// keeps few rows, sorts at once, as does one that fits.
 func TestLargeSortInRuns(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
@@ -144,11 +147,50 @@ func TestLargeSortInRuns(t *testing.T) {
 		}
 	}
 
-	// A statement with parameters.
+	// Orders and columns the merge cannot take as they are, compared with one
+	// machine's sort over all of each row: by an expression, by a position of
+	// one, and of types it does not compare or pass on. The last column breaks
+	// ties, and the sort of the rows holds it.
+	const rich = "id, n, [n, NULL, n + 1] AS l, {'a': k, 'b': [id]} AS s, (n * 1000000000000)::HUGEINT AS h, " +
+		"md5(n::VARCHAR)::UUID AS u, to_seconds(n % 1000) AS iv"
+	smaller := filepath.Join(dir, "smaller.parquet")
+	largeSortFile(t, smaller, 1_000_000)
+	for _, order := range []string{
+		"upper(k) DESC NULLS FIRST, n",
+		"8, n",
+		"u DESC",
+		"h, n",
+		"l DESC, n",
+	} {
+		query := "SELECT " + rich + ", upper(k) AS uk FROM read_parquet('" + smaller + "') ORDER BY " + order
+		t.Run(order, func(t *testing.T) {
+			conn := ts.admin(t, pgx.QueryExecModeSimpleProtocol)
+			before := sorts()
+			got := largeSortText(t, conn, query)
+			if sorts()-before != 1 {
+				t.Errorf("sorted in runs %v times, want once", sorts()-before)
+			}
+			mustExec(t, conn, "SET distributed_execution = off")
+			text := strings.Replace(query, "SELECT ", "SELECT /* at once */ ", 1)
+			ts.srv.sortBudget = -1
+			want := largeSortText(t, conn, text)
+			ts.srv.sortBudget = 0
+			if len(got) != len(want) {
+				t.Fatalf("%d rows, want %d", len(got), len(want))
+			}
+			for i := range got {
+				if got[i] != want[i] {
+					t.Fatalf("row %d:\n%s\nat once:\n%s", i, got[i], want[i])
+				}
+			}
+		})
+	}
+
+	// A statement with parameters, as many as its protocol sends.
 	params := ts.admin(t, pgx.QueryExecModeExec)
 	before := sorts()
 	var rowCount int64
-	rows, err := params.Query(context.Background(), "SELECT id, n FROM "+from+" WHERE n >= $1 ORDER BY id, n", int64(0))
+	rows, err := params.Query(context.Background(), "SELECT id, ts, k, secs, n, n + $1::BIGINT AS m FROM "+from+" ORDER BY upper(id), id, n", int64(5))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -159,42 +201,84 @@ func TestLargeSortInRuns(t *testing.T) {
 	if err := rows.Err(); err != nil {
 		t.Fatal(err)
 	}
-	if rowCount != 2_000_000 || sorts() != before {
+	if rowCount != 2_000_000 || sorts()-before != 1 {
 		t.Errorf("with a parameter: %d rows, sorted in runs %v times", rowCount, sorts()-before)
 	}
 
-	// A client that reads a few rows at a time.
+	// A client that reads a few rows at a time, running another statement on
+	// the session between its reads, as JDBC's fetch size has it do.
 	h, err := ts.admin(t, pgx.QueryExecModeSimpleProtocol).PgConn().Hijack()
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer h.Conn.Close() //nolint:errcheck
-	_ = h.Conn.SetDeadline(time.Now().Add(5 * time.Minute))
-	h.Frontend.Send(&pgproto3.Parse{Name: "big", Query: "SELECT id, n FROM " + from + " ORDER BY id, n"})
-	h.Frontend.Send(&pgproto3.Bind{PreparedStatement: "big", DestinationPortal: "p"})
-	h.Frontend.Send(&pgproto3.Execute{Portal: "p", MaxRows: 10})
-	h.Frontend.Send(&pgproto3.Sync{})
-	if err := h.Frontend.Flush(); err != nil {
-		t.Fatal(err)
+	_ = h.Conn.SetDeadline(time.Now().Add(10 * time.Minute))
+	fe := h.Frontend
+	receive := func(until string) (rows int, first string) {
+		t.Helper()
+		for {
+			msg, err := fe.Receive()
+			if err != nil {
+				t.Fatal(err)
+			}
+			switch m := msg.(type) {
+			case *pgproto3.DataRow:
+				if rows++; rows == 1 {
+					first = string(m.Values[len(m.Values)-1])
+				}
+			case *pgproto3.ErrorResponse:
+				t.Fatal(m.Message)
+			}
+			if fmt.Sprintf("%T", msg) == "*pgproto3."+until {
+				return rows, first
+			}
+		}
 	}
-	before = sorts()
-	limited := 0
-	for done := false; !done; {
-		msg, err := h.Frontend.Receive()
-		if err != nil {
+	send := func(msgs ...pgproto3.FrontendMessage) {
+		t.Helper()
+		for _, m := range msgs {
+			fe.Send(m)
+		}
+		if err := fe.Flush(); err != nil {
 			t.Fatal(err)
 		}
-		switch m := msg.(type) {
-		case *pgproto3.DataRow:
-			limited++
-		case *pgproto3.ErrorResponse:
-			t.Fatal(m.Message)
-		case *pgproto3.ReadyForQuery:
-			done = true
-		}
 	}
-	if limited != 10 || sorts() != before {
-		t.Errorf("a portal of 10 rows: %d rows, sorted in runs %v times", limited, sorts()-before)
+	send(&pgproto3.Query{String: "BEGIN"})
+	receive("ReadyForQuery")
+	before = sorts()
+	send(&pgproto3.Parse{Name: "big", Query: "SELECT id, ts, k, secs, n FROM " + from + " ORDER BY n DESC"},
+		&pgproto3.Bind{PreparedStatement: "big", DestinationPortal: "p"},
+		&pgproto3.Execute{Portal: "p", MaxRows: 10},
+		&pgproto3.Flush{})
+	got, first := receive("PortalSuspended")
+	if got != 10 || first != "1999999" {
+		t.Fatalf("the portal's first read: %d rows, from %s", got, first)
+	}
+	send(&pgproto3.Parse{Query: "SELECT 42"}, &pgproto3.Bind{}, &pgproto3.Execute{}, &pgproto3.Flush{})
+	if n, v := receive("CommandComplete"); n != 1 || v != "42" {
+		t.Fatalf("the statement between its reads: %d rows, %s", n, v)
+	}
+	send(&pgproto3.Execute{Portal: "p", MaxRows: 5}, &pgproto3.Flush{})
+	if got, first = receive("PortalSuspended"); got != 5 || first != "1999989" {
+		t.Fatalf("the portal's second read: %d rows, from %s", got, first)
+	}
+	send(&pgproto3.Execute{Portal: "p"}, &pgproto3.Sync{})
+	got, _ = receive("CommandComplete")
+	receive("ReadyForQuery")
+	// It counts once it has completed, after what the client sees.
+	for range 100 {
+		if sorts()-before == 1 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got != 2_000_000-15 || sorts()-before != 1 {
+		t.Errorf("the portal's last read: %d rows, sorted in runs %v times", got, sorts()-before)
+	}
+	send(&pgproto3.Query{String: "COMMIT"})
+	receive("ReadyForQuery")
+	if left := largeSortDirs(t, spill); len(left) > 0 {
+		t.Errorf("left in the spill directory: %v", left)
 	}
 
 	conn := ts.admin(t, pgx.QueryExecModeSimpleProtocol)
@@ -220,6 +304,159 @@ func TestLargeSortInRuns(t *testing.T) {
 			t.Errorf("%s: sorted in runs", q)
 		}
 	}
+}
+
+// TestLargeSortFalseInterrupt checks a read in runs whose merge fails as it
+// streams, DuckDB reporting an interrupt when nothing asked for one. Before a
+// row went out it sorts at once, as a merge cannot be read twice, and the
+// client gets every row; after, the client gets an internal error.
+func TestLargeSortFalseInterrupt(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	spill := t.TempDir()
+	file := filepath.Join(dir, "rows.parquet")
+	largeSortFile(t, file, 2_000_000)
+	metrics := NewMetrics(prometheus.NewRegistry())
+	ts := startServerWithConfig(t, config.Config{
+		DuckDB:  config.DuckDB{TempDir: spill, MemoryLimit: "400MiB", Threads: 4, ExtensionDir: os.Getenv("IGLOO_TEST_EXTENSION_DIR")},
+		Storage: config.Storage{AllowedLocations: []string{dir + "/"}},
+	}, func(o *Options) { o.Metrics = metrics })
+	conn := ts.admin(t, pgx.QueryExecModeSimpleProtocol)
+	query := "SELECT id, ts, k, secs, n AS sort_stream FROM read_parquet('" + file + "') ORDER BY sort_stream"
+
+	interruptStreams(t, "sort_stream", 0, 1)
+	rows, err := conn.Query(context.Background(), query)
+	if err != nil {
+		t.Fatal(err)
+	}
+	n := int64(0)
+	for rows.Next() {
+		vals, err := rows.Values()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if vals[4].(int64) != n {
+			t.Fatalf("row %d: %v", n, vals)
+		}
+		n++
+	}
+	if err := rows.Err(); err != nil || n != 2_000_000 {
+		t.Fatalf("after %d rows: %v, want all of them", n, err)
+	}
+	if got := testutil.ToFloat64(metrics.largeSorts); got != 0 {
+		t.Errorf("counted %v reads in runs that ended sorted at once", got)
+	}
+
+	interruptStreams(t, "sort_stream", 1000, 1)
+	sent, err := drainRows(conn, query)
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) || pgErr.Code != "XX000" || !strings.Contains(pgErr.Message, "was not canceled") || sent < 1000 {
+		t.Fatalf("after %d rows: %v, want the internal error", sent, err)
+	}
+	if left := largeSortDirs(t, spill); len(left) > 0 {
+		t.Errorf("left in the spill directory: %v", left)
+	}
+}
+
+// sortedArrow is an ArrowWriter that checks a result's last column ascends, and
+// returns stop once it has read a batch, if set.
+type sortedArrow struct {
+	t       *testing.T
+	calls   int
+	rows    int64
+	last    int64
+	stop    error
+	ordered bool
+}
+
+func (a *sortedArrow) Columns([]Column) error { return nil }
+func (a *sortedArrow) Row([]any) error        { return nil }
+func (a *sortedArrow) Complete(string) error  { return nil }
+func (a *sortedArrow) Records(rdr array.RecordReader) (int64, error) {
+	a.calls++
+	for rdr.Next() {
+		rec := rdr.RecordBatch()
+		col := rec.Column(int(rec.NumCols()) - 1).(*array.Int64)
+		for i := range col.Len() {
+			if a.rows > 0 && col.Value(i) < a.last {
+				a.t.Errorf("row %d: %d after %d", a.rows, col.Value(i), a.last)
+			}
+			a.last = col.Value(i)
+			a.rows++
+		}
+		if a.stop != nil {
+			return a.rows, a.stop
+		}
+	}
+	return a.rows, rdr.Err()
+}
+
+// TestLargeSortOverArrow reads rows in order larger than memory as Arrow record
+// batches, as Flight SQL reads them: in runs, every row in order. A statement
+// that fails once it has sent batches does not run again, which would send them
+// twice.
+func TestLargeSortOverArrow(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	file := filepath.Join(dir, "rows.parquet")
+	largeSortFile(t, file, 2_000_000)
+	metrics := NewMetrics(prometheus.NewRegistry())
+	ts := startServerWithConfig(t, config.Config{
+		DuckDB:  config.DuckDB{TempDir: t.TempDir(), MemoryLimit: "400MiB", Threads: 4, ExtensionDir: os.Getenv("IGLOO_TEST_EXTENSION_DIR")},
+		Storage: config.Storage{AllowedLocations: []string{dir + "/"}},
+	}, func(o *Options) { o.Metrics = metrics })
+	ctx := context.Background()
+	user, err := ts.store.Get(ctx, "igloo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	es, err := ts.srv.OpenEmbedded(ctx, user, "flight")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer es.Close() //nolint:errcheck
+	query := "SELECT id, ts, k, secs, n FROM read_parquet('" + file + "') ORDER BY n"
+	rec := &sortedArrow{t: t}
+	if err := es.Run(ctx, query, rec); err != nil {
+		t.Fatal(err)
+	}
+	if rec.rows != 2_000_000 || rec.calls != 1 {
+		t.Errorf("%d rows in %d calls, want 2000000 in one", rec.rows, rec.calls)
+	}
+	if got := testutil.ToFloat64(metrics.largeSorts); got != 1 {
+		t.Errorf("sorted in runs %v times, want once", got)
+	}
+
+	stopped := &sortedArrow{t: t, stop: errors.New("the client went away")}
+	if err := es.Run(ctx, query, stopped); err == nil {
+		t.Error("no error from a writer that failed")
+	}
+	if stopped.calls != 1 || stopped.rows == 0 {
+		t.Errorf("%d rows in %d calls, want some in one", stopped.rows, stopped.calls)
+	}
+}
+
+// largeSortText reads query's rows as text.
+func largeSortText(t *testing.T, conn *pgx.Conn, query string) []string {
+	t.Helper()
+	rows, err := conn.Query(context.Background(), query, pgx.QueryResultFormats{pgx.TextFormatCode})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var b strings.Builder
+		for _, v := range rows.RawValues() {
+			b.Write(v)
+			b.WriteByte('|')
+		}
+		out = append(out, b.String())
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("%s: %v", query, err)
+	}
+	return out
 }
 
 // vmHWM is the most memory the process has held, by the kernel's count.

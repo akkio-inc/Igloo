@@ -365,12 +365,20 @@ new delete files name.
 | Outer joins (`LEFT`, `RIGHT`, `FULL`) | Incremental while the tables the join fills with NULLs are unchanged | Full |
 | `GROUP BY` (or `SELECT DISTINCT`, or aggregates of all rows) with `count(*)`, `count(x)`, `sum(x)` of integers and decimals, and `avg(x)` of integers | Incremental | Incremental |
 | ... and also `min(x)`, `max(x)`, or `count(DISTINCT x)` of integers | Incremental | Full |
+| `UNION` of such filters, projections and joins | Incremental | Incremental |
+
+What these read may be a `WITH` clause (not recursive), a subquery in `FROM` or
+a `UNION ALL` of them, as long as that filters, projects and joins tables. And a
+query that only filters and computes from the rows of one aggregate, as
+`WITH t AS (SELECT g, sum(x) AS s FROM f GROUP BY g) SELECT g, s * 2 FROM t WHERE s > 1`,
+is that aggregate.
 
 - **Joins.** Rows appended to a joined table add the rows they join to;
   when several of the tables changed, the refresh joins each one's
   changes with the others as they were before or after them (Δ(A⋈B) =
   ΔA⋈B' + A⋈ΔB). A dimension table that changes reads the fact table it
-  joins whole, as a full refresh would.
+  joins whole, as a full refresh would. A `UNION ALL` gains what each of its
+  branches does, each change read through its branch alone.
 - **Aggregates.** An aggregating view keeps each group's partial
   aggregates (counts, sums, minimums, maximums, and `count(DISTINCT x)`'s
   values in a roaring bitmap) in a table of Igloo's own schema
@@ -378,7 +386,11 @@ new delete files name.
   included. A refresh aggregates the changed rows, merges them into the
   state, and writes the groups that changed; rows deleted are subtracted
   from counts and sums. Expressions of aggregates and of the `GROUP BY`
-  columns, and `HAVING`, work: they are computed from the state.
+  columns, and `HAVING`, work: they are computed from the state. A view
+  whose rows do not show their groups, or of one row of no group, is written
+  whole, as a full refresh writes it. The view's commit and the state's are
+  two: a refresh stopped between them makes the next refresh a full one, so
+  no change is counted twice.
 - **Exact, always.** Every table a refresh reads, it reads at the
   snapshot it records, so the next refresh starts where it ended, and the
   result equals a full refresh's to the bit. So sums and averages of
@@ -394,14 +406,13 @@ new delete files name.
   inserting the new took 23 s and left reads of the view slow until
   compaction), and readers, on every replica and through the result cache,
   see the old rows or the new ones. A refresh that fails or is stopped
-  leaves the old rows (see [operations](operations.md)); a partitioned view,
-  or one with columns of nested, fixed-length or nanosecond types, is
-  written by deleting and inserting, in one transaction. Igloo refreshes
+  leaves the old rows (see [operations](operations.md)). Igloo refreshes
   in full, and says why,
   when the query has a shape the table above leaves out (a window
-  function, a subquery, `LIMIT`, `UNION`, a `WITH` clause, a view or a
-  table of a connection, a function such as `now()` or `random()`, an
-  aggregate such as `median`);
+  function, a subquery in an expression, a subquery that aggregates and is
+  joined or aggregated again, `LIMIT`, `INTERSECT`, `EXCEPT`, a recursive
+  `WITH`, a view or a table of a connection, a function such as `now()` or
+  `random()`, an aggregate such as `median`);
   when reading what changed would cost more than 80% of reading the
   tables whole (see the next item); when a table has a column named
   `filename` or `file_row_number`, DuckDB's names for each row's data

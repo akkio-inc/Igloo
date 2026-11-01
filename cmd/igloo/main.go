@@ -60,6 +60,7 @@ import (
 	"github.com/akkio-inc/igloo/internal/sharing"
 	"github.com/akkio-inc/igloo/internal/sso"
 	"github.com/akkio-inc/igloo/internal/tasks"
+	"github.com/akkio-inc/igloo/internal/uploads"
 	"github.com/akkio-inc/igloo/internal/workload"
 )
 
@@ -423,7 +424,8 @@ func serve() error {
 		eraser, err = newEraser(cfg, erasure.Options{
 			Store: erasureStore, Catalog: cat, Policies: policies.Load, Engine: eng, Jobs: jobs, Purger: purger,
 			Locks: cloneStore, Failed: notifier.ErasureFailed, Blocked: notifier.ErasureBlocked, Metrics: erasure.NewMetrics(reg), Log: log,
-			Locations: cat.Locations, Memory: rewriteMemory(cfg, memory), IDDomains: domains, IDSets: idSetsFor(cfg, bitmapIDs),
+			Locations: cat.Locations, Making: cat.PendingNotes, Memory: rewriteMemory(cfg, memory), IDDomains: domains, IDSets: idSetsFor(cfg, bitmapIDs),
+			UploadKeys: uploads.Keys{GCSKeyID: cfg.Storage.GCS.HMACKeyID, GCSSecret: cfg.Storage.GCS.HMACSecret},
 			// What AI functions derived from the tables, cached, the models
 			// trained from them, and the views refreshed from them.
 			Derived: []erasure.Derived{aiRuntime.Store()}, Models: retrainer, Views: views,
@@ -525,10 +527,12 @@ func serve() error {
 		ExclusivePrepares:   !cfg.SharedPrepares,
 		ResultCacheSize:     cfg.ResultCacheSize,
 		QueryMemory:         eng.MemoryLimit(ctx),
+		HeavyInBackground:   cfg.HeavyInBackground,
 		RewriteMemory:       rewriteMemory(cfg, memory),
 		MemoryTotal:         memory.Total,
 		FreeMemory:          func(ctx context.Context) { dropDuckDBCaches(ctx, eng, log) },
 		AllowedLocations:    cfg.Storage.AllowedLocations,
+		UploadKeys:          uploads.Keys{GCSKeyID: cfg.Storage.GCS.HMACKeyID, GCSSecret: cfg.Storage.GCS.HMACSecret},
 		Warehouse:           warehouseRoot(cfg),
 		Workload:            limits,
 		Pool:                cfg.Pool,

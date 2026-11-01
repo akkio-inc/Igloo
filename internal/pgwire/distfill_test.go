@@ -79,9 +79,9 @@ func TestFillOnWorkers(t *testing.T) {
 		t.Errorf("after the insert: %s", got)
 	}
 
-	// A materialized view's full refresh: with a WITH clause, it is
+	// A materialized view's full refresh: a column renamed in FROM, it is
 	// refreshed in full.
-	mv := "WITH o AS (SELECT * FROM lake.public.orders) SELECT amount, count(*) AS n FROM o GROUP BY amount"
+	mv := "SELECT amount, count(*) AS n FROM lake.public.orders AS o(i) GROUP BY amount"
 	mustExec(t, conn, "CREATE MATERIALIZED VIEW fill_mv AS "+mv)
 	mustExec(t, conn, "REFRESH MATERIALIZED VIEW fill_mv")
 	if action, detail, _, _ := viewRefresh(t, conn, "public.fill_mv"); !strings.Contains(detail, "its query ran on") {

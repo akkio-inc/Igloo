@@ -244,6 +244,13 @@ func (s *Server) rebuildView(ctx context.Context, j tasks.Job) error {
 	sess.method, sess.job = methodTask, j.Kind+" "+j.Name
 	schema, table, _ := strings.Cut(j.Name, ".")
 	create := "CREATE OR REPLACE TABLE " + quoteName([]string{s.catalogName(), schema, table}) + " AS " + j.Statement
+	// Where the files of a stopped refresh are, once it is another table.
+	var old []string
+	if s.ddl != nil {
+		if tbl, err := s.ddl.LoadTable(ctx, schema, table); err == nil {
+			old = append(old, tbl.Location())
+		}
+	}
 	start := time.Now()
 	err = sess.runCancelable(ctx, create, func(ctx context.Context) error {
 		return s.execDDL(ctx, sess, owner, create)
@@ -256,7 +263,7 @@ func (s *Server) rebuildView(ctx context.Context, j tasks.Job) error {
 	// Files a stopped full refresh wrote under the old table's location,
 	// in none of its snapshots, which dropping it may not have taken. No
 	// refresh of the view runs while the request holds its lease.
-	if err := s.clearRefreshFiles(ctx, schema, table, true); err != nil {
+	if err := s.clearRefreshFiles(ctx, schema, table, true, old...); err != nil {
 		return fmt.Errorf("delete the files a stopped refresh of it left: %w", err)
 	}
 	s.dropViewState(ctx, sess, j)

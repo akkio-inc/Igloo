@@ -63,6 +63,7 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -124,6 +125,12 @@ type Proxy struct {
 	http   *http.Client
 	reads  *httputil.ReverseProxy
 	log    *slog.Logger
+
+	// holds are the tables whose commit is kept from the catalog (see
+	// hold.go), and holdCount how many, so that no other request pays.
+	holdMu    sync.Mutex
+	holds     map[string]*CommitHold
+	holdCount atomic.Int64
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -320,7 +327,9 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		start := time.Now()
-		p.reads.ServeHTTP(sw, r)
+		if h := p.holdOf(loadKeyOf(table)); h == nil || !p.serveHeldLoad(sw, r, h) {
+			p.reads.ServeHTTP(sw, r)
+		}
 		if p.log.Enabled(r.Context(), slog.LevelDebug) {
 			p.log.Debug("catalog read", "method", r.Method, "path", rest, "status", sw.status,
 				"took", time.Since(start).Round(time.Microsecond), "bytes", sw.bytes)
@@ -346,6 +355,9 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	body = withDefaults(rest, body)
+	if p.takeCommit(w, r, rest, body) {
+		return
+	}
 	// A change makes the listings kept stale: forgotten before it, so no
 	// listing begun before it is kept, and after it, so none answered
 	// while it was under way is. So does it the versions of the tables it
@@ -814,6 +826,8 @@ type tableCommit struct {
 type snapshot struct {
 	id           int64
 	manifestList string
+	// addedRecords is the rows its summary says it adds, -1 if it does not.
+	addedRecords int64
 }
 
 // commitPath matches the paths commits are posted to: a table's, or the
@@ -838,8 +852,9 @@ func parseCommit(rest string, body []byte) *commit {
 			Action   string `json:"action"`
 			Location string `json:"location"`
 			Snapshot *struct {
-				ID           int64  `json:"snapshot-id"`
-				ManifestList string `json:"manifest-list"`
+				ID           int64             `json:"snapshot-id"`
+				ManifestList string            `json:"manifest-list"`
+				Summary      map[string]string `json:"summary"`
 			} `json:"snapshot"`
 		} `json:"updates"`
 	}
@@ -880,7 +895,11 @@ func parseCommit(rest string, body []byte) *commit {
 			switch u.Action {
 			case "add-snapshot":
 				if u.Snapshot != nil {
-					t.snapshots = append(t.snapshots, snapshot{id: u.Snapshot.ID, manifestList: u.Snapshot.ManifestList})
+					added := int64(-1)
+					if n, err := strconv.ParseInt(u.Snapshot.Summary["added-records"], 10, 64); err == nil {
+						added = n
+					}
+					t.snapshots = append(t.snapshots, snapshot{id: u.Snapshot.ID, manifestList: u.Snapshot.ManifestList, addedRecords: added})
 				}
 			case "assign-uuid":
 				t.newUUID = true

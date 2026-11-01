@@ -173,9 +173,9 @@ func TestCohortExample(t *testing.T) {
 	p := h.planOf(q)
 	// The cohorts' DISTINCTs complete their groups by person; the genres'
 	// and sizes' distinct people are counted in place, and their groups
-	// completed by group.
-	if n := coordinatorStages(p); n != 2 || p.exchanges("aggregate") != 4 {
-		t.Errorf("%d stages to the coordinator and %d aggregate exchanges, want 2 and 4:\n%s", n, p.exchanges("aggregate"), p.describe())
+	// completed by group; workers join those by cohort, as USING says.
+	if n := coordinatorStages(p); n != 1 || p.exchanges("aggregate") != 4 {
+		t.Errorf("%d stages to the coordinator and %d aggregate exchanges, want 1 and 4:\n%s", n, p.exchanges("aggregate"), p.describe())
 	}
 }
 

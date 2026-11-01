@@ -106,11 +106,28 @@ check "workers take tasks from igloo pods only" "server" "$(admitted "$work/obje
 writes_env() { docf "$1" Deployment igloo | grep -A1 -E '^ +- name: IGLOO_WORKER_WRITES$' | sed -n 's/^ *value: //p'; }
 sa_of() { docf "$1" Deployment igloo-workers | sed -n 's/^ *serviceAccountName: //p'; }
 check "workers with the igloo pods' identity write no table's files" '"off"|igloo' "$(writes_env "$work/object.yaml")|$(sa_of "$work/object.yaml")"
-render "${bundled[@]}" --set workers.enabled=true --set workers.serviceAccount.create=true \
+s3=(--set postgresql.enabled=true --set objectStorage.enabled=false --set storage.warehouseLocation=s3://b/warehouse --set catalog.systemCredentials=aws --set workers.enabled=true)
+render "${s3[@]}" --set workers.serviceAccount.create=true \
   --set 'workers.serviceAccount.annotations.eks\.amazonaws\.com/role-arn=arn:aws:iam::123456789012:role/w' >"$work/own-sa.yaml"
 check "workers with an identity of their own write them" '"on"|igloo-worker' "$(writes_env "$work/own-sa.yaml")|$(sa_of "$work/own-sa.yaml")"
 check "their service account carries its annotations" 'eks.amazonaws.com/role-arn: arn:aws:iam::123456789012:role/w' \
   "$(docf "$work/own-sa.yaml" ServiceAccount igloo-worker | grep -o 'eks.amazonaws.com/role-arn: .*')"
+# writes_of VALUES... prints what the chart turns worker writes to with them.
+writes_of() { render "$@" >"$work/writes-of.yaml"; writes_env "$work/writes-of.yaml"; }
+check "not with the bundled store's keys, whatever their account" '"off"' \
+  "$(writes_of "${bundled[@]}" --set workers.enabled=true --set workers.serviceAccount.create=true)"
+check "not with the igloo pods' Secret, whatever their account" '"off"' \
+  "$(writes_of "${s3[@]}" --set storage.s3.existingSecret=igloo-s3 --set workers.serviceAccount.create=true)"
+check "not with the same Secret named again" '"off"' \
+  "$(writes_of "${s3[@]}" --set storage.s3.existingSecret=igloo-s3 --set workers.storage.s3.existingSecret=igloo-s3 --set workers.serviceAccount.create=true)"
+check "not with the igloo pods' account by name" '"off"' \
+  "$(writes_of "${s3[@]}" --set workers.serviceAccount.name=igloo)"
+check "not with keys of their own on an account with the igloo pods' cloud identity" '"off"' \
+  "$(writes_of "${s3[@]}" --set workers.storage.s3.existingSecret=workers-s3 --set 'serviceAccount.annotations.eks\.amazonaws\.com/role-arn=arn:aws:iam::123456789012:role/i')"
+check "with a Secret of their own and an account of their own" '"on"' \
+  "$(writes_of "${s3[@]}" --set storage.s3.existingSecret=igloo-s3 --set workers.storage.s3.existingSecret=workers-s3 --set workers.serviceAccount.create=true)"
+check "with a Secret of their own on an account with no cloud identity" '"on"' \
+  "$(writes_of "${s3[@]}" --set storage.s3.existingSecret=igloo-s3 --set workers.storage.s3.existingSecret=workers-s3)"
 render "${bundled[@]}" --set workers.enabled=true --set workers.writes=true >"$work/writes-on.yaml"
 check "workers.writes true turns them on" '"on"' "$(writes_env "$work/writes-on.yaml")"
 render "${bundled[@]}" --set workers.enabled=true --set workers.serviceAccount.create=true --set workers.writes=false >"$work/writes-off.yaml"

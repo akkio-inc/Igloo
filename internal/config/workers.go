@@ -348,6 +348,13 @@ func LoadWorker(lookup func(string) (string, bool)) (Config, error) {
 	if err != nil {
 		return cfg, err
 	}
+	// A worker reads ahead only if told to. Workers read cold on many threads
+	// already, each task its share of the files: on a fleet, at ten times the
+	// data, reading ahead saved no time beyond what runs differ by, and nearly
+	// half of what it fetched went unread.
+	if _, set := lookup("IGLOO_PREFETCH"); !set {
+		cfg.Prefetch.Enabled = false
+	}
 	var errs []error
 	if cfg.Storage.Location == "" {
 		errs = append(errs, errors.New("IGLOO_WAREHOUSE_LOCATION must be set"))
