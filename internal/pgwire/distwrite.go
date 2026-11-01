@@ -107,6 +107,8 @@ func (s *Server) newTableWrite(ctx context.Context, sess *session, schema, name 
 	if tbl.Metadata().Version() < 2 {
 		return nil, "the table is of Iceberg format version 1", nil
 	}
+	// DuckDB refuses an INSERT into such a table as it prepares it, so that no
+	// fill of one comes here but a view's.
 	if so := tbl.SortOrder(); !so.IsUnsorted() {
 		return nil, "the table has an Iceberg sort order", nil
 	}
@@ -158,10 +160,6 @@ func (s *Server) newTableWrite(ctx context.Context, sess *session, schema, name 
 	for i, f := range fields {
 		if !overwritable(f.Type) {
 			return nil, fmt.Sprintf("column %s is of type %s, whose Parquet a task's COPY would not write as Iceberg's", f.Name, f.Type), nil
-		}
-		if f.Required {
-			// COPY checks no NOT NULL, and writes the column as optional.
-			return nil, "column " + f.Name + " is NOT NULL", nil
 		}
 		typ, ok := types[f.Name]
 		if !ok {
@@ -416,6 +414,23 @@ func (s *Server) waitLateWrites() bool {
 	}
 }
 
+// checkRequired checks that no file holds a NULL in a column the table requires.
+// COPY checks no NOT NULL and writes every column as optional, so its files' null
+// counts say. The statement then runs on this replica, where DuckDB refuses them.
+func checkRequired(schema *iceberg.Schema, added []iceberg.DataFile) error {
+	for _, field := range schema.Fields() {
+		if !field.Required {
+			continue
+		}
+		for _, df := range added {
+			if n, ok := df.NullValueCounts()[field.ID]; !ok || n > 0 {
+				return fmt.Errorf("%w: %s may hold NULLs in the NOT NULL column %s", distributed.ErrWriteRefused, df.FilePath(), field.Name)
+			}
+		}
+	}
+	return nil
+}
+
 // checkAdded compares the data files made from footers with what the
 // workers said of them, and that a partitioned file's partition is known
 // for the rows it holds.
@@ -485,6 +500,9 @@ func (w *tableWrite) commit(ctx context.Context, files []distributed.WrittenFile
 	}
 	check := func(added []iceberg.DataFile, spec iceberg.PartitionSpec) error {
 		if err := checkAdded(kept, added, spec); err != nil {
+			return err
+		}
+		if err := checkRequired(w.tbl.Schema(), added); err != nil {
 			return err
 		}
 		if w.gate != nil {

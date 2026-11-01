@@ -1220,8 +1220,9 @@ func TestWorkersWriteOtherTargets(t *testing.T) {
 	if got, want := env.local(t, "SELECT count(*) FROM w_required"), env.local(t, "SELECT count(*) FROM src WHERE g = 1"); got != want {
 		t.Errorf("%s rows, want %s", got, want)
 	}
-	if left := written(t, env.location(t, "w_required")); len(left) != 0 {
-		t.Errorf("files of workers: %q", left)
+	env.checkWrote(t, "w_required")
+	if data, _ := liveFiles(t, admin, "w_required"); len(data) == 0 {
+		t.Error("no file holds its rows")
 	}
 	env.checkNoNotes(t)
 }

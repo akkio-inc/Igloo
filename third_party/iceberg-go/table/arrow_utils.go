@@ -1392,6 +1392,13 @@ func filesToDataFiles(ctx context.Context, fileIO iceio.IO, meta *MetadataBuilde
 
 	currentSchema, currentSpec := meta.CurrentSchema(), *partitionSpec
 
+	return filesToDataFilesOf(ctx, fileIO, currentSchema, currentSpec, meta.defaultSortOrderID, meta.props, filePaths, concurrency)
+}
+
+// filesToDataFilesOf is filesToDataFiles of a schema and sort order given.
+func filesToDataFilesOf(ctx context.Context, fileIO iceio.IO, currentSchema *iceberg.Schema, currentSpec iceberg.PartitionSpec, sortOrderID int,
+	props iceberg.Properties, filePaths []string, concurrency int,
+) (_ []iceberg.DataFile, err error) {
 	dataFiles := make([]iceberg.DataFile, len(filePaths))
 	eg, ctx := errgroup.WithContext(ctx)
 	eg.SetLimit(concurrency)
@@ -1408,7 +1415,7 @@ func filesToDataFiles(ctx context.Context, fileIO iceio.IO, meta *MetadataBuilde
 				}
 			}()
 
-			dataFiles[i] = fileToDataFile(ctx, fileIO, filePath, currentSchema, currentSpec, meta.defaultSortOrderID, meta.props)
+			dataFiles[i] = fileToDataFile(ctx, fileIO, filePath, currentSchema, currentSpec, sortOrderID, props)
 
 			return nil
 		})
