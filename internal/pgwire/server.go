@@ -428,8 +428,8 @@ type Server struct {
 	// results keeps queries' results (see resultcache.go); nil when it
 	// keeps none.
 	results *resultCache
-	// refreshFraction is the share of a table's rows past which a change
-	// is refreshed in full (defaultFullFraction when zero), and
+	// refreshFraction is the share of a full refresh's reads past which
+	// reading a change costs too much (defaultFullFraction when zero), and
 	// deleteTargets what refreshes know of which data files position
 	// delete files delete rows of (see refresh.go).
 	refreshFraction float64

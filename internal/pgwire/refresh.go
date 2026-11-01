@@ -62,11 +62,10 @@ const (
 	actionNoData      = "NO_DATA"
 )
 
-// defaultFullFraction is the share of a table's rows a change may reach
-// before a refresh reads the table whole rather than the change: past
-// it, reading the changed rows, and the other tables joined to them, is
-// about as much work as running the query again.
-const defaultFullFraction = 0.5
+// defaultFullFraction is the share of a full refresh's cost that reading
+// what changed may reach before a refresh reads the tables whole rather
+// than the change (see cheaperInFull).
+const defaultFullFraction = 0.8
 
 // refreshState is what a materialized view or dynamic table keeps between
 // refreshes, in its job's Refresh, as JSON.
@@ -414,16 +413,20 @@ func (r *refresher) changes(ctx context.Context) (map[string]incremental.Change,
 		if err != nil {
 			return nil, "", err
 		}
+		// A refresh picks a change's rows by DuckDB's columns of each
+		// row's data file and position, which a column of the same name
+		// would hide.
+		for _, v := range []string{"filename", "file_row_number"} {
+			if _, ok := tbl.Schema().FindFieldByNameCaseInsensitive(v); ok {
+				return nil, fmt.Sprintf("%s has a column named %s, by which DuckDB names each row's data file or position, and a refresh picks what changed", t, v), nil
+			}
+		}
 		c, err := incremental.Diff(ctx, tbl, t, from, to, r.s.deleteTargets)
 		if err != nil {
 			return nil, "", err
 		}
 		if c.Reason != "" {
 			return nil, c.Reason, nil
-		}
-		changed := c.AddedRows + c.RemovedRows + c.TouchedRows
-		if c.Total > 0 && float64(changed) > fraction*float64(c.Total) {
-			return nil, fmt.Sprintf("the change to %s, %d rows, is more than %.0f%% of its %d rows", t, changed, fraction*100, c.Total), nil
 		}
 		out[t] = c
 	}
@@ -443,7 +446,94 @@ func (r *refresher) changes(ctx context.Context) (map[string]incremental.Change,
 			return nil, fmt.Sprintf("rows were deleted from or updated in %s, which %s cannot take incrementally", src.Table(), what), nil
 		}
 	}
+	why, err := r.cheaperInFull(ctx, out, fraction)
+	if err != nil || why != "" {
+		return nil, why, err
+	}
 	return out, "", nil
+}
+
+// deletedRowCost is what DuckDB takes to apply a row's deletion by a
+// position delete file as it scans a table, in the bytes of files it reads
+// in that time: 1.3 to 3 KiB on local disk, and more on S3, where a count
+// and sum over a billion rows went from 2.7 s to 17 s once an update had
+// deleted 20 million of them.
+const deletedRowCost = 2048
+
+// cheaperInFull returns why reading the query's tables whole would cost
+// about as much as reading what changed, or "". Each read costs the bytes
+// of the files it reads and deletedRowCost for each row it applies a
+// position delete file's deletion of: a full refresh reads every
+// reference's table at its new snapshot, its delete files applied; an
+// incremental one each changed reference's change (the files added, the
+// files removed and those with rows deleted since, as the last refresh
+// read them, and the new delete files, joined by position) and, with it,
+// the other references' tables whole, as the delta rule joins them.
+// Reading what changed costs more for each byte, in the merge into the
+// view and its state, so it is chosen only while it costs less than
+// fraction of a full refresh. After an update of a few percent of a
+// table's rows, which touches every file, the change reads the files once
+// as they were, without the new deletions, which a full refresh applies.
+func (r *refresher) cheaperInFull(ctx context.Context, changes map[string]incremental.Change, fraction float64) (string, error) {
+	whole, changed := map[string]int64{}, map[string]int64{}
+	for _, src := range r.plan.Sources {
+		t := src.Table()
+		if _, ok := whole[t]; ok {
+			continue
+		}
+		schema, name, _ := strings.Cut(t, ".")
+		tbl, err := r.s.ddl.LoadTable(ctx, schema, name)
+		if err != nil {
+			return "", err
+		}
+		cost := func(snap int64) (bytes, deleted int64, err error) {
+			if _, bytes, err = incremental.SizeAt(ctx, tbl, snap); err != nil {
+				return 0, 0, err
+			}
+			deleted, err = incremental.Deleted(ctx, tbl, snap)
+			return bytes, deleted, err
+		}
+		b, d, err := cost(r.snaps[t])
+		if err != nil {
+			return "", err
+		}
+		whole[t] = b + deletedRowCost*d
+		c := changes[t]
+		if c.Empty() {
+			continue
+		}
+		changed[t] = c.Bytes
+		if c.FromBytes > 0 {
+			// The rows the last refresh's snapshot deleted of the files the
+			// change reads as it has them, as their share of its bytes.
+			fb, fd, err := cost(c.From)
+			if err != nil {
+				return "", err
+			}
+			if fb > 0 {
+				changed[t] += int64(float64(deletedRowCost*fd) * min(1, float64(c.FromBytes)/float64(fb)))
+			}
+		}
+	}
+	var full, delta int64
+	for i, src := range r.plan.Sources {
+		full += whole[src.Table()]
+		c := changes[src.Table()]
+		if c.Empty() {
+			continue
+		}
+		delta += changed[src.Table()]
+		for k, other := range r.plan.Sources {
+			if k != i {
+				delta += whole[other.Table()]
+			}
+		}
+	}
+	if full > 0 && float64(delta) > fraction*float64(full) {
+		return fmt.Sprintf("reading what changed costs about as much as reading its tables whole: %d against %d bytes of files, "+
+			"each deleted row to apply counted as %d", delta, full, deletedRowCost), nil
+	}
+	return "", nil
 }
 
 // incremental refreshes from what changed. It returns why it could not,
@@ -496,7 +586,22 @@ func (r *refresher) incremental(ctx context.Context) (refreshResult, string, err
 				parts = append(parts, "SELECT * FROM "+at(c.From)+" WHERE "+in(c.Removed))
 			}
 			if len(c.Touched) > 0 {
-				parts = append(parts, "(SELECT * FROM "+at(c.From)+" WHERE "+in(c.Touched)+" EXCEPT ALL SELECT * FROM "+at(c.To)+" WHERE "+in(c.Touched)+")")
+				// The rows the new delete files delete: those of the files
+				// they name, read as From has them, at their positions.
+				// Matched by the files' names, which writers spell the same
+				// in delete files and manifests however they spell the rest
+				// of the path. Taking From's rows of the files EXCEPT ALL
+				// To's read them twice and hashed every row: after an
+				// update of 2% of a table's rows spread over all its
+				// files, slower than reading the table whole.
+				deletes := make([]string, len(c.Deletes))
+				for i, f := range c.Deletes {
+					deletes[i] = quoteLiteral(f)
+				}
+				parts = append(parts, "(SELECT r.* EXCLUDE (__igloo_file, __igloo_pos) FROM (SELECT *, regexp_extract(filename, '[^/]+$') AS __igloo_file, "+
+					"file_row_number AS __igloo_pos FROM "+at(c.From)+" WHERE "+in(c.Touched)+") AS r SEMI JOIN "+
+					"(SELECT regexp_extract(file_path, '[^/]+$') AS f, pos FROM read_parquet(["+strings.Join(deletes, ", ")+"])) AS d "+
+					"ON r.__igloo_file = d.f AND r.__igloo_pos = d.pos)")
 			}
 			if err := r.temp(ctx, "VIEW", v[1], strings.Join(parts, " UNION ALL ")); err != nil {
 				return refreshResult{}, "", err

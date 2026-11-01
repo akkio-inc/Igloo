@@ -355,8 +355,9 @@ CREATE MATERIALIZED VIEW marts.campaign_totals SCHEDULE '30 minutes' AS
 Iceberg keeps every version of a table as a snapshot, and each snapshot
 says which data files it added and removed. A refresh reads the tables
 of its query at their current snapshots, records them, and the next
-refresh reads only the rows of the files added or removed since, and of
-the files whose rows were deleted since.
+refresh reads only the rows of the files added or removed since and, of
+the files whose rows were deleted since, the rows at the positions the
+new delete files name.
 
 | Query shape | Rows appended | Rows deleted or updated |
 |---|---|---|
@@ -390,13 +391,25 @@ the files whose rows were deleted since.
   has a shape the table above leaves out (a window function, a subquery,
   `LIMIT`, `UNION`, a `WITH` clause, a view or a table of a connection, a
   function such as `now()` or `random()`, an aggregate such as `median`);
-  when a change is more than half of a table's rows, which reading in
-  full costs about as much as; when a table's snapshot of the last refresh
-  is gone (table maintenance expired it, or the table was replaced or
-  rolled back) or its columns changed; when a table has equality delete
-  files or deletion vectors, which other engines write; when the query or
-  the policies on its tables changed, or a statement other than a refresh
-  wrote the view's table; and for the first refresh after `CREATE`.
+  when reading what changed would cost more than 80% of reading the
+  tables whole (see the next item); when a table has a column named
+  `filename` or `file_row_number`, DuckDB's names for each row's data
+  file and position, by which a refresh picks what changed; when a
+  table's snapshot of the last refresh is gone (table maintenance expired
+  it, or the table was replaced or rolled back) or its columns changed;
+  when a table has equality delete files or deletion vectors, which other
+  engines write; when the query or the policies on its tables changed, or
+  a statement other than a refresh wrote the view's table; and for the
+  first refresh after `CREATE`.
+- **Cost.** A read costs the bytes of the files it reads, and 2 KiB,
+  about what DuckDB takes to apply a deletion as it scans, for each row a
+  delete file deletes of them. A full refresh reads every table with all
+  its deletions; reading what changed reads the changed files as the last
+  refresh read them, the new delete files, joined to them by position,
+  and, for a join, the other tables it joins the change to. So a load of
+  several times the rows a table had refreshes in full, while an update
+  of a few rows in every file reads each file once, without applying the
+  new deletions.
 - **What it did.** `SHOW MATERIALIZED VIEWS` gives each view's
   `refresh_mode` (`INCREMENTAL` when its query can be refreshed so,
   `FULL` otherwise), `refresh_mode_reason`, and what its last refresh did

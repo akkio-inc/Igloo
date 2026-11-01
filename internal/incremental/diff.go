@@ -26,13 +26,18 @@ type Change struct {
 	// From had and To has not, whose rows From read.
 	Added, Removed []string
 	// Touched are data files both have, of which delete files added since
-	// From delete rows: the rows From read of them and To does not.
-	Touched []string
+	// From delete rows: the rows From read of them and To does not. Deletes
+	// are those delete files, whose positions name the rows.
+	Touched, Deletes []string
 	// Rows counts the rows of the files of each list, by their metadata
 	// (before deletes), and Total the rows To holds; Bytes counts the
 	// files' bytes, and TotalBytes those of To's files.
 	AddedRows, RemovedRows, TouchedRows, Total int64
 	Bytes, TotalBytes                          int64
+	// FromBytes counts the bytes of the files read as From has them, the
+	// removed and touched ones, some of whose rows From's delete files
+	// may delete.
+	FromBytes int64
 	// Reason, when set, says why the change cannot be read file by file,
 	// so that a refresh reads the table whole.
 	Reason string
@@ -155,6 +160,7 @@ func Diff(ctx context.Context, tbl *table.Table, name string, from, to int64, ta
 	for _, p := range c.Removed {
 		c.RemovedRows += removed[p].rows
 		c.Bytes += removed[p].bytes
+		c.FromBytes += removed[p].bytes
 	}
 	if len(deletes) == 0 && len(droppedDeletes) == 0 {
 		return c, nil
@@ -203,9 +209,18 @@ func Diff(ctx context.Context, tbl *table.Table, name string, from, to int64, ta
 	c.Touched = slices.Sorted(maps.Keys(touched))
 	for _, p := range c.Touched {
 		f := live[deletefiles.Canonical(p)]
-		// Read twice: as From and To have them.
+		// Read once, as From has them, for the rows at the new delete
+		// files' positions.
 		c.TouchedRows += f.rows
-		c.Bytes += 2 * f.bytes
+		c.Bytes += f.bytes
+		c.FromBytes += f.bytes
+	}
+	if len(c.Touched) > 0 {
+		for _, d := range deletes {
+			c.Deletes = append(c.Deletes, d.FilePath())
+			c.Bytes += d.FileSizeBytes()
+		}
+		slices.Sort(c.Deletes)
 	}
 	return c, nil
 }
@@ -240,18 +255,32 @@ func liveFiles(fs iceio.IO, snap *table.Snapshot) (map[string]liveFile, error) {
 }
 
 // Size returns the rows and the data files' bytes of tbl's current
-// snapshot: its summary's, or, where the summary lacks them, as DuckDB
-// writes it, its manifests'.
+// snapshot (see SizeAt).
 func Size(tbl *table.Table) (rows, bytes int64, err error) {
 	snap := tbl.CurrentSnapshot()
 	if snap == nil {
 		return 0, 0, nil
 	}
+	return sizeOf(context.Background(), tbl, snap)
+}
+
+// SizeAt returns the rows and the data files' bytes of tbl's snapshot
+// snap: its summary's, or, where the summary lacks them, as DuckDB writes
+// it, its manifests'. A snapshot tbl no longer has holds nothing.
+func SizeAt(ctx context.Context, tbl *table.Table, snap int64) (rows, bytes int64, err error) {
+	s := tbl.SnapshotByID(snap)
+	if s == nil {
+		return 0, 0, nil
+	}
+	return sizeOf(ctx, tbl, s)
+}
+
+func sizeOf(ctx context.Context, tbl *table.Table, snap *table.Snapshot) (rows, bytes int64, err error) {
 	rows, bytes = summaryInt(snap, "total-records"), summaryInt(snap, "total-files-size")
 	if rows >= 0 && bytes >= 0 {
 		return rows, bytes, nil
 	}
-	fs, err := tbl.FS(context.Background())
+	fs, err := tbl.FS(ctx)
 	if err != nil {
 		return 0, 0, err
 	}
@@ -264,6 +293,44 @@ func Size(tbl *table.Table) (rows, bytes int64, err error) {
 		rows, bytes = rows+f.rows, bytes+f.bytes
 	}
 	return rows, bytes, nil
+}
+
+// Deleted returns the rows the position delete files of tbl's snapshot
+// snap delete: its summary's total-position-deletes or, where the summary
+// lacks it, as DuckDB writes it, the rows of its delete files, by its
+// manifests.
+func Deleted(ctx context.Context, tbl *table.Table, snap int64) (int64, error) {
+	s := tbl.SnapshotByID(snap)
+	if s == nil {
+		return 0, nil
+	}
+	if n := summaryInt(s, "total-position-deletes"); n >= 0 {
+		return n, nil
+	}
+	fs, err := tbl.FS(ctx)
+	if err != nil {
+		return 0, err
+	}
+	manifests, err := s.Manifests(fs)
+	if err != nil {
+		return 0, err
+	}
+	var n int64
+	for _, m := range manifests {
+		if m.ManifestContent() != iceberg.ManifestContentDeletes {
+			continue
+		}
+		entries, err := m.FetchEntries(fs, true)
+		if err != nil {
+			return 0, err
+		}
+		for _, e := range entries {
+			if df := e.DataFile(); df.ContentType() == iceberg.EntryContentPosDeletes {
+				n += df.Count()
+			}
+		}
+	}
+	return n, nil
 }
 
 // summaryInt reads an integer of a snapshot's summary, or -1.

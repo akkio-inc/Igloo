@@ -2274,6 +2274,19 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   mixed-load benchmark's rollup and refresh jobs did for every dashboard.
   Results stay tied to the versions of the tables they read, and a
   statement prepared before DDL binds again without the cache.
+- A materialized view's or dynamic table's refresh chooses between reading
+  what changed and reading its tables whole by what each read costs: the
+  bytes of its files, and, for each row a position delete file deletes,
+  about what DuckDB takes to apply the deletion as it scans, which made
+  scans of a billion-row table on S3 six times slower after an update of
+  2% of its rows. It chose by the share of each table's rows in changed
+  files, so any update spread over every file refreshed in full, its
+  deletions applied. Reading what changed now takes the rows new delete
+  files delete by their positions, joined to the files as the last refresh
+  read them, rather than reading those files twice and comparing every row
+  (`EXCEPT ALL`). A table with a column named `filename` or
+  `file_row_number`, which would hide DuckDB's columns of each row's file
+  and position, refreshes in full.
 - A statement whose run lists a schema's tables as DuckDB binds it, as one
   over a table dropped since it was prepared does, binds again holding the
   catalog lock exclusively when other statements' binds hold it shared: it

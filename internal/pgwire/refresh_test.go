@@ -314,11 +314,12 @@ func TestRefreshFallsBack(t *testing.T) {
 	if _, _, mode, reason := viewRefresh(t, admin, "public.floats"); mode != "FULL" || !strings.Contains(reason, "DOUBLE") {
 		t.Errorf("a sum of doubles: %s, %q", mode, reason)
 	}
-	// A change of most of the table reads it whole.
-	mustExec(t, admin, "INSERT INTO f SELECT i, 'g' || (i % 4), i FROM range(100, 250) AS r(i)")
+	// A change of most of the table reads it whole, as reading the change
+	// would read about as many bytes.
+	mustExec(t, admin, "INSERT INTO f SELECT i, 'g' || (i % 4), i FROM range(100, 2000) AS r(i)")
 	mustExec(t, admin, "REFRESH MATERIALIZED VIEW sums")
-	if action, detail, _, _ := viewRefresh(t, admin, "public.sums"); action != "FULL" || !strings.Contains(detail, "is more than 50% of its 250 rows") {
-		t.Errorf("a change of half the table: %s, %q", action, detail)
+	if action, detail, _, _ := viewRefresh(t, admin, "public.sums"); action != "FULL" || !strings.Contains(detail, "costs about as much as reading its tables whole") {
+		t.Errorf("a change of most of the table: %s, %q", action, detail)
 	}
 	// A small one reads the change.
 	mustExec(t, admin, "INSERT INTO f VALUES (500, 'g1', 500)")
@@ -345,6 +346,59 @@ func TestRefreshFallsBack(t *testing.T) {
 	if n := count(t, admin, "SELECT count(*) FROM igloo.task_history WHERE name = 'public.sums' AND detail LIKE 'incremental: read 1 rows added%'"); n != 1 {
 		t.Errorf("incremental runs in the history: %d", n)
 	}
+	// A table with a column of the name of DuckDB's column of each row's
+	// data file reads whole, rather than by that column, which would read
+	// the table's own.
+	for _, sql := range []string{
+		"CREATE TABLE uploads (filename VARCHAR, bytes INTEGER)",
+		"INSERT INTO uploads SELECT 'f' || i, i FROM range(100) AS r(i)",
+		"CREATE MATERIALIZED VIEW upload_bytes AS SELECT count(*) AS n, sum(bytes) AS b FROM uploads",
+		"REFRESH MATERIALIZED VIEW upload_bytes",
+		"INSERT INTO uploads VALUES ('g', 1000)",
+		"REFRESH MATERIALIZED VIEW upload_bytes",
+	} {
+		mustExec(t, admin, sql)
+	}
+	if action, detail, _, _ := viewRefresh(t, admin, "public.upload_bytes"); action != "FULL" || !strings.Contains(detail, "column named filename") {
+		t.Errorf("a column named filename: %s, %q", action, detail)
+	}
+	if got := sortedTexts(t, admin, "SELECT n, b FROM upload_bytes"); !slices.Equal(got, []string{"101|5950"}) {
+		t.Errorf("upload_bytes: %q", got)
+	}
+}
+
+// TestRefreshCost checks that a refresh weighs the deletions a full one
+// would apply: a delete of rows in every one of a table's files reads the
+// files once as the last refresh read them and joins the new delete files
+// by position, where a full refresh would apply every deletion in its
+// scan; and that a small delete from a table that holds many deletions,
+// which both would apply, refreshes in full.
+func TestRefreshCost(t *testing.T) {
+	t.Parallel()
+	env := startRefreshServer(t)
+	admin := env.admin
+	mustExec(t, admin, "CREATE TABLE spend (id INTEGER, g VARCHAR, x INTEGER)")
+	for i := range 4 {
+		mustExec(t, admin, fmt.Sprintf("INSERT INTO spend SELECT i, 'g' || (i %% 4), i FROM range(%d, %d) AS r(i)", i*5000, (i+1)*5000))
+	}
+	mustExec(t, admin, "CREATE MATERIALIZED VIEW spend_sums AS SELECT g, count(*) AS n, sum(x) AS sx FROM spend GROUP BY g")
+	mustExec(t, admin, "REFRESH MATERIALIZED VIEW spend_sums")
+	check := func(step, want, why string) {
+		t.Helper()
+		mustExec(t, admin, "REFRESH MATERIALIZED VIEW spend_sums")
+		if action, detail, _, _ := viewRefresh(t, admin, "public.spend_sums"); action != want || !strings.Contains(detail, why) {
+			t.Errorf("%s: %s, %q; want %s", step, action, detail, want)
+		}
+		if got, want := sortedTexts(t, admin, "SELECT * FROM spend_sums"), sortedTexts(t, admin, "SELECT g, count(*), sum(x) FROM spend GROUP BY g"); !slices.Equal(got, want) {
+			t.Errorf("%s: %q, want %q", step, got, want)
+		}
+	}
+	mustExec(t, admin, "DELETE FROM spend WHERE id % 10 = 3")
+	check("a tenth deleted", "INCREMENTAL", "")
+	mustExec(t, admin, "DELETE FROM spend WHERE id % 10 <> 3 AND id % 10 <> 0")
+	check("most of the rest deleted", "INCREMENTAL", "")
+	mustExec(t, admin, "DELETE FROM spend WHERE id % 20 = 0")
+	check("a few more deleted, among many", "FULL", "costs about as much as reading its tables whole")
 }
 
 // TestDynamicTables checks Snowflake's DYNAMIC TABLE statements.
