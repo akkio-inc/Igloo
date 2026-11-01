@@ -2098,6 +2098,22 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
 
 ### Fixed
 
+- A block of the read cache missing or rewritten under a read no longer
+  fails the statement. A worker started with an empty disk read ahead as
+  if its cache were still empty after it was full, by a measurement of
+  the cache minutes old, while the cache's extension evicted
+  a block on each miss, and statements reading the same blocks ahead wrote
+  them through one temporary file each, the second truncating what the
+  first had renamed into place. The extension, which deletes a block it
+  takes for stale or evicts by checking that the file exists and then
+  removing it, then failed a task with "Could not remove file", and a short
+  block failed reads, or took the prefetcher down. Read-ahead now writes
+  each block through a file of its own, keeps to the disk's free space
+  beyond the extension's floor as it is now, reads nothing ahead with no
+  room, writes no block of an object without an ETag, and reads a footer
+  block that is not whole again from object storage; and a task or a
+  statement whose read raced another over a block runs again, up to three
+  times.
 - Planning a statement for workers no longer recurses without end on a
   common table expression filtered by `IN` a subquery that joins two
   subqueries, one with a scalar subquery in its filter: the subquery was

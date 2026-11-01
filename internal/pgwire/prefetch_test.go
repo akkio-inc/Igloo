@@ -17,9 +17,10 @@ import (
 )
 
 // localObject reads a data file of the test catalog's local warehouse.
+// Its ETag is any: the prefetcher reads ahead only objects that have one.
 type localObject struct{ *os.File }
 
-func (localObject) ETag() string { return "" }
+func (localObject) ETag() string { return `"local"` }
 
 // TestPrefetchStatements reads ahead, as a query runs, the blocks of the
 // files of the tables it reads, and not for a session that turned it off.

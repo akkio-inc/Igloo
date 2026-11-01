@@ -32,6 +32,7 @@ import (
 	"github.com/akkio-inc/igloo/internal/config"
 	"github.com/akkio-inc/igloo/internal/deletefiles"
 	"github.com/akkio-inc/igloo/internal/memlimit"
+	"github.com/akkio-inc/igloo/internal/prefetch"
 	"github.com/akkio-inc/igloo/internal/snowflake"
 )
 
@@ -496,6 +497,14 @@ func (w *Worker) serveTask(rw http.ResponseWriter, r *http.Request) {
 		if te.OutOfMemory {
 			log.Warn("task ran out of memory", "err", err)
 			w.opts.Metrics.task("out_of_memory", start)
+			w.fail(rw, http.StatusUnprocessableEntity, te)
+			return
+		}
+		if !te.Data && prefetch.BlockRace(err) {
+			// The coordinator runs it again at once.
+			log.Warn("a task's read of the read cache raced another over a block", "err", err)
+			te.CacheRace = true
+			w.opts.Metrics.task("cache_race", start)
 			w.fail(rw, http.StatusUnprocessableEntity, te)
 			return
 		}

@@ -81,6 +81,9 @@ const (
 	// maxThrottled is how often a task that object storage turned away
 	// is run again, after throttleWait, three times as long each time.
 	maxThrottled = 4
+	// maxCacheRaces is how often a task whose read of a worker's read
+	// cache raced another is run again, at once, on the next worker.
+	maxCacheRaces = 3
 )
 
 // Options configures a coordinator.
@@ -1323,19 +1326,23 @@ func assign(files []File, ws []*worker) [][]File {
 // returns the worker that ran it. A worker that answers with an error ran
 // the task and is healthy, and another would answer the same: the error
 // ends the job, without setting anyone's worker aside, and the statement
-// runs on the coordinator unless the error is in its data. One error is
+// runs on the coordinator unless the error is in its data. Two errors are
 // not the task's: object storage turning its requests away for now, past
 // DuckDB's retries (see storageRetries), which runs it again in a while,
-// on the next worker, up to maxThrottled times. The result goes to path,
+// on the next worker, up to maxThrottled times; and a read of the worker's
+// read cache racing another over a block's file (see cacheRaceError),
+// which runs it again at once, on the next worker, up to maxCacheRaces
+// times: a statement on the large worker alone failed for that, and ran
+// on the coordinator for want of it. The result goes to path,
 // within sp; a shuffle task writes each attempt to a directory of its own,
 // so the files of a failed attempt are never read.
 func (co *Coordinator) dispatch(ctx context.Context, task *taskRequest, ws []*worker, first int, path string, sp *spool) (*worker, *taskResult, error) {
 	var last error
 	// tried counts the workers tried; runs, every attempt, which names its
 	// output; passed, the workers passed over.
-	tried, throttles, passed := 0, 0, 0
+	tried, throttles, races, passed := 0, 0, 0, 0
 	for runs := 0; tried < min(maxAttempts, len(ws)); runs++ {
-		w := ws[(first+tried+throttles+passed)%len(ws)]
+		w := ws[(first+tried+throttles+races+passed)%len(ws)]
 		if passed < len(ws)-1 && co.pool.isDown(w.addr) {
 			// Set aside since the statement began, as a worker another task
 			// found hung is: while others remain, the task goes to them
@@ -1379,6 +1386,14 @@ func (co *Coordinator) dispatch(ctx context.Context, task *taskRequest, ws []*wo
 				return nil, nil, ctx.Err()
 			case <-time.After(wait):
 			}
+			continue
+		}
+		var cr *cacheRaceError
+		if errors.As(err, &cr) && races < maxCacheRaces {
+			races++
+			co.opts.Metrics.task("cache_race")
+			co.log.Warn("a task's read of a worker's read cache raced another; running it again", "query", task.Query,
+				"task", task.Task, "worker", w.addr, "retry", races, "err", err)
 			continue
 		}
 		var te *transportError
@@ -1526,6 +1541,9 @@ func (co *Coordinator) fetchTask(ctx context.Context, w *worker, body []byte, pa
 		}
 		if res.Error.Throttled {
 			return nil, &throttledError{msg: fmt.Sprintf("a task on %s: %s", w.addr, res.Error.Message)}
+		}
+		if res.Error.CacheRace {
+			return nil, &cacheRaceError{msg: fmt.Sprintf("a task on %s: %s", w.addr, res.Error.Message)}
 		}
 		if res.Error.Erased != 0 {
 			// The statement began before an erasure request this worker

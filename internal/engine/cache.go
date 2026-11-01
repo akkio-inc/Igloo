@@ -80,6 +80,10 @@ type readCache struct {
 	// size and limit are the cache's size and what it may grow to, as of
 	// the last measurement, for metrics.
 	size, limit atomic.Uint64
+	// floor and caching are reserve and on, for the prefetcher, which reads
+	// them while measureCache changes them (see room).
+	floor   atomic.Uint64
+	caching atomic.Bool
 
 	stop, done chan struct{}
 }
@@ -112,6 +116,8 @@ func (e *Engine) setupCache(exec func(string) error, cfg config.Config, log *slo
 	limit, reserve := cacheLimits(total, avail, 0, c.maxSize, c.dedicated)
 	c.reserve, c.on = reserve, limit > 0
 	c.limit.Store(limit)
+	c.floor.Store(reserve)
+	c.caching.Store(c.on)
 
 	if err := exec("LOAD cache_httpfs"); err != nil {
 		log.Warn("read cache off: cannot load the cache_httpfs extension", "err", err)
@@ -289,7 +295,31 @@ func (e *Engine) measureCache(log *slog.Logger) error {
 		log.Warn("read cache paused and emptied: its disk is almost full", "dir", c.dir, "disk_free", avail)
 	}
 	c.on = on
+	c.floor.Store(reserve)
+	c.caching.Store(on)
 	return nil
+}
+
+// room is how many more bytes the cache may take before cache_httpfs
+// evicts a block on each miss, for the prefetcher: what the last
+// measurement left it, and at most what the disk has free now beyond the
+// free space the extension keeps. The measurement is minutes old, and in
+// between the disk fills, with the cache's blocks and with what else is on
+// it, as the spill files and exchanges of a worker sharing it: a worker
+// started with an empty disk read ahead as if the cache were still empty
+// for a minute after it was full, while cache_httpfs evicted the blocks
+// read ahead as they landed and failed a read of one (see package
+// prefetch's errUnversioned).
+func (c *readCache) room() int64 {
+	limit, size := c.limit.Load(), c.size.Load()
+	if !c.caching.Load() || size >= limit {
+		return 0
+	}
+	room := int64(limit - size)
+	if _, avail, err := diskSpace(c.dir); err == nil {
+		room = min(room, int64(avail)-int64(c.floor.Load()))
+	}
+	return max(room, 0)
 }
 
 // adjustments are the statements that move the extension from its current

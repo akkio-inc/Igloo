@@ -204,6 +204,9 @@ type taskErr struct {
 	// Throttled says object storage turned the task's requests away for
 	// now (see throttled): the same task may well run a moment later.
 	Throttled bool `json:"throttled,omitempty"`
+	// CacheRace says a read of the worker's read cache raced another over
+	// a block's file (see prefetch.BlockRace): the same task runs again.
+	CacheRace bool `json:"cache_race,omitempty"`
 	// Erased, if set, says the worker refused the task: it was purged of
 	// what erasure requests deleted through Erased, later than the
 	// statement began (see erasure.go).
@@ -217,6 +220,12 @@ func (e *taskErr) Error() string { return e.Message }
 type throttledError struct{ msg string }
 
 func (e *throttledError) Error() string { return e.msg }
+
+// cacheRaceError is a task that failed because a read of the worker's read
+// cache raced another over a block's file (see taskErr.CacheRace).
+type cacheRaceError struct{ msg string }
+
+func (e *cacheRaceError) Error() string { return e.msg }
 
 // throttleSigns are how a request object storage turned away for now
 // reads in DuckDB's errors (HTTP Error: Request returned HTTP 503 for HTTP

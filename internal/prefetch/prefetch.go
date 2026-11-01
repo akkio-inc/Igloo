@@ -21,7 +21,10 @@
 // too), and then the blocks of the column chunks of the scan's columns, in
 // the order of the scan's files. It keeps at most a share of the cache's
 // room for blocks DuckDB has not read yet, so that prefetched blocks do not
-// evict each other, or other statements' blocks, before DuckDB reads them.
+// evict each other, or other statements' blocks, before DuckDB reads them,
+// and none once the cache has no room left, where cache_httpfs evicts a
+// block on each of DuckDB's misses. It writes only blocks of files whose
+// ETag it knows, which it marks them with as cache_httpfs does.
 // It writes a block with an access time an hour before its modification
 // time and tells one DuckDB read by its access time catching up: a read
 // moves it past the modification time, and cache_httpfs, which keeps its
@@ -46,8 +49,10 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -85,8 +90,8 @@ const (
 )
 
 // minAhead is what a statement may keep ahead of its scans however little
-// room the cache reports, when the prefetcher can tell which blocks DuckDB
-// read.
+// room the cache reports, as long as it reports some, when the prefetcher
+// can tell which blocks DuckDB read.
 var minAhead int64 = 64 << 20
 
 // boundedAhead is the most a statement reads ahead, in all, when the
@@ -131,7 +136,8 @@ type Options struct {
 	// for range reads.
 	Open func(ctx context.Context, path string) (Object, error)
 	// Room returns how many more bytes the read cache may hold before it
-	// evicts blocks. Nil means unbounded.
+	// evicts blocks, as of now: cache_httpfs evicts as soon as its disk is
+	// short of the free space it keeps. Nil means unbounded.
 	Room func() int64
 	Log  *slog.Logger
 }
@@ -200,6 +206,13 @@ func New(opts Options) (*Prefetcher, error) {
 	atime, err := probe(opts.Dir)
 	if err != nil {
 		return nil, err
+	}
+	// Blocks a crash left half written, each in a file of its own (see
+	// writeBlock).
+	if left, err := filepath.Glob(filepath.Join(opts.Dir, "*"+tmpSuffix)); err == nil {
+		for _, f := range left {
+			_ = os.Remove(f)
+		}
 	}
 	p := &Prefetcher{opts: opts,
 		fetched: prometheus.NewCounter(prometheus.CounterOpts{Name: "igloo_prefetch_bytes_total",
@@ -330,6 +343,26 @@ func BlockName(path string, offset, length int64) string {
 	return hex.EncodeToString(sum[:]) + "-" + filepath.Base(path) + "-" + strconv.FormatInt(offset, 10) + "-" + strconv.FormatInt(length, 10)
 }
 
+// blockPath is a block's file (see BlockName) as DuckDB's errors quote it.
+var blockPath = regexp.MustCompile(`/[0-9a-f]{64}-[^/"]*-[0-9]+-[0-9]+"`)
+
+// BlockRace reports whether err is DuckDB's I/O error over a block's file
+// in the read cache: the file changed while cache_httpfs read it. Two of
+// its steps race others over one block: it deletes a block it finds stale
+// by checking that the file exists and then removing it, which fails when
+// another read or its eviction removed it in between ("Could not remove
+// file"), and it reads a block in full, which fails on one being rewritten
+// ("Could not read enough bytes"). The block is a copy of a range of a
+// data file in object storage, so the same read a moment later succeeds:
+// the caller runs it again rather than fail the statement.
+func BlockRace(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "IO Error") && blockPath.MatchString(msg)
+}
+
 // block is a block of a file to fetch.
 type block struct {
 	file   *openFile
@@ -429,7 +462,31 @@ func (s *statement) budget() int64 {
 	if p.opts.Room == nil {
 		return 1 << 62
 	}
-	return max(minAhead, p.opts.Room()/roomShare/n)
+	room := p.opts.Room()
+	if room <= 0 {
+		// cache_httpfs evicts a block on each of DuckDB's misses: blocks
+		// read ahead would only take the place of others, and the churn of
+		// blocks written and evicted at once fails DuckDB's reads of them
+		// (see errUnversioned).
+		return 0
+	}
+	return max(minAhead, room/roomShare/n)
+}
+
+// roomAtAll waits until the statement may read anything ahead, reporting
+// false when it ends first: with no room, even a file's footer, which it
+// reads through the cache, would take another block's place.
+func (s *statement) roomAtAll() bool {
+	for s.ctx.Err() == nil {
+		if s.budget() > 0 {
+			return true
+		}
+		select {
+		case <-s.ctx.Done():
+		case <-time.After(checkReads):
+		}
+	}
+	return false
 }
 
 func (s *statement) run(scans []Scan) {
@@ -446,7 +503,7 @@ func (s *statement) run(scans []Scan) {
 		// tells whether the files themselves divide the filters' values.
 		var held *heldFile
 		for _, f := range sc.Files {
-			if s.ctx.Err() != nil {
+			if !s.roomAtAll() {
 				return
 			}
 			of := &openFile{File: f}
@@ -528,8 +585,9 @@ func (s *statement) waitForRoom(n int64) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for s.ctx.Err() == nil {
-		// One block at a time at least, unless reading ahead is bounded.
-		if s.ahead+n <= s.budget() || s.ahead == 0 && s.p.track != bounded {
+		// One block at a time at least, unless reading ahead is bounded or
+		// the cache has no room.
+		if budget := s.budget(); s.ahead+n <= budget || s.ahead == 0 && s.p.track != bounded && budget > 0 {
 			s.ahead += n
 			return true
 		}
@@ -685,6 +743,14 @@ func (p *Prefetcher) Hold(fn func() error) error {
 // errPresent says a block was in the cache already.
 var errPresent = errors.New("in the cache already")
 
+// errUnversioned says a block was not read ahead because object storage
+// gave its file no ETag. cache_httpfs, which Igloo has check a block's
+// version against the file's ETag as DuckDB opened it, would find such a
+// block stale and delete it, by a check that the block exists followed by
+// its removal, which fails the read when another read of the same block
+// deleted it in between ("Could not remove file").
+var errUnversioned = errors.New("its file has no ETag")
+
 // fetch reads a block and writes it into the cache as cache_httpfs would.
 func (p *Prefetcher) fetch(ctx context.Context, b block) error {
 	if ctx.Err() != nil {
@@ -704,6 +770,9 @@ func (p *Prefetcher) fetch(ctx context.Context, b block) error {
 			p.failed.Inc()
 		}
 		return b.file.err
+	}
+	if b.file.r.ETag() == "" {
+		return errUnversioned
 	}
 	buf := make([]byte, b.length)
 	if _, err := b.file.r.ReadAt(buf, b.offset); err != nil && !(errors.Is(err, io.EOF) && b.offset+b.length == b.file.Size) {
@@ -733,32 +802,44 @@ func (p *Prefetcher) fetch(ctx context.Context, b block) error {
 	return nil
 }
 
-// writeBlock writes a block's file whole and marked, then renames it into
-// place, so cache_httpfs never reads one half written.
+// writeBlock writes a block's file whole and marked, in a file of its own,
+// then renames it into place, so cache_httpfs never reads one half written.
+// The file is this write's alone: statements, as a worker's tasks over one
+// table's files, read the same blocks ahead at once, and two writes of one
+// file, the second truncating what the first had renamed into place, left
+// DuckDB reading a block short ("Could not read enough bytes"). Its access
+// time is an hour before its modification time, which DuckDB's first read
+// moves on (see readSince).
 func writeBlock(dst, path, etag string, data []byte) error {
-	tmp := dst + tmpSuffix
-	if err := os.WriteFile(tmp, data, 0o644); err != nil {
+	f, err := os.CreateTemp(filepath.Dir(dst), filepath.Base(dst)+".*"+tmpSuffix)
+	if err != nil {
 		return err
 	}
-	if err := unix.Setxattr(tmp, pathAttr, []byte(path), 0); err != nil {
+	tmp := f.Name()
+	_, err = f.Write(data)
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
+	if err == nil {
+		err = os.Chmod(tmp, 0o644)
+	}
+	if err == nil {
+		err = unix.Setxattr(tmp, pathAttr, []byte(path), 0)
+	}
+	if err == nil && etag != "" {
+		err = unix.Setxattr(tmp, versionAttr, []byte(etag), 0)
+	}
+	if err == nil {
+		now := time.Now()
+		_ = os.Chtimes(tmp, now.Add(-time.Hour), now)
+	}
+	if err == nil {
+		err = os.Rename(tmp, dst)
+	}
+	if err != nil {
 		_ = os.Remove(tmp)
-		return err
 	}
-	if etag != "" {
-		if err := unix.Setxattr(tmp, versionAttr, []byte(etag), 0); err != nil {
-			_ = os.Remove(tmp)
-			return err
-		}
-	}
-	// An access time an hour before the modification time, which DuckDB's
-	// first read moves on (see readSince).
-	now := time.Now()
-	_ = os.Chtimes(tmp, now.Add(-time.Hour), now)
-	if err := os.Rename(tmp, dst); err != nil {
-		_ = os.Remove(tmp)
-		return err
-	}
-	return nil
+	return err
 }
 
 // blocksOf returns the blocks that hold ranges of file f, in order, each
@@ -881,13 +962,15 @@ func (s *statement) readThroughCache(f *openFile, offset, length int64) ([]byte,
 		case <-s.ctx.Done():
 			return nil, s.ctx.Err()
 		case err := <-waits[i]:
-			if err != nil && !errors.Is(err, errPresent) {
+			if err != nil && !errors.Is(err, errPresent) && !errors.Is(err, errUnversioned) {
 				return nil, err
 			}
 		}
 		data, err := os.ReadFile(filepath.Join(p.opts.Dir, b.name))
-		if errors.Is(err, os.ErrNotExist) || errors.Is(err, syscall.ENOENT) {
-			// Evicted meanwhile: read it again, straight.
+		if errors.Is(err, os.ErrNotExist) || errors.Is(err, syscall.ENOENT) || err == nil && int64(len(data)) != b.length {
+			// Evicted meanwhile, or not whole: read it again, straight. A
+			// block read short, as two writes of one file once left one,
+			// took the worker down here.
 			b.file.once.Do(func() { b.file.r, b.file.err = p.opts.Open(s.ctx, b.file.Path) })
 			if b.file.err != nil {
 				return nil, b.file.err

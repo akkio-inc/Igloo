@@ -1264,6 +1264,26 @@ func (s *Server) runLocal(ctx context.Context, sess *session, st *statement, arg
 	return s.runStatement(ctx, sess, st, args, w)
 }
 
+// maxBlockRaces is how often runHere runs a statement again whose read of
+// the read cache raced another over a block.
+const maxBlockRaces = 3
+
+// runHere is runLocal, which it calls again, up to maxBlockRaces times,
+// when the statement's read of the read cache raced another over a block's
+// file (see prefetch.BlockRace) before it sent a row, outside a
+// transaction, which the failure aborted: the same read succeeds a moment
+// later, and a missing block of the cache must not fail a statement.
+func (s *Server) runHere(ctx context.Context, sess *session, st *statement, args []driver.NamedValue, w *tagWriter) error {
+	for again := 0; ; again++ {
+		err := s.runLocal(ctx, sess, st, args, w)
+		if again == maxBlockRaces || !prefetch.BlockRace(err) || w.Written() > 0 || sess.inTx || ctx.Err() != nil {
+			return err
+		}
+		s.log.Warn("a statement's read of the read cache raced another over a block; running it again", "user", sess.currentUser().Name,
+			"retry", again+1, "err", err)
+	}
+}
+
 // rearm returns the context to run a statement again under after ctx, the
 // one runCancelable gave it, ended because the memory watch canceled it:
 // one under outer that a cancel request or the memory watch can end, with
@@ -2036,13 +2056,13 @@ func (s *Server) preparedQuery(ctx context.Context, sess *session, user auth.Use
 					// Auto mode chose this replica on an estimate that can run
 					// far short (see guardAfter).
 					guard := guardLocal(ctx, guardAfter(parts.local, parts.alt, parts.budget, s.statementsRunning()), tw)
-					err = s.runLocal(guard.ctx, sess, st, args, tw)
+					err = s.runHere(guard.ctx, sess, st, args, tw)
 					stopPrefetch()
 					if fired, ran := guard.stop(tw); fired && ctx.Err() == nil && outer.Err() == nil {
 						return s.afterGuard(ctx, sess, st, args, tw, &parts, ran)
 					}
 				} else {
-					err = s.runLocal(ctx, sess, st, args, tw)
+					err = s.runHere(ctx, sess, st, args, tw)
 					stopPrefetch()
 				}
 				if (st.bitmaps || len(st.indexPins) > 0) && bitmapsDidNotFit(err) {

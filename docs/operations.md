@@ -581,7 +581,20 @@ more than DuckDB alone.
   reads (none for a scan that reads no column, as `COUNT(*)`'s), in the
   order the scan reads the files, and keeps at most a quarter
   of the cache's room for blocks DuckDB has not read yet, so they do not
-  evict each other or other statements' blocks first.
+  evict each other or other statements' blocks first. The room is what
+  the cache may still take as of its last measurement, and at most what
+  the disk has free now beyond the free space the cache's extension keeps,
+  which other files on the disk, such as spill files and a worker's
+  exchanges, take too. With no room, where the extension evicts a block on
+  each miss, it reads nothing ahead, not even footers, until there is.
+  It reads ahead only files whose objects have an ETag, which the
+  extension checks a block against.
+- A read of the cache that races another over a block (the extension
+  deletes a block it takes for stale or evicts by checking that the file
+  exists, then removing it) fails DuckDB's read of it with an I/O error
+  over the block's file. The statement runs again, up to three times,
+  before it has sent a row, and a worker's task runs again likewise: the
+  block is a copy of a range of a data file in object storage.
 - A scan the statement filters, by a `WHERE` clause or by a semi join or
   an inner join to a relation such as an audience (whose keys DuckDB skips
   row groups by), reads ahead in full only the files whose footers show
