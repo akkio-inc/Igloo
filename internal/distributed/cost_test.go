@@ -52,9 +52,9 @@ func TestChoose(t *testing.T) {
 		// At ten times the data, two reports that took 57 s and 25 s on
 		// workers were tried on one machine, estimated at 176 s and 180 s
 		// and short of memory: one took 251 s and spilled 8.4 GB.
-		{"p3seggen at 10x, after 57 s on workers", estimate{oneMachine: 176, onWorkers: 42, workers: 16, memory: true, spills: true},
+		{"large-table scan at 10x, after 57 s on workers", estimate{oneMachine: 176, onWorkers: 42, workers: 16, memory: true, spills: true},
 			runs{dist: 57.2}, true, true, false},
-		{"p4segaud at 10x, after 25 s on workers", estimate{oneMachine: 180, onWorkers: 40, workers: 16, memory: true, spills: true},
+		{"large join at 10x, after 25 s on workers", estimate{oneMachine: 180, onWorkers: 40, workers: 16, memory: true, spills: true},
 			runs{dist: 25.4}, true, true, false},
 		{"close, but one machine should spill", estimate{oneMachine: 70, onWorkers: 50, workers: 4, spills: true},
 			runs{dist: 40}, true, true, false},
@@ -197,7 +197,7 @@ func TestEstimateTimes(t *testing.T) {
 // cores and 12 threads (workers), zero where not measured. The side that
 // was faster by half again or more is chosen, but for those listed in
 // misses, whose first run, on the side the estimates pick, sends the next
-// to the faster side, and p1 at 10x, 24 s on one machine and 12 on
+// to the faster side, and a small-group scan at 10x, 24 s on one machine and 12 on
 // workers, which stays under the threshold.
 func TestScaleReports(t *testing.T) {
 	coordinator := machine{cores: 16, threads: 24, memory: 52_935_471_923}
@@ -205,9 +205,9 @@ func TestScaleReports(t *testing.T) {
 	misses := map[string]string{
 		// FLATTEN's arrays and maps cost far more a row than the rows say.
 		"E3 report-b at 10x":  "one",
-		"P p8flatmap at 100x": "one",
+		"map flatten at 100x": "one",
 		// Under DefaultThreshold on one machine.
-		"P p1media at 10x": "one",
+		"small-group scan at 10x": "one",
 	}
 	now := time.Now()
 	for _, c := range []struct {
@@ -223,14 +223,14 @@ func TestScaleReports(t *testing.T) {
 		{"F3 report-e at 1x", features{bytes: 4.669e+08, exchanged: 4.669e+08, held: 4.669e+08, rows: 7.23e+08, levels: 7, stages: 24}, 13, 0, "one"},
 		{"F4 report-f at 1x", features{bytes: 4.934e+08, exchanged: 3.491e+09, held: 4.934e+08, rows: 7.49e+08, levels: 7, stages: 22}, 4, 0, "one"},
 		{"F5 report-g at 1x", features{bytes: 8.144e+08, exchanged: 3.812e+09, held: 8.144e+08, rows: 9.34e+08, levels: 7, stages: 23}, 2, 0, "one"},
-		{"P p1media at 1x", features{bytes: 3.636e+08, exchanged: 3.636e+08, held: 3.636e+08, rows: 1.45e+08, levels: 2, stages: 2}, 3, 17, "one"},
-		{"P p2audmedia at 1x", features{bytes: 2.726e+08, exchanged: 3.27e+09, held: 2.726e+08, rows: 1.5e+08, levels: 2, stages: 3}, 1, 10, "one"},
-		{"P p3seggen at 1x", features{bytes: 1.248e+09, exchanged: 1.248e+09, held: 1.248e+09, rows: 3.49e+09, levels: 2, stages: 3}, 22, 87, "one"},
-		{"P p4segaud at 1x", features{bytes: 1.277e+09, exchanged: 6.377e+09, held: 1.277e+09, rows: 3.36e+09, levels: 2, stages: 3}, 2, 49, "one"},
-		{"P p5flatbrowse at 1x", features{bytes: 1.111e+08, exchanged: 1.111e+08, held: 1.111e+08, rows: 6.98e+07, levels: 2, stages: 2}, 2, 27, "one"},
-		{"P p6flatmedia at 1x", features{bytes: 6.059e+08, exchanged: 6.059e+08, held: 6.059e+08, rows: 1.81e+08, levels: 2, stages: 2}, 2, 26, "one"},
-		{"P p7flataud at 1x", features{bytes: 1.565e+08, exchanged: 4.653e+09, held: 1.565e+08, rows: 9.23e+07, levels: 2, stages: 2}, 1, 8, "one"},
-		{"P p8flatmap at 1x", features{bytes: 1.808e+07, exchanged: 0, held: 0, rows: 1.2e+08, levels: 1, stages: 1}, 7, 9, "tie"},
+		{"small-group scan at 1x", features{bytes: 3.636e+08, exchanged: 3.636e+08, held: 3.636e+08, rows: 1.45e+08, levels: 2, stages: 2}, 3, 17, "one"},
+		{"cohort join at 1x", features{bytes: 2.726e+08, exchanged: 3.27e+09, held: 2.726e+08, rows: 1.5e+08, levels: 2, stages: 3}, 1, 10, "one"},
+		{"large-table scan at 1x", features{bytes: 1.248e+09, exchanged: 1.248e+09, held: 1.248e+09, rows: 3.49e+09, levels: 2, stages: 3}, 22, 87, "one"},
+		{"large join at 1x", features{bytes: 1.277e+09, exchanged: 6.377e+09, held: 1.277e+09, rows: 3.36e+09, levels: 2, stages: 3}, 2, 49, "one"},
+		{"list flatten at 1x", features{bytes: 1.111e+08, exchanged: 1.111e+08, held: 1.111e+08, rows: 6.98e+07, levels: 2, stages: 2}, 2, 27, "one"},
+		{"wide list flatten at 1x", features{bytes: 6.059e+08, exchanged: 6.059e+08, held: 6.059e+08, rows: 1.81e+08, levels: 2, stages: 2}, 2, 26, "one"},
+		{"list flatten joined at 1x", features{bytes: 1.565e+08, exchanged: 4.653e+09, held: 1.565e+08, rows: 9.23e+07, levels: 2, stages: 2}, 1, 8, "one"},
+		{"map flatten at 1x", features{bytes: 1.808e+07, exchanged: 0, held: 0, rows: 1.2e+08, levels: 1, stages: 1}, 7, 9, "tie"},
 		{"E2 report-a at 10x", features{bytes: 1.349e+10, exchanged: 8.999e+10, held: 1.349e+10, rows: 1.2e+11, levels: 2, stages: 10}, 172, 84, "workers"},
 		{"E3 report-b at 10x", features{bytes: 1.044e+09, exchanged: 7.755e+10, held: 1.044e+09, rows: 4.82e+09, levels: 5, stages: 7}, 251, 113, "workers"},
 		{"F1 report-c at 10x", features{bytes: 1.186e+10, exchanged: 5.683e+10, held: 1.186e+10, rows: 5.83e+09, levels: 3, stages: 22}, 691, 170, "workers"},
@@ -240,26 +240,26 @@ func TestScaleReports(t *testing.T) {
 		// its stages read, it would spill.
 		{"F5 report-g at 10x", features{bytes: 8.144e+09, exchanged: 3.812e+10, held: 8.144e+09, rows: 1.01e+10, levels: 7, stages: 33,
 			planned: true, planSet: 3.1e10}, 25, 161, "one"},
-		{"P p1media at 10x", features{bytes: 3.636e+09, exchanged: 3.636e+09, held: 3.636e+09, rows: 1.45e+09, levels: 2, stages: 2}, 24, 12, "workers"},
-		{"P p2audmedia at 10x", features{bytes: 2.726e+09, exchanged: 3.27e+10, held: 2.726e+09, rows: 1.5e+09, levels: 2, stages: 3}, 9, 22, "one"},
-		{"P p3seggen at 10x", features{bytes: 1.248e+10, exchanged: 1.248e+10, held: 1.248e+10, rows: 3.49e+10, levels: 2, stages: 3}, 259, 40, "workers"},
-		{"P p4segaud at 10x", features{bytes: 1.277e+10, exchanged: 6.377e+10, held: 1.277e+10, rows: 3.36e+10, levels: 2, stages: 3}, 30, 22, "tie"},
-		{"P p5flatbrowse at 10x", features{bytes: 1.111e+09, exchanged: 1.111e+09, held: 1.111e+09, rows: 6.98e+08, levels: 2, stages: 2}, 11, 35, "one"},
-		{"P p6flatmedia at 10x", features{bytes: 6.059e+09, exchanged: 6.059e+09, held: 6.059e+09, rows: 1.81e+09, levels: 2, stages: 2}, 34, 36, "tie"},
-		{"P p7flataud at 10x", features{bytes: 1.565e+09, exchanged: 4.653e+10, held: 1.565e+09, rows: 7.69e+08, levels: 2, stages: 3}, 9, 39, "one"},
-		{"P p8flatmap at 10x", features{bytes: 1.808e+08, exchanged: 0, held: 0, rows: 1.2e+09, levels: 1, stages: 1}, 22, 31, "tie"},
+		{"small-group scan at 10x", features{bytes: 3.636e+09, exchanged: 3.636e+09, held: 3.636e+09, rows: 1.45e+09, levels: 2, stages: 2}, 24, 12, "workers"},
+		{"cohort join at 10x", features{bytes: 2.726e+09, exchanged: 3.27e+10, held: 2.726e+09, rows: 1.5e+09, levels: 2, stages: 3}, 9, 22, "one"},
+		{"large-table scan at 10x", features{bytes: 1.248e+10, exchanged: 1.248e+10, held: 1.248e+10, rows: 3.49e+10, levels: 2, stages: 3}, 259, 40, "workers"},
+		{"large join at 10x", features{bytes: 1.277e+10, exchanged: 6.377e+10, held: 1.277e+10, rows: 3.36e+10, levels: 2, stages: 3}, 30, 22, "tie"},
+		{"list flatten at 10x", features{bytes: 1.111e+09, exchanged: 1.111e+09, held: 1.111e+09, rows: 6.98e+08, levels: 2, stages: 2}, 11, 35, "one"},
+		{"wide list flatten at 10x", features{bytes: 6.059e+09, exchanged: 6.059e+09, held: 6.059e+09, rows: 1.81e+09, levels: 2, stages: 2}, 34, 36, "tie"},
+		{"list flatten joined at 10x", features{bytes: 1.565e+09, exchanged: 4.653e+10, held: 1.565e+09, rows: 7.69e+08, levels: 2, stages: 3}, 9, 39, "one"},
+		{"map flatten at 10x", features{bytes: 1.808e+08, exchanged: 0, held: 0, rows: 1.2e+09, levels: 1, stages: 1}, 22, 31, "tie"},
 		{"F1 report-c at 100x", features{bytes: 1.186e+11, exchanged: 5.683e+11, held: 1.186e+11, rows: 5.83e+10, levels: 3, stages: 22}, 0, 722, "workers"},
 		{"F2 report-d at 100x", features{bytes: 1.186e+11, exchanged: 5.683e+11, held: 1.186e+11, rows: 2.92e+10, levels: 3, stages: 11}, 0, 685, "workers"},
 		{"F4 report-f at 100x", features{bytes: 4.934e+10, exchanged: 3.491e+11, held: 4.934e+10, rows: 7.87e+10, levels: 7, stages: 26}, 2223, 1263, "workers"},
 		{"F5 report-g at 100x", features{bytes: 8.144e+10, exchanged: 3.812e+11, held: 8.144e+10, rows: 1.01e+11, levels: 7, stages: 34}, 311, 257, "tie"},
-		{"P p1media at 100x", features{bytes: 3.636e+10, exchanged: 3.636e+10, held: 3.636e+10, rows: 1.45e+10, levels: 2, stages: 2}, 501, 72, "workers"},
-		{"P p2audmedia at 100x", features{bytes: 2.726e+10, exchanged: 3.27e+11, held: 2.726e+10, rows: 1.5e+10, levels: 2, stages: 3}, 167, 41, "workers"},
-		{"P p3seggen at 100x", features{bytes: 1.248e+11, exchanged: 1.248e+11, held: 1.248e+11, rows: 3.49e+11, levels: 2, stages: 3}, 0, 262, "workers"},
-		{"P p4segaud at 100x", features{bytes: 1.277e+11, exchanged: 6.377e+11, held: 1.277e+11, rows: 3.36e+11, levels: 2, stages: 3}, 0, 119, "workers"},
-		{"P p5flatbrowse at 100x", features{bytes: 1.111e+10, exchanged: 1.111e+10, held: 1.111e+10, rows: 6.98e+09, levels: 2, stages: 2}, 363, 146, "workers"},
-		{"P p6flatmedia at 100x", features{bytes: 6.059e+10, exchanged: 6.059e+10, held: 6.059e+10, rows: 1.81e+10, levels: 2, stages: 2}, 0, 376, "workers"},
-		{"P p7flataud at 100x", features{bytes: 1.565e+10, exchanged: 4.653e+11, held: 1.565e+10, rows: 7.69e+09, levels: 2, stages: 3}, 281, 43, "workers"},
-		{"P p8flatmap at 100x", features{bytes: 1.808e+09, exchanged: 0, held: 0, rows: 1.2e+10, levels: 1, stages: 1}, 379, 30, "workers"},
+		{"small-group scan at 100x", features{bytes: 3.636e+10, exchanged: 3.636e+10, held: 3.636e+10, rows: 1.45e+10, levels: 2, stages: 2}, 501, 72, "workers"},
+		{"cohort join at 100x", features{bytes: 2.726e+10, exchanged: 3.27e+11, held: 2.726e+10, rows: 1.5e+10, levels: 2, stages: 3}, 167, 41, "workers"},
+		{"large-table scan at 100x", features{bytes: 1.248e+11, exchanged: 1.248e+11, held: 1.248e+11, rows: 3.49e+11, levels: 2, stages: 3}, 0, 262, "workers"},
+		{"large join at 100x", features{bytes: 1.277e+11, exchanged: 6.377e+11, held: 1.277e+11, rows: 3.36e+11, levels: 2, stages: 3}, 0, 119, "workers"},
+		{"list flatten at 100x", features{bytes: 1.111e+10, exchanged: 1.111e+10, held: 1.111e+10, rows: 6.98e+09, levels: 2, stages: 2}, 363, 146, "workers"},
+		{"wide list flatten at 100x", features{bytes: 6.059e+10, exchanged: 6.059e+10, held: 6.059e+10, rows: 1.81e+10, levels: 2, stages: 2}, 0, 376, "workers"},
+		{"list flatten joined at 100x", features{bytes: 1.565e+10, exchanged: 4.653e+11, held: 1.565e+10, rows: 7.69e+09, levels: 2, stages: 3}, 281, 43, "workers"},
+		{"map flatten at 100x", features{bytes: 1.808e+09, exchanged: 0, held: 0, rows: 1.2e+10, levels: 1, stages: 1}, 379, 30, "workers"},
 	} {
 		e := c.x.estimate(coordinator, workers)
 		got, _, reason := choose(e, runs{}, false, DefaultThreshold, now)
@@ -269,7 +269,7 @@ func TestScaleReports(t *testing.T) {
 			if side != miss {
 				t.Errorf("%s: %s first, the miss listed is %s (%s)", c.name, side, miss, reason)
 			}
-			if c.name == "P p1media at 10x" {
+			if c.name == "small-group scan at 10x" {
 				continue
 			}
 			// One run there, and the next goes to the faster side.
