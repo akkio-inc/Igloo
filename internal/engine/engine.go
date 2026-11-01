@@ -625,6 +625,16 @@ func (e *Engine) SetCatalogGuard(g catalogproxy.Guard) {
 	}
 }
 
+// HoldCommit holds schema.name's next commit from the catalog, and has DuckDB
+// write its files under dir (see catalogproxy.CommitHold). It returns nil if
+// another hold has the table, or there is no catalog.
+func (e *Engine) HoldCommit(schema, name, dir string) *catalogproxy.CommitHold {
+	if e.proxy == nil {
+		return nil
+	}
+	return e.proxy.HoldCommit([]string{schema}, name, dir)
+}
+
 // Close shuts DuckDB down. Sessions must be closed first: DuckDB's database
 // closes, deleting its spill files, as the last connection to it closes.
 func (e *Engine) Close() error {

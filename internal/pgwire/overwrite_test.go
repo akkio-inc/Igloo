@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	iofs "io/fs"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -14,6 +15,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/apache/iceberg-go"
+	icecat "github.com/apache/iceberg-go/catalog"
+	"github.com/apache/iceberg-go/table"
 	"github.com/jackc/pgx/v5"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
@@ -489,5 +493,340 @@ func TestFullRefreshAfterAConflict(t *testing.T) {
 	if parent := tbl.SnapshotByID(*cur.ParentSnapshotID); parent == nil || parent.Summary == nil || parent.Summary.Operation != "append" ||
 		cur.Summary.Properties["igloo.operation"] != "refresh" {
 		t.Errorf("the refresh's snapshot %+v follows %+v, not the insert's", cur.Summary, parent)
+	}
+}
+
+// metadataLeft returns the Avro files under table's metadata directory that no
+// snapshot of it has: a manifest list or manifest of a commit that was not made.
+func metadataLeft(t *testing.T, env *refreshEnv, table string) []string {
+	t.Helper()
+	ctx := context.Background()
+	tbl, err := env.srv.ddl.LoadTable(ctx, "public", table)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fs, err := tbl.FS(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	held := map[string]bool{}
+	for _, snap := range tbl.Metadata().Snapshots() {
+		held[strings.TrimPrefix(snap.ManifestList, "file://")] = true
+		manifests, err := snap.Manifests(fs)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, m := range manifests {
+			held[strings.TrimPrefix(m.FilePath(), "file://")] = true
+		}
+	}
+	files, err := filepath.Glob(filepath.Join(strings.TrimPrefix(tbl.Location(), "file://"), "metadata", "*.avro"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return slices.DeleteFunc(files, func(f string) bool { return held[f] })
+}
+
+// notInRefreshDir returns the files of paths in no refresh's directory.
+func notInRefreshDir(paths []string) []string {
+	return slices.DeleteFunc(slices.Clone(paths), func(p string) bool { return strings.Contains(p, "/data/"+overwriteDir) })
+}
+
+// filesUnder counts the files under dir, in any directory.
+func filesUnder(t *testing.T, dir string) int {
+	t.Helper()
+	n := 0
+	err := filepath.WalkDir(dir, func(_ string, d iofs.DirEntry, err error) error {
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				return nil
+			}
+			return err
+		}
+		if !d.IsDir() {
+			n++
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return n
+}
+
+// TestFullRefreshOfWhatCopyCannotWrite checks that a full refresh replaces the
+// files of a view's table in one commit when only DuckDB's INSERT can write
+// them: partitioned, or with nested columns. No delete files, the rows the
+// query's, in the table's partitions, and nothing of DuckDB's commit left; and
+// the replaced files go with snapshot expiry, as those a COPY wrote do.
+func TestFullRefreshOfWhatCopyCannotWrite(t *testing.T) {
+	t.Parallel()
+	for _, c := range []struct {
+		name, query string
+		// after runs after the view's first refresh.
+		after       []string
+		partitioned bool
+	}{
+		{name: "partitioned", query: "SELECT id, g, x FROM src", partitioned: true,
+			after: []string{"ALTER TABLE lake.public.v SET PARTITIONED BY (bucket(4, id), g)"}},
+		{name: "partitioned by a day", query: "SELECT id, DATE '2026-01-01' + CAST(id % 5 AS INTEGER) AS d, x FROM src", partitioned: true,
+			after: []string{"ALTER TABLE lake.public.v SET PARTITIONED BY (day(d))"}},
+		{name: "nested", query: "SELECT id, {'a': id, 'b': [g, g]} AS s, [{'k': id}] AS l, MAP {g: id} AS m, x FROM src"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
+			env := startRefreshServer(t)
+			env.srv.refreshFraction = 1e-9
+			admin := env.admin
+			for _, q := range []string{
+				"CREATE TABLE src AS SELECT i AS id, 'g' || (i % 3) AS g, i * 2 AS x FROM range(3000) AS r(i)",
+				"CREATE MATERIALIZED VIEW v AS " + c.query,
+				"REFRESH MATERIALIZED VIEW v",
+			} {
+				mustExec(t, admin, q)
+			}
+			for _, q := range c.after {
+				mustExec(t, admin, q)
+			}
+			check := func(step string) {
+				t.Helper()
+				if got, want := sortedTexts(t, admin, "SELECT * FROM v"), sortedTexts(t, admin, c.query); !slices.Equal(got, want) {
+					t.Errorf("%s: v holds %d rows, want %d", step, len(got), len(want))
+				}
+				if action, detail, _, _ := viewRefresh(t, admin, "public.v"); action != "FULL" {
+					t.Errorf("%s: %s, %s", step, action, detail)
+				}
+				data, deletes := liveFiles(t, admin, "v")
+				if len(deletes) > 0 || len(data) == 0 {
+					t.Errorf("%s: %d data files and %d delete files", step, len(data), len(deletes))
+				}
+				if out := notInRefreshDir(data); len(out) > 0 {
+					t.Errorf("%s: files outside refreshes' directories: %q", step, out)
+				}
+				if c.partitioned && len(data) < 2 {
+					t.Errorf("%s: the rows of a partitioned table are in %d files", step, len(data))
+				}
+				if n := len(filesNotes(t, env.srv)); n != 0 {
+					t.Errorf("%s: %d notes of refreshes' files left", step, n)
+				}
+				if left := metadataLeft(t, env, "v"); len(left) > 0 {
+					t.Errorf("%s: manifests of a commit not made: %q", step, left)
+				}
+			}
+			mustExec(t, admin, "DELETE FROM src WHERE id % 3 = 0")
+			mustExec(t, admin, "REFRESH MATERIALIZED VIEW v")
+			check("after a delete")
+			first, _ := liveFiles(t, admin, "v")
+
+			mustExec(t, admin, "DELETE FROM src WHERE id % 5 = 0")
+			mustExec(t, admin, "REFRESH MATERIALIZED VIEW v")
+			check("after another")
+			second, _ := liveFiles(t, admin, "v")
+			if slices.ContainsFunc(second, func(p string) bool { return slices.Contains(first, p) }) {
+				t.Error("the second refresh kept a file of the first")
+			}
+
+			// Nothing to write: the table is empty, and in one commit too.
+			mustExec(t, admin, "DELETE FROM src WHERE true")
+			mustExec(t, admin, "REFRESH MATERIALIZED VIEW v")
+			if n := count(t, admin, "SELECT count(*) FROM v"); n != 0 {
+				t.Errorf("v holds %d rows of a query of none", n)
+			}
+			data, deletes := liveFiles(t, admin, "v")
+			if len(data) != 0 || len(deletes) != 0 {
+				t.Errorf("v of no rows has %d data files and %d delete files", len(data), len(deletes))
+			}
+			mustExec(t, admin, "INSERT INTO src SELECT i, 'g' || (i % 3), i * 2 FROM range(100) AS r(i)")
+			mustExec(t, admin, "REFRESH MATERIALIZED VIEW v")
+			check("after it was emptied")
+
+			// Snapshot expiry deletes the replaced files; the current ones stay.
+			time.Sleep(20 * time.Millisecond)
+			m := maintenance.New(env.catalog, env.dir, maintenance.Options{Retention: 10 * time.Millisecond}, slog.New(slog.DiscardHandler))
+			m.RunOnce(context.Background())
+			for _, p := range first {
+				if _, err := os.Stat(p); !errors.Is(err, os.ErrNotExist) {
+					t.Errorf("a replaced file is left after snapshot expiry: %s, %v", p, err)
+				}
+			}
+			check("after snapshot expiry")
+		})
+	}
+}
+
+// TestFullRefreshByInsertInterrupted checks that a full refresh by INSERT that
+// fails, or is canceled, leaves the view as it was, and nothing it wrote: its
+// files and DuckDB's manifests; and that one whose query fails leaves its
+// connection out of the transaction it began.
+func TestFullRefreshByInsertInterrupted(t *testing.T) {
+	t.Parallel()
+	env := startRefreshServer(t)
+	admin := env.admin
+	for _, q := range []string{
+		"CREATE TABLE src AS SELECT i AS id, 'g' || (i % 3) AS g, i * 2 AS x FROM range(5000) AS r(i)",
+		"CREATE MATERIALIZED VIEW v AS SELECT id, g, x FROM src WHERE id % 2 = 0",
+		"REFRESH MATERIALIZED VIEW v",
+		"ALTER TABLE lake.public.v SET PARTITIONED BY (bucket(4, id), g)",
+	} {
+		mustExec(t, admin, q)
+	}
+	env.srv.refreshFraction = 1e-9
+	mustExec(t, admin, "DELETE FROM src WHERE id % 7 = 0")
+	mustExec(t, admin, "REFRESH MATERIALIZED VIEW v")
+	before := sortedTexts(t, admin, "SELECT * FROM v")
+	unchanged := func(step string) {
+		t.Helper()
+		if got := sortedTexts(t, admin, "SELECT * FROM v"); !slices.Equal(got, before) {
+			t.Errorf("%s: v holds %d rows, want the %d it held", step, len(got), len(before))
+		}
+		if n := len(filesNotes(t, env.srv)); n != 0 {
+			t.Errorf("%s: %d notes of refreshes' files left", step, n)
+		}
+		if left := metadataLeft(t, env, "v"); len(left) > 0 {
+			t.Errorf("%s: manifests of a commit not made: %q", step, left)
+		}
+	}
+
+	// A failure, DuckDB's files written and its commit kept.
+	mustExec(t, admin, "INSERT INTO src VALUES (100000, 'g9', 1)")
+	var dir string
+	env.srv.beforeOverwrite = func(_ context.Context, d string) error {
+		dir = d
+		if filesUnder(t, d) == 0 {
+			t.Errorf("DuckDB wrote nothing under %s", d)
+		}
+		return errors.New("an injected failure")
+	}
+	if _, err := admin.Exec(context.Background(), "REFRESH MATERIALIZED VIEW v"); err == nil || !strings.Contains(err.Error(), "an injected failure") {
+		t.Errorf("the refresh: %v", err)
+	}
+	if dir == "" || filesUnder(t, dir) != 0 {
+		t.Errorf("the failed refresh left %d files in %q", filesUnder(t, dir), dir)
+	}
+	unchanged("after a failure")
+
+	// A cancel, while the refresh waits to commit.
+	waiting := make(chan string, 1)
+	env.srv.beforeOverwrite = func(ctx context.Context, d string) error {
+		waiting <- d
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(30 * time.Second):
+			return errors.New("never canceled")
+		}
+	}
+	done := make(chan error, 1)
+	go func() {
+		_, err := admin.Exec(context.Background(), "REFRESH MATERIALIZED VIEW v")
+		done <- err
+	}()
+	dir = <-waiting
+	if err := admin.PgConn().CancelRequest(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-done; err == nil || strings.Contains(err.Error(), "never canceled") {
+		t.Errorf("the canceled refresh: %v", err)
+	}
+	if filesUnder(t, dir) != 0 {
+		t.Errorf("the canceled refresh left files in %s", dir)
+	}
+	unchanged("after a cancel")
+	env.srv.beforeOverwrite = nil
+
+	// A failure in DuckDB's INSERT itself: its transaction ends with it.
+	for _, q := range []string{
+		"CREATE TABLE codes AS SELECT i AS id, CAST(i AS VARCHAR) AS code FROM range(100) AS r(i)",
+		"CREATE MATERIALIZED VIEW w AS SELECT id, CAST(code AS INTEGER) AS n FROM codes",
+		"REFRESH MATERIALIZED VIEW w",
+		"ALTER TABLE lake.public.w SET PARTITIONED BY (bucket(4, id))",
+		"INSERT INTO codes VALUES (1000, 'not a number')",
+	} {
+		mustExec(t, admin, q)
+	}
+	if _, err := admin.Exec(context.Background(), "REFRESH MATERIALIZED VIEW w"); err == nil {
+		t.Error("a refresh whose query fails went through")
+	}
+	if n := count(t, admin, "SELECT count(*) FROM w"); n != 100 {
+		t.Errorf("w holds %d rows after its refresh failed", n)
+	}
+	if n := len(filesNotes(t, env.srv)); n != 0 {
+		t.Errorf("%d notes of refreshes' files left after its query failed", n)
+	}
+	mustExec(t, admin, "DELETE FROM codes WHERE id = 1000")
+	mustExec(t, admin, "INSERT INTO codes VALUES (1000, '1000')")
+	mustExec(t, admin, "REFRESH MATERIALIZED VIEW w")
+	if got, want := sortedTexts(t, admin, "SELECT * FROM w"), sortedTexts(t, admin, "SELECT id, CAST(code AS INTEGER) FROM codes"); !slices.Equal(got, want) {
+		t.Errorf("w after its query could run: %d rows, want %d", len(got), len(want))
+	}
+
+	// It goes through again.
+	mustExec(t, admin, "REFRESH MATERIALIZED VIEW v")
+	if got, want := sortedTexts(t, admin, "SELECT * FROM v"), sortedTexts(t, admin, "SELECT id, g, x FROM src WHERE id % 2 = 0"); !slices.Equal(got, want) {
+		t.Errorf("v after it all: %d rows, want %d", len(got), len(want))
+	}
+}
+
+// TestFullRefreshOfOtherEnginesTypes checks the same of a view's table another
+// engine replaced with columns of a fixed-length or nanosecond type, which
+// DuckDB describes as other types than COPY could write them in.
+func TestFullRefreshOfOtherEnginesTypes(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	for _, c := range []struct {
+		name  string
+		field iceberg.NestedField
+		value string
+		props iceberg.Properties
+	}{
+		{"fixed", iceberg.NestedField{ID: 2, Name: "f", Type: iceberg.FixedTypeOf(4)}, "CAST('abcd' AS BLOB)", nil},
+		{"nanoseconds", iceberg.NestedField{ID: 2, Name: "f", Type: iceberg.PrimitiveTypes.TimestampNs}, "TIMESTAMP '2026-01-01 00:00:00.123'",
+			iceberg.Properties{"format-version": "3"}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
+			env := startRefreshServer(t)
+			env.srv.refreshFraction = 1e-9
+			admin := env.admin
+			mustExec(t, admin, "CREATE TABLE src AS SELECT i AS id FROM range(100) AS r(i)")
+			mustExec(t, admin, "CREATE MATERIALIZED VIEW v AS SELECT id, "+c.value+" AS f FROM src")
+			mustExec(t, admin, "REFRESH MATERIALIZED VIEW v")
+
+			id := table.Identifier{"public", "v"}
+			if err := env.catalog.DropTable(ctx, id); err != nil {
+				t.Fatal(err)
+			}
+			schema := iceberg.NewSchema(0, iceberg.NestedField{ID: 1, Name: "id", Type: iceberg.PrimitiveTypes.Int64}, c.field)
+			var opts []icecat.CreateTableOpt
+			if c.props != nil {
+				opts = append(opts, icecat.WithProperties(c.props))
+			}
+			if _, err := env.catalog.CreateTable(ctx, id, schema, opts...); err != nil {
+				t.Fatal(err)
+			}
+			env.srv.engine.CatalogChanged()
+			var first []string
+			for _, q := range []string{"", "DELETE FROM src WHERE id < 10"} {
+				if q != "" {
+					mustExec(t, admin, q)
+				}
+				mustExec(t, admin, "REFRESH MATERIALIZED VIEW v")
+				if action, detail, _, _ := viewRefresh(t, admin, "public.v"); action != "FULL" {
+					t.Errorf("%s, %s", action, detail)
+				}
+				want := count(t, admin, "SELECT count(*) FROM src")
+				if n := count(t, admin, "SELECT count(*) FROM v WHERE f IS NOT NULL"); n != want {
+					t.Errorf("v holds %d rows, want %d", n, want)
+				}
+				data, deletes := liveFiles(t, admin, "v")
+				if len(deletes) > 0 || len(data) == 0 || len(notInRefreshDir(data)) > 0 {
+					t.Errorf("v's data files %q, delete files %q", data, deletes)
+				}
+				if slices.ContainsFunc(data, func(p string) bool { return slices.Contains(first, p) }) {
+					t.Errorf("the refresh kept a file of the last: %q", data)
+				}
+				first = data
+			}
+		})
 	}
 }

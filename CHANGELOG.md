@@ -2436,8 +2436,9 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   files; files a stopped one left go at the view's next refresh or an
   erasure request's replacement of the view, and an erasure request does
   not complete while any from before it may remain. Partitioned views and
-  views with columns of nested, fixed-length or nanosecond types are
-  written as before.
+  views with columns of nested, fixed-length or nanosecond types go the same
+  way, their files written by DuckDB's `INSERT`, whose commit the catalog
+  proxy keeps from the catalog.
 - A `CREATE TABLE ... AS` of an aggregate that the memory watch stops while
   it fills its table runs the fill again, its groups a share at a time, as
   it does when DuckDB runs out of memory: the benchmark's copy of a

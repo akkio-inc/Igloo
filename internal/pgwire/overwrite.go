@@ -20,6 +20,7 @@ import (
 	"github.com/apache/iceberg-go/table"
 
 	"github.com/akkio-inc/igloo/internal/catalog"
+	"github.com/akkio-inc/igloo/internal/catalogproxy"
 	"github.com/akkio-inc/igloo/internal/ddl"
 	"github.com/akkio-inc/igloo/internal/distributed"
 )
@@ -44,9 +45,11 @@ import (
 // deleted. A refresh that fails, or is canceled, deletes them; a stopped
 // one leaves the note, and the view's next refresh, or an erasure
 // request's replacement of the view, deletes them (see clearRefreshFiles).
-// A table whose files the refresh cannot write so (partitioned, or with
-// columns of nested, fixed-length or nanosecond types) is written by DELETE
-// and INSERT as before.
+// COPY writes a table of plain columns. A partitioned one, or one with columns
+// of nested, fixed-length or nanosecond types or that are required, DuckDB's
+// own INSERT writes, under the same directory, its commit kept from the
+// catalog, and the refresh commits the files it wrote the same way (see
+// insert).
 
 // errNoOverwrite says a view's table cannot be overwritten (see
 // overwritePlan).
@@ -63,8 +66,10 @@ const overwriteFileBytes = 512 << 20
 type overwritePlan struct {
 	r   *refresher
 	tbl *table.Table
-	// names, ids and types are the table's columns: their names, field ids
-	// and DuckDB types.
+	// copies says COPY can write the table's files (see overwritable), and
+	// names, ids and types are then its columns: their names, field ids and
+	// DuckDB types. Otherwise DuckDB's INSERT writes them (see insert).
+	copies       bool
 	names, types []string
 	ids          []int
 }
@@ -102,15 +107,21 @@ func (r *refresher) overwritePlan(ctx context.Context) (*overwritePlan, error) {
 	if err != nil {
 		return nil, err
 	}
-	if !tbl.Spec().IsUnpartitioned() || tbl.Metadata().Version() < 2 {
+	if tbl.Metadata().Version() < 2 {
 		return nil, errNoOverwrite
 	}
-	o := &overwritePlan{r: r, tbl: tbl}
+	o := &overwritePlan{r: r, tbl: tbl, copies: tbl.Spec().IsUnpartitioned()}
 	for _, f := range tbl.Schema().Fields() {
-		if !overwritable(f.Type) {
-			return nil, errNoOverwrite
+		if !overwritable(f.Type) || f.Required {
+			o.copies = false
 		}
 		o.names, o.ids = append(o.names, f.Name), append(o.ids, f.ID)
+	}
+	if !o.copies {
+		if _, ok := r.s.engine.(commitHolder); !ok {
+			return nil, errNoOverwrite
+		}
+		return o, nil
 	}
 	described, err := r.describe(ctx)
 	if err != nil {
@@ -124,6 +135,12 @@ func (r *refresher) overwritePlan(ctx context.Context) (*overwritePlan, error) {
 		o.types = append(o.types, t)
 	}
 	return o, nil
+}
+
+// commitHolder is the engine that can keep a table's commit from the catalog
+// (see catalogproxy.CommitHold).
+type commitHolder interface {
+	HoldCommit(schema, name, dir string) *catalogproxy.CommitHold
 }
 
 // overwritable reports whether a column of type t is one whose Parquet, as
@@ -177,7 +194,13 @@ func (o *overwritePlan) run(ctx context.Context, query string) (rows int64, err 
 		return -1, fmt.Errorf("note the files of the refresh: %w", err)
 	}
 	committed, leave := false, false
+	// What DuckDB wrote for its commit that was kept from the catalog: the
+	// files of its rows, wherever it wrote them, and its manifests, which
+	// no snapshot has.
+	var written, manifests []string
 	defer func() {
+		bg := context.WithoutCancel(ctx)
+		s.deleteFiles(bg, o.tbl, manifests)
 		if committed {
 			s.forgetRefreshFiles(ctx, r.schema, note)
 			return
@@ -186,15 +209,24 @@ func (o *overwritePlan) run(ctx context.Context, query string) (rows int64, err 
 			// For the view's next refresh, which tells.
 			return
 		}
-		// Whatever COPY wrote goes, canceled or not.
-		if derr := s.deleteRefreshFiles(context.WithoutCancel(ctx), o.tbl, dir); derr != nil {
+		s.deleteFiles(bg, o.tbl, written)
+		// Whatever was written goes, canceled or not, unless the table
+		// holds it: another session's commit, as DuckDB writes the refresh's
+		// rows, goes in the same directory.
+		if derr := s.clearNotedFiles(bg, r.schema, r.table, note); derr != nil {
 			s.log.Warn("could not delete the files of a failed refresh; the view's next refresh deletes them", "view", r.job.Name,
 				"dir", dir, "err", derr)
-			return
 		}
-		s.forgetRefreshFiles(ctx, r.schema, note)
 	}()
-	paths, rows, err := o.copy(ctx, dir, query)
+	var (
+		paths []string
+		added []iceberg.DataFile
+	)
+	if o.copies {
+		paths, rows, err = o.copy(ctx, dir, query)
+	} else {
+		added, written, manifests, rows, err = o.insert(ctx, dir, query)
+	}
 	if err != nil {
 		return -1, err
 	}
@@ -203,7 +235,7 @@ func (o *overwritePlan) run(ctx context.Context, query string) (rows int64, err 
 			return -1, err
 		}
 	}
-	if leave, err = o.commitAt(ctx, dir, paths, nil); err != nil {
+	if leave, err = o.commitAt(ctx, dir, paths, added, nil); err != nil {
 		return -1, err
 	}
 	committed = true
@@ -216,9 +248,9 @@ func (o *overwritePlan) run(ctx context.Context, query string) (rows int64, err 
 // after check, if set, of what their footers say. A commit whose answer was
 // lost, or that a cancel cut short, may have been made: its files stay if
 // the table holds them; leave says that cannot be told.
-func (o *overwritePlan) commitAt(ctx context.Context, dir string, paths []string, check func([]iceberg.DataFile, iceberg.PartitionSpec) error) (leave bool, err error) {
+func (o *overwritePlan) commitAt(ctx context.Context, dir string, paths []string, added []iceberg.DataFile, check func([]iceberg.DataFile, iceberg.PartitionSpec) error) (leave bool, err error) {
 	r, s := o.r, o.r.s
-	err = o.commit(ctx, paths, check)
+	err = o.commit(ctx, paths, added, check)
 	if err == nil {
 		return false, nil
 	}
@@ -226,7 +258,7 @@ func (o *overwritePlan) commitAt(ctx context.Context, dir string, paths []string
 	tbl, lerr := s.ddl.LoadTable(bg, r.schema, r.table)
 	held := false
 	if lerr == nil {
-		held, lerr = holdsFiles(bg, tbl, dir)
+		held, lerr = holdsFiles(bg, tbl, dir, added...)
 	}
 	switch {
 	case lerr != nil:
@@ -236,6 +268,92 @@ func (o *overwritePlan) commitAt(ctx context.Context, dir string, paths []string
 	}
 	s.log.Warn("a refresh's commit was made, though it failed", "view", r.job.Name, "err", err)
 	return false, nil
+}
+
+// insert has DuckDB write query's rows as the table says, under dir, by an
+// INSERT whose commit is kept from the catalog (see catalogproxy.CommitHold),
+// and returns the data files it wrote, their paths, the manifest list and
+// manifests it wrote for them, which no snapshot will have, and the rows.
+func (o *overwritePlan) insert(ctx context.Context, dir, query string) (added []iceberg.DataFile, written, manifests []string, rows int64, err error) {
+	r := o.r
+	hold := r.s.engine.(commitHolder).HoldCommit(r.schema, r.table, dir)
+	if hold == nil {
+		return nil, nil, nil, 0, fmt.Errorf("another refresh of %s is writing its files", r.job.Name)
+	}
+	defer hold.Release()
+	if _, err = r.exec(ctx, "BEGIN"); err != nil {
+		return nil, nil, nil, 0, err
+	}
+	open := true
+	defer func() {
+		if open {
+			_, _ = r.exec(context.WithoutCancel(ctx), "ROLLBACK")
+		}
+	}()
+	err = r.s.runBound(r.sess, nil, func() (err error) {
+		rows, err = r.exec(ctx, "INSERT INTO "+r.qualified+" "+query)
+		return err
+	})
+	if err != nil {
+		return nil, nil, nil, 0, err
+	}
+	hold.Arm(rows)
+	if _, err = r.exec(ctx, "COMMIT"); err != nil {
+		return nil, nil, nil, 0, err
+	}
+	open = false
+	taken, ok := hold.Taken()
+	if !ok {
+		if rows == 0 {
+			// Nothing to commit, nor to put in the old files' place.
+			return nil, nil, nil, 0, nil
+		}
+		return nil, nil, nil, 0, fmt.Errorf("the commit of the files of %s did not come", r.job.Name)
+	}
+	manifests = []string{taken.ManifestList}
+	fs, err := o.tbl.FS(ctx)
+	if err != nil {
+		return nil, nil, manifests, 0, err
+	}
+	snap := table.Snapshot{SnapshotID: taken.SnapshotID, ManifestList: taken.ManifestList}
+	list, err := snap.Manifests(fs)
+	if err != nil {
+		return nil, nil, manifests, 0, err
+	}
+	for _, m := range list {
+		if m.SnapshotID() != taken.SnapshotID {
+			continue
+		}
+		manifests = append(manifests, m.FilePath())
+		entries, err := m.FetchEntries(fs, false)
+		if err != nil {
+			return nil, written, manifests, 0, err
+		}
+		for _, e := range entries {
+			if df := e.DataFile(); e.Status() == iceberg.EntryStatusADDED && df.ContentType() == iceberg.EntryContentData {
+				added = append(added, df)
+				written = append(written, df.FilePath())
+			}
+		}
+	}
+	return added, written, manifests, rows, nil
+}
+
+// deleteFiles deletes what a refresh wrote and no snapshot holds.
+func (s *Server) deleteFiles(ctx context.Context, tbl *table.Table, paths []string) {
+	if len(paths) == 0 {
+		return
+	}
+	fs, err := tbl.FS(ctx)
+	if err != nil {
+		s.log.Debug("could not delete a refresh's files; the orphan cleanup will", "err", err)
+		return
+	}
+	for _, p := range paths {
+		if err := fs.Remove(p); err != nil && !errors.Is(err, iofs.ErrNotExist) {
+			s.log.Debug("could not delete a refresh's file; the orphan cleanup will", "file", p, "err", err)
+		}
+	}
 }
 
 // copy writes query's rows with COPY into dir, as Parquet with the table's
@@ -315,10 +433,9 @@ const maxOverwriteAttempts = 10
 // delete file of its current snapshot, in one snapshot. On a conflict it
 // does so again on the new current snapshot. check, if set, checks what
 // the files' footers say before anything is committed.
-func (o *overwritePlan) commit(ctx context.Context, paths []string, check func([]iceberg.DataFile, iceberg.PartitionSpec) error) error {
+func (o *overwritePlan) commit(ctx context.Context, paths []string, added []iceberg.DataFile, check func([]iceberg.DataFile, iceberg.PartitionSpec) error) error {
 	r, tbl := o.r, o.tbl
 	schemaID := tbl.Schema().ID
-	var added []iceberg.DataFile
 	for attempt := 0; ; attempt++ {
 		tx := tbl.NewTransaction()
 		if added == nil && len(paths) > 0 {
@@ -585,13 +702,18 @@ func splitDir(dir string) (parent, name string) {
 	return dir[:i], dir[i+1:]
 }
 
-// holdsFiles reports whether any snapshot of tbl holds a file in dir.
-func holdsFiles(ctx context.Context, tbl *table.Table, dir string) (bool, error) {
+// holdsFiles reports whether any snapshot of tbl holds a file in dir, or any
+// of files.
+func holdsFiles(ctx context.Context, tbl *table.Table, dir string, files ...iceberg.DataFile) (bool, error) {
 	fs, err := tbl.FS(ctx)
 	if err != nil {
 		return false, err
 	}
 	prefix := strings.TrimSuffix(dir, "/") + "/"
+	named := make(map[string]bool, len(files))
+	for _, f := range files {
+		named[f.FilePath()] = true
+	}
 	seen := map[string]bool{}
 	for _, snap := range tbl.Metadata().Snapshots() {
 		manifests, err := snap.Manifests(fs)
@@ -608,7 +730,8 @@ func holdsFiles(ctx context.Context, tbl *table.Table, dir string) (bool, error)
 				return false, err
 			}
 			for _, e := range entries {
-				if strings.HasPrefix(strings.TrimPrefix(e.DataFile().FilePath(), "file://"), prefix) {
+				path := e.DataFile().FilePath()
+				if named[path] || strings.HasPrefix(strings.TrimPrefix(path, "file://"), prefix) {
 					return true, nil
 				}
 			}

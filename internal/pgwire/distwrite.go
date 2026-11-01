@@ -406,7 +406,7 @@ func (w *tableWrite) commit(ctx context.Context, files []distributed.WrittenFile
 	check := func(added []iceberg.DataFile, spec iceberg.PartitionSpec) error { return checkAdded(kept, added, spec) }
 	var err error
 	if w.overwrite != nil {
-		w.left, err = w.overwrite.commitAt(ctx, w.dir, paths, check)
+		w.left, err = w.overwrite.commitAt(ctx, w.dir, paths, nil, check)
 		w.committed = err == nil
 	} else if len(paths) > 0 {
 		err = w.add(ctx, paths, check)

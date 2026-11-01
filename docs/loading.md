@@ -394,9 +394,7 @@ new delete files name.
   inserting the new took 23 s and left reads of the view slow until
   compaction), and readers, on every replica and through the result cache,
   see the old rows or the new ones. A refresh that fails or is stopped
-  leaves the old rows (see [operations](operations.md)); a partitioned view,
-  or one with columns of nested, fixed-length or nanosecond types, is
-  written by deleting and inserting, in one transaction. Igloo refreshes
+  leaves the old rows (see [operations](operations.md)). Igloo refreshes
   in full, and says why,
   when the query has a shape the table above leaves out (a window
   function, a subquery, `LIMIT`, `UNION`, a `WITH` clause, a view or a
