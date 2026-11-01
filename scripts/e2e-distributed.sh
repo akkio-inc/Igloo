@@ -253,7 +253,10 @@ if [ "${got:-0}" -ge 1 ]; then pass "and runs on workers"; else fail "a clone ra
 echo "snapshot isolation"
 # A statement reads one snapshot of each table, on the workers and in the
 # part the coordinator runs itself (the scalar subquery), while another
-# session deletes rows and adds a column.
+# session deletes rows and adds a column. The commit must land while the
+# statement is reading, so it waits for a task of the statement to end: a commit
+# that lands first, as a fixed wait lets it on a loaded machine, is one the
+# statement rightly reads, on this replica, its columns having changed.
 {
   echo "CREATE TABLE iso AS SELECT * FROM orders WHERE false;"
   for part in 0 1 2 3 4 5; do echo "INSERT INTO iso SELECT * FROM orders WHERE hash(o_orderkey) % 6 = $part;"; done
@@ -261,9 +264,14 @@ echo "snapshot isolation"
 iso="SELECT x.o_orderstatus, x.n, x.s, (SELECT count(*) FROM iso) AS total FROM
   (SELECT o_orderstatus, count(*) AS n, sum(length(repeat(o_comment, 5000))) AS s FROM iso GROUP BY 1) AS x ORDER BY 1"
 want="$(psql_admin -c "SET distributed_execution = 'off'" -c "$iso" | grep -v '^SET$')"
+tasks_ended() { curl -fsS "http://127.0.0.1:$http_port/metrics" 2>/dev/null | sed -n 's/^igloo_distributed_tasks_total{result="ok"} //p'; }
+before="$(tasks_ended)"
 psql_admin -c "SET distributed_execution = 'on'" -c "/* iso */ $iso" | grep -v '^SET$' >"$work/iso" &
 query=$!
-sleep 1
+deadline=$((SECONDS + 180))
+while [ "$(tasks_ended)" = "$before" ] && kill -0 "$query" 2>/dev/null && [ "$SECONDS" -lt "$deadline" ]; do
+  sleep 0.1
+done
 psql_admin -c "DELETE FROM iso WHERE o_orderkey % 2 = 0" -c "ALTER TABLE iso ADD COLUMN extra INTEGER" >/dev/null
 wait "$query" || true
 if [ "$(cat "$work/iso")" = "$want" ]; then
