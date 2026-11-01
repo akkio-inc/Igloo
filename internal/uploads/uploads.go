@@ -24,6 +24,8 @@ import (
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
+	"github.com/aws/smithy-go/middleware"
+	smithyhttp "github.com/aws/smithy-go/transport/http"
 )
 
 // Upload is a file not finished in a store.
@@ -78,6 +80,7 @@ func For(fsys icebergio.IO, location string, keys Keys) (Store, error) {
 			Region:       "auto",
 			UsePathStyle: true,
 			Credentials:  credentials.NewStaticCredentialsProvider(keys.GCSKeyID, keys.GCSSecret, ""),
+			APIOptions:   []func(*middleware.Stack) error{unsignedAcceptEncoding},
 		})
 		return &s3Store{client: client, scheme: u.Scheme, bucket: u.Host}, nil
 	case "az", "azure", "abfs", "abfss", "wasb", "wasbs":
@@ -92,6 +95,32 @@ func For(fsys icebergio.IO, location string, keys Keys) (Store, error) {
 		return &azureStore{client: client, base: base}, nil
 	}
 	return nil, nil
+}
+
+// unsignedAcceptEncoding leaves the header the S3 client adds out of what it signs:
+// on GCS's XML API, what reaches the check is not what was signed, and every request
+// is refused with SignatureDoesNotMatch.
+func unsignedAcceptEncoding(stack *middleware.Stack) error {
+	type saved struct{}
+	drop := middleware.FinalizeMiddlewareFunc("dropAcceptEncoding", func(ctx context.Context, in middleware.FinalizeInput, next middleware.FinalizeHandler) (middleware.FinalizeOutput, middleware.Metadata, error) {
+		if req, ok := in.Request.(*smithyhttp.Request); ok {
+			ctx = middleware.WithStackValue(ctx, saved{}, req.Header.Get("Accept-Encoding"))
+			req.Header.Del("Accept-Encoding")
+		}
+		return next.HandleFinalize(ctx, in)
+	})
+	restore := middleware.FinalizeMiddlewareFunc("restoreAcceptEncoding", func(ctx context.Context, in middleware.FinalizeInput, next middleware.FinalizeHandler) (middleware.FinalizeOutput, middleware.Metadata, error) {
+		if req, ok := in.Request.(*smithyhttp.Request); ok {
+			if v, _ := middleware.GetStackValue(ctx, saved{}).(string); v != "" {
+				req.Header.Set("Accept-Encoding", v)
+			}
+		}
+		return next.HandleFinalize(ctx, in)
+	})
+	if err := stack.Finalize.Insert(drop, "Signing", middleware.Before); err != nil {
+		return err
+	}
+	return stack.Finalize.Insert(restore, "Signing", middleware.After)
 }
 
 // s3Store is S3's multipart uploads, and those of the stores that speak it.
