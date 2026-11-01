@@ -604,6 +604,12 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   the fewest tasks. `EXPLAIN DISTRIBUTED` shows the choice (`fleet`) and
   the ways weighed (`options`), and `query_history.placement` where a
   statement ran and why (see [when](docs/distributed-execution.md#when)).
+- Auto mode no longer tries a statement of five minutes or more on a
+  number of workers estimated past a fifth of its best way's time, to
+  measure it, and a first run takes the best way: an ordered result of 361 million rows that
+  took 470 s on 16 workers was tried on one, and took 621 s, slower than
+  one machine. The estimates of fewer workers count their shares of a sort
+  spilling past their memory, as one worker's of that 41.6 GB sort did.
 - Auto mode's estimates count the client's taking a result's rows, either
   way, where one machine's estimate of 361 million ordered rows was 30 s
   against 516 s; a sort or window that holds half of the replica's room or

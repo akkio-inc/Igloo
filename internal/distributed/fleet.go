@@ -71,6 +71,14 @@ const (
 	// tried once (see exploreFleet): the estimates run within a factor of
 	// 1.35 of the runs at the root mean square (see levelCost).
 	fleetExploreWithin = 1.4
+	// exploreLong is how long a statement takes, by its fastest way, for a
+	// probe of another way to be bounded by exploreLongWithin times that
+	// (see exploreFleet): the probe costs no more than a fifth of a run of
+	// many minutes. Shorter, a probe within fleetExploreWithin costs less
+	// than two minutes, and found the report of 127 s on 16 workers its 112
+	// s on 8, estimated at 164 s.
+	exploreLong       = 5 * time.Minute
+	exploreLongWithin = 1.2
 	// levelCost is what a level of a statement's stages takes on workers
 	// beside their reading: its round of tasks, which wait for the level
 	// before; stages of one level run at once. workerReadShare is the share
@@ -237,14 +245,23 @@ func threadsPerCore(threads, cores int) float64 {
 // 16 workers of 24.6 GiB ran reports whose stages fed 19 to 22 times one
 // machine's memory in 790 to 1,025 s, at their memory limits, without a
 // task running out. So a worker's share of the working set does not
-// lengthen its time.
+// lengthen its time. A sort's does: workers sort their shares of the rows
+// whole, for the coordinator to merge, and spill as one machine does what
+// their memory does not hold. A sort of 361 million rows held at 41.6 GB,
+// on one worker of 26 GB, sent its first row after 147 s and took 621 s,
+// where 16 workers took 462 to 476 s.
 func (x features) onFleet(n int, f fleet) option {
 	o := option{workers: n, spill: spillOn(x.set()/float64(n), f.memory)}
 	o.spill.factor, o.spill.oom = 1, false
+	if x.planSorted > 0 {
+		if s := spillOn(x.planSorted/float64(n), f.memory); s.factor > 1 {
+			o.spill = s
+		}
+	}
 	cores := float64(n * max(f.cores, 1))
 	rate := coldRateAt(threadsPerCore(f.threads, f.cores)) * workerReadShare
 	work := max(float64(x.bytes)/(cores*rate), x.rows/(cores*rowRate))
-	o.estimate = startCost + float64(max(x.levels, 1))*levelCost + work
+	o.estimate = startCost + float64(max(x.levels, 1))*levelCost + work*o.spill.factor
 	if n > f.running {
 		o.estimate += f.start.Seconds()
 		o.started = n - f.running
@@ -487,9 +504,14 @@ func pick(opts []option, dollars bool) (best option, why string, ok bool) {
 // the cheapest of those not measured whose time, as corrected, is within
 // fleetExploreWithin of the fastest measured option's and that best does
 // not beat on both time and cost, unless the statement was tried so
-// within exploreEvery or nothing was measured. A report took 200 s on 4
-// workers, its estimate, and 127 s on 16; the estimates, corrected by the
-// run on 16, took 8 for 162 s, and it took 112 s there.
+// within exploreEvery or nothing was measured, as on its first run, which
+// takes best. A report took 200 s on 4 workers, its estimate, and 127 s on
+// 16; the estimates, corrected by the run on 16, took 8 for 162 s, and it
+// took 112 s there. For a statement of many minutes (exploreLong), the probe
+// is within exploreLongWithin of best's time too: an ordered result of
+// 361 million rows, measured at 470 s on 16 workers, was tried on one,
+// as its spilling sort was not estimated there, and took 621 s, slower
+// than one machine's 515.
 func exploreFleet(opts []option, best option, r runs, now time.Time) (option, bool) {
 	if now.Sub(r.fleetExplored) < exploreEvery {
 		return option{}, false
@@ -500,11 +522,15 @@ func exploreFleet(opts []option, best option, r runs, now time.Time) (option, bo
 			fastest = min(fastest, o.seconds)
 		}
 	}
+	limit := fleetExploreWithin * fastest
+	if base := min(fastest, best.seconds); base >= exploreLong.Seconds() {
+		limit = min(limit, exploreLongWithin*base)
+	}
 	var out option
 	found := false
 	for _, o := range opts {
 		switch {
-		case o.measured, o.failed, o.large, o.spill.oom, math.IsInf(fastest, 1), o.seconds > fleetExploreWithin*fastest:
+		case o.measured, o.failed, o.large, o.spill.oom, math.IsInf(fastest, 1), o.seconds > limit:
 		case o.seconds >= best.seconds && o.cost >= best.cost:
 		case !found || o.cost < out.cost:
 			out, found = o, true

@@ -877,3 +877,53 @@ func TestOrderWithoutLimit(t *testing.T) {
 		}
 	}
 }
+
+// TestProbeOrdered checks the ways on workers auto mode weighs, and tries,
+// for an ordered result of 361 million rows whose sort holds 41.6 GB, at
+// ten times the data on a replica with 34 GB for it: auto mode ran it on
+// workers, then tried one worker to measure it, which took 621 s against
+// 462 to 476 s on 16 and 509 to 522 s on one machine. One worker's share
+// of the sort spills there; a first run takes the best way, not a probe;
+// and a probe of a statement of minutes is within a fifth of the best
+// way's time.
+func TestProbeOrdered(t *testing.T) {
+	now := time.Now()
+	replica := scaleCoordinator
+	replica.memory = 48_571_428_571 // 34 GB for a statement
+	ordered := features{bytes: 4e9, rows: 3.61e8, levels: 1, stages: 1, planned: true, planSet: 43e9, planBytes: 4e9,
+		planFields: 3.61e8 * 4, planSorted: 41.6e9}
+	e := ordered.estimate(replica, benchWorkers)
+	explain := describeOptions(e.options, e.dollars)
+	for _, o := range e.options {
+		share := ordered.planSorted / float64(o.workers)
+		if spills := share > slightSpill*memoryShare*float64(benchWorkers.memory); spills != (o.spill.factor > 1) {
+			t.Errorf("%s, a sort share of %.1f GB: spills %.1fx (%s)", o, share/1e9, o.spill.factor, explain)
+		}
+	}
+	if one := e.options[0]; one.workers != 1 || one.spill.factor < 1.5 {
+		t.Errorf("one worker: %s, spills %.1fx (%s)", one, one.spill.factor, explain)
+	}
+	workers, _, reason := choose(e, runs{}, false, DefaultThreshold, now)
+	if !workers || !e.risky {
+		t.Errorf("first run: workers %v, risky %v (%s)", workers, e.risky, reason)
+	}
+	if o, probe := exploreFleet(e.options, e.picked, runs{}, now); probe {
+		t.Errorf("first run: probes %s (%s)", o, explain)
+	}
+	// After 470 s on 16 workers: no probe beyond a fifth of that, nor of
+	// one worker.
+	r := runs{dist: 470, distWorkers: 16, fleets: map[int]float64{fleetBucket(16): 470}}
+	e.pick(r, benchWorkers)
+	explain = describeOptions(e.options, e.dollars)
+	if e.picked.seconds > 470*fleetMargin {
+		t.Errorf("after 470 s on 16: picked %s at %.0f s (%s)", e.picked, e.picked.seconds, explain)
+	}
+	if o, probe := exploreFleet(e.options, e.picked, r, now); probe && (o.workers == 1 || o.seconds > exploreLongWithin*min(470, e.picked.seconds)) {
+		t.Errorf("after 470 s on 16: probes %s at %.0f s (%s)", o, o.seconds, explain)
+	}
+	// A statement of seconds still probes within fleetExploreWithin.
+	short := []option{{workers: 4, estimate: 50, seconds: 50, cost: 1}, {workers: 16, estimate: 40, seconds: 40, measured: true, cost: 2}}
+	if o, probe := exploreFleet(short, short[1], runs{}, now); !probe || o.workers != 4 {
+		t.Errorf("a statement of 40 s: probes %v %s", probe, o)
+	}
+}

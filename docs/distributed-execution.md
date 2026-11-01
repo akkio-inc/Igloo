@@ -589,7 +589,15 @@ which an earlier rule took, estimated within a fifth of 16, cost $0.143 and
 times the fastest it ran on and not beaten by the way chosen, is tried
 once a day to measure it: the first report ran on 16 first, the estimates'
 fastest; its 127 s there took 8 to 164 s, so it was tried on 8, and stayed
-on 8 at 112 s. Of more workers running, it takes those with the fewest
+on 8 at 112 s. A statement's first run takes the estimates' best way, never
+a probe, and one of five minutes or more is tried only on a number estimated
+within a fifth of its best way's time, so that a probe costs it at most
+that: an ordered result of 361 million rows that took 470 s on 16 workers
+was tried on one, and took 621 s. Workers sort their shares of an ordered
+result whole, for the coordinator to merge, so a worker spills its share
+of the sort past its memory as one machine does, which the estimates of
+fewer workers count; their other work is partitioned to their memory.
+Of more workers running, it takes those with the fewest
 tasks; the others serve other statements, or stop when idle. The reason,
 in `EXPLAIN DISTRIBUTED`'s `fleet` row and in `query_history.placement`,
 says which it took and why, and its `options` row lists each way's time
