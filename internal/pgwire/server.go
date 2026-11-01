@@ -2231,7 +2231,7 @@ func (s *Server) preparedQuery(ctx context.Context, sess *session, user auth.Use
 		peak, sampled := sess.wl.peak, sess.wl.sampled
 		if used != nil && parts.workers == 0 && s.heavy != nil {
 			// Which of this replica's DuckDBs the next like it runs in.
-			s.heavy.observe(shape, used.CPUTime)
+			s.heavy.observe(shape, used.CPUTime, sess.wl.ranInBackground)
 		}
 		switch {
 		case parts.workers > 0:

@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql/driver"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -26,10 +27,11 @@ import (
 // Alone, they run as fast as they would have in the first.
 //
 // A statement is heavy if statements of its shape, its text with the
-// literals masked, last took heavySeconds of all the machine's cores. One
-// not yet seen runs in the first DuckDB; if it has run long enough to be
-// heavy by what it can have used beside the others running, and has sent the
-// client nothing, it starts again in the second, once, within
+// literals masked, lately took heavySeconds of all the machine's cores and
+// heavyFactor times what the replica's others of some size do (see
+// heavyHistory). One not yet seen runs in the first DuckDB; if it has run long
+// enough to be heavy by what it can have used beside the others running, and has
+// sent the client nothing, it starts again in the second, once, within
 // heavyMoveWithin. So a report's first run costs it at most a few seconds
 // more, and dashboards see its later ones only as the cores they leave idle.
 //
@@ -49,9 +51,32 @@ import (
 // be heavy runs to its end in the first.
 
 // heavySeconds is how long of all the machine's cores makes a statement
-// heavy. A dashboard's statement takes a fraction of that: on 12 cores, one
-// over a billion rows used 30 to 40 s of CPU, and a report over them 700.
+// heavy, at the least. A dashboard's statement takes a fraction of that: on 12
+// cores, one over a billion rows used 30 to 40 s of CPU, and a report over them
+// 700 to 12,000.
 const heavySeconds = 5
+
+// heavyFactor is how many times what the replica's other statements of some
+// size use a heavy one uses. Dashboards of a few seconds each over more rows
+// are not heavy beside each other: in the second DuckDB they would only wait
+// behind the reports.
+const heavyFactor = 8
+
+const (
+	// heavyRuns is how many of a shape's latest runs count. What DuckDB
+	// measures as CPU is the time threads spend in operators, preempted or
+	// waiting for the disk or not: a dashboard's statement of 40 s measured 430 s
+	// beside a report that took the read cache's memory. So it counts only ever
+	// more than it used, and the least of the latest runs is close to it.
+	heavyRuns = 3
+	// heavyAtOnce is how many times over the line one run in the first DuckDB
+	// makes a shape heavy with no other.
+	heavyAtOnce = 5
+	// heavyProbeEvery is how often a shape known to be heavy runs in the first
+	// DuckDB again, where it soon moves if it is still heavy, as it has only the
+	// second DuckDB's measures, which count its waiting for the cores.
+	heavyProbeEvery = 8
+)
 
 // maxHeavyShapes bounds the shapes remembered; they are forgotten all at
 // once, and learned again.
@@ -62,50 +87,120 @@ const maxHeavyShapes = 4096
 // cost it more than it is likely to cost the others.
 var heavyMoveWithin = 60 * time.Second
 
-// heavyHistory is what statements of each shape last took.
+// heavyHistory is what statements of each shape took.
 type heavyHistory struct {
-	mu sync.Mutex
-	// heavy says what statements of each seen shape are.
-	shapes map[string]bool
-	// cpu is how much CPU time makes a statement heavy, and after how long
-	// it starts again in the background, per statement sharing the cores.
-	cpu   time.Duration
-	after time.Duration
+	mu     sync.Mutex
+	shapes map[string]*shapeRuns
+	// cpu is how much CPU time at the least makes a statement heavy, factor
+	// how many times the others' (see line), and after how long it starts again
+	// in the background, per statement sharing the cores.
+	cpu    time.Duration
+	factor time.Duration
+	after  time.Duration
+}
+
+// shapeRuns is a shape's latest runs.
+type shapeRuns struct {
+	cpu   [heavyRuns]time.Duration
+	runs  int
+	heavy bool
+	// probe counts down to its next run in the first DuckDB.
+	probe int
+}
+
+// sorted returns the CPU of the latest runs, from the least.
+func (r *shapeRuns) sorted() []time.Duration {
+	out := slices.Clone(r.cpu[:min(r.runs, heavyRuns)])
+	slices.Sort(out)
+	return out
 }
 
 func newHeavyHistory() *heavyHistory {
-	return &heavyHistory{shapes: map[string]bool{}, cpu: heavySeconds * time.Second * time.Duration(runtime.GOMAXPROCS(0)), after: heavySeconds * time.Second}
+	return &heavyHistory{shapes: map[string]*shapeRuns{}, cpu: heavySeconds * time.Second * time.Duration(runtime.GOMAXPROCS(0)),
+		factor: heavyFactor, after: heavySeconds * time.Second}
 }
 
-// observe learns what a run of shape took. A statement goes back to being
-// light only well under the line, so that one that sits on it does not go
-// back and forth.
-func (h *heavyHistory) observe(shape string, cpu time.Duration) {
+// line is how much CPU makes shape heavy: at least h.cpu, and heavyFactor times
+// what the other statements of some size use, as many of them as use less
+// as use more, once there are a few. h.mu is held.
+func (h *heavyHistory) line(shape string) time.Duration {
+	var others []time.Duration
+	for name, r := range h.shapes {
+		if name == shape || r.runs == 0 {
+			continue
+		}
+		if low := r.sorted()[0]; low >= h.cpu/10 {
+			others = append(others, low)
+		}
+	}
+	if len(others) < 2 {
+		return h.cpu
+	}
+	slices.Sort(others)
+	return max(h.cpu, h.factor*others[(len(others)-1)/2])
+}
+
+// observe learns what a run of shape took. All of its latest runs are over the
+// line for it to be heavy, and one run alone only far over it, in the first
+// DuckDB, whose measure is less far from what it used.
+func (h *heavyHistory) observe(shape string, cpu time.Duration, inBackground bool) {
 	if shape == "" {
 		return
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if len(h.shapes) >= maxHeavyShapes {
-		h.shapes = map[string]bool{}
+		h.shapes = map[string]*shapeRuns{}
 	}
+	r := h.shapes[shape]
+	if r == nil {
+		r = &shapeRuns{}
+		h.shapes[shape] = r
+	}
+	r.cpu[r.runs%heavyRuns] = cpu
+	r.runs++
+	line := h.line(shape)
+	was := r.heavy
 	switch {
-	case cpu >= h.cpu:
-		h.shapes[shape] = true
-	case cpu < h.cpu/2:
-		h.shapes[shape] = false
+	case r.sorted()[0] < line:
+		r.heavy = false
+	case r.runs >= 2:
+		r.heavy = true
 	default:
-		if _, seen := h.shapes[shape]; !seen {
-			h.shapes[shape] = false
-		}
+		r.heavy = !inBackground && cpu >= heavyAtOnce*line
+	}
+	if r.heavy && !was {
+		r.probe = heavyProbeEvery
 	}
 }
 
-// heavy says whether the last run of shape was heavy.
+// heavy says whether statements of shape are known to be heavy.
 func (h *heavyHistory) heavy(shape string) bool {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	return h.shapes[shape]
+	r := h.shapes[shape]
+	return r != nil && r.heavy
+}
+
+// place says where a read of shape runs: in the background, or in the first
+// DuckDB, where it may start again in the background if it runs long, unless
+// its shape is known not to.
+func (h *heavyHistory) place(shape string) (background, mayMove bool) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	r := h.shapes[shape]
+	switch {
+	case r == nil:
+		return false, true
+	case r.heavy:
+		if r.probe--; r.probe > 0 {
+			return true, false
+		}
+		r.probe = heavyProbeEvery
+		return false, true
+	}
+	runs := r.sorted()
+	return false, runs[len(runs)/2] >= h.line(shape)
 }
 
 // moveAfter is how long a statement not known to be heavy runs before it
@@ -293,7 +388,8 @@ func (s *Server) runPlaced(ctx, outer context.Context, sess *session, st *statem
 		s.foregroundRead(st)
 		return s.runHere(ctx, sess, st, args, tw)
 	}
-	if s.heavy.heavy(sess.wl.shape) {
+	background, mayMove := s.heavy.place(sess.wl.shape)
+	if background {
 		if ran, err := s.runInBackground(ctx, sess, st, args, tw, parts); ran {
 			return err
 		}
@@ -301,6 +397,9 @@ func (s *Server) runPlaced(ctx, outer context.Context, sess *session, st *statem
 		return s.runHere(ctx, sess, st, args, tw)
 	}
 	s.foregroundRead(st)
+	if !mayMove {
+		return s.runHere(ctx, sess, st, args, tw)
+	}
 	// It may turn out heavy, beside others.
 	start := time.Now()
 	guard := guardLocalBy(ctx, func() time.Duration {

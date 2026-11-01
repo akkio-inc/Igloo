@@ -69,6 +69,8 @@ type workloadState struct {
 	// backgroundUsed is what the latest statement used, if it ran in the
 	// second DuckDB, whose connection has a meter of its own.
 	backgroundUsed *audit.Resources
+	// ranInBackground says the statement measure last measured ran there.
+	ranInBackground bool
 	// controller holds statements back for their limits.
 	controller *workload.Controller
 }
@@ -219,6 +221,7 @@ func statementShape(text string) string {
 
 // measure returns what DuckDB measured of st, which just ran.
 func (sess *session) measure(st *statement) *audit.Resources {
+	sess.wl.ranInBackground = sess.wl.backgroundUsed != nil
 	if u := sess.wl.backgroundUsed; u != nil {
 		// It ran in the second DuckDB (see background.go).
 		sess.wl.backgroundUsed = nil

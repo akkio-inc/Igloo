@@ -399,7 +399,7 @@ func (s *Server) runStagedCreate(ctx context.Context, sess *session, st *stateme
 		// Whether the next like it runs in the second DuckDB.
 		defer func() {
 			if err == nil && f.cpu > 0 {
-				s.heavy.observe(sess.wl.shape, f.cpu)
+				s.heavy.observe(sess.wl.shape, f.cpu, sess.wl.ranInBackground)
 			}
 		}()
 	}
