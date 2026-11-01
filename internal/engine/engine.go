@@ -119,6 +119,9 @@ type Engine struct {
 	// current what it is now set to; fgRead when a statement that reads
 	// tables last ran in it, in Unix nanoseconds.
 	limit, current, fgRead atomic.Int64
+	// bgOver is what the process holds past what the two DuckDBs hold (see
+	// balance).
+	bgOver atomic.Int64
 }
 
 // OpenPartitionFiles is how many files of a partitioned write DuckDB keeps

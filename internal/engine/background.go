@@ -130,7 +130,19 @@ func openBackground(ctx context.Context, cfg config.Config, log *slog.Logger) (*
 // over a billion rows read their files again, 12 GB each, and took 60 s, not
 // 8. The background DuckDB then has what the first does not hold, down to a
 // quarter of the limit, and spills: what it gives up is its own to give up.
+//
+// Two DuckDBs hold more than their limits count, each its own metadata and what
+// its allocator keeps: a report over a billion rows and dashboards beside it took
+// the process 11 GB past what they held, against 2 GB for one DuckDB, and left the
+// machine so little that the memory watch stopped the report. So what the limits
+// share is less what the process holds past them, beyond backgroundOver of it.
 const (
+	// backgroundOver is how much past what the two hold the limit leaves room
+	// for, as a divisor of it.
+	backgroundOver = 16
+	// backgroundLeast is the least of the limit they share, as a part of it
+	// out of 4.
+	backgroundLeast = 3
 	// backgroundMinShare is the least of the limit the background DuckDB
 	// keeps, as a divisor.
 	backgroundMinShare = 4
@@ -221,10 +233,26 @@ func (e *Engine) balance(ctx context.Context) {
 		if err != nil {
 			return
 		}
-		wantMain, wantBg = balancedLimits(total, mainHeld, bgHeld, reading)
+		mainAll := mainHeld
+		if !reading {
+			if mainAll, err = e.held(ctx, queryAllMemory); err != nil {
+				return
+			}
+		}
+		// Up at once, and down slowly: the limits should not follow what
+		// the allocator hands back and takes again.
+		over := max(processRSS()-mainAll-bgHeld, e.bgOver.Load()-total/64, 0)
+		e.bgOver.Store(over)
+		wantMain, wantBg = balancedLimits(roomFor(total, over), mainHeld, bgHeld, reading)
 	}
 	applyLimit(ctx, e, wantMain)
 	applyLimit(ctx, bg, wantBg)
+}
+
+// roomFor is what the two DuckDBs' limits share of total, when the process holds
+// over past what they hold.
+func roomFor(total, over int64) int64 {
+	return max(total-max(over-total/backgroundOver, 0), total/4*backgroundLeast)
 }
 
 // balancedLimits returns the two DuckDBs' limits, out of total, given what

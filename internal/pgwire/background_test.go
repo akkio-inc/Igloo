@@ -330,6 +330,14 @@ func TestHeavyHistory(t *testing.T) {
 	if background, mayMove := h.place("moved"); h.heavy("moved") || background || !mayMove {
 		t.Errorf("one run moved to the second: heavy %v, background %v, may move %v", h.heavy("moved"), background, mayMove)
 	}
+	// One that started again in the background starts there next time, once.
+	h.moved("unseen")
+	if background, _ := h.place("unseen"); !background {
+		t.Error("the next run of one moved does not start in the second DuckDB")
+	}
+	if background, mayMove := h.place("unseen"); background || !mayMove {
+		t.Errorf("the run after that: background %v, may move %v", background, mayMove)
+	}
 	// In the first it takes what it takes: light, and it stays where it is.
 	h.observe("moved", 40*time.Second, false)
 	h.observe("moved", 45*time.Second, false)

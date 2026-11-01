@@ -30,3 +30,23 @@ func TestBalancedLimits(t *testing.T) {
 		}
 	}
 }
+
+// TestRoomFor checks that the limits leave room for what the process holds past
+// what they count.
+func TestRoomFor(t *testing.T) {
+	const total = 16 << 30
+	for _, c := range []struct{ over, want int64 }{
+		{0, total},
+		{1 << 30, total},
+		{2 << 30, total - 1<<30},
+		{3 << 30, total - 2<<30},
+		{100 << 30, 12 << 30},
+	} {
+		if got := roomFor(total, c.over); got != c.want {
+			t.Errorf("%d past what they hold: %d, want %d", c.over, got, c.want)
+		}
+	}
+	if processRSS() < 0 {
+		t.Error("a process holds no less than nothing")
+	}
+}

@@ -106,6 +106,10 @@ type shapeRuns struct {
 	heavy bool
 	// probe counts down to its next run in the first DuckDB.
 	probe int
+	// moved says its last run started again in the background: the next starts
+	// there, as a run that gets far in the first takes the memory of its caches,
+	// and one that fails there says nothing else.
+	moved bool
 }
 
 // sorted returns the CPU of the latest runs, from the least.
@@ -192,15 +196,33 @@ func (h *heavyHistory) place(shape string) (background, mayMove bool) {
 	switch {
 	case r == nil:
 		return false, true
+	case r.moved:
+		r.moved = false
+		return true, false
 	case r.heavy:
 		if r.probe--; r.probe > 0 {
 			return true, false
 		}
 		r.probe = heavyProbeEvery
 		return false, true
+	case r.runs == 0:
+		return false, true
 	}
 	runs := r.sorted()
 	return false, runs[len(runs)/2] >= h.line(shape)
+}
+
+// moved says a run of shape started again in the background.
+func (h *heavyHistory) moved(shape string) {
+	if shape == "" {
+		return
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.shapes[shape] == nil {
+		h.shapes[shape] = &shapeRuns{}
+	}
+	h.shapes[shape].moved = true
 }
 
 // moveAfter is how long a statement not known to be heavy runs before it
@@ -414,6 +436,7 @@ func (s *Server) runPlaced(ctx, outer context.Context, sess *session, st *statem
 	if !fired || ctx.Err() != nil || outer.Err() != nil {
 		return err
 	}
+	s.heavy.moved(sess.wl.shape)
 	s.log.Debug("a statement turned out heavy beside others; starting it again in the background", "ran", ran.Round(time.Millisecond))
 	if bgRan, err := s.runInBackground(ctx, sess, st, args, tw, parts); bgRan {
 		return err
