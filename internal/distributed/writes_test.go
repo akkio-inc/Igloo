@@ -145,6 +145,42 @@ func TestRowWiseFinal(t *testing.T) {
 	}
 }
 
+// TestPartitionFiles checks how many partitions a sample of a fill's rows says it
+// has, and which fills' files are worth writing on workers.
+func TestPartitionFiles(t *testing.T) {
+	for _, c := range []struct {
+		name               string
+		half, all, sampled int64
+		rows, want         float64
+	}{
+		{"all of its rows", 3, 10, 1000, 1000, 10},
+		{"fewer rows than the plan says", 3, 10, 1000, 500, 10},
+		{"a few values, soon all seen", 128, 128, 1 << 20, 6e9, 128},
+		{"rows in the order of the column", 2, 4, 1 << 20, 4 << 20, 16},
+		{"a value a row", 1 << 19, 1 << 20, 1 << 20, 1 << 24, 1 << 24},
+		{"nothing sampled", 0, 0, 0, 100, 0},
+	} {
+		if got := partitionsOf(c.half, c.all, c.sampled, c.rows); got != c.want {
+			t.Errorf("%s: %v partitions, want %v", c.name, got, c.want)
+		}
+	}
+	for _, c := range []struct {
+		name  string
+		bytes int64
+		f     fleet
+		want  float64
+	}{
+		{"a small table on few", 1 << 28, fleet{most: 16}, 2},
+		{"one worker", 1 << 28, fleet{running: 1}, 1},
+		{"a gigabyte a worker", 5 << 30, fleet{most: 16}, 5},
+		{"more than there are", 100 << 30, fleet{most: 16, running: 2}, 16},
+	} {
+		if got := writeTasks(c.bytes, c.f); got != c.want {
+			t.Errorf("%s: %v tasks, want %v", c.name, got, c.want)
+		}
+	}
+}
+
 // TestWriteBounds checks what a task's COPY may hold: little on a small worker,
 // and Iceberg's own row groups on one with room.
 func TestWriteBounds(t *testing.T) {

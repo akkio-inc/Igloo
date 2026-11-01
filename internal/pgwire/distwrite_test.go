@@ -1085,6 +1085,47 @@ func TestWorkersWriteAuto(t *testing.T) {
 	env.checkWrote(t, "w_auto")
 }
 
+// TestWorkersWriteManyPartitionsAuto checks that auto mode has this replica write
+// a table whose files would be small on workers, with the same rows, and workers
+// one of few partitions, and that a statement forced onto workers still goes there.
+func TestWorkersWriteManyPartitionsAuto(t *testing.T) {
+	t.Parallel()
+	env := startWriteServerWith(t, func(o *distributed.Options) { o.MinWorkerWrite = 1 << 20 })
+	rows := "SELECT id, g, x FROM src"
+	partitioned := func(table, by string) {
+		mustExec(t, env.admin, "SET distributed_execution = off")
+		mustExec(t, env.admin, "CREATE TABLE "+table+" AS "+rows+" LIMIT 0")
+		mustExec(t, env.admin, "ALTER TABLE "+table+" SET PARTITIONED BY ("+by+")")
+		mustExec(t, env.admin, "RESET distributed_execution")
+	}
+	partitioned("w_few", "g")
+	mustExec(t, env.admin, "INSERT INTO w_few "+rows)
+	env.checkWrote(t, "w_few")
+
+	partitioned("w_many", "truncate(20, id)")
+	mustExec(t, env.admin, "INSERT INTO w_many "+rows)
+	data, _ := liveFiles(t, env.admin, "w_many")
+	if len(data) == 0 {
+		t.Fatal("no files")
+	}
+	for _, f := range data {
+		if strings.Contains(f, "/"+distributed.SealedDirMark) {
+			t.Fatalf("auto mode had workers write %d files of a table: %s", len(data), f)
+		}
+	}
+	if got, want := env.local(t, "SELECT * FROM w_many ORDER BY ALL"), env.local(t, rows+" ORDER BY ALL"); got != want {
+		t.Errorf("rows differ:\n%.300s\nwant\n%.300s", got, want)
+	}
+
+	partitioned("w_forced", "truncate(20, id)")
+	env.force(t)
+	mustExec(t, env.admin, "INSERT INTO w_forced "+rows)
+	env.checkWrote(t, "w_forced")
+	if data, _ := liveFiles(t, env.admin, "w_forced"); len(data) > 2*2000+2 {
+		t.Errorf("%d files of 2,000 partitions on two workers", len(data))
+	}
+}
+
 // erasedLedger says an erasure request has just deleted files.
 type erasedLedger struct{}
 

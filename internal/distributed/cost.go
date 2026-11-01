@@ -1,6 +1,7 @@
 package distributed
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
@@ -435,6 +436,74 @@ func (x features) writeFits(f fleet) bool {
 	threads := float64(max(f.threads, f.cores, 1))
 	share := float64(f.memory) / float64(taskSlots(f.cores, f.memory))
 	return writeVectorRows*writeVectorHeld*threads*width <= share/2
+}
+
+// PartitionedFills is an Env whose statement fills a partitioned table: the
+// files workers would write of it are as many as its tasks and partitions.
+type PartitionedFills interface {
+	// FillPartitions counts the table's partitions among the first rows of query,
+	// the fill's source: in the first half of them, and in all of them, of sampled
+	// rows. all is zero for a table with no partitions.
+	FillPartitions(ctx context.Context, query string, rows int64) (half, all, sampled int64, err error)
+}
+
+const (
+	// leastPartitionFile is the smallest mean file of a partitioned table workers
+	// write in auto mode. On S3, a file took a thread of a worker about 120 ms
+	// beside its bytes, what about 4 MiB of them take, and more of the coordinator's
+	// time and of every later read: below this, a file costs more than its bytes.
+	// Options.MinWorkerWrite, set below it, lowers it too.
+	leastPartitionFile = 8 << 20
+	// partitionSample and partitionSampleTime bound the look at a fill's first rows:
+	// nothing that long-running fills would notice, and most reads stop early.
+	partitionSample     = 1 << 20
+	partitionSampleTime = 3 * time.Second
+)
+
+// partitionsOf estimates the partitions of a fill of rows rows from a sample of
+// them: what its second half added goes on at that rate, for rows in the order of
+// a partition's column, and ends where it added none.
+func partitionsOf(half, all, sampled int64, rows float64) float64 {
+	rest := rows - float64(sampled)
+	if sampled <= 0 || rest <= 0 {
+		return float64(all)
+	}
+	return float64(all) + float64(all-half)/(float64(sampled)/2)*rest
+}
+
+// writeTasks is about how many tasks read a fill's bytes, as a stage divides a
+// table among workers of f (see execution.stage).
+func writeTasks(bytes int64, f fleet) float64 {
+	most := max(f.most, f.running, 1)
+	want := int((bytes + bytesPerWorker - 1) / bytesPerWorker)
+	return float64(min(max(want, min(2, most)), most))
+}
+
+// partitionFilesFit reports whether the files workers would write of a fill are
+// worth writing there: its tasks each write a file of each partition, so that a
+// table of many gets many small files. It looks at the rows only where the table
+// is partitioned, and goes by what it has if it cannot.
+func (co *Coordinator) partitionFilesFit(ctx context.Context, env Env, query string, x features, f fleet) bool {
+	pf, ok := env.(PartitionedFills)
+	if !ok {
+		return true
+	}
+	ctx, cancel := context.WithTimeout(ctx, partitionSampleTime)
+	defer cancel()
+	half, all, sampled, err := pf.FillPartitions(ctx, query, partitionSample)
+	if err != nil {
+		co.log.Debug("could not count a fill's partitions", "err", err)
+	}
+	if err != nil || all == 0 {
+		return true
+	}
+	parts, tasks := partitionsOf(half, all, sampled, x.rows), writeTasks(x.bytes, f)
+	if x.fillOut()/(tasks*parts) >= min(leastPartitionFile, co.minWorkerWrite()) {
+		return true
+	}
+	co.log.Info("this replica writes a partitioned table, whose files would be small on workers", "partitions", int64(parts), "tasks", int64(tasks),
+		"bytes", int64(x.fillOut()))
+	return false
 }
 
 // defaultMinWorkerWrite is the fewest bytes of files workers write rather

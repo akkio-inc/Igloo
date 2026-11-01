@@ -1000,6 +1000,31 @@ func (e *sessionEnv) Fill() bool { return e.st.fill }
 // FillWrites says workers could write the table the statement fills.
 func (e *sessionEnv) FillWrites() bool { return e.st.writer != nil }
 
+// FillPartitions counts the partitions of the table the statement fills among
+// the first rows of query, as a task's COPY computes them (distributed.PartitionedFills).
+func (e *sessionEnv) FillPartitions(ctx context.Context, query string, rows int64) (half, all, sampled int64, err error) {
+	w := e.st.writer
+	if w == nil || len(w.partitions) == 0 {
+		return 0, 0, 0, nil
+	}
+	first := fmt.Sprintf("SELECT * FROM (%s) LIMIT %d", query, rows)
+	source := strings.Replace(w.sel, distributed.WriteSource, first, 1)
+	res, err := e.sess.conn.QueryContext(ctx, fmt.Sprintf("SELECT count(DISTINCT p) FILTER (WHERE n <= %d), count(DISTINCT p), count(*) FROM "+
+		"(SELECT row_number() OVER () AS n, hash(%s) AS p FROM (%s))", rows/2, strings.Join(w.partitions, ", "), source), nil)
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	defer res.Close() //nolint:errcheck
+	dest := make([]driver.Value, 3)
+	if err := res.Next(dest); err != nil {
+		return 0, 0, 0, err
+	}
+	half, _ = dest[0].(int64)
+	all, _ = dest[1].(int64)
+	sampled, _ = dest[2].(int64)
+	return half, all, sampled, nil
+}
+
 // Others counts the statements running on this replica beside the
 // session's, for auto mode's choice (distributed.Loads).
 func (e *sessionEnv) Others() int { return e.s.othersRunning(e.sess) }
