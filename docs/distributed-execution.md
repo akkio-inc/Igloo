@@ -1035,7 +1035,11 @@ give the workers more memory.
   bytes the worker said. The data file committed is made from what it read.
   Any mismatch commits nothing of the statement, which then runs on the
   replica, and logs an error. A compromised worker can put wrong rows in a
-  table it is writing, as it can return wrong rows to any read, and until its
+  table it is writing, as it can return wrong rows to any read, and its wrong
+  rows can come with statistics that hide them: a file's partition and column
+  bounds come from the statistics in its footer, which the worker wrote, so a
+  filter on such a column, a `DELETE`'s too, can pass them over. Erasure requests
+  hash every row's values, and no statistic hides a row from those. Until its
   credentials expire it can overwrite the files of its own attempt. Nothing
   reads those by then: what is checked and committed is the coordinator's
   copy, in a directory no worker's grant names. It cannot get a file outside
