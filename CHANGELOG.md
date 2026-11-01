@@ -535,6 +535,12 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
 
 ### Distributed execution
 
+- DuckDB's freed buffers go back to the system: Igloo fixes glibc's `mmap`
+  threshold at 128 KiB, where it had risen to as much as 32 MiB with the
+  largest allocation freed. After a sort that returned its rows a process kept
+  0.5 GiB where it had kept 3.4 GiB, with the same CPU seconds over TPC-H,
+  alone and with sessions at once. See
+  [sizing](docs/operations.md#sizing).
 - Bucketed tables stay in place beside what is not bucketed. A join of a table
   bucketed by the join column to another table, or to a relation workers
   compute, shuffles the other side into the table's buckets, by the key's

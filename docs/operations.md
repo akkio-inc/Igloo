@@ -306,6 +306,11 @@ using all of its cores.
   `memory is nearly gone with no statement running` with the session,
   user and statement hash of the statement it canceled last. A statement
   that stops when canceled, and lets DuckDB stop, never leads to either.
+- **Memory that comes back.** Igloo fixes glibc's `mmap` threshold at 128 KiB,
+  so that DuckDB's buffers go back to the system when freed, rather than stay
+  in the allocator's arenas: after a sort that returned its rows, a process
+  kept 0.5 GiB where it had kept 3.4 GiB, with the same CPU seconds over TPC-H.
+  `GLIBC_TUNABLES=glibc.malloc.mmap_threshold=...` sets another.
 - **Spill disk.** Queries that need more memory than the limit write
   temporary files to `IGLOO_DUCKDB_TEMP_DIR`. Give it fast local disk, local
   NVMe where the machine has it ([spill on local NVMe](#spill-on-local-nvme)),

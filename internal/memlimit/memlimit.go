@@ -42,8 +42,10 @@ type Plan struct {
 
 // Apply sets Go's memory limit to what the process's memory leaves after
 // duckdb, DuckDB's memory limit, and Reserve, but at least MinGo, unless
-// GOMEMLIMIT set one. It does nothing when the process's memory is unknown.
+// GOMEMLIMIT set one, or nothing when the process's memory is unknown. It
+// also has what DuckDB frees go back to the system (see mmapThreshold).
 func Apply(duckdb int64) Plan {
+	fixMmapThreshold()
 	total, source := Total()
 	p := Plan{Total: total, Source: source, DuckDB: duckdb}
 	if os.Getenv("GOMEMLIMIT") != "" {
