@@ -288,7 +288,8 @@ and spill. In line, the first ones finish in the time they take alone.
 `SELECT`, `INSERT`, `UPDATE`, `DELETE`, `MERGE`, `COPY` and `CREATE TABLE
 ... AS` count; settings, transaction control, `SHOW`, catalog listings and
 other DDL do not, and neither does a result the [result
-cache](operations.md#result-cache) answers. A statement waiting for this
+cache](operations.md#result-cache) answers, or a query ending in `LIMIT 0`,
+which tools send to learn its columns and runs nothing. A statement waiting for this
 limit says so: `behind the replica's limit of 8 statements at once`.
 
 ### Reservations from history
@@ -298,7 +299,8 @@ spill to disk, and on a busy disk take far longer than one after the other;
 a fixed limit, though, holds back the light statements with the heavy ones.
 Igloo instead learns what each statement holds at once, by its shape (its
 text with string and number literals masked, which a dashboard sends again
-with other audiences, dates and limits), and the next statement of that
+with other audiences, dates and limits, though `LIMIT 0` has a shape of its
+own), and the next statement of that
 shape reserves `IGLOO_STATEMENT_RESERVATIONS` of it (`auto`, the default,
 is all of it) of the replica's memory before it starts, as a role's
 `memory_limit` reserves (see [role limits](#role-limits)). A statement whose

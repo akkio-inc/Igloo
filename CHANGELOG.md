@@ -1908,6 +1908,10 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   large dashboard's statements learned under a twentieth of what they
   allocated, started beside the heavy ones next time and spilled. Runs
   cancelled after ten seconds or more count as needing all the memory.
+- A query ending in `LIMIT 0`, which tools send to learn its columns, has a
+  shape of its own, and does not wait behind the replica's limit: 32 of a
+  dashboard's 96 queries were such, and the shape they shared with the ones
+  that ran said those used next to nothing.
 - A statement reads ahead only the files no statement has lately for the same
   columns: a dashboard's 96 queries, in cache, each parsed the footers of every
   file they read and asked for each of their blocks.
