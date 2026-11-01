@@ -33,7 +33,11 @@ func TestResultsStream(t *testing.T) {
 				n++
 			}
 			rows.Close()
-			if err := rows.Err(); err == nil || !strings.Contains(err.Error(), "a late failure") {
+			// A failing thread marks the statement interrupted, and the thread
+			// reading the rows, seeing the mark before it looks for an error,
+			// may report that instead: on one run in many, all DuckDB says of
+			// the failure.
+			if err := rows.Err(); err == nil || !strings.Contains(err.Error(), "a late failure") && !strings.Contains(err.Error(), "Interrupted!") {
 				t.Fatalf("after %d rows: %v, want the late failure", n, err)
 			}
 			if n == 0 {
