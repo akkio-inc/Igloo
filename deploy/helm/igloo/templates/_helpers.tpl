@@ -174,13 +174,28 @@ key: {{ $otherKey }}
 {{- end -}}
 
 {{/*
-IGLOO_DUCKDB_MEMORY_LIMIT: duckdb.memoryLimit, or 80% of
-resources.limits.memory in MiB but always leaving at least 512Mi for the rest
-of the process, so DuckDB spills to disk before the container reaches its
-limit. (DuckDB allocates beyond its limit for per-thread state, and the Go
-runtime, mapped extensions and spill-file page cache share the container's
-memory; on a 1Gi pod with 18 cores a large aggregation peaked at about 190Mi of
-anonymous memory above DuckDB's limit.) Empty when neither is set.
+DuckDB's memory limit in MiB, of a container's memory limit in MiB (a
+float), where none is set, as Igloo gives it (memlimit.DuckDBLimit): what the
+memory leaves after an eighth of it (at least 512Mi), which Igloo keeps free
+before it lowers DuckDB's limit, and a twentieth in reserve (at least 256Mi),
+less an eighth of the limit itself for what DuckDB holds beyond it as it
+spills, but at least half of the memory.
+*/}}
+{{- define "igloo.duckdbShareMiB" -}}
+{{- $total := float64 . -}}
+{{- $high := maxf (divf $total 8.0) 512.0 -}}
+{{- $reserve := maxf (divf $total 20.0) 256.0 -}}
+{{- floor (maxf (mulf (subf (subf $total $high) $reserve) (divf 8.0 9.0)) (divf $total 2.0)) -}}
+{{- end -}}
+
+{{/*
+IGLOO_DUCKDB_MEMORY_LIMIT: duckdb.memoryLimit, or what igloo.duckdbShareMiB
+leaves of resources.limits.memory, so DuckDB spills to disk before the
+container reaches its limit. (DuckDB allocates beyond its limit for
+per-thread state, and the Go runtime, mapped extensions and spill-file page
+cache share the container's memory; on a 1Gi pod with 18 cores a large
+aggregation peaked at about 190Mi of anonymous memory above DuckDB's limit.)
+Empty when neither is set.
 */}}
 {{- define "igloo.duckdbMemoryLimit" -}}
 {{- if .Values.duckdb.memoryLimit -}}
@@ -199,9 +214,9 @@ anonymous memory above DuckDB's limit.) Empty when neither is set.
 {{- $number := float64 (regexReplaceAll $re $limit "${1}") -}}
 {{- $bytes := mulf $number (float64 (get $unitBytes (regexReplaceAll $re $limit "${2}"))) -}}
 {{- $total := divf $bytes 1048576.0 -}}
-{{- $mib := floor (min (mulf $total 0.8) (subf $total 512.0)) -}}
+{{- $mib := float64 (include "igloo.duckdbShareMiB" $total) -}}
 {{- if lt $mib 256.0 -}}
-{{- fail (printf "igloo: resources.limits.memory %q leaves DuckDB less than 256Mi after a 512Mi reserve; use at least 1Gi, or set duckdb.memoryLimit" $limit) -}}
+{{- fail (printf "igloo: resources.limits.memory %q leaves DuckDB less than 256Mi; use at least 1Gi, or set duckdb.memoryLimit" $limit) -}}
 {{- end -}}
 {{- printf "%dMiB" (int64 $mib) -}}
 {{- end -}}

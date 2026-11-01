@@ -604,6 +604,15 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   the fewest tasks. `EXPLAIN DISTRIBUTED` shows the choice (`fleet`) and
   the ways weighed (`options`), and `query_history.placement` where a
   statement ran and why (see [when](docs/distributed-execution.md#when)).
+- DuckDB's memory limit, where `IGLOO_DUCKDB_MEMORY_LIMIT` does not set it,
+  is what Igloo's memory leaves after the eighth it keeps free before it
+  lowers DuckDB's limit, its reserve and an eighth of the limit itself,
+  about 73% of it, where it was DuckDB's own 80% of the machine (and the
+  Helm chart's 80% of the container's limit): finishing a `count(DISTINCT)`
+  it had spilled, DuckDB holds about 0.1 GiB a thread beyond its limit,
+  and a `count(DISTINCT)` of a billion IDs into a table on a replica of
+  61.6 GiB took 5 GiB more within a second, and was canceled with 2.6 GiB
+  left. With 4.1 GiB less for DuckDB, it would have left 6.7.
 - Auto mode no longer takes a run cut short on the replica, as one the
   guard stopped, for proof that a statement's shape fits there: such a
   run, learned at all of a replica's 53 GB from the query history, made a

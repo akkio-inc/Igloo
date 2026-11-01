@@ -82,6 +82,30 @@ func Reserve(total int64) int64 {
 	return max(total/20, 256<<20)
 }
 
+// DuckDBLimit is the memory limit Igloo gives DuckDB of total, the memory
+// the process may use, where none is configured: what total leaves after
+// High(total), which Adapt keeps free, and the Reserve, less an eighth of
+// the limit itself for what DuckDB holds beyond it as it spills, but at
+// least half of total. It is zero when total is.
+//
+// DuckDB's own default, 80% of the machine's memory, left too little
+// beside it. Finishing a count(DISTINCT) it had spilled, DuckDB held 0.07
+// to 0.12 GiB a thread beyond its limit, 1.2 to 3 GiB at 24 threads under
+// limits of 4 to 16 GiB, and a few hundred MiB at 4; at 24 threads on a
+// replica of 61.6 GiB, with the metadata database and the catalog beside
+// it, a count(DISTINCT) of a billion IDs into a table took 5 GiB more
+// within a second, 69 s in, faster than Adapt lowers the limit, and the
+// watch canceled it with 2.6 GiB left. DuckDB runs a thread for each 2 GiB
+// of its limit past the cores (see the engine's threads), so an eighth of
+// the limit is about 0.25 GiB a thread. That replica's DuckDB now has
+// 45.2 GiB, not 49.3.
+func DuckDBLimit(total int64) int64 {
+	if total <= 0 {
+		return 0
+	}
+	return max((total-High(total)-Reserve(total))/9*8, total/2)
+}
+
 // GoLimit is the memory limit for Go: what total leaves after DuckDB's
 // limit and the reserve, but at least MinGo.
 func GoLimit(total, duckdb int64) int64 {

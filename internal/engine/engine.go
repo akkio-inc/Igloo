@@ -23,6 +23,7 @@ import (
 	"github.com/akkio-inc/igloo/internal/catalog"
 	"github.com/akkio-inc/igloo/internal/catalogproxy"
 	"github.com/akkio-inc/igloo/internal/config"
+	"github.com/akkio-inc/igloo/internal/memlimit"
 	"github.com/akkio-inc/igloo/internal/models"
 	"github.com/akkio-inc/igloo/internal/policy"
 	"github.com/akkio-inc/igloo/internal/prefetch"
@@ -890,12 +891,28 @@ func threadsFor(cfg config.Config, perCore int, memory int64) int {
 	return 0
 }
 
-// configure applies cfg's DuckDB settings with exec, then its threads (see
-// threadsFor), which depend on the memory limit those settings leave, as
-// query reads it.
+// processMemory is the memory the process may use (memlimit.Total), zero
+// where it cannot be read. A variable, for tests.
+var processMemory = func() int64 {
+	total, _ := memlimit.Total()
+	return total
+}
+
+// configure applies cfg's DuckDB settings with exec, its memory limit
+// memlimit.DuckDBLimit of the process's memory where cfg sets none, then
+// its threads (see threadsFor), which depend on the memory limit those
+// settings leave, as query reads it.
 func configure(cfg config.Config, perCore int, exec func(string) error, query func(string) (string, error)) error {
 	d := cfg.DuckDB
 	d.Threads = 0
+	if d.MemoryLimit == "" {
+		// DuckDB's own default, 80% of the machine's memory, leaves too
+		// little for what it holds past its limit as it spills, beside
+		// the rest of the process and the memory watch's margins.
+		if n := memlimit.DuckDBLimit(processMemory()); n > 0 {
+			d.MemoryLimit = fmt.Sprintf("%dMiB", n>>20)
+		}
+	}
 	for _, stmt := range settingStatements(d) {
 		if err := exec(stmt); err != nil {
 			return fmt.Errorf("configure duckdb (%s): %w", stmt, err)

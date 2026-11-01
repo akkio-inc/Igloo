@@ -236,10 +236,21 @@ statements, `CREATE SECRET` and credential settings are replaced by `'***'`.
 Each Igloo replica is a complete query engine. A query runs on one replica,
 using all of its cores.
 
-- **Memory** is what matters most. DuckDB uses up to 80% of the memory it
-  sees, or `IGLOO_DUCKDB_MEMORY_LIMIT`. Under Kubernetes, set the limit to
-  about 80% of the container's memory limit (the Helm chart does this) so the
-  kernel does not kill the process. The rest of Igloo (the SQL endpoints,
+- **Memory** is what matters most. DuckDB uses up to
+  `IGLOO_DUCKDB_MEMORY_LIMIT`, by default what the container's memory limit,
+  or else the machine's memory, leaves after an eighth of it (at least
+  512 MiB), which Igloo keeps free before it lowers DuckDB's limit (below),
+  and a reserve of a twentieth (at least 256 MiB), less an eighth of the
+  limit itself, for what DuckDB holds beyond it as it spills; at least half
+  of the memory. That is about 73%: 45.2 GiB of 61.6. DuckDB's own default,
+  80%, left too little: finishing a `count(DISTINCT)` it had spilled, DuckDB
+  held 0.07 to 0.12 GiB a thread beyond its limit, 1.2 to 3 GiB at 24
+  threads, and at 24 threads on a replica of 61.6 GiB, with the metadata
+  database and the catalog beside it, a `count(DISTINCT)` of a billion IDs
+  into a table took 5 GiB more within a second, and Igloo canceled it to
+  keep the kernel from killing the process. Under Kubernetes the Helm chart
+  sets the same limit from the container's memory limit, so the kernel does
+  not kill the process. The rest of Igloo (the SQL endpoints,
   the catalog proxy, [table maintenance](#compaction-memory)) runs in the
   same process, in Go. Igloo limits Go's memory to what the container's
   memory limit, or else the machine's memory, leaves after DuckDB's limit

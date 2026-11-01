@@ -89,8 +89,8 @@ storage:
     existingSecret: ""
 
 duckdb:
-  # -> IGLOO_DUCKDB_MEMORY_LIMIT, e.g. "6GB". Empty: 80% of
-  # resources.limits.memory, leaving at least 512Mi for the rest of the
+  # -> IGLOO_DUCKDB_MEMORY_LIMIT, e.g. "6GB". Empty: about 73% of
+  # resources.limits.memory, as Igloo leaves room for the rest of the
   # process, so queries spill to disk before the container is OOM-killed.
   memoryLimit: ""
   # -> IGLOO_DUCKDB_THREADS. null: two per core of the node (four on workers),
@@ -485,7 +485,7 @@ workers:
     instanceType: ""
     spot: false
     duckdb:
-      # Empty: 80% of resources.limits.memory, as for workers; igloo pods
+      # Empty: about 73% of resources.limits.memory, as for workers; igloo pods
       # also get it as IGLOO_LARGE_WORKER_MEMORY, for estimates while the
       # large worker is stopped.
       memoryLimit: ""

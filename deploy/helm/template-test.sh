@@ -41,7 +41,7 @@ render -f test-values/pools.yaml >"$work/pools.yaml"
 check "a pool's Deployment knows its pool" '"acme"' "$(env_of Deployment igloo-pool-acme IGLOO_POOL)"
 check "and its price" '"2.72"' "$(env_of Deployment igloo-pool-acme IGLOO_PRICE_PER_HOUR)"
 check "a pool leaves maintenance to the default pool" '"false"' "$(env_of Deployment igloo-pool-acme IGLOO_MAINTENANCE)"
-check "DuckDB's memory follows the pool's limit" '"52428MiB"' "$(env_of Deployment igloo-pool-acme IGLOO_DUCKDB_MEMORY_LIMIT)"
+check "DuckDB's memory follows the pool's limit" '"48059MiB"' "$(env_of Deployment igloo-pool-acme IGLOO_DUCKDB_MEMORY_LIMIT)"
 check "a pool adds its extraEnv to the release's" 'analytics|2h' \
   "$(env_of Deployment igloo-pool-acme IGLOO_CATALOG_SCHEMA)|$(env_of Deployment igloo-pool-acme IGLOO_STATEMENT_TIMEOUT)"
 check "a pool that scales to zero leaves its replicas to its gateway" "" "$(doc Deployment igloo-pool-acme | grep -E '^  replicas:' || true)"
@@ -123,7 +123,7 @@ envf() { docf "$1" "$2" "$3" | grep -A1 -E "^ +- name: $4\$" | sed -n 's/^ *valu
 lw() { envf "$work/large.yaml" Deployment igloo "$1"; }
 check "igloo pods find the large worker" '"igloo-workers-large:7433"|kubernetes|"igloo-workers-large"' \
   "$(lw IGLOO_LARGE_WORKER)|$(lw IGLOO_LARGE_WORKER_COMPUTE)|$(lw IGLOO_LARGE_WORKER_K8S_DEPLOYMENT)"
-check "and know its size and price" '"60"|"367001MiB"|"4.35"' \
+check "and know its size and price" '"60"|"336418MiB"|"4.35"' \
   "$(lw IGLOO_LARGE_WORKER_CORES)|$(lw IGLOO_LARGE_WORKER_MEMORY)|$(lw IGLOO_LARGE_WORKER_PRICE_PER_HOUR)"
 check "and the workers' price" '"0.31"' "$(lw IGLOO_WORKER_PRICE_PER_HOUR)"
 check "and the machines, for list prices" '"m7gd.4xlarge"|"true"|"us-east-2"|"r7gd.16xlarge"|' \

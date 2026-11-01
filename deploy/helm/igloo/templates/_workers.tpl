@@ -139,8 +139,9 @@ from it. Call with (list "<setting name>" "<quantity>").
 {{- end -}}
 
 {{/*
-A worker's IGLOO_DUCKDB_MEMORY_LIMIT: workers.duckdb.memoryLimit, or 80% of
-workers.resources.limits.memory leaving at least 512Mi, as for igloo pods.
+A worker's IGLOO_DUCKDB_MEMORY_LIMIT: workers.duckdb.memoryLimit, or what
+igloo.duckdbShareMiB leaves of workers.resources.limits.memory, as for igloo
+pods.
 The large worker's comes from workers.large the same way.
 */}}
 {{- define "igloo.workerMemoryLimit" -}}
@@ -157,9 +158,9 @@ The large worker's comes from workers.large the same way.
 {{- else -}}
 {{- with $w.resources -}}{{- with .limits -}}{{- with .memory -}}
 {{- $total := float64 (include "igloo.quantityMiB" (list (printf "%sresources.limits.memory" $prefix) .)) -}}
-{{- $mib := floor (min (mulf $total 0.8) (subf $total 512.0)) -}}
+{{- $mib := float64 (include "igloo.duckdbShareMiB" $total) -}}
 {{- if lt $mib 256.0 -}}
-{{- fail (printf "igloo: %sresources.limits.memory leaves DuckDB less than 256Mi after a 512Mi reserve; use at least 1Gi, or set %sduckdb.memoryLimit" $prefix $prefix) -}}
+{{- fail (printf "igloo: %sresources.limits.memory leaves DuckDB less than 256Mi; use at least 1Gi, or set %sduckdb.memoryLimit" $prefix $prefix) -}}
 {{- end -}}
 {{- printf "%dMiB" (int64 $mib) -}}
 {{- end -}}{{- end -}}{{- end -}}

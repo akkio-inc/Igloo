@@ -163,9 +163,10 @@ pass for each cloud.
   release whose `admin.password` is shorter than 16 characters, move it into
   such a Secret, or give the admin a long password with `ALTER USER` and set
   `admin.password` to it.
-- **Memory**: unless `duckdb.memoryLimit` is set, DuckDB gets 80% of
-  `resources.limits.memory`, leaving at least 512Mi for the rest of the process
-  (1Gi gives DuckDB 512MiB, 8Gi gives 6553MiB), and spills larger queries to
+- **Memory**: unless `duckdb.memoryLimit` is set, DuckDB gets what Igloo
+  would give it of `resources.limits.memory` (see [sizing](../../../docs/operations.md#sizing)):
+  about 73%, at least half (1Gi gives DuckDB 512MiB, 8Gi gives 6007MiB,
+  64Gi 48059MiB), and spills larger queries to
   `/var/lib/igloo/tmp` (`duckdb.spillVolume`). Keep a memory limit set: DuckDB
   allocates somewhat beyond its own limit, and spill files are written through
   the page cache, which counts against the container.
@@ -431,7 +432,7 @@ workers:
   `IGLOO_LARGE_WORKER_COMPUTE=kubernetes`,
   `IGLOO_LARGE_WORKER_K8S_DEPLOYMENT`, `IGLOO_LARGE_WORKER_CORES` (whole
   cores of `requests.cpu`), `IGLOO_LARGE_WORKER_MEMORY` (its DuckDB memory
-  limit, `workers.large.duckdb.memoryLimit` or 80% of
+  limit, `workers.large.duckdb.memoryLimit` or about 73% of
   `resources.limits.memory`, for estimates while it is stopped) and
   `IGLOO_LARGE_WORKER_PRICE_PER_HOUR`.
 - Each compute pool with workers gets a large worker of its own,
@@ -469,7 +470,7 @@ workers:
 | `storage.s3.stsRoleArn` | `""` | `IGLOO_S3_STS_ROLE_ARN`: role Igloo assumes to hand other engines credentials limited to one table. Empty on AWS: engines get metadata but no credentials. |
 | `storage.gcs.existingSecret` | `""` | Keys `hmac-key-id`, `hmac-secret` for `IGLOO_GCS_HMAC_*`; required for `gs://` |
 | `storage.azure.existingSecret` | `""` | Key `account-key` for `IGLOO_AZURE_ACCOUNT_KEY`. Empty: workload identity. |
-| `duckdb.memoryLimit` | `""` | `IGLOO_DUCKDB_MEMORY_LIMIT`, e.g. `6GB`. Empty: 80% of `resources.limits.memory`, leaving at least 512Mi. |
+| `duckdb.memoryLimit` | `""` | `IGLOO_DUCKDB_MEMORY_LIMIT`, e.g. `6GB`. Empty: about 73% of `resources.limits.memory`, at least half (see Memory, above). |
 | `duckdb.threads` | `null` | `IGLOO_DUCKDB_THREADS`; null: two per core, as memory allows |
 | `duckdb.maxTempSize` | `""` | `IGLOO_DUCKDB_MAX_TEMP_SIZE`; empty: 90% of `duckdb.spillVolume.sizeLimit`, so an oversized query fails instead of the pod being evicted |
 | `duckdb.spillVolume.sizeLimit` | `50Gi` | Size of the spill `emptyDir` |

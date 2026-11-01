@@ -99,6 +99,41 @@ func TestPlan(t *testing.T) {
 	}
 }
 
+// TestDuckDBLimit checks the limit Igloo gives DuckDB where none is
+// configured: what the process's memory leaves after High, which Adapt
+// keeps free, the reserve, and an eighth of the limit, which DuckDB holds
+// beyond it as it spills; at least half of the memory.
+func TestDuckDBLimit(t *testing.T) {
+	const gib = float64(1 << 30)
+	// The benchmark's replica: 61.6 GiB, where DuckDB's own default gave it
+	// 49.3, and a count(DISTINCT) of a billion IDs was canceled with 2.6
+	// GiB left after taking 5 GiB more within a second, with 7.6 left
+	// before. 4.1 GiB less for DuckDB leaves the watch 6.7 GiB.
+	total := int64(66_169_339_904)
+	l := DuckDBLimit(total)
+	if got := float64(l) / gib; got < 45.1 || got > 45.3 {
+		t.Errorf("61.6 GiB: DuckDB %.2f GiB", got)
+	}
+	others := total - total*8/10 - int64(76)<<30/10
+	if after := total - l - others - 5<<30; after < Low(total) || float64(after)/gib < 6.5 {
+		t.Errorf("the benchmark's statement leaves %s", Format(after))
+	}
+	// What is left covers High, the reserve and an eighth of the limit, and
+	// Go's limit, past the reserve, all but High and that eighth.
+	if rest := total - l; rest < High(total)+Reserve(total)+l/8 {
+		t.Errorf("61.6 GiB: %s left beside DuckDB's %s", Format(rest), Format(l))
+	}
+	for _, c := range []struct{ total, want int64 }{
+		{8 << 30, 6007 << 20}, // (8192 - 1024 - 409.6) MiB * 8/9
+		{1 << 30, 512 << 20},  // half: High and the reserve take 768 MiB
+		{0, 0},
+	} {
+		if got := DuckDBLimit(c.total); got>>20 != c.want>>20 {
+			t.Errorf("%s: DuckDB %s, want %s", Format(c.total), Format(got), Format(c.want))
+		}
+	}
+}
+
 func TestFormat(t *testing.T) {
 	for n, want := range map[int64]string{512: "512 B", 1536: "1.5 KiB", 3 << 20: "3.0 MiB", 30 << 30: "30.0 GiB"} {
 		if got := Format(n); got != want {
