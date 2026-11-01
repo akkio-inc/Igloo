@@ -96,7 +96,7 @@ var errErased = errors.New("an erasure request had the worker purge what it dele
 func (w *Worker) admit(ctx context.Context, t *runningTask) (done func(), err error) {
 	w.erasureMu.Lock()
 	defer w.erasureMu.Unlock()
-	if t.erased > w.purged.Load() {
+	if notLater(t.erased) > w.purged.Load() {
 		if err := w.purgeLocked(ctx, t.erased); err != nil {
 			return nil, fmt.Errorf("the worker could not purge what erasure requests deleted before it runs the task: %w", err)
 		}
@@ -107,11 +107,18 @@ func (w *Worker) admit(ctx context.Context, t *runningTask) (done func(), err er
 	return w.begin(t), nil
 }
 
+// notLater is n, a time in Unix nanoseconds that erasure's protocol carries,
+// or now if that is earlier.
+func notLater(n int64) int64 { return min(n, time.Now().UnixNano()) }
+
 // purgeLocked purges the worker of what erasure requests deleted through
 // through, in Unix nanoseconds. w.erasureMu is held, so no task begins
 // meanwhile.
 func (w *Worker) purgeLocked(ctx context.Context, through int64) error {
-	target := max(through, w.admitted.Load())
+	// Purged now, of what was deleted by now: never of what is yet to be, which
+	// anything that holds the worker secret could say, to have this worker
+	// purge nothing for the requests to come. A later deletion is more to purge.
+	target := max(notLater(through), w.admitted.Load())
 	// From now on, tasks of statements that began before are refused; those
 	// running are canceled, and the purge waits for them, so that nothing
 	// they read goes back into the cache after it.
@@ -269,7 +276,7 @@ func (w *Worker) servePurge(rw http.ResponseWriter, r *http.Request) {
 	}
 	w.erasureMu.Lock()
 	var err error
-	if req.Through > w.purged.Load() {
+	if notLater(req.Through) > w.purged.Load() {
 		err = w.purgeLocked(r.Context(), req.Through)
 	}
 	w.erasureMu.Unlock()
@@ -282,14 +289,32 @@ func (w *Worker) servePurge(rw http.ResponseWriter, r *http.Request) {
 }
 
 // noteErased records that erasure requests deleted files through n, Unix
-// nanoseconds, which the coordinator's next statements' tasks carry.
+// nanoseconds, which the coordinator's next statements' tasks carry. n, from
+// a worker's answer, is no later than now: a far later one would keep the
+// coordinator's statements from seeing the deletions to come (ErasedSince).
 func (co *Coordinator) noteErased(n int64) {
+	n = notLater(n)
 	for {
 		cur := co.erased.Load()
 		if n <= cur || co.erased.CompareAndSwap(cur, n) {
 			return
 		}
 	}
+}
+
+// erasedSkew is how far ahead of this replica's clock a worker's says it was
+// purged and is still believed: its clock may run ahead, but a worker purges
+// through no later than its now, so anything further was never true of it.
+const erasedSkew = time.Minute
+
+// purgedThrough is what a worker's status says it was purged through, or none
+// where that is later than it can have been, as one of an older version told
+// by another that held the worker secret may still say: it purges again.
+func purgedThrough(erased int64) int64 {
+	if erased > time.Now().Add(erasedSkew).UnixNano() {
+		return 0
+	}
+	return erased
 }
 
 // ErasureLedger is where erasure requests (package erasure) keep what they
@@ -355,6 +380,7 @@ func (co *Coordinator) PurgeWorkers(ctx context.Context, ledger ErasureLedger) e
 				errs[i] = ledger.WorkerSeen(ctx, name, "", name+" at "+w.addr+", Igloo "+st.Version, time.Now())
 				return
 			}
+			st.Erased = purgedThrough(st.Erased)
 			if through > st.Erased {
 				purged, err := co.pool.purge(ctx, w.addr, through)
 				if err != nil {
@@ -367,7 +393,7 @@ func (co *Coordinator) PurgeWorkers(ctx context.Context, ledger ErasureLedger) e
 				errs[i] = errors.Join(errs[i], err)
 				return
 			}
-			if through > 0 && st.Erased >= through {
+			if through > 0 && purgedThrough(st.Erased) >= through {
 				errs[i] = errors.Join(errs[i], ledger.Emptied(ctx, st.Cache, latest, ""))
 			}
 		})
