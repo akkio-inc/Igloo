@@ -515,6 +515,9 @@ func (co *Coordinator) planOn(ctx context.Context, query string, env Env, mode M
 	shape := ""
 	if mode == ModeAuto && !dry && sizes == nil && onLarge == nil {
 		shape = planKey(stmt, nil)
+		if u := co.staysHere(shape, env, len(ws)); u != nil {
+			return nil, nil, u
+		}
 	}
 	ctx = withDescribes(ctx)
 	values, err := co.computedValues(ctx, env, stmt)

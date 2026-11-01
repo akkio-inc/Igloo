@@ -857,6 +857,10 @@ distributed, but only on workers already running and on no more of them
 than the automatic decision would use; it never starts a worker. So no user can
 start a fleet of machines, or keep one busy, by repeating a query.
 
+A statement whose last runs already decide that it stays on the replica, as
+one that took under the threshold there, does not plan for workers again: its
+first run pays for that, and a run far past what it took plans again.
+
 Planning a statement for workers ends with the session's
 `statement_timeout` and a cancel request, which end `EXPLAIN DISTRIBUTED`
 as they end any statement; a part whose relations workers compute nest
