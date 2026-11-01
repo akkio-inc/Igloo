@@ -771,10 +771,10 @@ func TestGuardGate(t *testing.T) {
 }
 
 // TestGuardAfter checks when the guard runs a statement auto mode ran here
-// on workers instead: past three times its estimate here, times the
-// statements sharing the replica, and only once its run here has taken as
-// long as the workers' estimate, start included; never before the minimum
-// or a run's budget.
+// on workers instead: past three times its estimate here, or its estimate
+// once while other statements run beside it, and only once its run here
+// has taken as long as the workers' estimate, start included; never before
+// the minimum or a run's budget.
 func TestGuardAfter(t *testing.T) {
 	const s = time.Second
 	for _, c := range []struct {
@@ -786,24 +786,27 @@ func TestGuardAfter(t *testing.T) {
 		// E1-like at ten times the data: estimated at 13 s here and 30 s on
 		// workers; it took 58 to 97 s here and 50 s on workers. The fixed
 		// 90 s floor let it run 90 s here first.
-		{"E1-like at 10x", 13 * s, 30 * s, 0, 1, 39 * s},
+		{"E1-like at 10x", 13 * s, 30 * s, 0, 0, 39 * s},
 		// Workers stopped: their start counts, and the run here may take as
 		// long before it moves.
-		{"E1-like at 10x, workers stopped", 13 * s, 75 * s, 0, 1, 75 * s},
+		{"E1-like at 10x, workers stopped", 13 * s, 75 * s, 0, 0, 75 * s},
 		// F3-like at ten times the data: 51 s here by the estimate, 1,798 s
 		// in fact; 168 s estimated on workers, 150 to 190 s in fact.
-		{"F3-like at 10x", 51 * s, 168 * s, 0, 1, 168 * s},
+		{"F3-like at 10x", 51 * s, 168 * s, 0, 0, 168 * s},
 		// A short statement waits the minimum, not three times its estimate.
-		{"short", 2 * s, 5 * s, 0, 1, guardMinimum},
-		// Eight statements at once share the replica: each takes about
-		// eight times as long, which is no reason to move any.
-		{"one of eight at once", 13 * s, 30 * s, 0, 8, 312 * s},
+		{"short", 2 * s, 5 * s, 0, 0, guardMinimum},
+		// Beside other statements, which it takes cores from: its estimate
+		// once, here the workers' estimate. A report estimated at 65 s here
+		// ran 577 s beside 16 users' dashboards, the guard waiting 17
+		// times three times its estimate.
+		{"beside seven others", 13 * s, 30 * s, 0, 7, 30 * s},
+		{"F5-like beside dashboards", 65 * s, 61 * s, 0, 16, 65 * s},
 		// Workers estimated far slower than the run here: it is not moved
 		// before it has run as long as they would take.
-		{"workers far slower", 10 * s, 600 * s, 0, 1, 600 * s},
+		{"workers far slower", 10 * s, 600 * s, 0, 0, 600 * s},
 		// Tried here after a run of 200 s on workers.
-		{"budget", 14 * s, 30 * s, 200 * s, 1, 200 * s},
-		{"workers' estimate unknown", 13 * s, 0, 0, 1, 90 * s},
+		{"budget", 14 * s, 30 * s, 200 * s, 0, 200 * s},
+		{"workers' estimate unknown", 13 * s, 0, 0, 0, 90 * s},
 	} {
 		if got := guardAfter(c.est, c.alt, c.budget, c.load); got != c.want {
 			t.Errorf("%s: after %s, want %s", c.name, got, c.want)
@@ -815,10 +818,156 @@ func TestGuardAfter(t *testing.T) {
 	// at most when the workers' estimate holds and the guard is not held
 	// back by three times the estimate here.
 	for _, c := range []struct{ est, alt time.Duration }{{13 * s, 30 * s}, {51 * s, 168 * s}, {5 * s, 40 * s}} {
-		after := guardAfter(c.est, c.alt, 0, 1)
+		after := guardAfter(c.est, c.alt, 0, 0)
 		if worst := float64(after+c.alt) / float64(c.alt); after > max(3*c.est, c.alt, guardMinimum) || worst > 2 && after != 3*c.est {
 			t.Errorf("estimated %s here, %s on workers: after %s, up to %.1f times the workers' time", c.est, c.alt, after, worst)
 		}
+	}
+}
+
+// A heavy statement auto mode runs here does not take the replica's cores
+// from short ones: started beside another statement, it runs on workers;
+// running here alone when one starts beside it, the guard moves it to the
+// workers within the guard's time, not three times its estimate; and the
+// short statement beside it completes within a bound meanwhile. At ten
+// times the data, beside 16 users' dashboards, a report estimated at 65 s
+// here ran 577 s, the dashboards' median rising from 4 ms to 23 s.
+func TestHeavyBesideShort(t *testing.T) {
+	ds := startDistServer(t, 2)
+	// Estimated at about 45 s here, under the threshold alone; twice that
+	// beside another statement, over it, and the workers far faster.
+	ds.source.size = 300 << 20
+	defer func(a, s float64, m time.Duration) { guardAlternative, guardShared, guardMinimum = a, s, m }(guardAlternative, guardShared, guardMinimum)
+	guardAlternative, guardShared, guardMinimum = 0, 0, 300*time.Millisecond
+	ctx := context.Background()
+	heavyConn := ds.testServer.admin(t, pgx.QueryExecModeSimpleProtocol)
+	shortConn := ds.testServer.admin(t, pgx.QueryExecModeSimpleProtocol)
+	for _, c := range []*pgx.Conn{heavyConn, shortConn} {
+		mustExec(t, c, "SET search_path = 'lake.public,memory.main'")
+	}
+	read := func(conn *pgx.Conn, query string) (string, error) {
+		rows, err := conn.Query(ctx, query)
+		if err != nil {
+			return "", err
+		}
+		var b strings.Builder
+		for rows.Next() {
+			vals, err := rows.Values()
+			if err != nil {
+				return "", err
+			}
+			fmt.Fprintln(&b, vals...)
+		}
+		return b.String(), rows.Err()
+	}
+	guarded := "SELECT amount, count(*) AS n FROM orders GROUP BY amount ORDER BY amount"
+	placed := "SELECT amount, sum(id) AS s FROM orders GROUP BY amount ORDER BY amount"
+	mustExec(t, heavyConn, "SET distributed_execution = off")
+	wantGuarded, err := read(heavyConn, guarded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantPlaced, err := read(heavyConn, placed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustExec(t, heavyConn, "RESET distributed_execution")
+
+	var heavyHere, placedHere atomic.Int32
+	besideStarted := make(chan struct{}, 4)
+	release := make(chan struct{})
+	ds.srv.failLocal = func(ctx context.Context, st *statement) error {
+		switch {
+		case strings.Contains(st.query, "count(*) AS n FROM orders"):
+			// Heavy here: it runs until stopped.
+			heavyHere.Add(1)
+			<-ctx.Done()
+			return ctx.Err()
+		case strings.Contains(st.query, "sum(id) AS s FROM orders"):
+			placedHere.Add(1)
+		case strings.Contains(st.query, "'beside'"):
+			// A short statement's session, running while the test holds it.
+			besideStarted <- struct{}{}
+			<-release
+		}
+		return nil
+	}
+	defer func() { ds.srv.failLocal = nil }()
+
+	// Alone, the heavy statement runs here; once a statement starts
+	// beside it, the guard moves it to the workers.
+	heavyDone := make(chan error, 1)
+	var got string
+	go func() {
+		var err error
+		got, err = read(heavyConn, guarded)
+		heavyDone <- err
+	}()
+	deadline := time.Now().Add(20 * time.Second)
+	for heavyHere.Load() == 0 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if heavyHere.Load() == 0 {
+		t.Fatal("the heavy statement did not start here")
+	}
+	besideDone := make(chan error, 1)
+	start := time.Now()
+	go func() {
+		_, err := read(shortConn, "SELECT 'beside' AS x")
+		besideDone <- err
+	}()
+	<-besideStarted
+	select {
+	case err := <-heavyDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("the guard did not move the heavy statement while another ran beside it")
+	}
+	moved := time.Since(start)
+	close(release)
+	if err := <-besideDone; err != nil {
+		t.Fatal(err)
+	}
+	if got != wantGuarded {
+		t.Errorf("moved:\n%s\nwant:\n%s", got, wantGuarded)
+	}
+	if q := lastRun(t, ds.history, guarded); q.Workers == 0 || !strings.Contains(q.Placement, "moved by the guard") {
+		t.Errorf("moved: %d workers, placement %q", q.Workers, q.Placement)
+	}
+	// Within the guard's minimum and a check or two, far short of three
+	// times its estimate of about 45 s.
+	if moved > 10*time.Second {
+		t.Errorf("moved after %s beside another statement", moved)
+	}
+
+	// Started beside another statement, a heavy statement runs on workers
+	// at once, and the short statement beside it completes meanwhile.
+	release = make(chan struct{})
+	besideDone = make(chan error, 1)
+	go func() {
+		_, err := read(shortConn, "SELECT 'beside' AS x")
+		besideDone <- err
+	}()
+	<-besideStarted
+	got, err = read(heavyConn, placed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	close(release)
+	shortStart := time.Now()
+	if err := <-besideDone; err != nil {
+		t.Fatal(err)
+	}
+	if short := time.Since(shortStart); short > 5*time.Second {
+		t.Errorf("the short statement took %s to finish once released", short)
+	}
+	if got != wantPlaced || placedHere.Load() != 0 {
+		t.Errorf("placed: ran here %d times\n%s\nwant:\n%s", placedHere.Load(), got, wantPlaced)
+	}
+	if q := lastRun(t, ds.history, placed); q.Workers == 0 || !strings.Contains(q.Placement, "other statements run on this replica") {
+		t.Errorf("placed: %d workers, placement %q", q.Workers, q.Placement)
 	}
 }
 

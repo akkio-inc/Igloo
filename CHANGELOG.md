@@ -604,6 +604,17 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   the fewest tasks. `EXPLAIN DISTRIBUTED` shows the choice (`fleet`) and
   the ways weighed (`options`), and `query_history.placement` where a
   statement ran and why (see [when](docs/distributed-execution.md#when)).
+- A heavy statement no longer takes the replica's cores from short ones
+  where workers are configured, with nothing to set: auto mode weighs the
+  replica's time at as many times as long as the statements running on it
+  beside the one it plans, up to four, so a heavy statement started among
+  dashboards' runs on workers; and the guard moves a heavy statement that
+  runs on the replica to workers once it has run its estimate while others
+  run beside it, weighing it again every second, where it had waited
+  three times its estimate times the statements running when it started,
+  and so never fired under load. At ten times the data, beside 16 users'
+  dashboards and two ELT streams, a report that had run in 25 s on the
+  replica ran 577 s there, the dashboards' median rising from 4 ms to 23 s.
 - A relation of uncertain size, as an audience filtered to one version of
   a lookup, whose tables' statistics bound it under what every worker may
   read (a `GROUP BY` or `DISTINCT` of columns by their distinct counts,

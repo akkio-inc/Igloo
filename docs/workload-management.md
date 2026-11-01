@@ -205,6 +205,21 @@ How limits are enforced:
 ([metrics](operations.md#monitoring)) show how often limits hold statements
 back.
 
+### Heavy statements beside short ones
+
+With workers configured ([distributed
+execution](distributed-execution.md)), nothing needs setting for a heavy
+statement not to take the replica's cores from short ones: auto mode runs a
+heavy statement on workers when other statements run on the replica beside
+it, as it weighs the replica's time at as many times as long as the
+statements sharing it, up to four; and the guard moves a heavy statement
+that runs on the replica to workers once it has run its estimate while
+others run beside it, rather than three times it (see [beside other
+statements](distributed-execution.md#when)). `IGLOO_WORKER_THRESHOLD`
+sets how long a statement must take for workers to be worth it. Without
+workers, the replica's limit below and roles' limits hold heavy statements
+back.
+
 ### The replica's limit
 
 `IGLOO_MAX_CONCURRENT_STATEMENTS` limits the queries and changes of data

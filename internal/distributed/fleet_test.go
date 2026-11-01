@@ -279,6 +279,51 @@ func TestFleetChoice(t *testing.T) {
 	}
 }
 
+// TestChooseShared checks that statements running beside one on the
+// replica send a heavy statement to workers rather than take their cores:
+// F5-like at ten times the data, estimated at 65 s here and 73 s on 16
+// workers, runs here alone and on workers beside three others; one that
+// ran in 25 s here and 66 s on 16 workers alone, as F5-like did, runs here
+// alone and on workers beside three (it ran 577 s here beside 16 users'
+// dashboards), and so does one that ran in 25 s here alone, never on
+// workers; a dashboard's statement of 3 s stays here beside ten.
+func TestChooseShared(t *testing.T) {
+	now := time.Now()
+	f5 := features{bytes: 9.2562e9, exchanged: 3.922e10, held: 9.2562e9, rows: 1.3863e10, levels: 9, stages: 28, planned: true, planSet: 3.1e10}
+	decide := func(x features, others int, r runs, found bool) (bool, string) {
+		t.Helper()
+		e := x.estimate(scaleCoordinator, benchWorkers)
+		e.others = others
+		if found {
+			e.pick(r, benchWorkers)
+		}
+		workers, _, reason := choose(e, r, found, DefaultThreshold, now)
+		return workers, reason
+	}
+	if workers, reason := decide(f5, 0, runs{}, false); workers {
+		t.Errorf("F5-like alone: workers (%s)", reason)
+	}
+	if workers, reason := decide(f5, 3, runs{}, false); !workers || !strings.Contains(reason, "3 other statements run on this replica") {
+		t.Errorf("F5-like beside three: workers %v (%s)", workers, reason)
+	}
+	r := runs{local: 25, dist: 66, distWorkers: 16, fleets: map[int]float64{fleetBucket(16): 66}, explored: now}
+	if workers, reason := decide(f5, 0, r, true); workers {
+		t.Errorf("F5-like alone after 25 s here and 66 s on 16: workers (%s)", reason)
+	}
+	if workers, reason := decide(f5, 3, r, true); !workers {
+		t.Errorf("F5-like beside three after 25 s here and 66 s on 16: here (%s)", reason)
+	}
+	// Ran here in 25 s alone, never on workers: beside three, 100 s by
+	// that, and the workers estimated at 73 s.
+	if workers, reason := decide(f5, 3, runs{local: 25, explored: now}, true); !workers {
+		t.Errorf("F5-like beside three after 25 s here: here (%s)", reason)
+	}
+	dash := features{bytes: 4e8, held: 4e8, rows: 1e9, levels: 2, stages: 3}
+	if workers, reason := decide(dash, 10, runs{}, false); workers {
+		t.Errorf("a dashboard's statement beside ten: workers (%s)", reason)
+	}
+}
+
 // TestFleetCalibration checks the workers' estimates against the second
 // scale runs at ten times the data: seven reports on 16 workers, and two
 // on 1, 2, 4 and 8, within a factor of 1.35 at the root mean square of

@@ -558,6 +558,10 @@ func (co *Coordinator) planOn(ctx context.Context, query string, env Env, mode M
 	if fe, ok := env.(Footprints); ok {
 		m.allocated, m.ranHere = fe.Footprint()
 	}
+	others := 0
+	if le, ok := env.(Loads); ok && mode == ModeAuto {
+		others = le.Others()
+	}
 	// The large worker only where auto mode decides: forced statements run
 	// on the fleet.
 	f := co.fleet(ctx, ws, plan.mayStart, mode == ModeAuto)
@@ -574,6 +578,7 @@ func (co *Coordinator) planOn(ctx context.Context, query string, env Env, mode M
 		x.planBytes, x.planWork = p.bytes, p.work
 	}
 	e := x.estimate(m, f)
+	e.others = others
 	if found {
 		r = comparable(r, m.memory, co.pool.lastMemory(), co.largeMemory())
 		found = r.local > 0 || r.dist > 0 || r.large > 0 || r.outOfMemory || r.guarded || !r.explored.IsZero()

@@ -419,6 +419,25 @@ the replica would take longer than `IGLOO_WORKER_THRESHOLD` (a minute), or
 would run short of memory, and the workers are estimated to be at least
 1.5 times faster.
 
+**Beside other statements.** Statements running at once on the replica
+share its cores: one that runs beside others takes about as many times as
+long, up to four, and takes their cores. So auto mode weighs the replica's
+time at that many times its estimate, or what the statement took there
+before: a heavy statement started while others run, as 16 users'
+dashboards or an ELT stream, runs on workers rather than among them, where
+it would take long enough to be worth workers (`IGLOO_WORKER_THRESHOLD`)
+and the workers no slower than that (alone, 1.5 times faster); a statement of seconds stays
+on the replica however many run, and one that ran only on workers is not
+tried on the replica meanwhile. At ten times the data, beside 16 users'
+dashboards and two ELT streams, a report that had run in 25 s on the replica
+and 66 s on 16 workers alone ran 577 s on the replica, which auto mode had
+chosen, the dashboards' median rising from 4 ms to 23 s; now it runs on the
+workers, estimated at 73 s there against 100 s on the replica so shared. The reason in `EXPLAIN DISTRIBUTED` and `query_history.placement`
+says how many other statements ran. Without workers, statements share the
+replica's cores as DuckDB schedules them; [the replica's
+limit](workload-management.md#the-replicas-limit) and roles' limits hold
+heavy ones back.
+
 **Spilling.** A machine that runs a statement whole spills to disk when the
 rows its joins, groupings and distinct counts hold, its working set, are
 more than the 70% of its memory limit it has for them. Igloo estimates the
@@ -619,11 +638,12 @@ The replica's estimate can also run far short, as for a statement that
 spills: one estimated at 51 s took 1,798 s on the replica and 362 s on
 workers. So a statement auto mode runs on the replica, though workers could
 run it, is stopped there once, without sending a row, it has run three
-times its estimate (times the statements running on the replica when it
-started, which share its cores) and as long as the workers are estimated to
-take it from scratch, their start included, and at least 15 seconds; it
-then runs on workers, started if they are stopped, the client getting its
-rows as if it had run there. Moving once the run has taken what the workers
+times its estimate, or its estimate once while other statements run on the
+replica beside it, which it takes cores from, and as long as the workers
+are estimated to take it from scratch, their start included, and at least
+15 seconds; the guard weighs it again every second, as statements come and
+go beside it. It then runs on workers, started if they are stopped, the
+client getting its rows as if it had run there. Moving once the run has taken what the workers
 would take bounds the loss at about twice the faster side, as long as the
 workers' estimate holds: a report estimated at 13 s on the replica and 30 s
 on workers, which took 58 to 97 s on the replica and 50 s on workers at ten

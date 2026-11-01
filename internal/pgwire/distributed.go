@@ -346,6 +346,8 @@ var (
 	guardFactor      = 3.0
 	guardAlternative = 1.0
 	guardMinimum     = 15 * time.Second
+	// guardShared is guardFactor while other statements run beside it.
+	guardShared = 1.0
 )
 
 // guardUnknown is when the guard fires for a statement whose workers'
@@ -355,13 +357,18 @@ const guardUnknown = 90 * time.Second
 // guardAfter is how long a statement auto mode estimated at est on this
 // replica, and at alt on workers, their start included, runs here before
 // the guard runs it on workers instead: once it has run guardFactor times
-// its estimate, as many times as statements ran on the replica when it
-// started (load), which share its cores; and once the workers, from
-// scratch, are estimated to take no longer than it has run here
-// (guardAlternative times alt), so that running it there is clearly the
-// better bet; never before guardMinimum, nor budget, what a run on workers
-// took when auto mode tries this replica after one (see
-// distributed.LocalBudget).
+// its estimate, or, while others run beside it (others), its estimate
+// once, as it takes their cores; and once the workers, from scratch, are
+// estimated to take no longer than it has run here (guardAlternative times
+// alt), so that running it there is clearly the better bet; never before
+// guardMinimum, nor budget, what a run on workers took when auto mode tries
+// this replica after one (see distributed.LocalBudget). The guard weighs it
+// again every guardCheck, as statements come and go beside it.
+//
+// It once waited as many times longer as statements ran when one started,
+// as they shared the replica's cores: at ten times the data, beside 16
+// users' dashboards, a report estimated at 65 s here ran 577 s, the
+// dashboards' median rising from 4 ms to 23 s, and the guard never fired.
 //
 // Moving when the run here has taken what the workers would bounds the
 // loss at about twice the faster side's time, as long as their estimate
@@ -373,32 +380,41 @@ const guardUnknown = 90 * time.Second
 // its run here is never moved there, however long it runs, and one that
 // ran on workers after the guard moved it runs there from then on, so the
 // guard cannot send a statement back and forth.
-func guardAfter(est, alt, budget time.Duration, load int) time.Duration {
-	after := time.Duration(guardFactor * float64(est) * float64(max(load, 1)))
+func guardAfter(est, alt, budget time.Duration, others int) time.Duration {
+	factor := guardFactor
+	if others > 0 {
+		factor = min(factor, guardShared)
+	}
+	after := time.Duration(factor * float64(est))
 	if alt <= 0 {
 		after = max(after, guardUnknown)
 	}
 	return max(after, time.Duration(guardAlternative*float64(alt)), guardMinimum, budget)
 }
 
-// statementsRunning counts the statements running on this replica, which
-// share its cores, for the guard (see guardAfter): its sessions' that are
-// past waiting for their limits.
-func (s *Server) statementsRunning() int {
+// guardCheck is how often the guard weighs a statement again.
+var guardCheck = time.Second
+
+// othersRunning counts the statements running on this replica beside
+// sess's, which share its cores: its other sessions' that are past waiting
+// for their limits.
+func (s *Server) othersRunning(sess *session) int {
 	r := s.sessions
 	r.mu.Lock()
 	all := make([]*session, 0, len(r.byPID))
-	for _, sess := range r.byPID {
-		all = append(all, sess)
+	for _, other := range r.byPID {
+		if other != sess {
+			all = append(all, other)
+		}
 	}
 	r.mu.Unlock()
 	n := 0
-	for _, sess := range all {
-		sess.mu.Lock()
-		if sess.statement != "" && !sess.queued {
+	for _, other := range all {
+		other.mu.Lock()
+		if other.statement != "" && !other.queued {
 			n++
 		}
-		sess.mu.Unlock()
+		other.mu.Unlock()
 	}
 	return n
 }
@@ -409,31 +425,58 @@ type localGuard struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 	gate   rowGate
-	timer  *time.Timer
 	start  time.Time
 	fired  atomic.Bool
+	// done ends the guard's checks, once, when it stops.
+	done     chan struct{}
+	stopOnce sync.Once
 }
 
 // guardLocal arms a guard over a run on this replica, which writes to tw,
 // that fires after d (see guardAfter): run it under the guard's ctx, and
 // stop the guard after.
 func guardLocal(ctx context.Context, d time.Duration, tw *tagWriter) *localGuard {
-	g := &localGuard{start: time.Now()}
+	return guardLocalBy(ctx, func() time.Duration { return d }, tw)
+}
+
+// guardLocalBy is guardLocal of a time that after says again every
+// guardCheck, as the statements beside the run come and go.
+func guardLocalBy(ctx context.Context, after func() time.Duration, tw *tagWriter) *localGuard {
+	g := &localGuard{start: time.Now(), done: make(chan struct{})}
 	g.ctx, g.cancel = context.WithCancel(ctx)
 	tw.gate = &g.gate
-	g.timer = time.AfterFunc(d, func() {
+	fire := func() bool {
 		if g.gate.fire() {
 			g.fired.Store(true)
 			g.cancel()
+			return true
 		}
-	})
+		return false
+	}
+	every := min(guardCheck, max(after()/4, 10*time.Millisecond))
+	go func() {
+		t := time.NewTicker(every)
+		defer t.Stop()
+		for {
+			select {
+			case <-g.done:
+				return
+			case <-g.ctx.Done():
+				return
+			case <-t.C:
+				if time.Since(g.start) >= after() && fire() {
+					return
+				}
+			}
+		}
+	}()
 	return g
 }
 
 // stop disarms the guard, and says whether it canceled the run and how
 // long the run had taken.
 func (g *localGuard) stop(tw *tagWriter) (fired bool, ran time.Duration) {
-	g.timer.Stop()
+	g.stopOnce.Do(func() { close(g.done) })
 	g.cancel()
 	tw.gate = nil
 	return g.fired.Load(), time.Since(g.start)
@@ -848,6 +891,10 @@ func tableColumns(ctx context.Context, sess *session, db, schema, table string) 
 // Footprint is what the latest statement of the shape of the one planned
 // allocated over its run on this replica, which it completed (see
 // distributed.Footprints); ok is false when none has.
+// Others counts the statements running on this replica beside the
+// session's, for auto mode's choice (distributed.Loads).
+func (e *sessionEnv) Others() int { return e.s.othersRunning(e.sess) }
+
 func (e *sessionEnv) Footprint() (allocated int64, ok bool) {
 	// The session's path is read already, for the statement's shape.
 	return e.s.workload.Footprint(e.s.workloadShape(context.Background(), e.sess, e.st.prepared))

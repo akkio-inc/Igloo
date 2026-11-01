@@ -62,6 +62,11 @@ const (
 	heldFactor = 6
 	// Workers must be estimated this much faster than one machine.
 	speedup = 1.5
+	// shareCap is the most other statements on the replica auto mode counts
+	// as sharing its cores with a statement (see choose): beside three or
+	// more, a statement takes about four times as long there, and slows
+	// each of them.
+	shareCap = 3
 	// farBeyondRatio is how many times its room a working set must be for
 	// the coordinator not to run a statement whose workers failed (see
 	// Plan.FitsHere): 4 times, by the spill curve twice as long, where a
@@ -149,6 +154,9 @@ type estimate struct {
 	// stages, is past farBeyondRatio times the room (see Plan.FitsHere).
 	memory, spills, farBeyond bool
 	local                     spill
+	// others are the statements running on the replica beside it, which
+	// share its cores (see choose).
+	others int
 	// options are the ways on workers weighed, dollars says their costs are
 	// in dollars, and fleet why the one in workers and large, picked, was
 	// chosen.
@@ -180,6 +188,13 @@ type machine struct {
 	// (see Footprints).
 	ranHere   bool
 	allocated int64
+}
+
+// Loads is an Env whose session knows how many other statements run on the
+// replica now, which share its cores with the statement being planned
+// (see choose).
+type Loads interface {
+	Others() int
 }
 
 // Footprints is an Env whose session knows what statements of the shape
@@ -646,10 +661,36 @@ func levels(stages []*Stage) int {
 // within threshold on workers, nor on a side estimated at more than
 // exploreWithin times what it took on the other, nor on one machine where
 // it should not fit.
+//
+// Statements running beside it on the replica (e.others) share its cores:
+// a statement takes 1 + e.others times as long there, up to shareCap + 1
+// times, which is what auto mode weighs one machine's time at, so that a
+// heavy statement runs on workers rather than take the cores of the
+// replica's other statements, as a dashboard's, and one ran only on
+// workers is not tried on the replica meanwhile. At ten times the data,
+// beside 16 users' dashboards, a report that had run in 25 s on one
+// machine, and 66 s on 16 workers alone, ran 577 s there, the dashboards'
+// median rising from 4 ms to 23 s.
 func choose(e estimate, r runs, found bool, threshold time.Duration, now time.Time) (workers, explore bool, reason string) {
+	workers, explore, reason = chooseShared(e, r, found, threshold, now, float64(1+min(max(e.others, 0), shareCap)))
+	if e.others > 0 {
+		reason += fmt.Sprintf("; %d other statements run on this replica", e.others)
+	}
+	return workers, explore, reason
+}
+
+// chooseShared is choose with one machine's time taken share times as
+// long, as other statements share its cores.
+func chooseShared(e estimate, r runs, found bool, threshold time.Duration, now time.Time, share float64) (workers, explore bool, reason string) {
 	limit := threshold.Seconds()
+	// Alone, workers must be clearly faster; beside others, no slower than
+	// the replica shared, which they leave to the others.
+	faster := speedup
+	if share > 1 {
+		faster = 1
+	}
 	worth := func(oneMachine float64) bool {
-		return e.workers > 0 && (oneMachine > limit || e.spills) && e.onWorkers < oneMachine/speedup
+		return e.workers > 0 && (oneMachine*share > limit || e.spills) && e.onWorkers < oneMachine*share/faster
 	}
 	// Measured on one side only, a statement that took under exploreUnder
 	// there is tried once a day on the other, whatever the estimates say,
@@ -676,17 +717,17 @@ func choose(e estimate, r runs, found bool, threshold time.Duration, now time.Ti
 		// machine at 178 s.
 		return true, true, fmt.Sprintf("it ran in %.0f s on %d workers; trying %d once, estimated at %.0f s", r.dist, r.distWorkers, e.workers, e.onWorkers)
 	case found && r.local > 0 && r.dist > 0:
-		if r.dist < r.local {
+		if r.dist < r.local*share {
 			return true, false, fmt.Sprintf("it ran in %.0f s on workers and %.0f s on one machine", r.dist, r.local)
 		}
 		return false, false, fmt.Sprintf("it ran in %.0f s on one machine and %.0f s on workers", r.local, r.dist)
 	case found && r.local > 0:
 		switch {
-		case r.local < limit:
-			return false, false, fmt.Sprintf("it ran in %.0f s on one machine, under %.0f s", r.local, limit)
+		case r.local*share < limit:
+			return false, false, fmt.Sprintf("it ran in %.0f s on one machine, under %.0f s", r.local, limit/share)
 		case e.workers > 0 && mayExplore && r.local < exploreUnder.Seconds() && tryWorkers(r.local):
 			return true, true, fmt.Sprintf("it ran in %.0f s on one machine; trying workers once, estimated at %.0f s", r.local, e.onWorkers)
-		case r.local < e.oneMachine/2:
+		case share == 1 && r.local < e.oneMachine/2:
 			return false, false, fmt.Sprintf("it ran in %.0f s on one machine, well under the %.0f s estimated", r.local, e.oneMachine)
 		case worth(r.local):
 			return true, false, fmt.Sprintf("it ran in %.0f s on one machine, and workers should take %.0f s", r.local, e.onWorkers)
@@ -696,9 +737,9 @@ func choose(e estimate, r runs, found bool, threshold time.Duration, now time.Ti
 		return false, false, fmt.Sprintf("it ran in %.0f s on one machine, and workers should take %.0f s", r.local, e.onWorkers)
 	case found && r.dist > 0:
 		switch {
-		case mayExplore && r.dist < exploreUnder.Seconds() && tryOne(r.dist):
+		case share == 1 && mayExplore && r.dist < exploreUnder.Seconds() && tryOne(r.dist):
 			return false, true, fmt.Sprintf("it ran in %.0f s on workers; trying one machine once, estimated at %.0f s", r.dist, e.oneMachine)
-		case mayExplore && !r.heavy && r.dist > slowOnWorkers*e.oneMachine:
+		case share == 1 && mayExplore && !r.heavy && r.dist > slowOnWorkers*e.oneMachine:
 			// Far slower on workers than one machine should take it, even
 			// short of memory: without this it stayed there for good.
 			return false, true, fmt.Sprintf("it ran in %.0f s on workers, over %.0f times one machine's estimate of %.0f s; trying one machine once",
@@ -710,7 +751,7 @@ func choose(e estimate, r runs, found bool, threshold time.Duration, now time.Ti
 			return true, false, fmt.Sprintf("it ran in %.0f s on workers, and one machine should run short of memory", r.dist)
 		case r.heavy:
 			return true, false, fmt.Sprintf("it ran in %.0f s on workers, whose exchanges held %.1f GB, more than one machine's memory holds", r.dist, float64(r.exchangeBytes)/1e9)
-		case r.dist <= e.onWorkers/2 || r.dist < e.oneMachine/speedup:
+		case r.dist <= e.onWorkers/2 || r.dist < e.oneMachine*share/faster:
 			return true, false, fmt.Sprintf("it ran in %.0f s on workers, and one machine should take %.0f s", r.dist, e.oneMachine)
 		}
 		return false, false, fmt.Sprintf("it ran in %.0f s on workers, and one machine should take %.0f s", r.dist, e.oneMachine)
