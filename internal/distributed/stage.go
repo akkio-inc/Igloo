@@ -598,6 +598,8 @@ func (e *execution) stage(ctx context.Context, s *Stage) error {
 		if writes {
 			task.SQL = writeSQL(s, e.target)
 			task.Write = writeRequestFor(e.target, e.target.Dir+"/"+e.qid+"/s"+strconv.Itoa(s.ID)+"-"+strconv.Itoa(i))
+			// A task out of memory may have been sorting them.
+			task.Write.AsTheyCome = e.smaller > 0
 		} else if s.Out == nil {
 			task.SQL, task.Columns = s.SQL, s.Columns
 			out = filepath.Join(e.dir, fmt.Sprintf("%d-%d.parquet", s.ID, i))
