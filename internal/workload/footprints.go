@@ -41,7 +41,14 @@ const maxFootprints = 4096
 type footprints struct {
 	mu       sync.Mutex
 	fraction float64
-	held     map[string]int64
+	held     map[string]footprint
+}
+
+// footprint is what statements of a shape held at once, and whether the
+// run it was learned from ended before its end.
+type footprint struct {
+	held       int64
+	unfinished bool
 }
 
 // EstimateFromHistory makes the controller reserve, for a statement that
@@ -75,12 +82,12 @@ func (c *Controller) observe(shape string, n int64, atLeast bool) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.held == nil || len(f.held) >= maxFootprints {
-		f.held = make(map[string]int64)
+		f.held = make(map[string]footprint)
 	}
-	if old, ok := f.held[shape]; atLeast && ok && old >= n {
+	if old, ok := f.held[shape]; atLeast && ok && old.held >= n {
 		return
 	}
-	f.held[shape] = n
+	f.held[shape] = footprint{held: n, unfinished: atLeast}
 }
 
 // FootprintOf is what Observe learns of a run that allocated allocated
@@ -107,7 +114,7 @@ func (c *Controller) Estimate(shape string) int64 {
 	}
 	f := &c.history
 	f.mu.Lock()
-	held := f.held[shape]
+	held := f.held[shape].held
 	f.mu.Unlock()
 	r := int64(float64(held) * f.fraction)
 	if r < c.budget/minReservationShare {
@@ -117,16 +124,37 @@ func (c *Controller) Estimate(shape string) int64 {
 }
 
 // Footprint returns what the latest statement of shape held at once on
-// this replica (see Observe); ok is false when none of its shape has run
-// here. Auto mode takes it for proof that one machine is not short of
-// memory for the statement, whatever its estimate says.
+// this replica, in a run it completed or, if more, in one that ended
+// before its end (see Observe and ObserveUnfinished); ok is false when
+// none of its shape has run here.
 func (c *Controller) Footprint(shape string) (held int64, ok bool) {
-	if c == nil || shape == "" {
+	held, _, ok = c.footprint(shape)
+	return held, ok
+}
+
+// Completed is Footprint where the run it was learned from completed; ok
+// is false otherwise. Auto mode takes it for proof that one machine is not
+// short of memory for the statement, whatever its estimate says. A run cut
+// short says only that the statement needed at least what it held: a
+// report the guard stopped on a replica of 53 GB was learned at all of
+// it, from the query history, which auto mode then took for a working set
+// that fit, though DuckDB's plan put it at about three times that; it was
+// tried on the replica once a day, estimated at 47 s, and spilled 54 GB.
+func (c *Controller) Completed(shape string) (held int64, ok bool) {
+	held, unfinished, ok := c.footprint(shape)
+	if !ok || unfinished {
 		return 0, false
+	}
+	return held, true
+}
+
+func (c *Controller) footprint(shape string) (held int64, unfinished, ok bool) {
+	if c == nil || shape == "" {
+		return 0, false, false
 	}
 	f := &c.history
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	held, ok = f.held[shape]
-	return held, ok
+	fp, ok := f.held[shape]
+	return fp.held, fp.unfinished, ok
 }

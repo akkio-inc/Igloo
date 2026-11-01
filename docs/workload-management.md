@@ -283,7 +283,9 @@ build took 558 to 590 seconds; after a restart, with what the history kept,
 to 4,096 of them, and statements that ran on [workers](distributed-execution.md)
 are not learned from, since most of what they allocated was the workers'.
 A shape that ran to its end on the replica also tells auto mode that the
-replica is not short of memory for it (see [when](distributed-execution.md#when)).
+replica is not short of memory for it (see [when](distributed-execution.md#when));
+one whose latest run was cut short, as by the guard or a timeout, holding
+more than it held to its end before, does not.
 
 ## Compute pools
 

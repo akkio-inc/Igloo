@@ -887,16 +887,17 @@ func tableColumns(ctx context.Context, sess *session, db, schema, table string) 
 }
 
 // Setting returns the session's value of a DuckDB setting.
-// Footprint is what the latest statement of the shape of the one planned
-// allocated over its run on this replica, which it completed (see
-// distributed.Footprints); ok is false when none has.
 // Others counts the statements running on this replica beside the
 // session's, for auto mode's choice (distributed.Loads).
 func (e *sessionEnv) Others() int { return e.s.othersRunning(e.sess) }
 
+// Footprint is what the latest statement of the shape of the one planned
+// held on this replica, in a run it completed (see
+// distributed.Footprints); ok is false when none has, or the latest run
+// learned from ended before its end.
 func (e *sessionEnv) Footprint() (allocated int64, ok bool) {
 	// The session's path is read already, for the statement's shape.
-	return e.s.workload.Footprint(e.s.workloadShape(context.Background(), e.sess, e.st.prepared))
+	return e.s.workload.Completed(e.s.workloadShape(context.Background(), e.sess, e.st.prepared))
 }
 
 func (e *sessionEnv) Setting(ctx context.Context, name string) (string, error) {

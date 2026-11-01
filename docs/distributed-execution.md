@@ -557,15 +557,22 @@ workers. A statement that ran both ways runs where it was faster. One that ran o
 One that ran only one way, in under ten minutes, is tried once the other
 way, at most once a day, so that runs come to be compared with runs, if
 the other way is estimated at no more than twice what it took, and, on the
-replica, if it should fit in its memory; past that, one that ran only on
+replica, if its working set should fit in its memory, within half again
+its room (see spilling, below); past that, one that ran only on
 the replica, well within its estimate, stays there, and one that ran only
 on workers stays there if it beat its estimates, or if the replica should
 run short of memory, unless it took more than ten times the replica's
-estimate there: that one is tried on the replica once a day, and may take
+estimate there, and its working set is not four or more times the
+replica's room: that one is tried on the replica once a day, and may take
 as long there as it took on workers before the guard (below) runs it on
 them again. The replica is not short of memory for a statement whose
 shape, its text with its literals masked, ran to its end there, whatever
-its estimate, and it spills only if that run allocated more than its share
+its estimate (a run cut short, as by the guard, says only that it needed at
+least what it held, and does not count: one the guard stopped on a replica
+of 53 GB was learned, from the query history, at all of it, which auto mode
+took for a working set that fit, where DuckDB's plan put it at about three
+times that, and it was tried on the replica, estimated at 47 s, and
+spilled 54 GB), and it spills only if that run allocated more than its share
 (see [reservations from history](workload-management.md#reservations-from-history)):
 the estimate counts what a join exchanges, not what its filters leave, and
 held a dashboard's joins of a lookup of billions of rows too large for

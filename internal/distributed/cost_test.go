@@ -119,6 +119,8 @@ func TestChoose(t *testing.T) {
 			runs{dist: 126}, true, true, false},
 		{"ran on workers 90 times one machine's estimate, exchanging more than it holds", estimate{oneMachine: 14, onWorkers: 30, workers: 2, memory: true},
 			runs{dist: 1312, heavy: true}, true, true, false},
+		{"ran on workers 90 times one machine's estimate, its working set far beyond it", estimate{oneMachine: 14, onWorkers: 30, workers: 2, memory: true,
+			spills: true, farBeyond: true}, runs{dist: 1312}, true, true, false},
 	} {
 		workers, explore, reason := choose(c.e, c.r, c.found, DefaultThreshold, now)
 		if workers != c.workers || explore != c.explore || reason == "" {

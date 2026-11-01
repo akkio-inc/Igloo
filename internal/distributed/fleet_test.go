@@ -279,6 +279,36 @@ func TestFleetChoice(t *testing.T) {
 	}
 }
 
+// TestSpillingNotProbed checks that auto mode never tries one machine, to
+// measure it, where its working set says it would spill. F3-like at ten
+// times the data took 108 s on 16 workers; an earlier run on the replica,
+// which the guard stopped, was learned at all of the replica's 53 GB
+// (the query history's memory for a run cut short), which auto mode took
+// for proof that the statement fit: estimated at 47 s, it was tried there
+// once, held 52 GB, spilled 54 GB and was moved after 145 s. Its plan's
+// working set, about three times that, says it spills.
+func TestSpillingNotProbed(t *testing.T) {
+	now := time.Now()
+	f3 := features{bytes: 6.683e9, exchanged: 6.683e9, held: 6.683e9, rows: 1.273e10, levels: 8, stages: 28,
+		planned: true, planSet: 150e9, planBytes: 6.635e9, planWork: 179}
+	r := runs{dist: 108, distWorkers: 16, fleets: map[int]float64{fleetBucket(16): 108}}
+	here := scaleCoordinator
+	here.ranHere, here.allocated = true, here.memory
+	e := f3.estimate(here, benchWorkers)
+	e.pick(r, benchWorkers)
+	if e.spills || math.Abs(e.oneMachine-47) > 3 {
+		t.Errorf("as on the benchmark: one machine %.0f s, %s", e.oneMachine, e.local)
+	}
+	// A run cut short is no footprint (see workload.Controller.Completed):
+	// by the plan, it spills, and is not tried there.
+	e = f3.estimate(scaleCoordinator, benchWorkers)
+	e.pick(r, benchWorkers)
+	workers, explore, reason := choose(e, r, true, DefaultThreshold, now)
+	if !e.spills || !workers || explore || !strings.Contains(reason, "one machine should run short of memory") {
+		t.Errorf("by its plan: spills %v, workers %v, explore %v (%s; %s)", e.spills, workers, explore, reason, e.local)
+	}
+}
+
 // TestChooseShared checks that statements running beside one on the
 // replica send a heavy statement to workers rather than take their cores:
 // F5-like at ten times the data, estimated at 65 s here and 73 s on 16

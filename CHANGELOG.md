@@ -604,6 +604,14 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   the fewest tasks. `EXPLAIN DISTRIBUTED` shows the choice (`fleet`) and
   the ways weighed (`options`), and `query_history.placement` where a
   statement ran and why (see [when](docs/distributed-execution.md#when)).
+- Auto mode no longer takes a run cut short on the replica, as one the
+  guard stopped, for proof that a statement's shape fits there: such a
+  run, learned at all of a replica's 53 GB from the query history, made a
+  report whose plan's working set was about three times that count as
+  fitting, and it was tried on the replica once a day, estimated at 47 s,
+  spilling 54 GB until the guard moved it after 145 s. Nor is a statement
+  tried on the replica where its working set is four or more times its
+  room, however much slower it ran on workers than the replica's estimate.
 - A heavy statement no longer takes the replica's cores from short ones
   where workers are configured, with nothing to set: auto mode weighs the
   replica's time at as many times as long as the statements running on it

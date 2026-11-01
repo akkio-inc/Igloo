@@ -660,7 +660,9 @@ func levels(stages []*Stage) int {
 // to learn how long it takes there, but never one that ran on one machine
 // within threshold on workers, nor on a side estimated at more than
 // exploreWithin times what it took on the other, nor on one machine where
-// it should not fit.
+// its working set should spill (see spillOn), or, after a run on workers
+// far slower than one machine's estimate, where it is far beyond one
+// machine's memory.
 //
 // Statements running beside it on the replica (e.others) share its cores:
 // a statement takes 1 + e.others times as long there, up to shareCap + 1
@@ -739,9 +741,11 @@ func chooseShared(e estimate, r runs, found bool, threshold time.Duration, now t
 		switch {
 		case share == 1 && mayExplore && r.dist < exploreUnder.Seconds() && tryOne(r.dist):
 			return false, true, fmt.Sprintf("it ran in %.0f s on workers; trying one machine once, estimated at %.0f s", r.dist, e.oneMachine)
-		case share == 1 && mayExplore && !r.heavy && r.dist > slowOnWorkers*e.oneMachine:
+		case share == 1 && mayExplore && !r.heavy && !e.farBeyond && r.dist > slowOnWorkers*e.oneMachine:
 			// Far slower on workers than one machine should take it, even
-			// short of memory: without this it stayed there for good.
+			// short of memory: without this it stayed there for good. Not
+			// where its working set is far beyond one machine's memory,
+			// which it would spill for far longer than its estimate says.
 			return false, true, fmt.Sprintf("it ran in %.0f s on workers, over %.0f times one machine's estimate of %.0f s; trying one machine once",
 				r.dist, slowOnWorkers, e.oneMachine)
 		case e.memory || e.spills:
