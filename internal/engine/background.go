@@ -133,6 +133,14 @@ func openBackground(ctx context.Context, cfg config.Config, log *slog.Logger) (*
 // With statements in line behind the background DuckDB's and none running in
 // the first, the caches give way all the same (see WatchForeground).
 //
+// What the background DuckDB holds it gives up only as fast as its spill files
+// take it, and what it cannot write out it keeps, while the first takes memory
+// faster than that. So the first gets what the background DuckDB has let go of
+// and backgroundLead more, and the background DuckDB is told to let go of that
+// much ahead of it. With the first free to take three quarters of the limit at
+// once, the two together held 134% of it beside a burst of heavy statements, and
+// the process 29.7 GiB of a machine's 30.8, until the kernel killed it.
+//
 // Two DuckDBs hold more than their limits count, each its own metadata and what
 // its allocator keeps: a report over a billion rows and dashboards beside it took
 // the process 11 GB past what they held, against 2 GB for one DuckDB, and left the
@@ -148,6 +156,9 @@ const (
 	// backgroundMinShare is the least of the limit the background DuckDB
 	// keeps, as a divisor.
 	backgroundMinShare = 4
+	// backgroundLead is how far past what the background DuckDB has let go of
+	// the first may go while reading, as a divisor of the limit.
+	backgroundLead = 8
 	// foregroundIdle is how long after the first's last read its caches
 	// give way.
 	foregroundIdle = 30 * time.Second
@@ -286,12 +297,14 @@ func roomFor(total, over int64) int64 {
 // they hold now: mainHeld, with its caches if reading says the first is
 // reading, and bgHeld, with its own.
 func balancedLimits(total, mainHeld, bgHeld int64, reading bool) (mainLimit, bgLimit int64) {
-	bgLimit = max(total-mainHeld, total/backgroundMinShare)
 	if reading {
+		lead := total / backgroundLead
+		bgLimit = max(total-mainHeld-lead, total/backgroundMinShare)
 		// So that the two keep to total, the quarter the background DuckDB
 		// keeps is off the first's.
-		return total - min(bgHeld, total/backgroundMinShare), bgLimit
+		return min(max(total-bgHeld, mainHeld+lead), total-min(bgHeld, total/backgroundMinShare)), bgLimit
 	}
+	bgLimit = max(total-mainHeld, total/backgroundMinShare)
 	return max(total-min(bgHeld, bgLimit), total/backgroundMinShare), bgLimit
 }
 

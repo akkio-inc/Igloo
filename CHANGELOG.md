@@ -1934,6 +1934,12 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   when statements wait in line behind it and none runs in the first: a dashboard's
   heavy statements, held to what those caches left them, spilled while the rest
   waited for them. Its 96 queries at ten times the data took 234 s rather than 260.
+- While the first DuckDB reads, it goes only an eighth of the memory limit past
+  what the second has let go of, and the second is told to let go of that much
+  ahead of it. Free to take three quarters of the limit at once, whatever the
+  second held, the first took memory faster than the second's spill files could
+  give it back: beside a burst of heavy statements the two held 134% of the limit,
+  and the kernel killed the process.
 - Statements wait in the order they would end if each ran alone from when it
   came, as their shape's runs say, rather than in arrival order; a shape that took
   under a second of CPU does not wait at all; and a statement of a shape not seen
