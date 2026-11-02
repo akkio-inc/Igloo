@@ -36,11 +36,10 @@ itself to run them on its 16 workers.
 Reruns returned the same rows. At a tenth of the data, both reports return the
 rows one machine returns.
 
-A machine lost with no warning can take a report up to about twice as long, and
-the report still returns the same rows: the statement runs its parts again
-without that worker. A graceful shutdown, such as a Spot notice, costs nothing
-measurable. Here one of 16 workers stops about 40 s into a report, at a tenth of
-the data:
+A report that loses a machine with no warning still finishes, with the same
+rows: the statement runs its parts again without that worker. A graceful
+shutdown, such as a Spot notice, costs nothing measurable. Here one of 16
+workers stops about 40 s into a report, at a tenth of the data:
 
 | How the worker stopped | Undisturbed | With it stopped |
 |---|---|---|
