@@ -613,6 +613,168 @@ func TestWorkingSetOfUnion(t *testing.T) {
 	}
 }
 
+// TestWorkingSetOfGuesses checks a report whose plan, at a hundred times the
+// data, compounds DuckDB's guesses: groups of a tenth of their input, by keys it
+// computes, which were thousands; their metrics joined to the cohorts' sizes and
+// to themselves, each taken for more than its inputs, and each corrected as its
+// inputs were; and windows over that. It was estimated at 37.9 TB, 25 TB of it a
+// window, so that every way on workers should run out of memory, and ran on one
+// machine; 16 workers took 521 to 825 s. What its aggregates hold of their input
+// stands; a join does not multiply the rows of the side with more without its
+// keys' distinct counts, and a grouping by computed keys keeps a hundredth.
+func TestWorkingSetOfGuesses(t *testing.T) {
+	cols := func(names ...string) []Column {
+		var out []Column
+		for _, n := range names {
+			out = append(out, Column{Name: n, Type: "VARCHAR"})
+		}
+		return out
+	}
+	lookup := &Table{Name: "lookup", Rows: 14_000_000_000, Bytes: 750e9, Columns: cols("audience", "version", "person")}
+	people := &Table{Name: "people", Rows: 100_000_000, Bytes: 10e9, Columns: cols("person", "age")}
+	events := &Table{Name: "events", Rows: 3_600_000_000, Bytes: 120e9, Columns: cols("person", "seconds", "channel", "title")}
+	st := newPlanStats([]*Stage{{Inputs: []Input{{Table: lookup}, {Table: people}, {Table: events}}}}, 16)
+	cohorts := op("HASH_GROUP_BY", []map[string]any{op("ICEBERG_SCAN", nil, "Projections", []string{"person"}, "Filters", "(NOT (person IS NULL))",
+		"Estimated Cardinality", "2000000000")}, "Groups", []string{"#0"}, "Aggregates", []string{}, "Estimated Cardinality", "2000000000")
+	cohort := op("CTE_SCAN", nil, "CTE Index", "6", "Estimated Cardinality", "2000000000")
+	signals := op("HASH_GROUP_BY", []map[string]any{op("PROJECTION", []map[string]any{op("HASH_JOIN", []map[string]any{
+		op("FILTER", []map[string]any{op("PROJECTION", []map[string]any{op("CROSS_PRODUCT", []map[string]any{
+			op("ICEBERG_SCAN", nil, "Projections", []string{"person", "seconds", "channel", "title"}, "Estimated Cardinality", "3600000000"),
+			op("RANGE", nil, "Estimated Cardinality", "7")})},
+			"Projections", []string{"person", "struct_extract(x, 'dimension')", "struct_extract(x, 'value')"}, "Estimated Cardinality", "25200000000")}, "Estimated Cardinality", "25200000000"),
+		cohort}, "Join Type", "INNER", "Conditions", "person = person", "Estimated Cardinality", "20000000000")},
+		"Projections", []string{"#1", "#2", "#0"}, "Estimated Cardinality", "20000000000")},
+		"Groups", []string{"#0", "#1"}, "Aggregates", []string{"count(DISTINCT #2)"}, "Estimated Cardinality", "3600000000")
+	traits := op("HASH_GROUP_BY", []map[string]any{op("PROJECTION", []map[string]any{op("HASH_JOIN", []map[string]any{
+		op("ICEBERG_SCAN", nil, "Projections", []string{"person", "age"}, "Estimated Cardinality", "100000000"), cohort},
+		"Join Type", "INNER", "Conditions", "person = person", "Estimated Cardinality", "100000000000")},
+		"Projections", []string{"upper(#1)", "#0"}, "Estimated Cardinality", "100000000000")},
+		"Groups", []string{"#0"}, "Aggregates", []string{"count(DISTINCT #1)"}, "Estimated Cardinality", "100000000")
+	sizes := op("HASH_GROUP_BY", []map[string]any{op("PROJECTION", []map[string]any{cohort}, "Projections", []string{"upper(person)", "#0"},
+		"Estimated Cardinality", "2000000000")}, "Groups", []string{"#0"}, "Aggregates", []string{"count(DISTINCT #1)"}, "Estimated Cardinality", "1")
+	metrics := op("PROJECTION", []map[string]any{op("HASH_JOIN", []map[string]any{op("UNION", []map[string]any{signals, traits}), sizes},
+		"Join Type", "INNER", "Conditions", "upper(cohort) = upper(cohort)", "Estimated Cardinality", "15000000000")},
+		"Projections", []string{"#0", "#1", "#2", "#3"}, "Estimated Cardinality", "15000000000")
+	metric := op("CTE_SCAN", nil, "CTE Index", "12", "Estimated Cardinality", "15000000000")
+	ranked := op("ORDER_BY", []map[string]any{op("WINDOW", []map[string]any{op("HASH_JOIN", []map[string]any{metric, metric},
+		"Join Type", "INNER", "Conditions", []string{"upper(a) = upper(a)", "upper(b) = upper(b)"}, "Estimated Cardinality", "31000000000")},
+		"Projections", []string{"rank() OVER (PARTITION BY #0 ORDER BY #1)"})})
+	report := op("CTE", []map[string]any{cohorts, op("CTE", []map[string]any{metrics, op("TOP_N", []map[string]any{ranked}, "Top", "10000")},
+		"CTE Name", "metrics", "Table Index", "12", "Estimated Cardinality", "31000000000")},
+		"CTE Name", "cohorts", "Table Index", "6", "Estimated Cardinality", "31000000000")
+
+	p, err := planOf(planJSON(t, report), st)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]heldPart{}
+	for _, h := range p.parts {
+		if h.rows > got[h.op].rows {
+			got[h.op] = h
+		}
+	}
+	// Seven rows for each of 3.6 billion events, on their way to their groups.
+	if g := got["HASH_GROUP_BY DISTINCT"]; g.rows != 2.52e10 {
+		t.Errorf("distinct pairs: %+v", g)
+	}
+	// A hundredth of them and of what the people came to, for what is above.
+	if w := got["WINDOW"]; w.rows > 3e8 {
+		t.Errorf("window: %+v, in a working set of %.0f GB", w, p.set/1e9)
+	}
+	if p.sorted > 100e9 {
+		t.Errorf("sorts hold %.0f GB", p.sorted/1e9)
+	}
+	if p.set < 2e12 || p.set > 6e12 {
+		t.Errorf("working set %.0f GB", p.set/1e9)
+	}
+	// The result is what TOP_N keeps, for the client.
+	if p.fields > 1e6 {
+		t.Errorf("%g fields of a result of 10,000 rows", p.fields)
+	}
+	x := features{bytes: 120e9, exchanged: 600e9, held: 120e9, rows: 1.9e11, levels: 11, stages: 25, planned: true, planSet: p.set, planBytes: p.bytes,
+		planWork: p.work, planKeeps: p.keeps, planFields: p.fields, planSorted: p.sorted, planJoins: p.joins}
+	m := machine{cores: 16, threads: 16, memory: 44e9}
+	e := x.estimate(m, fleet{cores: 16, threads: 16, running: 16, most: 16, memory: 26 << 30})
+	if e.workers != 16 || math.IsInf(e.onWorkers, 1) || !e.spills || !e.local.oom {
+		t.Errorf("%d workers, %.0f s; one machine %.0f s, spills %v, %s", e.workers, e.onWorkers, e.oneMachine, e.spills, e.local)
+	}
+	if workers, explore, reason := choose(e, runs{}, false, DefaultThreshold, time.Now()); !workers || explore {
+		t.Errorf("on workers %v, trying %v: %s", workers, explore, reason)
+	}
+	// As it was: a sort beyond every way on workers, and still the most of them.
+	x.planSet, x.planSorted = 37.9e12, 25e12
+	e = x.estimate(m, fleet{cores: 16, threads: 16, running: 4, most: 16, memory: 26 << 30})
+	workers, explore, reason := choose(e, runs{}, false, DefaultThreshold, time.Now())
+	if !workers || explore || e.workers != 16 || !strings.Contains(e.fleet, "short of memory") {
+		t.Errorf("every way short of memory: on workers %v on %d, trying %v: %s; %s", workers, e.workers, explore, reason, e.fleet)
+	}
+	if e = x.estimate(m, fleet{}); math.IsInf(e.oneMachine, 1) {
+		t.Errorf("no workers: one machine %.0f s", e.oneMachine)
+	}
+	if workers, _, reason := choose(e, runs{}, false, DefaultThreshold, time.Now()); workers || !strings.Contains(reason, "no workers") {
+		t.Errorf("no workers: on workers %v: %s", workers, reason)
+	}
+}
+
+// TestLatestVersionOfAnAudience checks a report that reads one audience's latest
+// version: DuckDB's rows of the lookup are one audience's already, its filter
+// counted, which is not a filter's hundredth again; so of a report that took 216 s
+// on one machine and spilled 36 GB, estimated at 52 s with a working set of 0.2 GB.
+// The members keep a row each of what is joined to them, not a fifth of it. Of a
+// lookup not filtered so, the latest version still counts as a filter does (see
+// F4-like in TestPlanShapes).
+func TestLatestVersionOfAnAudience(t *testing.T) {
+	lookup := &Table{Name: "lookup", Rows: 6_300_000_000, Bytes: 128e9, Columns: []Column{{Name: "audience", Type: "VARCHAR"}, {Name: "version", Type: "INTEGER"},
+		{Name: "member", Type: "VARCHAR"}}}
+	versions := &Table{Name: "versions", Rows: 2000, Bytes: 1e5, Columns: []Column{{Name: "audience", Type: "VARCHAR"}, {Name: "ver_no", Type: "INTEGER"}}}
+	people := &Table{Name: "people", Rows: 400_000_000, Bytes: 8e9, Columns: []Column{{Name: "id", Type: "VARCHAR"}, {Name: "day", Type: "DATE"}, {Name: "interests", Type: "VARCHAR[]"}}}
+	st := newPlanStats([]*Stage{{Inputs: []Input{{Table: lookup}, {Table: versions}, {Table: people}}}}, 16)
+	latest := op("PROJECTION", []map[string]any{op("UNGROUPED_AGGREGATE", []map[string]any{
+		op("ICEBERG_SCAN", nil, "Projections", []string{"ver_no"}, "Filters", "audience='a'", "Estimated Cardinality", "22")}, "Aggregates", []string{"max(#0)"})},
+		"Projections", []string{"#0"}, "Estimated Cardinality", "1")
+	members := op("HASH_GROUP_BY", []map[string]any{op("HASH_JOIN", []map[string]any{
+		op("ICEBERG_SCAN", nil, "Projections", []string{"version", "member"}, "Filters", "audience='a'", "Estimated Cardinality", "57800000"), latest},
+		"Join Type", "INNER", "Conditions", "version = SUBQUERY", "Estimated Cardinality", "57800000")},
+		"Groups", []string{"#1"}, "Aggregates", []string{}, "Estimated Cardinality", "57800000")
+	chosen := op("HASH_JOIN", []map[string]any{op("ICEBERG_SCAN", nil, "Projections", []string{"id", "day", "interests"}, "Filters", "day>='2000-01-01'::DATE",
+		"Estimated Cardinality", "80000000"), members}, "Join Type", "SEMI", "Conditions", "id = #0", "Estimated Cardinality", "16000000")
+	p, err := planOf(planJSON(t, chosen), st)
+	if err != nil {
+		t.Fatal(err)
+	}
+	held := map[string]float64{}
+	for _, h := range p.parts {
+		held[h.op] = max(held[h.op], h.rows)
+	}
+	if held["HASH_JOIN"] != 57.8e6 {
+		t.Errorf("the join to the members holds %g rows, want all of DuckDB's for one audience: %+v", held["HASH_JOIN"], p.parts)
+	}
+	grouped := op("HASH_GROUP_BY", []map[string]any{chosen}, "Groups", []string{"#2"}, "Aggregates", []string{"count_star()"}, "Estimated Cardinality", "16000000")
+	if p, err = planOf(planJSON(t, grouped), st); err != nil {
+		t.Fatal(err)
+	}
+	for _, h := range p.parts {
+		held[h.op] = max(held[h.op], h.rows)
+	}
+	// As many as the members, where DuckDB took a fifth of what it read.
+	if held["HASH_GROUP_BY"] < 57.8e6 {
+		t.Errorf("what was joined to the members: %g rows: %+v", held["HASH_GROUP_BY"], p.parts)
+	}
+	// Reading the lookup for one audience's latest version reads a hundredth.
+	if want := int64(float64(columnSet{"version": true, "member": true}.bytes(lookup)) * filterSelectivity); p.bytes < want || p.bytes > want+8e9+1e5 {
+		t.Errorf("reads %d bytes, want %d of the lookup and all of the people", p.bytes, want)
+	}
+	x := features{bytes: 7e9, exchanged: 83e9, held: 7e9, rows: 5.75e9, levels: 5, stages: 9, planned: true, planSet: p.set, planBytes: p.bytes, planWork: p.work,
+		planKeeps: p.keeps, planJoins: p.joins}
+	e := x.estimate(machine{cores: 16, threads: 16, memory: 44e9}, fleet{cores: 16, threads: 16, running: 16, most: 16, memory: 26 << 30})
+	if !e.memory || e.onWorkers > e.oneMachine {
+		t.Fatalf("one machine %.0f s, short of memory %v; workers %.0f s", e.oneMachine, e.memory, e.onWorkers)
+	}
+	if workers, explore, reason := choose(e, runs{}, false, DefaultThreshold, time.Now()); !workers || explore {
+		t.Errorf("its first run: on workers %v, trying %v: %s", workers, explore, reason)
+	}
+}
+
 // TestPlanKeeps checks the share of the rows a plan's scans read that its
 // result keeps, which a fill writes (see fillCost): all of them for a
 // copy, a filter's share for a filtered one, and no more than a hundredth

@@ -571,7 +571,11 @@ root mean square of the logarithms, where 6 seconds a stage and the
 replica's rate were within 2.05. It runs the statement on workers only if
 the replica would take longer than `IGLOO_WORKER_THRESHOLD` (a minute), or
 would run short of memory, and the workers are estimated to be at least
-1.5 times faster.
+1.5 times faster. Short of memory by what it exchanges, workers need only be
+no slower: a report estimated at 52 s, what it reads, took 174 s by way of the
+guard, and 68 to 87 s on workers. A working set four or more times the
+replica's room runs on workers whatever they are estimated to take, as long as
+there are workers.
 
 **Beside other statements.** Statements running at once on the replica
 share its cores: one that runs beside others takes about as many times as
@@ -632,10 +636,17 @@ events to a union of an audience and everyone, taken for the audience
 alone, was estimated at 5.6 GB and 15 s, and took 714 s, spilling 235 GB);
 an inner join of rows to keys it knows nothing of keeps no fewer of the side with more rows than the other side's
 filters keep, rather than the fifth DuckDB takes (157 million events
-joined to an audience of everyone kept every row); a join to one row, as
+joined to an audience of everyone kept every row), and no more than that
+side's rows: DuckDB's guesses at a join's inputs, each corrected as the last
+was, took a report at a hundred times the data for 37.9 TB, 25 TB of it a
+window over its metrics, where it is now taken for 4.7 TB; a grouping by keys
+it computes keeps no more than a hundredth of its input for what is above it;
+a semi-join keeps at least a row for each of its keys; a join to one row, as
 of a scalar subquery's latest version, keeps what a filter by a constant
-does, where DuckDB keeps every row, but one group by DuckDB's estimate of
-keys nothing knows is not one row; a cross product with a small source of
+does, where DuckDB keeps every row, unless its scan is filtered so already,
+as one audience's rows of a lookup are, which DuckDB counted; one group by
+DuckDB's estimate of keys nothing knows is not one row; a `TOP_N` keeps what
+it says; a cross product with a small source of
 its own, as `FLATTEN` over a list of objects becomes, makes a row for each
 pair; a grouping makes no more groups where its input has more rows than
 DuckDB took; and a window over the whole input without an order (`OVER
@@ -688,7 +699,11 @@ worker](#a-large-worker) if it has one. The trade-off is explicit: of the
 ways whose time is within a fifth of the fastest way's, it takes the
 cheapest, so it never takes a way that another beats on both time and cost
 (costs within 2% count as the same, and the way on fewer workers wins
-them). A way costs its machines' seconds at their prices an hour
+them). Where every way looks short of memory by its estimate it takes the one
+with the most memory, not the replica: tasks spill, and run again over more
+partitions with more memory each, and a report so estimated at a hundred
+times the data, which 16 workers took 521 to 825 s over, ran on the replica
+until it was cancelled at 632 s, 302 GB spilled. A way costs its machines' seconds at their prices an hour
 (`IGLOO_WORKER_PRICE_PER_HOUR`, `IGLOO_LARGE_WORKER_PRICE_PER_HOUR` and
 `IGLOO_PRICE_PER_HOUR` for the replica, or else the list price of the
 workers' instance types, see [prices](#prices)): its workers', with the idle
