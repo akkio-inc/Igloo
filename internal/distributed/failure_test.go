@@ -51,12 +51,15 @@ func TestWorkerDiesMidTask(t *testing.T) {
 }
 
 // A worker that stops answering in the middle of a task, its connections
-// open and its kernel taking what is sent, but nothing served, as one whose
-// Go threads all wait: the coordinator finds it hung by its status, runs
-// its tasks on the others, and the result is complete.
+// open and its kernel taking what is sent and new connections, but nothing
+// served, as one whose Go threads all wait: the coordinator finds it hung by
+// its status, once it has answered none for heartbeatSilence, runs its tasks
+// on the others, and the result is complete.
 func TestWorkerHangsMidTask(t *testing.T) {
-	defer func(every, timeout time.Duration) { taskCheckEvery, taskCheckTimeout = every, timeout }(taskCheckEvery, taskCheckTimeout)
-	taskCheckEvery, taskCheckTimeout = 50*time.Millisecond, 200*time.Millisecond
+	defer func(every, timeout, silence time.Duration) {
+		taskCheckEvery, taskCheckTimeout, heartbeatSilence = every, timeout, silence
+	}(taskCheckEvery, taskCheckTimeout, heartbeatSilence)
+	taskCheckEvery, taskCheckTimeout, heartbeatSilence = 50*time.Millisecond, 200*time.Millisecond, time.Second
 	h := newHarness(t, 0.02, 6, 3)
 	f := &freezer{thaw: make(chan struct{})}
 	h.wrap = func(i int, ln net.Listener) net.Listener {

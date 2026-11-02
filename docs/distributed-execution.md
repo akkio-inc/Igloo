@@ -977,9 +977,11 @@ clones do: workers read the files the metadata lists, wherever they lie in
 the warehouse.
 
 If a worker cannot be reached, stops in the middle of a statement or stops
-answering its status (three answers missed, a second apart, about 7 seconds)
-while it runs a task, what it held runs again on the others, and the failed
-worker is left out for 30 seconds. A worker that answers a task with an error ran it and is healthy:
+answering its status while it runs a task, what it held runs again on the
+others, and the failed worker is left out for 30 seconds. One whose machine
+takes no connection either, as one without power, is found after three
+answers missed a second apart, about 7 seconds; one whose machine still takes
+connections, busy past answering or hung, after a minute without an answer. A worker that answers a task with an error ran it and is healthy:
 the statement then runs on the coordinator at once, without trying other
 workers or leaving any out. Object storage turning requests away for now
 (S3's 503 SlowDown) is not such an error: DuckDB tries the request again
@@ -1176,8 +1178,8 @@ other manifests only with that port open between them, or say `object`.
   task runs again a few times before the statement fails (and runs on the
   server if it fits there). A worker too busy to send a
   file says so within five seconds and is asked again for up to five
-  minutes; one that stops sending for a minute, or answering its status for
-  about 7 seconds, counts as lost. A statement
+  minutes; one that stops sending for a minute, or stops answering its status
+  and taking connections for about 7 seconds, counts as lost. A statement
   never returns
   rows short of a lost file: a task checks that the files it reads hold the
   rows written.

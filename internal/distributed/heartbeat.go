@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"sync"
 	"sync/atomic"
@@ -19,6 +20,13 @@ import (
 // memory, on a load of 56, the slowest took 100 ms, and with four threads a core, on a
 // load of 103, 1.1 s. Powered off, one of 16 workers took 69 s to find before: a reader's
 // minute of silence, and the check that followed.
+//
+// A worker busy past answering is not lost, though: its machine's kernel still takes a
+// connection, which a machine without power does not, nor one whose process is gone.
+// With each check the worker is also dialed, and a missed answer counts towards taking
+// it for lost in seconds only when the dial fails too. One that takes the connection
+// but answers nothing, busy or hung, is taken for lost only after heartbeatSilence
+// without an answer, far longer than a busy worker takes.
 //
 // Everyone who waits on a worker shares its heartbeat. A statement of many tasks asks
 // a worker once a second, not once for each. Missed answers do not count while nothing
@@ -37,6 +45,20 @@ var (
 // heartbeatPatience bounds how long missed answers do not count because no worker
 // answered; a variable for tests.
 var heartbeatPatience = 30 * time.Second
+
+// heartbeatSilence is how long a worker whose machine takes connections may answer no
+// status before it is taken for lost; a variable for tests.
+var heartbeatSilence = time.Minute
+
+// reachWorker dials the worker at addr, and says whether its machine took the
+// connection; a variable for tests, which take a worker's power away.
+var reachWorker = func(ctx context.Context, addr string) error {
+	c, err := (&net.Dialer{}).DialContext(ctx, "tcp", addr)
+	if err != nil {
+		return err
+	}
+	return c.Close()
+}
 
 // behindBy is how far past a check's timeout the process must be to take itself to
 // have run behind, rather than the worker to have been silent.
@@ -121,6 +143,7 @@ func (h *heartbeats) run(ctx context.Context, addr string, b *heartbeat) {
 	t := time.NewTicker(taskCheckEvery)
 	defer t.Stop()
 	misses := 0
+	// silent is when the worker last began to miss answers.
 	var silent time.Time
 	for {
 		select {
@@ -130,7 +153,28 @@ func (h *heartbeats) run(ctx context.Context, addr string, b *heartbeat) {
 		}
 		began := time.Now()
 		cctx, cancel := context.WithTimeout(ctx, taskCheckTimeout)
-		err := h.check(cctx, addr)
+		// The check, and once it is slow to answer or failed, a dial of the worker's
+		// machine beside it.
+		checked := make(chan error, 1)
+		go func() { checked <- h.check(cctx, addr) }()
+		var reached chan error
+		dial := func() {
+			reached = make(chan error, 1)
+			go func() { reached <- reachWorker(cctx, addr) }()
+		}
+		var err, unreached error
+		select {
+		case err = <-checked:
+		case <-time.After(taskCheckTimeout / 4):
+			dial()
+			err = <-checked
+		}
+		if err != nil {
+			if reached == nil {
+				dial()
+			}
+			unreached = <-reached
+		}
 		cancel()
 		switch {
 		case ctx.Err() != nil:
@@ -143,16 +187,16 @@ func (h *heartbeats) run(ctx context.Context, addr string, b *heartbeat) {
 		if silent.IsZero() {
 			silent = began
 		}
-		patient := time.Since(silent) < heartbeatPatience
-		if behind := time.Since(began) > taskCheckTimeout+behindBy; behind && patient {
-			// This process ran behind, and may have read the answer late.
+		if unreached == nil {
+			// Its machine takes connections: busy, or its process hung.
+			misses = 0
+			if time.Since(silent) < heartbeatSilence {
+				continue
+			}
+			err = fmt.Errorf("took connections but answered no status for %s: %w", time.Since(silent).Round(time.Second), err)
+		} else if !h.missed(addr, began, silent) {
 			continue
-		}
-		if patient && h.answered.Load() < began.UnixNano() && h.others(addr) {
-			// Nobody answered: it may be this end that went silent.
-			continue
-		}
-		if misses++; misses < taskCheckMisses {
+		} else if misses++; misses < taskCheckMisses {
 			continue
 		}
 		h.mu.Lock()
@@ -169,6 +213,19 @@ func (h *heartbeats) run(ctx context.Context, addr string, b *heartbeat) {
 		}
 		return
 	}
+}
+
+// missed reports whether a check of the worker at addr that began at began, and that
+// neither it nor its machine answered, counts against it: not while this process ran
+// behind, or nobody answered, for up to heartbeatPatience from silent.
+func (h *heartbeats) missed(addr string, began, silent time.Time) bool {
+	patient := time.Since(silent) < heartbeatPatience
+	if behind := time.Since(began) > taskCheckTimeout+behindBy; behind && patient {
+		// This process ran behind, and may have read the answer late.
+		return false
+	}
+	// Nobody answered: it may be this end that went silent.
+	return !patient || h.answered.Load() >= began.UnixNano() || !h.others(addr)
 }
 
 // statusAnswered asks the worker at addr for its status with client, and says whether

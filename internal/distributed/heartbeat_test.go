@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"runtime"
 	"slices"
 	"strings"
 	"sync"
@@ -21,6 +22,21 @@ func fastBeats(t *testing.T, every, timeout, patience time.Duration) {
 	was1, was2, was3 := taskCheckEvery, taskCheckTimeout, heartbeatPatience
 	t.Cleanup(func() { taskCheckEvery, taskCheckTimeout, heartbeatPatience = was1, was2, was3 })
 	taskCheckEvery, taskCheckTimeout, heartbeatPatience = every, timeout, patience
+}
+
+// unpowered has the machines of the addresses off reports while a test runs take no
+// connection, as a machine without power takes none: a dial waits until it gives up.
+func unpowered(t *testing.T, off func(addr string) bool) {
+	t.Helper()
+	was := reachWorker
+	t.Cleanup(func() { reachWorker = was })
+	reachWorker = func(ctx context.Context, addr string) error {
+		if off(addr) {
+			<-ctx.Done()
+			return ctx.Err()
+		}
+		return was(ctx, addr)
+	}
 }
 
 // lostIn reports whether lost closed within d.
@@ -127,6 +143,97 @@ func TestHeartbeats(t *testing.T) {
 
 func taskCheckMissesInt() int64 { return int64(taskCheckMisses) }
 
+// TestBusyWorkerNotTakenForLost has a worker whose status answers come past the
+// heartbeat's timeout while its tasks keep every core busy, as workers' did under a
+// billion rows of count(DISTINCT): its machine takes connections, so it is not taken
+// for lost, its tasks finish there, and the rows are one machine's. A worker that is
+// powered off in the same statement, answering nothing and taking no connection, still
+// is, within seconds. One that takes connections but answers nothing is, after
+// heartbeatSilence.
+func TestBusyWorkerNotTakenForLost(t *testing.T) {
+	fastBeats(t, 50*time.Millisecond, 200*time.Millisecond, 5*time.Second)
+	defer func(silence time.Duration) { heartbeatSilence = silence }(heartbeatSilence)
+	heartbeatSilence = 20 * time.Second
+	h := localHarness(t, 4)
+	f := frozenWorker(t, h, 2)
+	var busy atomic.Bool
+	h.workers[1].beforeStatus = func() {
+		if busy.Load() {
+			time.Sleep(4 * taskCheckTimeout)
+		}
+	}
+	// Each of its tasks first keeps every core busy for a while.
+	h.workers[1].beforeTask = func(http.ResponseWriter, *http.Request) bool {
+		busy.Store(true)
+		var wg sync.WaitGroup
+		until := time.Now().Add(500 * time.Millisecond)
+		for range runtime.NumCPU() {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for x := 0; time.Now().Before(until); x++ {
+					_ = x * x
+				}
+			}()
+		}
+		wg.Wait()
+		return true
+	}
+	want, _, err := h.query(context.Background(), exchangeQuery)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var ran atomic.Int32
+	var frozenAt, foundAt atomic.Int64
+	var lost sync.Map
+	hook := func(r slog.Record) {
+		if strings.HasPrefix(r.Message, "a worker stopped answering; it is taken for lost") {
+			lost.Store(attr(r, "worker"), true)
+			foundAt.CompareAndSwap(0, time.Now().UnixNano())
+		}
+		if r.Message == "ran a stage" && strings.Contains(attr(r, "stage"), " to exchange ") && ran.Add(1) == 1 {
+			frozenAt.Store(time.Now().UnixNano())
+			f.frozen.Store(true)
+		}
+	}
+	h.hook.Store(&hook)
+	start := time.Now()
+	got, _, _, _, err := h.run(context.Background(), exchangeQuery, ModeOn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if msg := compareRows(want, got, true); msg != "" {
+		t.Error(msg)
+	}
+	if !busy.Load() {
+		t.Fatal("the busy worker got no task")
+	}
+	if _, ok := lost.Load(h.lns[1].Addr().String()); ok {
+		t.Errorf("the busy worker was taken for lost, %s into the statement", time.Since(start))
+	}
+	if _, ok := lost.Load(h.lns[2].Addr().String()); !ok || frozenAt.Load() == 0 {
+		t.Fatalf("the powered-off worker was not taken for lost (frozen at %d)", frozenAt.Load())
+	}
+	if took := time.Duration(foundAt.Load() - frozenAt.Load()); took > 5*time.Second {
+		t.Errorf("the powered-off worker was taken for lost %s after it went", took)
+	}
+
+	// Taking connections but answering nothing, past heartbeatSilence.
+	heartbeatSilence = 300 * time.Millisecond
+	hb := newHeartbeats(func(ctx context.Context, addr string) error {
+		<-ctx.Done()
+		return ctx.Err()
+	}, nil)
+	gone, why, release := hb.watch(h.lns[1].Addr().String())
+	defer release()
+	if !lostIn(gone, 5*time.Second) {
+		t.Fatal("a worker that takes connections and answers nothing was not taken for lost")
+	}
+	if !strings.Contains(why().Error(), "took connections but answered no status") {
+		t.Errorf("why: %v", why())
+	}
+}
+
 // tasksRun counts the tasks h's workers are given.
 func tasksRun(h *harness) *atomic.Int64 {
 	var n atomic.Int64
@@ -214,17 +321,21 @@ func TestRepeatable(t *testing.T) {
 
 // frozenWorker has h's worker i stop serving on the first freeze, its connections open
 // and its kernel taking what is sent, as a machine that lost power closes nothing:
-// not a killed process.
+// not a killed process. Nor does it take new connections.
 func frozenWorker(t *testing.T, h *harness, i int) *freezer {
 	t.Helper()
 	f := &freezer{thaw: make(chan struct{})}
+	var addr atomic.Value
 	h.wrap = func(n int, ln net.Listener) net.Listener {
 		if n != i {
 			return ln
 		}
 		f.Listener = ln
+		addr.Store(ln.Addr().String())
 		return f
 	}
+	// Frozen, its machine takes no connection either.
+	unpowered(t, func(a string) bool { return f.frozen.Load() && a == addr.Load() })
 	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 	defer cancel()
 	if err := h.workers[i].Shutdown(ctx); err != nil {
