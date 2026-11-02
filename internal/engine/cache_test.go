@@ -58,6 +58,7 @@ func TestCacheStatements(t *testing.T) {
 		"SET GLOBAL cache_httpfs_min_disk_bytes_for_cache = 42",
 		"SET GLOBAL cache_httpfs_enable_cache_validation = true",
 		"SET GLOBAL cache_httpfs_evict_policy = 'lru_sp'",
+		"SET GLOBAL cache_httpfs_parallel_read_mode = 'duckdb_task_scheduler'",
 		"SET GLOBAL enable_external_file_cache = true",
 		`SELECT cache_httpfs_add_exclusion_regex('^(?!s3://my\.bucket/ware''house/)')`,
 		`SELECT cache_httpfs_add_exclusion_regex('^s3://my\.bucket/ware''house/_igloo_shuffle/')`,

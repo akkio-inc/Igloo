@@ -220,7 +220,8 @@ func TestCacheHTTPFSReadAheadUnderEviction(t *testing.T) {
 				"SET GLOBAL cache_httpfs_cache_directory = '" + dir + "'", "SET GLOBAL cache_httpfs_evict_policy = 'lru_sp'",
 				"SET GLOBAL cache_httpfs_min_disk_bytes_for_cache = 1152921504606846976",
 				"SET GLOBAL cache_httpfs_disk_cache_reader_enable_memory_cache = false",
-				"SET GLOBAL enable_external_file_cache = false", "SET GLOBAL cache_httpfs_type = 'on_disk'",
+				"SET GLOBAL enable_external_file_cache = false", "SET GLOBAL cache_httpfs_parallel_read_mode = 'duckdb_task_scheduler'",
+				"SET GLOBAL cache_httpfs_type = 'on_disk'",
 			} {
 				if _, err := db.Exec(q); err != nil {
 					t.Fatalf("%s: %v", q, err)

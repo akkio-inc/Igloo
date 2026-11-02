@@ -2,6 +2,7 @@ package pgwire
 
 import (
 	"errors"
+	"os"
 	"time"
 
 	"github.com/jeroenrinzema/psql-wire/codes"
@@ -49,6 +50,8 @@ type Metrics struct {
 	// resultcache.go).
 	resultCache *prometheus.CounterVec
 	resultBytes prometheus.Gauge
+	// processThreads is the threads of the process.
+	processThreads prometheus.GaugeFunc
 	// backgrounds counts the statements run in the second DuckDB (see
 	// background.go).
 	backgrounds prometheus.Counter
@@ -137,6 +140,10 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 			Name: "igloo_result_cache_bytes",
 			Help: "Memory the results the result cache keeps take, as Igloo estimates it.",
 		}),
+		processThreads: prometheus.NewGaugeFunc(prometheus.GaugeOpts{
+			Name: "igloo_process_threads",
+			Help: "Threads of the process, Go's and DuckDB's; Go's own go_threads counts only Go's.",
+		}, processThreads),
 		backgrounds: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "igloo_background_statements_total",
 			Help: "Heavy statements run in the second DuckDB, whose threads give way to the first's.",
@@ -146,7 +153,7 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 			Help: "Tables CREATE TABLE ... AS filled in passes over its aggregate's groups, whose list, string or DISTINCT aggregates would not have fit in memory in one.",
 		}),
 	}
-	reg.MustRegister(m.sessions, m.queries, m.duration, m.logins, m.reruns, m.ids, m.filled, m.skipped, m.reports, m.recognized, m.fallbacks,
+	reg.MustRegister(m.processThreads, m.sessions, m.queries, m.duration, m.logins, m.reruns, m.ids, m.filled, m.skipped, m.reports, m.recognized, m.fallbacks,
 		m.indexStatements, m.memoryExits, m.implicitRetries, m.prepares, m.sortedWrites, m.largeSorts, m.resultCache, m.resultBytes, m.aggPasses, m.backgrounds)
 	return m
 }
@@ -197,6 +204,15 @@ func (m *Metrics) largeSort() {
 	if m != nil {
 		m.largeSorts.Inc()
 	}
+}
+
+// processThreads reads the threads of the process, 0 where /proc does not tell.
+func processThreads() float64 {
+	tasks, err := os.ReadDir("/proc/self/task")
+	if err != nil {
+		return 0
+	}
+	return float64(len(tasks))
 }
 
 func (m *Metrics) backgroundStatement() {

@@ -166,6 +166,15 @@ func cacheStatements(dir, warehouseRoot string, reserve uint64, on bool) []strin
 		// off, does that job better and is what Igloo used before.
 		"SET GLOBAL cache_httpfs_disk_cache_reader_enable_memory_cache = false",
 		"SET GLOBAL enable_external_file_cache = true",
+		// By default a read starts a thread for each of its blocks, up to 1,024, warm
+		// or cold, and a read of a column of a row group of half a million rows
+		// has dozens: 20,394 threads on a replica of 16 cores with dashboards, ELT and
+		// reports beside each other, a load of 240, and no statement finished for
+		// 20 minutes. Blocks are read as DuckDB's tasks instead, on its threads, so
+		// that its thread count bounds them.
+		"SET GLOBAL cache_httpfs_parallel_read_mode = 'duckdb_task_scheduler'",
+		// Where the extension falls back on threads of its own.
+		fmt.Sprintf("SET GLOBAL cache_httpfs_max_fanout_subrequest = %d", readFanoutFallback),
 		// Cache only the warehouse: other allowed locations hold files
 		// that are read once, such as data to load, and so do the rows
 		// distributed-execution workers exchange.
@@ -176,6 +185,10 @@ func cacheStatements(dir, warehouseRoot string, reserve uint64, on bool) []strin
 		"SET GLOBAL cache_httpfs_type = "+literal(cacheType),
 	)
 }
+
+// readFanoutFallback is the threads a read may start where the extension has no
+// DuckDB to give its blocks to.
+const readFanoutFallback = 8
 
 // cacheOffStatements make the loaded extension behave like plain httpfs.
 func cacheOffStatements() []string {
