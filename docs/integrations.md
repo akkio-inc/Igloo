@@ -2,25 +2,21 @@
 
 Igloo speaks the PostgreSQL wire protocol, so the tools an analytics team
 already uses connect with their PostgreSQL drivers and adapters: dbt, BI
-tools, notebooks. The protocol is PostgreSQL's; the SQL a tool then sends
-runs as DuckDB's (or Snowflake's), so a tool works when its SQL does, which
-the tests below check for each one. This page says how to set each tool up,
-what each test runs, and what to expect. [SQL and clients](sql.md#clients)
-lists every tested driver, and [what differs from PostgreSQL](sql.md#differences-from-postgresql).
+tools, notebooks. This page says how to set each one up, which versions are
+tested, and what to expect. [SQL and clients](sql.md#clients) lists every
+tested driver, and [what differs from PostgreSQL](sql.md#differences-from-postgresql).
 
-| Tool | Connects with | What the test runs | Test |
-|---|---|---|---|
-| dbt Core 1.12 | dbt-postgres 1.11 | dbt itself, on a project of seeds, models, snapshots and tests | `make e2e` |
-| Jupyter, scripts | SQLAlchemy 2.1 with psycopg 3, pandas 3, polars 2 (SQLAlchemy, connectorx, ADBC) | Those libraries, in a script | `make e2e` |
-| Tableau, Looker, DBeaver | PostgreSQL JDBC 42.7 | The JDBC driver, making the metadata calls these tools make and running SQL shaped like theirs. The tools themselves do not run. | `make e2e` |
-| Metabase 0.64 | its PostgreSQL driver | Metabase itself, through its API: schema sync, and questions written by hand and built in the editor | `make bi-e2e` |
-| Apache Superset 6.1 | SQLAlchemy with psycopg2 | Superset itself, through its API: datasets, time-series charts and SQL Lab | `make bi-e2e` |
-| Power BI | Npgsql 4.0 (bundled with Power BI Desktop) and 10.0 | Npgsql, replaying Power BI's type loading, navigator queries and a report's query. Power BI itself does not run. | `make bi-e2e` |
+| Tool | Connects with | Tested by |
+|---|---|---|
+| dbt Core 1.12 | dbt-postgres 1.11 | `scripts/e2e.sh`, every pull request |
+| Jupyter, scripts | SQLAlchemy 2.1 with psycopg 3, pandas 3, polars 2 (SQLAlchemy, connectorx, ADBC) | `scripts/e2e.sh` |
+| Tableau, Looker, DBeaver | PostgreSQL JDBC 42.7 | `scripts/e2e.sh` (the metadata calls and SQL they issue) |
+| Metabase 0.64 | its PostgreSQL driver | `scripts/bi-e2e.sh`, weekly |
+| Apache Superset 6.1 | SQLAlchemy with psycopg2 | `scripts/bi-e2e.sh`, weekly |
+| Power BI | Npgsql 4.0 (bundled with Power BI Desktop) and 10.0 | `scripts/bi-e2e.sh`, weekly |
 
-`make e2e` (`scripts/e2e.sh`) runs in CI on pull requests and before each
-release, which publishes nothing unless it passes, and by hand. It does not
-run on pushes to `main`. `make bi-e2e` (`scripts/bi-e2e.sh`) runs weekly on
-GitHub Actions and on demand; it pulls about 3 GB of images.
+`make bi-e2e` runs the BI tools' checks locally; it pulls about 3 GB of
+images.
 
 ## Connecting
 
@@ -73,7 +69,7 @@ agency:
 `IGLOO_CATALOG_NAME` says otherwise: dbt-postgres qualifies every relation
 with it, as in `"lake"."analytics"."fct_spend"`.
 
-What works, as `scripts/clients/dbt` exercises it in `make e2e`:
+What works, as `scripts/clients/dbt` exercises it on every pull request:
 
 - `dbt seed`, `run`, `test`, `build`, `snapshot`, `show`, `docs generate`
   and `source freshness`.
@@ -134,10 +130,8 @@ Datasets, time-series charts with time grains, and SQL Lab work.
 ### Power BI
 
 *Get data → PostgreSQL database*. Server: `igloo.example.com:5432`,
-database: `igloo`. Power BI folds filters and aggregations into SQL that
-Igloo runs. Its connector's driver, Npgsql, runs in the tests with Power BI's
-type loading, navigator queries and a report's query replayed; Power BI
-itself is not part of them. Power BI encrypts the connection
+database: `igloo`. Import and DirectQuery both work; Power BI folds filters
+and aggregations into SQL that Igloo runs. Power BI encrypts the connection
 by default, so turn on [TLS](operations.md#tls), or clear *Encrypt
 connection* only on a private network. Power BI reads `numeric` columns as
 fixed decimals with their precision and scale.
@@ -147,15 +141,12 @@ fixed decimals with their precision and scale.
 *Connect → PostgreSQL*, with *Require SSL* once TLS is on. Tableau uses the
 PostgreSQL JDBC driver: it lists schemas and tables through the driver's
 metadata calls, describes custom SQL with `LIMIT 0`, and generates
-`DATE_TRUNC`, `CASE`, window functions and percentiles. The tests make
-those calls and run SQL shaped like Tableau's through the driver; Tableau
-itself is not part of them.
+`DATE_TRUNC`, `CASE`, window functions and percentiles, all of which work.
 
 ### Looker
 
-Dialect *PostgreSQL 9.5+*. SQL shaped like Looker's (CTEs, `TO_CHAR` of
-truncated dates, window functions) runs in the tests through the JDBC driver;
-Looker itself is not part of them. For persistent derived tables,
+Dialect *PostgreSQL 9.5+*. Looker's generated SQL (CTEs, `TO_CHAR` of
+truncated dates, window functions) works. For persistent derived tables,
 give Looker's user `CREATE`, `SELECT`, `INSERT` and `DELETE` on a scratch
 schema and set it as the connection's temp database.
 
@@ -211,7 +202,7 @@ writes Parquet from Igloo directly, much faster (see
 
 ## Known limitations
 
-- `COPY ... FROM STDIN` is not supported yet, so `psql`'s `\copy ... from`,
+- `COPY ... FROM STDIN` is not supported, so `psql`'s `\copy ... from`,
   `pandas.to_sql(method=...)` with COPY, and ADBC's bulk ingestion fail;
   `INSERT`, `to_sql` and `write_database` work. Load files with `COPY ...
   FROM` an allowed location instead.

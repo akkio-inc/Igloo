@@ -61,8 +61,7 @@ change touches locally (above, and `make e2e` for what crosses the stack).
 It checks:
 
 - gofmt, `go vet` and `go test`
-- `make migrate-test` and `make bench-test`: the migration report's and the
-  benchmark scripts' unit tests. The benchmark itself runs by hand.
+- `make migrate-test` and `make bench-test`
 - the container image, built natively for linux/amd64 and linux/arm64
 - `make e2e`
 - `helm lint` and `helm template` for `deploy/helm/igloo`

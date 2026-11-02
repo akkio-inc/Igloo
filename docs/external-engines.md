@@ -202,8 +202,7 @@ the gateway or load balancer.
 ### Apache Spark
 
 Tested with Spark 3.5.9 and Iceberg 1.11.0: reads, `INSERT`, `MERGE INTO`,
-`CREATE TABLE AS`, refusals by grants (`scripts/engines-e2e.sh`, run by hand,
-not in CI).
+`CREATE TABLE AS`, refusals by grants (`scripts/engines-e2e.sh`).
 
 ```properties
 spark.jars.packages                      org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:1.11.0,org.apache.iceberg:iceberg-aws-bundle:1.11.0
@@ -243,8 +242,7 @@ credentials. Neither has been tested against Igloo yet.
 ### Trino
 
 Tested with Trino 483: reads, `INSERT`, `UPDATE`, `DELETE`, refusals by
-grants (`scripts/engines-e2e.sh`, run by hand, not in CI). In
-`etc/catalog/igloo.properties`:
+grants. In `etc/catalog/igloo.properties`:
 
 ```properties
 connector.name=iceberg
