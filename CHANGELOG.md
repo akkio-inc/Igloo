@@ -1951,6 +1951,10 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   statements running leaves no room for it, whatever they reserved. A dashboard's
   324 queries at ten times the data took 1,945 s rather than 2,086, with a median
   of 392 s rather than 429.
+- A comparison with what a `CASE` of constants can never be, as of a view's `CASE`
+  with a value it has none of, is false before DuckDB plans the statement, which
+  then reads none of the tables behind it: a dashboard's statements that ask for
+  such a value took a minute of the cores each at ten times its data.
 - Statements wait in the order they would end if each ran alone from when it
   came, as their shape's runs say, rather than in arrival order; a shape that took
   under a second of CPU does not wait at all; and a statement of a shape not seen

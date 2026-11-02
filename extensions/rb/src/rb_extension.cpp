@@ -40,6 +40,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                          LogicalType::VARCHAR, Value("off"), CheckMode);
 	rb::RegisterRewrite(config);
 	rb::RegisterStats(loader, config);
+	rb::RegisterFold(config);
 	rb::RegisterStrings(loader);
 	rb::RegisterDivide(loader);
 	rb::RegisterFlatten(loader);

@@ -71,7 +71,7 @@ src="$here/src"
 croaring="$root/third_party/croaring"
 gcc -std=c11 -O3 -fPIC -fvisibility=hidden -I"$croaring" -c "$croaring/roaring.c" -o "$obj/roaring.o"
 pids=()
-for f in rb_extension rb_aggregate rb_scalar rb_memory rb_rewrite rb_stats rb_strings rb_divide rb_flatten; do
+for f in rb_extension rb_aggregate rb_scalar rb_memory rb_rewrite rb_stats rb_fold rb_strings rb_divide rb_flatten; do
 	g++ -std=c++17 -O2 -fPIC -DNDEBUG -DDUCKDB_BUILD_LOADABLE_EXTENSION -I"$headers" -I"$croaring" -I"$src" \
 		-c "$src/$f.cpp" -o "$obj/$f.o" &
 	pids+=($!)
@@ -81,7 +81,7 @@ for pid in "${pids[@]}"; do
 done
 
 g++ -shared -Wl,-s -o "$obj/rb.so" "$obj/roaring.o" "$obj/rb_extension.o" "$obj/rb_aggregate.o" "$obj/rb_scalar.o" \
-	"$obj/rb_memory.o" "$obj/rb_rewrite.o" "$obj/rb_stats.o" "$obj/rb_strings.o" "$obj/rb_divide.o" "$obj/rb_flatten.o" \
+	"$obj/rb_memory.o" "$obj/rb_rewrite.o" "$obj/rb_stats.o" "$obj/rb_fold.o" "$obj/rb_strings.o" "$obj/rb_divide.o" "$obj/rb_flatten.o" \
 	-lstdc++ -lm
 
 # DuckDB's extension footer, unsigned: 22 bytes of WebAssembly custom-section

@@ -86,6 +86,14 @@ many columns it holds. An optimizer pass that runs before DuckDB's own has
 each scan of a table with counts report them beside its table function's own
 statistics, for that statement (`src/rb_stats.cpp`).
 
+## Comparisons a CASE can never satisfy
+
+A pass before DuckDB's optimizers (`rb_fold.cpp`) replaces with false a comparison
+of a column that is a `CASE` of constants, none of them NULL, with a constant it
+is not (`=` or `IN`), through the projections above the `CASE`. DuckDB's optimizers
+then take out what can give no rows, the tables behind it included. Under a
+collation or a cast of the column, the comparison is left alone.
+
 ## Faster trim
 
 DuckDB's `trim` decodes every character of a string to find Unicode's space
