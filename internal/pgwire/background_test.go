@@ -423,7 +423,8 @@ func TestMostOfSize(t *testing.T) {
 	h.after = 5 * time.Second
 	short := aStatement{expect: time.Second, ran: 2 * time.Second}
 	unseen := aStatement{ran: 2 * time.Second}
-	sized := aStatement{expect: 30 * time.Second, ran: time.Second}
+	sized := aStatement{expect: 30 * time.Second, ran: time.Minute}
+	starting := aStatement{expect: 30 * time.Second, ran: time.Second}
 	long := aStatement{ran: time.Minute}
 	slowed := aStatement{expect: time.Second, ran: time.Minute}
 	waiting := aStatement{expect: time.Second, waiting: true}
@@ -442,6 +443,7 @@ func TestMostOfSize(t *testing.T) {
 		{[]aStatement{sized, sized, sized, sized, long, long, short}, true},
 		{[]aStatement{slowed}, false},
 		{[]aStatement{slowed, slowed, slowed, sized}, false},
+		{[]aStatement{starting}, false},
 		{[]aStatement{waiting}, true},
 		{[]aStatement{short, short, waiting, waiting, waiting}, true},
 		{[]aStatement{short, short, short, waiting}, false},

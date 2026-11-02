@@ -267,17 +267,20 @@ type aStatement struct {
 	waiting bool
 }
 
-// mostOfSize says whether most of beside are of some size: known to take as much
-// alone as makes a statement heavy at the least, or, of a shape not seen yet, running
-// for half as long as a statement not known to be heavy would before it could have
-// used that much. A statement known to be short counts as short however long it has
+// mostOfSize says whether most of beside are of some size: waiting in line, or
+// running for half as long as a statement not known to be heavy would before it could
+// have used that much, and not known to take less alone than makes a statement heavy
+// at the least. A statement known to be short counts as short however long it has
 // run: a heavy statement beside dashboards slows them, and were that to make them of
-// some size, it would stay beside them. Their p95 went from 9 s to 119 s.
+// some size, it would stay beside them. Their p95 went from 9 s to 119 s. And what a
+// statement is known to take alone counts only once it has run that long: their first
+// runs on a replica, beside the heavy statement, measured many times what they take,
+// which kept it in the first with them, where it ran out of memory, and them with it.
 func (h *heavyHistory) mostOfSize(beside []aStatement) bool {
 	long := h.moveAfter(len(beside)) / 2
 	sized := 0
 	for _, b := range beside {
-		if b.waiting || b.expect >= h.after || b.expect == 0 && b.ran >= long {
+		if b.waiting || b.ran >= long && (b.expect == 0 || b.expect >= h.after) {
 			sized++
 		}
 	}
