@@ -24,8 +24,8 @@ container, as CI does.
 is deterministic, so every platform gets identical rows:
 
 - Igloo: `make load-tpch SF=10`, or on a cloud deployment
-  `CALL dbgen(sf = 10)` followed by `CREATE TABLE ... AS SELECT` per table,
-  as `deploy/single-vm/sql/load-tpch.sql` does. Keep the tables in the
+  `CALL dbgen(sf = 10)`, one at a time, followed by `CREATE TABLE ... AS SELECT`
+  per table, as `deploy/single-vm/sql/load-tpch.sql` does. Keep the tables in the
   cloud's object storage (Amazon S3 here), as Snowflake and Databricks do,
   and pass `--storage S3` so the report labels the run; results with tables
   on the machine's own disk are labeled `local disk` and are not a fair

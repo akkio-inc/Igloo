@@ -17,7 +17,7 @@ import (
 func TestSizeRowGroups(t *testing.T) {
 	db := openDuckDB(t)
 	dir := t.TempDir()
-	u := unsortedTable{files: 4, rows: 50_000, keys: 500}
+	u := unsortedTable{files: 4, rows: 700_000, keys: 500}
 	cat := u.table(t, db, dir, table.UnsortedSortOrder)
 	set := func(props iceberg.Properties) {
 		t.Helper()
@@ -82,6 +82,87 @@ func TestSizeRowGroups(t *testing.T) {
 	m.opts.Memory, m.opts.Threads = 1<<30, 4
 	if got := size(); got != "1000" {
 		t.Errorf("a user's size became %q", got)
+	}
+}
+
+// TestSplitRowGroups checks that a pass rewrites a small table Igloo created whose row
+// groups are too few for its size, once, with its rows as they were; and leaves alone
+// one whose row groups are fine, a user's, and one too large to be small.
+func TestSplitRowGroups(t *testing.T) {
+	db := openDuckDB(t)
+	ctx := context.Background()
+	m := New(nil, t.TempDir()+"/", Options{Memory: 1 << 30, Threads: 4}, quiet)
+	groups := func(tbl *table.Table) (files, groups int, rows int64) {
+		t.Helper()
+		tasks, err := tbl.Scan().PlanFiles(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		fs, err := tbl.FS(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, task := range tasks {
+			n, err := filerewrite.RowGroups(fs, task.File.FilePath())
+			if err != nil {
+				t.Fatal(err)
+			}
+			groups += n
+			rows += task.File.Count()
+		}
+		return len(tasks), groups, rows
+	}
+	mark := func(cat listedCatalog, props iceberg.Properties) {
+		t.Helper()
+		tx := cat.tbl.NewTransaction()
+		if err := tx.SetProperties(props); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := tx.Commit(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Two files of a row group each, of 400,000 rows.
+	u := unsortedTable{files: 2, rows: 400_000, keys: 500, rowGroups: 524_288}
+	cat := u.table(t, db, t.TempDir(), table.UnsortedSortOrder)
+	if f, g, rows := groups(cat.tbl); f != 2 || g > 8 || rows != 800_000 {
+		t.Fatalf("the table to split: %d files, %d row groups, %d rows", f, g, rows)
+	}
+	// One Igloo did not create stays as it is.
+	committed, err := m.splitRowGroups(ctx, cat.tbl, quiet)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if committed.CurrentSnapshot().SnapshotID != cat.tbl.CurrentSnapshot().SnapshotID {
+		t.Error("a table without the marker was rewritten")
+	}
+	mark(cat, iceberg.Properties{rowGroupsProperty: "auto"})
+	committed, err = m.splitRowGroups(ctx, cat.tbl, quiet)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f, g, rows := groups(committed)
+	if rows != 800_000 || g < 6 {
+		t.Errorf("after the split: %d files, %d row groups, %d rows", f, g, rows)
+	}
+	// Once is enough, and checked once.
+	snap := committed.CurrentSnapshot().SnapshotID
+	cat.tbl = committed
+	if again, err := m.splitRowGroups(ctx, cat.tbl, quiet); err != nil || again.CurrentSnapshot().SnapshotID != snap {
+		t.Errorf("a second pass: %v", err)
+	}
+	delete(m.splitChecked, name(cat.tbl.Identifier()))
+	if again, err := m.splitRowGroups(ctx, cat.tbl, quiet); err != nil || again.CurrentSnapshot().SnapshotID != snap {
+		t.Errorf("a table with enough row groups was rewritten: %v", err)
+	}
+
+	// Row groups as small as they aim at stay as they are.
+	fine := unsortedTable{files: 8, rows: 100_000, keys: 500}
+	cat = fine.table(t, db, t.TempDir(), table.UnsortedSortOrder)
+	mark(cat, iceberg.Properties{rowGroupsProperty: "auto"})
+	before := cat.tbl.CurrentSnapshot().SnapshotID
+	if got, err := m.splitRowGroups(ctx, cat.tbl, quiet); err != nil || got.CurrentSnapshot().SnapshotID != before {
+		t.Errorf("a table of 8 files of 100,000 rows was rewritten: %v", err)
 	}
 }
 

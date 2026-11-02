@@ -47,6 +47,15 @@ import (
 // gigabytes and took 714 s on one machine, was estimated at 5.6 GB and 15
 // s, and stayed there.
 //
+// What the estimates above a report's aggregates rest on are DuckDB's guesses
+// at their groups, and each operator's rows are corrected as its inputs' were,
+// so errors compound: at a hundred times the data that report, by what it took
+// for a join of its metrics to themselves, was estimated at 37.9 TB. So without
+// a join's keys' distinct counts it does not multiply the rows of the side with
+// more, and a grouping by keys it computes keeps no more than aggregateKeeps of
+// its input. Now 4.7 TB, nine tenths of it what its aggregates hold of their
+// input, about what a tenth of the data came to.
+//
 // The plan also says what one machine reads (each table's columns that
 // its scans project, once: the read cache serves them again) and the
 // rows its hash tables take in, at hashMissRate a core where a table is
@@ -303,6 +312,8 @@ func topAggregate(n *planNode) bool {
 		switch {
 		case strings.Contains(name, "GROUP_BY"), strings.Contains(name, "AGGREGATE"):
 			return true
+		case name == "CTE" && len(n.Children) == 2:
+			n = n.Children[1]
 		case len(n.Children) != 1:
 			return false
 		case name == "ORDER_BY", name == "PROJECTION", name == "FILTER", name == "TOP_N", strings.Contains(name, "LIMIT"):
@@ -338,6 +349,14 @@ func planOf(plan string, st planStats) (planEstimate, error) {
 	}
 	if w.unknown != "" {
 		return planEstimate{}, errors.New("no estimate of the rows of " + w.unknown)
+	}
+	if aggregated && w.scanned > 0 {
+		// DuckDB's guess at its groups, a client's to take on any way the
+		// statement runs: at a hundred times the data, an aggregate by a table's
+		// genre, of a few dozen rows, was estimated at 3,300 s of sending them
+		// on 2 workers or 16, which took 2 for 3,999 s as near 16's 3,375, and
+		// it took 449 s there and 25 s on 16.
+		result = min(result, aggregateKeeps*w.scanned)
 	}
 	out := planEstimate{parts: w.parts, work: w.work, bytes: w.bytes(), fields: result * float64(max(columns, 1))}
 	var joins, all float64
@@ -502,6 +521,15 @@ func (w *setWalker) walk(n *planNode) (rowsEstimate, []column) {
 		est.ours, est.kept = card, 1
 	}
 	switch {
+	case name == "CTE" && len(rows) == 2:
+		// A statement's rows are its body's, not those of what it reads.
+		return rows[1], outs[1]
+	case name == "TOP_N":
+		// No more than it keeps, for a client that takes as many.
+		if top, err := strconv.ParseFloat(strings.TrimSpace(strings.Join(n.strs("Top"), "")), 64); err == nil {
+			est.ours, est.duck = min(est.ours, top), min(est.duck, top)
+		}
+		return est, inCols
 	case name == "UNION" && len(rows) > 1:
 		return unionRows(rows, card, ok), unionColumns(outs)
 	case name == "CTE_SCAN":
@@ -604,6 +632,12 @@ func (w *setWalker) walk(n *planNode) (rowsEstimate, []column) {
 		w.hold(name, "group", entries, entry)
 		w.distinct(name, aggs, inCols, in.ours, width(groups))
 		w.work += in.ours / hashRate(entries*entry)
+		if computedKeys(groups) {
+			// Keys it computes, as a report's dimensions and their values:
+			// rows above it are few, whatever it holds on its way to them
+			// (see aggregateKeeps).
+			est.ours = max(min(est.ours, aggregateKeeps*in.ours), min(est.ours, 2))
+		}
 		return est, append(groups, make([]column, len(aggs))...)
 	case name == "UNGROUPED_AGGREGATE":
 		w.distinct(name, n.strs("Aggregates"), inCols, in.ours, 0)
@@ -666,6 +700,12 @@ func unionColumns(branches [][]column) []column {
 	return out
 }
 
+// computedKeys says a grouping has keys, and none is a table's column, which
+// may have as many values as rows, and none has a distinct count.
+func computedKeys(groups []column) bool {
+	return len(groups) > 0 && !slices.ContainsFunc(groups, func(c column) bool { return c.name != "" || c.distinct > 0 })
+}
+
 // equality matches a join condition of equal columns.
 var equality = regexp.MustCompile(`^\s*(\S+)\s*=\s*(\S+)\s*$`)
 
@@ -680,7 +720,9 @@ var equality = regexp.MustCompile(`^\s*(\S+)\s*=\s*(\S+)\s*$`)
 //     scans, from scans, counted as filtered so;
 //   - for any other inner join on equal columns, no fewer than the rows of
 //     the side with more, as its filters leave them, that the other side's
-//     filters keep, each row of it joined to its key's row of the other;
+//     filters keep, each row of it joined to its key's row of the other, and
+//     no more than that side's: nothing says it multiplies them, however
+//     DuckDB's guesses at its inputs compound (see the package's notes);
 //   - for a left join, no fewer than its left side's rows;
 //   - for a cross product, or a join of a small source of its own, every
 //     pair of its sides' rows.
@@ -718,6 +760,12 @@ func (w *setWalker) joinRows(n *planNode, rows []rowsEstimate, outs [][]column, 
 			share = 1 / c.distinct
 		}
 		for i := scans[side]; i < scans[side+1]; i++ {
+			if w.scans[i].selective {
+				// DuckDB's rows already are its filter's: one audience's rows,
+				// as a lookup's are taken for by every audience's share of
+				// them, of which the latest version is most of a large one.
+				share = 1
+			}
 			w.scans[i].selective = true
 		}
 		return max(other.ours*share, 1), other.kept * share
@@ -729,9 +777,13 @@ func (w *setWalker) joinRows(n *planNode, rows []rowsEstimate, outs [][]column, 
 		if r.ours > l.ours {
 			fact, dim = r, l
 		}
-		return max(scaled, fact.ours*dim.kept), kept
+		return max(min(scaled, fact.ours), fact.ours*dim.kept), kept
+	case equal && typ == "SEMI":
+		// Each key of the other side keeps a row at least, where its rows are
+		// that many: DuckDB takes it to keep a fifth of them.
+		return min(max(scaled, r.ours), l.ours), kept
 	case typ == "LEFT":
-		return max(scaled, l.ours), l.kept
+		return max(min(scaled, max(l.ours, r.ours)), l.ours), l.kept
 	}
 	return scaled, kept
 }

@@ -8,7 +8,7 @@
 #   - a worker killed in the middle of a statement does not fail it,
 #   - with IGLOO_EXCHANGES=auto, workers exchange rows on their disks, and
 #     a worker killed while it holds some does not give wrong rows,
-#   - statement timeouts reach the workers,
+#   - statement timeouts reach the workers, and so does a client's going away,
 #   - a clone reads its source's files on the workers,
 #   - a statement keeps its snapshot while another session commits,
 #   - tables with lists, maps and structs run distributed, unnests and
@@ -237,6 +237,21 @@ echo "statement timeout"
 got="$(psql_admin -v VERBOSITY=verbose -c "SET distributed_execution = 'on'" -c "SET statement_timeout = '1s'" \
   -c "SELECT l_returnflag, sum(length(repeat(l_comment, 3000))) FROM lineitem GROUP BY 1" || true)"
 if grep -q "57014" <<<"$got"; then pass "statement_timeout cancels a distributed statement"; else fail "timeout: $got"; fi
+
+echo "a client that goes away"
+gone="${project}-gone-client"
+docker run -d --rm --name "$gone" --network "$network" -e PGPASSWORD="$admin_password" postgres:17 \
+  psql -h igloo -U igloo -d igloo -X -c "SET distributed_execution = 'on'" \
+  -c "SELECT l_returnflag, sum(length(repeat(l_comment, 3000))) FROM lineitem GROUP BY 1" >/dev/null
+sleep 3
+docker kill "$gone" >/dev/null 2>&1 || true
+deadline=$((SECONDS + 15))
+until compose logs --no-color igloo 2>/dev/null | grep -q "a client went away" || [ "$SECONDS" -ge "$deadline" ]; do sleep 1; done
+if compose logs --no-color igloo 2>/dev/null | grep -q "a client went away"; then
+  pass "a client killed mid-statement has its statement canceled"
+else
+  fail "a client killed mid-statement: its statement was not canceled within 15 s"
+fi
 
 echo "clones"
 # A clone's data files lie under its source's location; workers read the

@@ -535,6 +535,11 @@ func (s *Server) runStatement(ctx context.Context, sess *session, st *statement,
 	// Maintenance leaves the tables it writes be until it commits (see
 	// txTables).
 	defer sess.useTables(st)()
+	endDataGen, refused := holdDataGen(st)
+	if refused != nil {
+		return refused
+	}
+	defer endDataGen()
 	if st.tempFill != nil {
 		rows, err := s.runTempCreate(ctx, sess, st.tempFill)
 		if err != nil {

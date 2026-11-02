@@ -734,6 +734,69 @@ func TestUnseenWaitsWhileMemoryIsFull(t *testing.T) {
 	r()
 }
 
+// TestUnseenStopsWaiting checks that statements nothing is known of do not wait for
+// the memory for as long as what holds it runs, and start one at a time once they have
+// waited long enough.
+func TestUnseenStopsWaiting(t *testing.T) {
+	const gb = int64(1) << 30
+	c := NewController(8 * gb)
+	c.patience = 20 * time.Millisecond
+	ctx := context.Background()
+	r, _, err := c.Admit(ctx, Limits{Memory: gb})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r()
+	c.sample(7 * gb)
+	first, waited, err := c.Admit(ctx, Limits{Counted: true, Unseen: true})
+	if err != nil || waited < c.patience {
+		t.Fatalf("an unseen statement with the memory full: waited %s: %v", waited, err)
+	}
+	defer first()
+	// The next waits for what that one holds to show.
+	short, cancel := context.WithTimeout(ctx, 100*time.Millisecond)
+	defer cancel()
+	if _, _, err := c.Admit(short, Limits{Counted: true, Unseen: true}); !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("the next, just after it: %v", err)
+	}
+}
+
+// TestLeavingEarly checks that a statement that lets go before it ends, as a canceled
+// one does, lets those behind it start, and still says what it held when it ends.
+func TestLeavingEarly(t *testing.T) {
+	const gb = int64(1) << 30
+	c := NewController(8 * gb)
+	ctx := context.Background()
+	done, _, err := c.Admit(ctx, Limits{Memory: gb})
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.sample(7 * gb)
+	started := make(chan struct{})
+	go func() {
+		r, _, err := c.Admit(ctx, Limits{Counted: true, Unseen: true})
+		if err != nil {
+			t.Error(err)
+		}
+		close(started)
+		r()
+	}()
+	select {
+	case <-started:
+		t.Fatal("an unseen statement started with the memory full")
+	case <-time.After(50 * time.Millisecond):
+	}
+	done()
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("an unseen statement did not start once the other let go")
+	}
+	if peak, sampled := done(); peak != 7*gb || !sampled {
+		t.Errorf("what it held: %d, sampled %v", peak, sampled)
+	}
+}
+
 // TestTook checks how long a shape's statements take here, by its latest runs:
 // the median, the lower one of two, of its completed runs.
 func TestTook(t *testing.T) {
@@ -942,4 +1005,65 @@ func TestRunsThatReadNothing(t *testing.T) {
 	c.ObserveEmpty("only")
 	c.ObserveEmpty("only")
 	seen("only", 0, 0, true)
+}
+
+// TestUnseenStartAFewAtATime checks that statements nothing is known of do not all
+// start at once while what they will hold cannot show yet, and that one that ends
+// leaves room for the next.
+func TestUnseenStartAFewAtATime(t *testing.T) {
+	const gb = int64(1) << 30
+	c := NewController(16 * gb)
+	c.LimitReplica(8)
+	ctx := context.Background()
+	// The first with nothing running; then until those just started make it full.
+	var running []func() (int64, bool)
+	for range 3 {
+		r, waited, err := c.Admit(ctx, Limits{Counted: true, Unseen: true})
+		if err != nil || waited != 0 {
+			t.Fatalf("waited %s: %v", waited, err)
+		}
+		running = append(running, r)
+	}
+	started := make(chan func() (int64, bool), 1)
+	go func() {
+		r, _, err := c.Admit(ctx, Limits{Counted: true, Unseen: true})
+		if err != nil {
+			t.Error(err)
+		}
+		started <- r
+	}()
+	select {
+	case <-started:
+		t.Fatal("a fourth started beside three just started")
+	case <-time.After(50 * time.Millisecond):
+	}
+	// One that knows what it reserves starts all the same.
+	known, waited, err := c.Admit(ctx, Limits{Counted: true})
+	if err != nil || waited != 0 {
+		t.Fatalf("a known statement waited %s: %v", waited, err)
+	}
+	known()
+	// One that ends leaves room.
+	running[0]()
+	var r func() (int64, bool)
+	select {
+	case r = <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the fourth did not start once one had ended")
+	}
+	r()
+	// Once they have had the time to grow, what is held says.
+	c.mu.Lock()
+	for w := range c.unseen {
+		w.started = time.Now().Add(-unseenGrows)
+	}
+	c.mu.Unlock()
+	c.sample(gb)
+	r, waited, err = c.Admit(ctx, Limits{Counted: true, Unseen: true})
+	if err != nil || waited != 0 {
+		t.Fatalf("with room, past their time to grow: waited %s: %v", waited, err)
+	}
+	r()
+	running[1]()
+	running[2]()
 }

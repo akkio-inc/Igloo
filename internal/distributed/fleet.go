@@ -436,8 +436,12 @@ func (o option) unproven() bool { return o.large && !o.measured && o.spill.facto
 // another would finish, the cheapest of those within fleetMargin of the
 // fastest, the one on fewer workers on a tie (costs within costTie); and
 // says why. No option faster than the one picked and cheaper by more than
-// costTie is passed over: it would be within the margin too. ok is false
-// when none would finish.
+// costTie is passed over: it would be within the margin too. Where all should
+// run out of memory by their estimates it is the one with the most memory: a
+// statement's tasks spill, and run again over more partitions with more memory
+// each, and a report so estimated at a hundred times the data, which 16 workers
+// took 521 to 825 s over, ran on one machine instead until it was cancelled, 302
+// GB spilled. ok is false with no options.
 func pick(opts []option, dollars bool) (best option, why string, ok bool) {
 	proven := slices.ContainsFunc(opts, func(o option) bool { return !o.spill.oom && !o.unproven() })
 	eligible := func(o option) bool { return !o.spill.oom && !(proven && o.unproven()) }
@@ -448,7 +452,11 @@ func pick(opts []option, dollars bool) (best option, why string, ok bool) {
 		}
 	}
 	if fastest < 0 {
-		return option{}, "every way on workers would run out of memory", false
+		if len(opts) == 0 {
+			return option{}, "no way on workers", false
+		}
+		best := mostMemory(opts)
+		return best, fmt.Sprintf("%s, %.0f s, its memory the most of any way, as every way looks short of memory by its estimate", best, best.seconds), true
 	}
 	limit := opts[fastest].seconds * fleetMargin
 	chosen := fastest
@@ -503,6 +511,18 @@ func pick(opts []option, dollars bool) (best option, why string, ok bool) {
 		b.WriteString(" (prices not set: by worker-seconds)")
 	}
 	return best, b.String(), true
+}
+
+// mostMemory is the option of opts that holds the most: the most workers, or the
+// large worker where nothing else is offered.
+func mostMemory(opts []option) option {
+	best := opts[0]
+	for _, o := range opts[1:] {
+		if best.large || !o.large && o.workers > best.workers {
+			best = o
+		}
+	}
+	return best
 }
 
 // exploreFleet is the option to run a statement on once, to measure it,

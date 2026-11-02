@@ -20,6 +20,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/duckdb/duckdb-go/v2"
@@ -569,6 +570,11 @@ type Server struct {
 	lateWritesStop chan struct{}
 	lateWritesWait func()
 	stopLateWrites sync.Once
+	// clientWatchStop ends the watch for clients that went away (see
+	// clientgone.go), which watchingClients starts once.
+	clientWatchStop chan struct{}
+	watchingClients sync.Once
+	stopClientWatch sync.Once
 	// uploadKeys is Options.UploadKeys.
 	uploadKeys uploads.Keys
 	// uploadStoreFor, in tests, is the store of unfinished writes of a directory.
@@ -863,6 +869,7 @@ func New(engine Engine, opts Options, log *slog.Logger) (*Server, error) {
 	}
 	s.wire = srv
 	s.lateWritesStop = make(chan struct{})
+	s.clientWatchStop = make(chan struct{})
 	return s, nil
 }
 
@@ -871,6 +878,7 @@ func (s *Server) Serve(l net.Listener) error {
 	if s.requireTLS {
 		l = requireTLS(l)
 	}
+	s.watchingClients.Do(func() { go s.watchClients() })
 	return s.wire.Serve(s.startup.listener(l))
 }
 
@@ -879,6 +887,7 @@ func (s *Server) Serve(l net.Listener) error {
 func (s *Server) Shutdown(ctx context.Context) error {
 	s.indexBuilds.stopped.Store(true)
 	err := s.wire.Shutdown(ctx)
+	s.stopClientWatch.Do(func() { close(s.clientWatchStop) })
 	s.stopLateWrites.Do(func() { close(s.lateWritesStop) })
 	s.lateWrites.Wait()
 	err = errors.Join(err, s.closeBackground())
@@ -1076,6 +1085,11 @@ type session struct {
 	// statement's run it watches (see watchStuck).
 	stuck   *stuckWatch
 	watched context.Context
+	// socket is the client's connection, for a client's session, which is
+	// looked at while a statement runs; clientGone, under mu, says it closed,
+	// once logged (see clientgone.go).
+	socket     syscall.RawConn
+	clientGone bool
 	// privs are the user's grants, loaded when first needed.
 	privs privilegeSnapshot
 	// fixed, when set, are the session's grants for good, and its user is
@@ -1476,7 +1490,7 @@ func (sess *session) runCancelable(ctx context.Context, query string, fn func(co
 	if timeout := sess.queuedTimeout(); timeout > 0 {
 		queued, cancelQueued = context.WithTimeout(ctx, timeout)
 	}
-	release, err := sess.admit(queued)
+	release, leave, err := sess.admit(queued)
 	cancelQueued()
 	if err != nil {
 		return err
@@ -1490,6 +1504,20 @@ func (sess *session) runCancelable(ctx context.Context, query string, fn func(co
 		ctx, cancelRun = context.WithTimeout(ctx, timeout)
 		defer cancelRun()
 	}
+	// Once canceled or past its timeout it holds nobody up, however long DuckDB
+	// takes to stop it, its slots and what it reserved or holds of the memory:
+	// statements behind a report that went on after its client had gone started
+	// only when it was stopped. One the memory watch canceled keeps them, as what
+	// it holds is why, and it may run again (see rearm).
+	stopLeaving := context.AfterFunc(ctx, func() {
+		sess.mu.Lock()
+		shed := sess.shed
+		sess.mu.Unlock()
+		if !shed {
+			leave()
+		}
+	})
+	defer stopLeaving()
 	stopWatch := sess.watchStuck(ctx)
 	err = fn(ctx)
 	stopWatch()

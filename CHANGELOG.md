@@ -13,6 +13,31 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
 
 ### SQL and tables
 
+- A small table's row groups no longer limit the threads that scan it. A table
+  under 256 MiB loaded in row groups of half a million rows has few, and DuckDB reads
+  each on one thread. A maintenance pass now rewrites one that has too few, into
+  row groups of about a sixteenth of it, of at least 122,880 rows.
+
+- A canceled statement holds nobody up. Statements behind one waited until DuckDB
+  had stopped it, for its slots and its memory, and a statement of a shape not seen
+  yet waited for memory for as long as what held it ran: behind a report estimated
+  at 16 hours, it waited before it was even planned for workers. Canceled, past its
+  timeout or with its client gone, a statement now gives up its place at once, and a
+  shape not seen yet waits for memory for at most a minute.
+
+- A statement stops when its client goes away. Nothing read a client's
+  connection while its statement ran, so a report whose client was killed went on
+  spilling, from 302 GB to 355 GB in two minutes, until Igloo was restarted. The
+  server now looks at the sockets of sessions running a statement every second
+  and cancels the statement of one that closed, as a cancel request does, on this
+  replica, in the second DuckDB, on workers and while its rows stream.
+
+- `CALL dbgen` from sessions at once no longer crashes the server. DuckDB's data
+  generators keep their state in the process, and two at once ended it with a
+  segmentation fault. One statement of a process may call them at a time, the
+  others fail with SQLSTATE `55P03`, and a macro, view or prepared statement may
+  not keep them for later. Only admins could call them, and still only they can.
+
 - Models trained and scored in SQL, as Snowflake's ML classes:
   `SNOWFLAKE.ML.FORECAST` and `ANOMALY_DETECTION` (Snowflake's `fast`
   method, many series, exogenous columns, intervals from
@@ -1941,8 +1966,8 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   second held, the first took memory faster than the second's spill files could
   give it back: beside a burst of heavy statements the two held 134% of the limit,
   and the kernel killed the process.
-- A heavy statement stays in the first DuckDB while most of what runs there is of
-  some size itself, known to take 5 seconds of all the cores alone or having run
+- A heavy statement stays in the first DuckDB while most of what runs there or
+  waits to is of some size itself, known to take 5 seconds of all the cores alone or having run
   for a while, since there is nothing short for it to give way to. Under a
   dashboard's burst at ten times its data, statements sent to the second had a tenth
   of what the others left of the cores and ran past 15 minutes, and those moved
@@ -1951,10 +1976,17 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   statements running leaves no room for it, whatever they reserved. A dashboard's
   324 queries at ten times the data took 1,945 s rather than 2,086, with a median
   of 392 s rather than 429.
+- Statements of a shape not seen yet start a few at a time, each counting for a
+  quarter of the memory until it has had 30 s to hold what it will, or has ended.
+  Five that started together when the memory emptied held 39 GB of spill files
+  between them, and two ran past 15 minutes.
 - A comparison with what a `CASE` of constants can never be, as of a view's `CASE`
   with a value it has none of, is false before DuckDB plans the statement, which
   then reads none of the tables behind it: a dashboard's statements that ask for
   such a value took a minute of the cores each at ten times its data.
+- Snowflake's `x LIKE ANY ('%a%', '%b%', ...)` is one regular expression where that
+  is faster, rather than a comparison for each pattern that works out `x` again:
+  over `TRIM(LOWER(x))`, 25 patterns took 0.7 s of 10 million strings, not 6.4.
 - A run that read nothing, as DuckDB plans a statement to no rows for some values
   of its literals, says nothing of what other statements of its shape reserve and
   take, or which `FLATTEN` form suits them.

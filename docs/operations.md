@@ -924,6 +924,11 @@ whose replicas share them and stop them once idle; each pool has its own.
   that the client is not held, and the server logs `a statement canceled
   or past its timeout has not stopped`, with DuckDB's progress. Its session
   ends once DuckDB stops it.
+- A statement stops when its client goes away. The server looks at the
+  socket of each session running a statement every second and cancels the
+  statement of one that closed, as a cancel request does, wherever it runs,
+  and logs `a client went away while its statement ran`; the history records
+  it as canceled.
 - `IGLOO_MAX_CONNECTIONS` caps sessions per replica; further logins fail with
   SQLSTATE `53300`. Connections that have not signed in yet are limited too:
   as many may be signing in at once (at least 100), half of them from one
@@ -1238,6 +1243,15 @@ long ones cost more: copying 4 million rows of 2 KB took 6 s rather than
 4.4 s, and 15.8 GiB rather than 12.1 GiB. If a table's rows are like that,
 set its `write.parquet.row-group-size` before you load it.
 
+DuckDB reads a row group on one thread, so a scan takes at least as long as
+reading its largest row group, however many threads there are, and a small
+table gets few from the statements that load it: a million rows in 2 to 4. So a
+table under 256 MiB aims at 16 row groups, of at least 122,880 rows, and a
+maintenance pass rewrites one that Igloo sizes, that is not partitioned or
+clustered, whose row groups hold half as many rows again as that. A query
+that read all the columns of a table of a million rows twice took 0.47 s where it
+had 9 row groups, 0.51 s with 4 and 0.58 s with 2.
+
 Maintenance then sets a table's `write.parquet.row-group-size` from its
 bytes a row as compaction would, once it has rows, and again when that size
 moves by more than 15%. DuckDB holds a row group, uncompressed, on each of
@@ -1492,6 +1506,7 @@ and the catalog runs its database migrations before it serves. Read
 | SQLSTATE `57014`, `statement queued timeout: it waited 30s to start, behind the limit of 4 statements at once for role analysts` | The statement waited for its [role limits](workload-management.md#role-limits), or [the replica's](workload-management.md#the-replicas-limit), until its `statement_queued_timeout`. Run fewer statements at once, raise the limit, or give the team a compute pool. |
 | SQLSTATE `42501`, `ST_Read goes through GDAL` | GDAL-based readers and writers are refused; load spatial data as GeoParquet, shapefiles or GeoJSON ([media analytics](media-analytics.md#loading-boundaries)). |
 | `CREATE TABLE` fails with `schema: data did not match any variant` | The table has a column the catalog cannot store, such as a `GEOMETRY`; store `ST_AsWKB(geom)` instead ([media analytics](media-analytics.md#loading-boundaries)). |
+| SQLSTATE `55P03`, `another statement is generating data with dbgen or dsdgen` | DuckDB's data generators keep their state in the process, and two at once crash it: one statement of a process may call them at a time, and only by `CALL` or in a `SELECT`, not through a macro, view or prepared statement (SQLSTATE `0A000`). Run them in turn. |
 | SQLSTATE `53300` | The replica is at `IGLOO_MAX_CONNECTIONS`. Use a connection pool, raise the limit, or add replicas. |
 | SQLSTATE `58000`, `cannot check this statement: the session's user could not be read from the metadata database for 2m0s` | The replica has not reached the metadata database (`IGLOO_METADATA_DATABASE_URL`) for longer than `IGLOO_ACCESS_MAX_STALENESS`, so it cannot tell whether the user, their grants or the policies changed. Statements run again once it can; check the database and the network to it. |
 | SQLSTATE `57P03`, `cannot open a session: waited 30s for the catalog lock, which a statement listing or changing the catalog has held for ...` | A listing or DDL has had the catalog to itself for that long ([concurrency on a replica](#concurrency-on-a-replica)); logins wait for it no longer. Try again; if it lasts, find the statement among those running in the console and cancel it. |

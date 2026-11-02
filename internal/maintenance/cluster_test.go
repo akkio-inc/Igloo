@@ -33,6 +33,8 @@ type unsortedTable struct {
 	// keys is how many distinct keys there are; one in nullEvery rows has
 	// a NULL key (0 for none).
 	keys, nullEvery int
+	// rowGroups is the rows of a row group of its files, if not DuckDB's.
+	rowGroups int
 }
 
 func (u unsortedTable) schema() *iceberg.Schema {
@@ -58,9 +60,13 @@ func (u unsortedTable) write(t testing.TB, db *sql.DB, dir string, first, count 
 	var paths []string
 	for f := first; f < first+count; f++ {
 		path := filepath.Join(dir, fmt.Sprintf("duckdb-%03d.parquet", f))
+		options := "FORMAT parquet"
+		if u.rowGroups > 0 {
+			options += fmt.Sprintf(", ROW_GROUP_SIZE %d", u.rowGroups)
+		}
 		stmt := fmt.Sprintf(`COPY (SELECT i AS id, %s AS audience, CAST(i %% 3 AS INTEGER) AS ver,
 			'payload-' || md5(i::VARCHAR) || '-' || md5((i + 1)::VARCHAR) AS payload
-			FROM range(%d, %d) t(i) ORDER BY random()) TO '%s' (FORMAT parquet)`, key, f*u.rows, (f+1)*u.rows, path)
+			FROM range(%d, %d) t(i) ORDER BY random()) TO '%s' (%s)`, key, f*u.rows, (f+1)*u.rows, path, options)
 		if _, err := db.Exec(stmt); err != nil {
 			t.Fatal(err)
 		}

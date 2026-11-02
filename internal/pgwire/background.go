@@ -43,8 +43,8 @@ import (
 // connection's tables or a view not yet copied there, fails as it is
 // prepared, and runs in the first.
 //
-// All this is for short statements beside heavy ones. Where most of what runs in
-// the first DuckDB is of some size itself (see besideIsHeavy), there are none to
+// All this is for short statements beside heavy ones. Where most of what runs or
+// waits to in the first DuckDB is of some size itself (see besideIsHeavy), there are none to
 // give way to, and a heavy statement stays in the first: under a dashboard's burst
 // at ten times its data, with every statement a minute or more, those sent to the
 // second had a tenth of what the others left of the cores, and ran past 15 minutes
@@ -281,9 +281,11 @@ func (h *heavyHistory) mostOfSize(beside []aStatement) bool {
 	return sized*2 > len(beside)
 }
 
-// besideIsHeavy says whether most of what runs in the first DuckDB beside sess is
-// of some size itself, so that a heavy statement would give way to nothing (see the
-// top of this file).
+// besideIsHeavy says whether most of what runs in the first DuckDB beside sess, or
+// waits in line to, is of some size itself, so that a heavy statement would give way
+// to nothing (see the top of this file). Those waiting count: alone in the first with
+// 16 in line, a heavy statement went to the second, where it had none of the first's
+// caches and restarted, and took half as long again, as the others waited for it.
 func (s *Server) besideIsHeavy(sess *session) bool {
 	r := s.sessions
 	r.mu.Lock()
@@ -298,7 +300,7 @@ func (s *Server) besideIsHeavy(sess *session) bool {
 	beside := make([]aStatement, 0, len(all))
 	for _, other := range all {
 		other.mu.Lock()
-		running, shape, started := other.statement != "" && !other.queued && !other.inBackground, other.runShape, other.started
+		running, shape, started := other.statement != "" && !other.inBackground, other.runShape, other.started
 		other.mu.Unlock()
 		if running {
 			beside = append(beside, aStatement{expect: s.workload.Expect(shape), ran: now.Sub(started)})

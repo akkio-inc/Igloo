@@ -1048,7 +1048,7 @@ func chooseShared(e estimate, r runs, found bool, threshold time.Duration, now t
 		t := oneMachine * share
 		switch {
 		case e.workers == 0 || math.IsInf(e.onWorkers, 1):
-			return fmt.Sprintf("one machine should take %.0f s, and no way on workers would finish", t)
+			return fmt.Sprintf("one machine should take %.0f s, and there are no workers to run it", t)
 		case t <= limit && !e.spills:
 			return fmt.Sprintf("one machine should take %.0f s, within the %.0f s a statement must take for workers to be worth it", t, limit)
 		case faster > 1:
@@ -1119,10 +1119,19 @@ func chooseShared(e estimate, r runs, found bool, threshold time.Duration, now t
 				r.dist, faster, e.oneMachine)
 		}
 		return false, false, fmt.Sprintf("it ran in %.0f s on workers, no faster than one machine's estimate of %.0f s, shared", r.dist, e.oneMachine*share)
-	case e.spills && e.workers > 0 && e.onWorkers <= spillWithin*e.oneMachine:
+	case e.spills && e.workers > 0 && (e.farBeyond || e.onWorkers <= spillWithin*e.oneMachine):
+		// Far beyond its memory, whatever workers should take: their tasks
+		// share it out over their partitions, and one machine's time is only
+		// a floor (see farBeyondRatio).
 		return true, false, fmt.Sprintf("one machine should take %.0f s or more, spilling, and workers %.0f s", e.oneMachine, e.onWorkers)
 	case worth(e.oneMachine):
 		return true, false, fmt.Sprintf("one machine should take %.0f s and workers %.0f s", e.oneMachine, e.onWorkers)
+	case e.memory && e.workers > 0 && e.onWorkers <= e.oneMachine*share:
+		// Workers no slower, and short of memory by what it exchanges: one
+		// machine's estimate is what it reads, and a report so estimated at 52
+		// s, within the threshold, took 90 s there before the guard moved it,
+		// 174 s in all, and 216 s left there, against 68 to 87 s on workers.
+		return true, false, fmt.Sprintf("one machine should take %.0f s and run short of memory, and workers %.0f s", e.oneMachine, e.onWorkers)
 	case risky(e.oneMachine):
 		return true, false, riskyReason(fmt.Sprintf("one machine should take %.0f s and workers %.0f s", e.oneMachine, e.onWorkers))
 	}

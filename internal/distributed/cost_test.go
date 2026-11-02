@@ -120,6 +120,18 @@ func TestChoose(t *testing.T) {
 			runs{dist: 126}, true, true, false},
 		{"ran on workers 90 times one machine's estimate, exchanging more than it holds", estimate{oneMachine: 14, onWorkers: 30, workers: 2, memory: true},
 			runs{dist: 1312, heavy: true}, true, true, false},
+		// Short of memory by what it exchanges, and workers no slower: a report
+		// estimated at 52 s took 174 s by way of the guard, and 68 to 87 s on
+		// workers. Not where workers are slower, as a report's that took 10 s
+		// here and 66 s there.
+		{"short of memory, workers no slower", estimate{oneMachine: 52, onWorkers: 45, workers: 16, memory: true}, runs{}, false, true, false},
+		{"short of memory, workers slower", estimate{oneMachine: 30, onWorkers: 79, workers: 8, memory: true}, runs{}, false, false, false},
+		{"fits, workers no slower", estimate{oneMachine: 52, onWorkers: 45, workers: 16}, runs{}, false, false, false},
+		// Far beyond its memory, whatever workers should take: not just past
+		// its room, where their time decides.
+		{"far beyond its memory, workers slower", estimate{oneMachine: 100, onWorkers: 400, workers: 16, memory: true, spills: true, farBeyond: true}, runs{}, false, true, false},
+		{"past its room, workers slower", estimate{oneMachine: 100, onWorkers: 400, workers: 16, memory: true, spills: true}, runs{}, false, false, false},
+		{"far beyond its memory, no workers", estimate{oneMachine: 100, onWorkers: math.Inf(1), memory: true, spills: true, farBeyond: true}, runs{}, false, false, false},
 		// Far over an estimate that says it spills: the estimate is wrong, as
 		// a report's of 15 s, after 200 s on workers, that took 714 s there.
 		{"ran on workers 90 times one machine's estimate, which says it spills", estimate{oneMachine: 14, onWorkers: 30, workers: 2, memory: true, spills: true},

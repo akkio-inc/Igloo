@@ -777,6 +777,11 @@ func likeAny(left []*node, op string, all bool, g *node, escape []*node) (*node,
 	if len(pats) == 0 {
 		return nil, &Error{Code: CodeSyntax, Message: op + " ANY needs at least one pattern"}
 	}
+	if !all && op == "LIKE" && len(escape) == 0 {
+		if pattern, ok := containsAnyPattern(left, pats); ok {
+			return seq(left, raw("regexp_matches(CAST("), x, raw(" AS VARCHAR), "+quoteString(pattern)+")")), nil
+		}
+	}
 	join := " OR "
 	if all {
 		join = " AND "
@@ -790,6 +795,44 @@ func likeAny(left []*node, op string, all bool, g *node, escape []*node) (*node,
 		kids = append(kids, escape...)
 	}
 	return seq(left, append(kids, raw(")"))...), nil
+}
+
+// containsAnyMany is how many patterns make one regular expression faster than a
+// comparison for each over a plain column: on 10 million strings, 0.38 s to 0.37 s
+// at 8 patterns, 0.69 s to 0.37 s at 16. Over an expression, each comparison works it
+// out again, and it is faster at 2.
+const containsAnyMany = 8
+
+// containsAnyPattern returns the regular expression that is true of a string just
+// where one of pats, each '%text%', is: x LIKE ANY ('%a%', ...) as a comparison for
+// each of 25 patterns over TRIM(LOWER(x)) took 6.4 s of 10 million strings in 16
+// comparisons where the one expression took 0.72 s, reading x once. left is what
+// they compare. It leaves the patterns alone if any has more to it than text.
+func containsAnyPattern(left []*node, pats [][]*node) (string, bool) {
+	many := 2
+	if isColumnRef(left) {
+		many = containsAnyMany
+	}
+	if len(pats) < many {
+		return "", false
+	}
+	var parts []string
+	for _, p := range pats {
+		idx := sig(p)
+		if len(idx) != 1 {
+			return "", false
+		}
+		v, ok := p[idx[0]].stringValue()
+		if !ok || len(v) < 3 || v[0] != '%' || v[len(v)-1] != '%' {
+			return "", false
+		}
+		text := v[1 : len(v)-1]
+		if strings.ContainsAny(text, "%_\\") {
+			return "", false
+		}
+		parts = append(parts, regexp.QuoteMeta(text))
+	}
+	return strings.Join(parts, "|"), true
 }
 
 // orderBy makes the place of NULLs in each ORDER BY explicit, as

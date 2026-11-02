@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/apache/iceberg-go"
 	"github.com/apache/iceberg-go/table"
@@ -72,6 +73,82 @@ func (m *Maintainer) sizeRowGroups(ctx context.Context, tbl *table.Table, log *s
 	}
 	log.Info("sized the row groups inserts write", "rows", rows, "bytes_a_row", size/records, "row_width", width)
 	return nil
+}
+
+// A new table starts with row groups of half a million rows, before anyone knows how
+// many it will have (see catalogproxy's firstRowGroups), and the statements that load a
+// small one write it in a few: a table of a million rows, in 2 to 4. DuckDB reads a
+// row group on one thread, so scanning it took as long on 64 cores as on 32: over TPC-H
+// at scale factor 100, the one query that reads all of such a table's columns, twice,
+// took 0.51 s on tables loaded so, or 0.58 s if one statement had written it, and
+// 0.47 s with 9 row groups, and no other query moved. So a pass rewrites what is small
+// enough to aim at filerewrite.TableRowGroups row groups, once it knows the table's bytes,
+// if its row groups hold half as many rows again as it aims at.
+
+// splitRowGroups rewrites tbl, if Igloo created it and nobody else set its row group
+// size, if it is small and its row groups too few: splitChecked holds the snapshot
+// looked at last. It returns the table as committed.
+func (m *Maintainer) splitRowGroups(ctx context.Context, tbl *table.Table, log *slog.Logger) (*table.Table, error) {
+	snap := tbl.CurrentSnapshot()
+	if snap == nil || !strings.HasPrefix(tbl.Properties()[rowGroupsProperty], "auto") || !tbl.Metadata().PartitionSpec().IsUnpartitioned() {
+		return tbl, nil
+	}
+	key := name(tbl.Identifier())
+	if m.splitChecked[key] == snap.SnapshotID {
+		return tbl, nil
+	}
+	if _, _, clustered := clusterFields(tbl); clustered {
+		return tbl, nil
+	}
+	size, records, err := tableBytes(ctx, tbl)
+	if err != nil || size <= 0 || records <= 0 {
+		return tbl, err
+	}
+	if size > filerewrite.TableRowGroups*filerewrite.TargetRowGroupBytes {
+		m.splitChecked[key] = snap.SnapshotID
+		return tbl, nil
+	}
+	want := filerewrite.TargetRows(size, records)
+	tasks, err := tbl.Scan().PlanFiles(ctx)
+	if err != nil {
+		return tbl, err
+	}
+	// A file has a row group at least, and most tables that many files or more.
+	coarse := func(groups int64) bool { return 2*records > 3*want*groups }
+	groups := int64(len(tasks))
+	if !coarse(groups) {
+		m.splitChecked[key] = snap.SnapshotID
+		return tbl, nil
+	}
+	fs, err := tbl.FS(ctx)
+	if err != nil {
+		return tbl, err
+	}
+	groups = 0
+	rewrite := make(map[string]struct{}, len(tasks))
+	for _, t := range tasks {
+		n, err := filerewrite.RowGroups(fs, t.File.FilePath())
+		if err != nil {
+			return tbl, err
+		}
+		groups += int64(n)
+		rewrite[t.File.FilePath()] = struct{}{}
+	}
+	if !coarse(groups) {
+		m.splitChecked[key] = snap.SnapshotID
+		return tbl, nil
+	}
+	start := time.Now()
+	g := table.CompactionTaskGroup{Tasks: tasks, TotalSizeBytes: size}
+	committed, res, err := m.rewriteGroups(ctx, tbl, []table.CompactionTaskGroup{g}, rewrite, "split row groups", rewriteGroup)
+	if err != nil || res.removed == 0 {
+		return committed, err
+	}
+	m.opts.Metrics.compacted(res.removed, res.added)
+	log.Info("split a small table's row groups", "rows", records, "row_groups_before", groups, "rows_a_group", want,
+		"files_before", res.removed, "files_after", res.added, "bytes_before", res.bytesBefore, "bytes_after", res.bytesAfter,
+		"took", time.Since(start).Round(time.Millisecond), "peak_memory", res.peak)
+	return committed, nil
 }
 
 // openPartitionFiles is how many files of a partitioned write DuckDB keeps

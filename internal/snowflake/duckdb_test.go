@@ -370,3 +370,39 @@ func TestCreateViewColumnComments(t *testing.T) {
 		t.Errorf("got %q %v", client, spend)
 	}
 }
+
+// TestLikeAnyContains checks that LIKE ANY of text anywhere in a value, which it
+// translates to one regular expression, is true of the same values as a comparison
+// for each pattern: with characters that mean something to a regular expression, on
+// more than one line, in other scripts, and for NULL.
+func TestLikeAnyContains(t *testing.T) {
+	conn := session(t)
+	ctx := context.Background()
+	values := []string{"NULL", "''", "'plain'", "'has a.b in it'", "'axb'", "'c++ here'", "'cc'", "'(x)'", "'x|y'", "'x'", "'[z]'", "'z'",
+		"'line one' || chr(10) || 'needle' || chr(10) || 'line three'", "'Needle'", "'naïve'", "'nai'", "'日本語'", "'本'", "'$^'", "'it''s'", "'{1}'", "'\\d'"}
+	patterns := []string{"a.b", "c++", "(x)", "x|y", "[z]", "needle", "ï", "本", "$^", "it''s", "{1}"}
+	var quoted, ors []string
+	for _, p := range patterns {
+		quoted = append(quoted, "'%"+p+"%'")
+		ors = append(ors, "(v LIKE '%"+p+"%')")
+	}
+	res, err := Translate("SELECT v, LOWER(v) LIKE ANY ("+strings.Join(quoted, ", ")+") AS got FROM t", Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(res.SQL, "regexp_matches") {
+		t.Fatalf("not one regular expression: %s", res.SQL)
+	}
+	for _, v := range values {
+		table := "(SELECT " + v + " AS v) AS t"
+		q := "SELECT coalesce(CAST(got AS VARCHAR), 'NULL'), coalesce(CAST(want AS VARCHAR), 'NULL') FROM (SELECT got, want FROM (" +
+			strings.Replace(res.SQL, "FROM t", ", ("+strings.ReplaceAll(strings.Join(ors, " OR "), "(v ", "(lower(v) ")+") AS want FROM "+table, 1) + "))"
+		var got, want string
+		if err := conn.QueryRowContext(ctx, q).Scan(&got, &want); err != nil {
+			t.Fatalf("%s: %v\n%s", v, err, q)
+		}
+		if got != want {
+			t.Errorf("%s: %s, want %s", v, got, want)
+		}
+	}
+}
