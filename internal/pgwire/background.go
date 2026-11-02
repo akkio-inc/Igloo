@@ -303,7 +303,7 @@ func (s *Server) besideIsHeavy(sess *session) bool {
 	beside := make([]aStatement, 0, len(all))
 	for _, other := range all {
 		other.mu.Lock()
-		running, waiting, shape, started := other.statement != "" && !other.inBackground, other.queued, other.runShape, other.started
+		running, waiting, shape, started := other.statement != "" && !other.inBackground && !other.elsewhere, other.queued, other.runShape, other.started
 		other.mu.Unlock()
 		if running {
 			beside = append(beside, aStatement{expect: s.workload.Expect(shape), ran: now.Sub(started), waiting: waiting})

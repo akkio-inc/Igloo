@@ -2004,6 +2004,8 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
 - Auto mode keeps a statement of seconds on the replica however busy it is, by its
   last run there or on workers, rather than go by an estimate of one machine that
   runs far past both: a dashboard's statements of 1.5 s ran on workers for good.
+- Statements running on workers no longer count as sharing the replica's cores when
+  auto mode weighs where another runs, or as what a heavy statement gives way to.
 - A worker gives its task slots to the statement that has started the fewest tasks
   there, rather than in the order they came, so that a short statement's tasks do not
   wait for all of a long one's.

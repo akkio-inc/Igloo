@@ -139,6 +139,19 @@ func countsOnReplica(sess *session, st *statement) bool {
 	return false
 }
 
+// onWorkers says the running statement goes on to run on workers: it holds nothing of
+// this replica from now on, beside the statements here. They counted it as sharing
+// the replica's cores, so that beside 56 statements on workers, 3 of them heavy for
+// each that ran here, a statement of seconds went to workers too.
+func (sess *session) onWorkers() {
+	if sess.wl.elsewhere != nil {
+		sess.wl.elsewhere()
+	}
+	sess.mu.Lock()
+	sess.elsewhere = true
+	sess.mu.Unlock()
+}
+
 // admit waits until the session's limits let a statement start, and
 // returns the function to call when it ends.
 func (sess *session) admit(ctx context.Context) (release, leave func(), err error) {

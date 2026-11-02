@@ -310,9 +310,7 @@ func (s *Server) startDistributed(ctx context.Context, sess *session, user auth.
 		// made (see runFinal).
 		plan.StreamMerged()
 	}
-	if sess.wl.elsewhere != nil {
-		sess.wl.elsewhere()
-	}
+	sess.onWorkers()
 	ex, err := s.dist.Execute(ctx, plan, settings)
 	if err != nil {
 		// Released now if the statement is done; otherwise once it has run
@@ -527,7 +525,7 @@ func (s *Server) othersRunning(sess *session) int {
 	n := 0
 	for _, other := range all {
 		other.mu.Lock()
-		if other.statement != "" && !other.queued {
+		if other.statement != "" && !other.queued && !other.elsewhere {
 			n++
 		}
 		other.mu.Unlock()

@@ -1073,10 +1073,12 @@ type session struct {
 	// because Igloo exits (see exitForMemory).
 	statement string
 	started   time.Time
-	// runShape is the running statement's shape, and inBackground says it runs
-	// in the second DuckDB, for the statements beside it (see besideIsHeavy).
+	// runShape is the running statement's shape, inBackground says it runs in the
+	// second DuckDB, and elsewhere on workers, for the statements beside it (see
+	// besideIsHeavy and othersRunning).
 	runShape     string
 	inBackground bool
+	elsewhere    bool
 	shed         bool
 	shedAt       time.Time
 	exiting      bool
@@ -1481,7 +1483,7 @@ func (sess *session) runCancelable(ctx context.Context, query string, fn func(co
 	defer func() {
 		sess.mu.Lock()
 		sess.running, sess.statement, sess.started, sess.queued = nil, "", time.Time{}, false
-		sess.runShape = ""
+		sess.runShape, sess.elsewhere = "", false
 		sess.mu.Unlock()
 		cancel()
 	}()
