@@ -634,6 +634,11 @@ func (sess *session) setInBackground(on bool) {
 	sess.mu.Unlock()
 }
 
+// outOfSpillSpace says DuckDB could write no more to its spill files.
+func outOfSpillSpace(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "failed to offload data block")
+}
+
 // runInBackground runs st in the second DuckDB. ran false says it did not,
 // and nothing was sent: it runs in the first.
 func (s *Server) runInBackground(ctx context.Context, sess *session, st *statement, args []driver.NamedValue, tw *tagWriter, parts *distParts) (ran bool, err error) {
@@ -663,8 +668,10 @@ func (s *Server) runInBackground(ctx context.Context, sess *session, st *stateme
 		return true, nil
 	}
 	// Whatever failed there, unless the statement was canceled, the first
-	// DuckDB may do better, if the client has seen nothing yet.
-	if ctx.Err() != nil || tw.Written() > 0 || distributed.DataError(err) {
+	// DuckDB may do better, if the client has seen nothing yet. Not with its spill
+	// files where the disk is full: run again in the first, a report that had filled
+	// the disk from the second took the dashboards' p95 from 8 s to 108 s, and failed.
+	if ctx.Err() != nil || tw.Written() > 0 || distributed.DataError(err) || outOfSpillSpace(err) {
 		return true, err
 	}
 	s.log.Debug("a heavy statement failed in the second DuckDB; running it in the first", "err", err)

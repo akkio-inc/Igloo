@@ -2,6 +2,7 @@ package pgwire
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -494,5 +495,17 @@ func TestHeavyStaysBesideHeavy(t *testing.T) {
 	}
 	if n := backgrounds(m); n != 2 {
 		t.Errorf("%v ran in the background, with nothing beside it", n)
+	}
+}
+
+// TestOutOfSpillSpace checks what says the disk is full of a statement's spill files.
+func TestOutOfSpillSpace(t *testing.T) {
+	t.Parallel()
+	full := errors.New("Out of Memory Error: failed to offload data block of size 256.0 KiB (30.4 GiB/30.4 GiB used).")
+	if !outOfSpillSpace(full) {
+		t.Error("a full disk not recognized")
+	}
+	if outOfSpillSpace(errors.New("Out of Memory Error: could not allocate block")) || outOfSpillSpace(nil) {
+		t.Error("something else taken for a full disk")
 	}
 }
