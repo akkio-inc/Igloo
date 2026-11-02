@@ -2144,7 +2144,9 @@ const (
 	viewQuery = "__igloo_view_query"
 	// viewColumns, on a subquery read as a view, replaces its column
 	// aliases: its relation's stages wrote only some of its columns, named
-	// as the candidate reads them (see asRelation).
+	// as the candidate reads them (see asRelation). Like the others it is
+	// set only while the fragment is built, so a candidate given up on
+	// leaves none in the statement.
 	viewColumns = "__igloo_view_columns"
 )
 
@@ -2161,6 +2163,9 @@ func (pl *planner) views(c *candidate) (*job, error) {
 	for i, k := range c.keyed {
 		k.view = fmt.Sprintf("__igloo_k%d", i)
 		k.ref()[viewMark] = k.view
+		if k.rel != nil && k.rel.projected {
+			k.rel.ref[viewColumns] = []any{}
+		}
 	}
 	for i, r := range c.whole {
 		v := fmt.Sprintf("__igloo_w%d", i)
@@ -2174,6 +2179,9 @@ func (pl *planner) views(c *candidate) (*job, error) {
 			r.ref[viewQuery] = q
 		} else {
 			r.ref[viewMark] = v
+			if r.projected {
+				r.ref[viewColumns] = []any{}
+			}
 		}
 	}
 	names := map[string]string{}
