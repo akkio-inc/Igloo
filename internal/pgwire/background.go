@@ -262,6 +262,9 @@ type aStatement struct {
 	// workload.Controller.Expect), zero for a shape not seen yet, and ran how long
 	// it has run.
 	expect, ran time.Duration
+	// waiting says it waits in line, for what is held: what makes a heavy statement
+	// give way, the cores, is not what it waits for.
+	waiting bool
 }
 
 // mostOfSize says whether most of beside are of some size: known to take as much
@@ -274,7 +277,7 @@ func (h *heavyHistory) mostOfSize(beside []aStatement) bool {
 	long := h.moveAfter(len(beside)) / 2
 	sized := 0
 	for _, b := range beside {
-		if b.expect >= h.after || b.expect == 0 && b.ran >= long {
+		if b.waiting || b.expect >= h.after || b.expect == 0 && b.ran >= long {
 			sized++
 		}
 	}
@@ -300,10 +303,10 @@ func (s *Server) besideIsHeavy(sess *session) bool {
 	beside := make([]aStatement, 0, len(all))
 	for _, other := range all {
 		other.mu.Lock()
-		running, shape, started := other.statement != "" && !other.inBackground, other.runShape, other.started
+		running, waiting, shape, started := other.statement != "" && !other.inBackground, other.queued, other.runShape, other.started
 		other.mu.Unlock()
 		if running {
-			beside = append(beside, aStatement{expect: s.workload.Expect(shape), ran: now.Sub(started)})
+			beside = append(beside, aStatement{expect: s.workload.Expect(shape), ran: now.Sub(started), waiting: waiting})
 		}
 	}
 	return s.heavy.mostOfSize(beside)
