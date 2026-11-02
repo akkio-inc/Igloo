@@ -114,11 +114,19 @@ func TestRefreshes(t *testing.T) {
 	p := New(f, nil)
 	var stopped atomic.Bool
 	t.Cleanup(func() { stopped.Store(true) })
+	// The background waits for the first token to be handed out, which it
+	// would otherwise replace first if it ran first.
+	handedOut := make(chan struct{})
+	var once sync.Once
+	t.Cleanup(func() { once.Do(func() { close(handedOut) }) })
 	p.after = func(time.Duration) <-chan time.Time {
 		c := make(chan time.Time, 1)
-		if !stopped.Load() {
-			c <- time.Now()
-		}
+		go func() {
+			<-handedOut
+			if !stopped.Load() {
+				c <- time.Now()
+			}
+		}()
 		return c
 	}
 	get := func() string {
@@ -132,6 +140,7 @@ func TestRefreshes(t *testing.T) {
 	if got := get(); got != "first" {
 		t.Fatalf("got %s", got)
 	}
+	once.Do(func() { close(handedOut) })
 	deadline := time.Now().Add(10 * time.Second)
 	for get() != "second" {
 		if time.Now().After(deadline) {
