@@ -1057,6 +1057,11 @@ type session struct {
 	catHolds   []*catalogHold
 	catHeld    catalogMode
 	catRelease func()
+	// catWait is how long the session waited for the engine lock since its
+	// last statement was recorded (see recordQuery), and catSince when it
+	// last took it exclusively, for logging long holds (see unlockCatalog).
+	catWait  time.Duration
+	catSince time.Time
 	// sharedPrepare is set while prepareChecked prepares a statement holding
 	// the catalog lock shared, which stops at DuckDB's first failure to
 	// prepare it (see sharedprepare.go).
@@ -2441,21 +2446,40 @@ func (s *Server) relockCatalog(sess *session) {
 		return
 	}
 	s.unlockCatalog(sess)
+	start := time.Now()
 	switch want {
 	case catalogExclusive:
 		sess.catRelease = s.engine.CatalogLock()
+		sess.catSince = time.Now()
+		sess.catWait += sess.catSince.Sub(start)
 	case catalogShared:
 		sess.catRelease = s.engine.CatalogShare()
+		sess.catWait += time.Since(start)
 	}
 	sess.catHeld = want
 }
+
+// catalogHoldLogged is how long a session holds the catalog lock
+// exclusively, keeping every other session's binds, listings and DDL
+// waiting, before letting go of it is logged.
+const catalogHoldLogged = time.Second
 
 // unlockCatalog lets go of the engine's catalog lock the session holds, if
 // any, keeping its holds.
 func (s *Server) unlockCatalog(sess *session) {
 	if sess.catRelease != nil {
+		var held time.Duration
+		if sess.catHeld == catalogExclusive {
+			held = time.Since(sess.catSince)
+		}
 		sess.catRelease()
 		sess.catRelease = nil
+		if held >= catalogHoldLogged {
+			// The session's backend pid, which its client was given (not its
+			// history's session_id, which takes the session's mutex).
+			s.log.Info("held the catalog lock exclusively, keeping other sessions' statements waiting",
+				"pid", sess.pid, "held", held.Round(time.Millisecond))
+		}
 	}
 	sess.catHeld = catalogFree
 }

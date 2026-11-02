@@ -72,6 +72,9 @@ type queryRecord struct {
 	// it waited for its user's limits.
 	used   *audit.Resources
 	queued time.Duration
+	// catWait is how long its steps waited for the catalog lock (see
+	// relockCatalog); recordQuery takes it from the session.
+	catWait time.Duration
 	// parts is what running the statement in parts on workers took, and
 	// shape its key for the workload controller (see shapeKey), if any.
 	parts distParts
@@ -124,6 +127,12 @@ func (s *Server) recordQuery(sess *session, r queryRecord) {
 	if s.audit == nil || sess == nil {
 		return
 	}
+	// What its steps waited for the catalog lock since the session's last
+	// statement was recorded is this one's; a record held and recorded
+	// again (see holdRecords) has it already.
+	if r.catWait == 0 {
+		r.catWait, sess.catWait = sess.catWait, 0
+	}
 	if sess.held != nil {
 		*sess.held = append(*sess.held, r)
 		return
@@ -144,6 +153,7 @@ func (s *Server) recordQuery(sess *session, r queryRecord) {
 		QueryTag:        sess.queryTag(),
 		Pool:            s.pool,
 		Queued:          r.queued,
+		CatalogWait:     r.catWait,
 		Resources:       r.used,
 		Workers:         r.parts.workers,
 		Stages:          r.parts.stages,

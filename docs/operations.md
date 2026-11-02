@@ -502,6 +502,11 @@ catalog's default schema. A login waits at most 30 seconds for a listing or
 DDL that has the catalog to itself, and then fails with SQLSTATE `57P03`,
 saying how long the catalog has been held, rather than waiting with it.
 
+`igloo.query_history` records how long each statement waited for the
+catalog as `catalog_wait_ms`, and a statement that has it to itself for a
+second or more is logged when it lets go (`held the catalog lock
+exclusively`), with its session's backend pid and how long it held it.
+
 These serialized steps are brief (preparing or binding a statement, a
 listing, most DDL), and they do not wait for data queries to finish, nor data
 queries for them beyond their bind. So a `dbt` run swapping tables and a BI

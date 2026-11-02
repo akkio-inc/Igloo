@@ -67,6 +67,10 @@ type Query struct {
 	Pool string
 	// Queued is how long it waited for its role's limits before starting.
 	Queued time.Duration
+	// CatalogWait is how long its steps waited for its replica's catalog
+	// lock, which DDL and listings of the catalog hold exclusively and
+	// binding a statement holds shared (see engine.Engine.CatalogLock).
+	CatalogWait time.Duration
 	// Resources is what DuckDB measured while it ran; nil when it did not.
 	Resources *Resources
 	// Job is the task, pipe or materialized view the statement ran for,
