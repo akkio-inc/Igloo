@@ -924,6 +924,11 @@ whose replicas share them and stop them once idle; each pool has its own.
   that the client is not held, and the server logs `a statement canceled
   or past its timeout has not stopped`, with DuckDB's progress. Its session
   ends once DuckDB stops it.
+- A statement stops when its client goes away. The server looks at the
+  socket of each session running a statement every second and cancels the
+  statement of one that closed, as a cancel request does, wherever it runs,
+  and logs `a client went away while its statement ran`; the history records
+  it as canceled.
 - `IGLOO_MAX_CONNECTIONS` caps sessions per replica; further logins fail with
   SQLSTATE `53300`. Connections that have not signed in yet are limited too:
   as many may be signing in at once (at least 100), half of them from one

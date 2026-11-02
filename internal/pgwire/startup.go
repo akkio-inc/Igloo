@@ -10,6 +10,7 @@ import (
 	"os"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 )
 
@@ -163,6 +164,9 @@ func (c *startupConn) signedIn() {
 	_ = c.Conn.SetDeadline(time.Time{})
 	c.release()
 }
+
+// SyscallConn gives the connection's socket, to look at (see clientgone.go).
+func (c *startupConn) SyscallConn() (syscall.RawConn, error) { return innerSocket(c.Conn) }
 
 func (c *startupConn) Close() error {
 	c.release()

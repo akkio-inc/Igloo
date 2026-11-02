@@ -199,6 +199,7 @@ func (s *Server) loginAccepted(ctx context.Context, writer *buffer.Writer, user 
 		timeout:  s.timeout,
 		activity: s.activity,
 		stuck:    s.stuck,
+		socket:   clientSocket(wire.AcceptedConn(ctx)),
 		open:     make(map[*wire.PreparedStatement]*statement),
 		appName:  wire.ClientParameters(ctx)[wire.ParamApplicationName],
 

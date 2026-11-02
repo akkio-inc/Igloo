@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"io"
 	"net"
+	"syscall"
 )
 
 // Request codes a client may send before its startup message.
@@ -69,6 +70,9 @@ func (c *gatedConn) Read(p []byte) (int, error) {
 	}
 	return c.Conn.Read(p)
 }
+
+// SyscallConn gives the connection's socket, to look at (see clientgone.go).
+func (c *gatedConn) SyscallConn() (syscall.RawConn, error) { return innerSocket(c.Conn) }
 
 // fatalError encodes a PostgreSQL ErrorResponse with severity FATAL.
 func fatalError(code, message string) []byte {

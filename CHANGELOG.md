@@ -13,6 +13,13 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
 
 ### SQL and tables
 
+- A statement stops when its client goes away. Nothing read a client's
+  connection while its statement ran, so a report whose client was killed went on
+  spilling, from 302 GB to 355 GB in two minutes, until Igloo was restarted. The
+  server now looks at the sockets of sessions running a statement every second
+  and cancels the statement of one that closed, as a cancel request does, on this
+  replica, in the second DuckDB, on workers and while its rows stream.
+
 - `CALL dbgen` from sessions at once no longer crashes the server. DuckDB's data
   generators keep their state in the process, and two at once ended it with a
   segmentation fault. One statement of a process may call them at a time, the

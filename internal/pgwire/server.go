@@ -20,6 +20,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/duckdb/duckdb-go/v2"
@@ -569,6 +570,11 @@ type Server struct {
 	lateWritesStop chan struct{}
 	lateWritesWait func()
 	stopLateWrites sync.Once
+	// clientWatchStop ends the watch for clients that went away (see
+	// clientgone.go), which watchingClients starts once.
+	clientWatchStop chan struct{}
+	watchingClients sync.Once
+	stopClientWatch sync.Once
 	// uploadKeys is Options.UploadKeys.
 	uploadKeys uploads.Keys
 	// uploadStoreFor, in tests, is the store of unfinished writes of a directory.
@@ -863,6 +869,7 @@ func New(engine Engine, opts Options, log *slog.Logger) (*Server, error) {
 	}
 	s.wire = srv
 	s.lateWritesStop = make(chan struct{})
+	s.clientWatchStop = make(chan struct{})
 	return s, nil
 }
 
@@ -871,6 +878,7 @@ func (s *Server) Serve(l net.Listener) error {
 	if s.requireTLS {
 		l = requireTLS(l)
 	}
+	s.watchingClients.Do(func() { go s.watchClients() })
 	return s.wire.Serve(s.startup.listener(l))
 }
 
@@ -879,6 +887,7 @@ func (s *Server) Serve(l net.Listener) error {
 func (s *Server) Shutdown(ctx context.Context) error {
 	s.indexBuilds.stopped.Store(true)
 	err := s.wire.Shutdown(ctx)
+	s.stopClientWatch.Do(func() { close(s.clientWatchStop) })
 	s.stopLateWrites.Do(func() { close(s.lateWritesStop) })
 	s.lateWrites.Wait()
 	err = errors.Join(err, s.closeBackground())
@@ -1076,6 +1085,11 @@ type session struct {
 	// statement's run it watches (see watchStuck).
 	stuck   *stuckWatch
 	watched context.Context
+	// socket is the client's connection, for a client's session, which is
+	// looked at while a statement runs; clientGone, under mu, says it closed,
+	// once logged (see clientgone.go).
+	socket     syscall.RawConn
+	clientGone bool
 	// privs are the user's grants, loaded when first needed.
 	privs privilegeSnapshot
 	// fixed, when set, are the session's grants for good, and its user is
