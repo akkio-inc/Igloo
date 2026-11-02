@@ -89,6 +89,16 @@ type WorkerErasure struct {
 // cancels its tasks with, before it empties its caches.
 var errIsolated = errors.New("the worker heard from no coordinator for a while, and emptied its caches")
 
+// Behind reports whether a worker refused a statement for having begun before an
+// erasure request's deletion, as its coordinator knew of none yet: every erasureEvery, it
+// can know less than a worker another coordinator purged, and just after it starts, or
+// with its metadata database restored, it can know nothing. The same statement planned
+// again begins after it, and reads tables as they are then.
+func Behind(err error) bool {
+	var u *errUnsupported
+	return errors.As(err, &u) && u.behind
+}
+
 // errErased is what a purge cancels the tasks of statements that began
 // before the deletion with.
 var errErased = errors.New("an erasure request had the worker purge what it deleted while the task ran")

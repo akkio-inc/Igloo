@@ -588,6 +588,10 @@ func (co *Coordinator) probeWrite(ctx context.Context, ws []*worker, target *Wri
 			co.noteWriteDenied(err)
 			return err
 		}
+		if Behind(err) {
+			// Nothing to do with writing.
+			return err
+		}
 		return errors.Join(ErrWriteDenied, err)
 	}
 	return err
@@ -649,6 +653,23 @@ func (pl *planner) markWrites(final node) {
 		cols = "(" + strings.Join(names, ", ") + ")"
 	}
 	last.writeSQL = "WITH " + quoteIdent(last.placeholder) + cols + " AS (" + last.SQL + ") " + sql
+}
+
+// noWriteReason says why workers do not write a fill forced onto them, in the order
+// planning looks.
+func noWriteReason(table, may bool, stages []*Stage, x features, f fleet) string {
+	switch {
+	case !table:
+		return "the table is of a kind they do not write (the log says which)"
+	case !may:
+		return "a worker was refused a write within the last ten minutes"
+	case !slices.ContainsFunc(stages, func(s *Stage) bool { return s.writeSQL != "" }):
+		return "the statement's last step needs its rows together"
+	case !x.writeFits(f):
+		return fmt.Sprintf("its rows take about %d KB each, by %d rows in %d bytes of files, more than a worker's task holds of %d bytes of memory",
+			int64(x.rowBytes())>>10, int64(x.rows), x.bytes, f.memory)
+	}
+	return "unknown"
 }
 
 // rowWise reports whether final, a plan's combine step, reads s's rows and

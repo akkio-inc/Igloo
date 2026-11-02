@@ -470,6 +470,9 @@ func quoteLiteral(s string) string {
 // runs on one machine as usual.
 type errUnsupported struct {
 	reason string
+	// behind says a worker refused the statement for having begun before an erasure
+	// request it was purged for, which its coordinator now knows of (see Behind).
+	behind bool
 	// key is the statement's plan key when auto mode chose one machine
 	// for a statement that could run on workers (PlanKey), and oneMachine
 	// how long one machine was estimated to take it, in seconds, when

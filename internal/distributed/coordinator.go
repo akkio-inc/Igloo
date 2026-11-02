@@ -635,6 +635,9 @@ func (co *Coordinator) planOn(ctx context.Context, query string, env Env, mode M
 		}
 	}
 	plan.writes = x.workersWrite
+	if opts.force && x.fill && !plan.writes {
+		co.log.Info("workers will not write a forced statement's table; this replica writes it", "reason", noWriteReason(fill && fills.FillWrites(), co.workersMayWrite(), plan.Stages, x, f))
+	}
 	e := x.estimate(m, f)
 	e.others = others
 	if found {
@@ -1748,7 +1751,7 @@ func (co *Coordinator) fetchTask(ctx context.Context, w *worker, body []byte, pa
 			// was purged for: it runs on the coordinator, and the next
 			// statements carry the deletion (see erasure.go).
 			co.noteErased(res.Error.Erased)
-			return nil, &errUnsupported{reason: res.Error.Message}
+			return nil, &errUnsupported{reason: res.Error.Message, behind: true}
 		}
 		switch {
 		case res.Error.Bitmap:

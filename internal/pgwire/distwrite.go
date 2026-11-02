@@ -83,12 +83,13 @@ func (s *Server) tableWriter(ctx context.Context, sess *session, schema, name st
 		return nil
 	}
 	w, why, err := s.newTableWrite(ctx, sess, schema, name, len(src.columns), order)
+	mode := sessionMode(sess, sess.currentUser())
 	switch {
 	case err != nil:
-		s.log.Debug("workers will not write a table's files", "table", schema+"."+name, "err", err)
+		s.logHere(mode, "workers will not write a table's files", "table", schema+"."+name, "err", err)
 		return nil
 	case why != "":
-		s.log.Debug("workers will not write a table's files", "table", schema+"."+name, "why", why)
+		s.logHere(mode, "workers will not write a table's files", "table", schema+"."+name, "why", why)
 		return nil
 	}
 	return w

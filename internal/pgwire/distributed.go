@@ -209,6 +209,16 @@ func sessionMode(sess *session, user auth.User) distributed.Mode {
 	return mode
 }
 
+// logHere says why a statement stays on this replica: for all to see where the session
+// asked for workers, which is the one time that surprises anyone.
+func (s *Server) logHere(mode distributed.Mode, msg string, args ...any) {
+	if mode == distributed.ModeOn || mode == distributed.ModeOnRunning {
+		s.log.Info(msg, args...)
+		return
+	}
+	s.log.Debug(msg, args...)
+}
+
 // runDistributed runs st on workers if it qualifies in mode and writes its
 // rows to w. done is false when st did not run, and should run on this
 // replica; parts is what running it took.
@@ -250,7 +260,7 @@ func (s *Server) startDistributed(ctx context.Context, sess *session, user auth.
 		return nil, parts, false, nil
 	}
 	if reason := policyReason(st); reason != "" {
-		s.log.Debug("statement runs on this replica", "user", user.Name, "reason", reason)
+		s.logHere(mode, "statement runs on this replica", "user", user.Name, "reason", reason)
 		return nil, parts, false, nil
 	}
 	env := &sessionEnv{s: s, sess: sess, user: user, st: st}
@@ -274,13 +284,13 @@ func (s *Server) startDistributed(ctx context.Context, sess *session, user auth.
 		if !distributed.IsUnsupported(err) {
 			s.log.Warn("could not plan a distributed statement; running it here", "user", user.Name, "err", err)
 		} else {
-			s.log.Debug("statement runs on this replica", "user", user.Name, "reason", err)
+			s.logHere(mode, "statement runs on this replica", "user", user.Name, "reason", err)
 		}
 		return nil, parts, false, nil
 	}
 	settings, err := s.distributedSettings(ctx, sess)
 	if err != nil {
-		s.log.Debug("statement runs on this replica", "user", user.Name, "reason", err)
+		s.logHere(mode, "statement runs on this replica", "user", user.Name, "reason", err)
 		return nil, parts, false, nil
 	}
 	if st.writer != nil && plan.WorkersWrite() {
@@ -357,10 +367,28 @@ func (s *Server) startDistributed(ctx context.Context, sess *session, user auth.
 			s.log.Warn("a worker ran out of memory running part of a statement; the statement fails rather than run again",
 				"user", user.Name, "err", err)
 			return nil, distParts{workers: plan.Workers(), large: plan.Large(), placement: plan.Placement(), key: plan.Key}, true, errWorkerMemory
+		case distributed.Behind(err) && !st.behindOnce:
+			// A worker knows of a later deletion than this coordinator did as the
+			// statement began. It knows now, and nothing ran: planned again, the
+			// statement begins after it, and reads tables as they are then.
+			st.behindOnce = true
+			s.log.Info("a worker was purged for a later erasure request than this replica had heard of; planning the statement again",
+				"user", user.Name, "err", err)
+			r, p, ran, err := s.startDistributed(ctx, sess, user, st, mode)
+			if r != nil {
+				return r, r.parts, true, nil
+			}
+			if ran {
+				return nil, p, true, err
+			}
+			if p.release != nil {
+				p.release()
+			}
+			return nil, p, false, nil
 		case distributed.IsUnsupported(err):
 			// The workers found what planning could not, such as data
 			// files without field IDs.
-			s.log.Debug("statement runs on this replica", "user", user.Name, "reason", err)
+			s.logHere(mode, "statement runs on this replica", "user", user.Name, "reason", err)
 			return nil, parts, false, nil
 		case distributed.WriteDenied(err) && st.writer != nil:
 			// Workers may not write the table's files: they run the query, and
