@@ -70,6 +70,12 @@ type Engine struct {
 	cache *readCache
 	// prefetcher reads ahead into the cache, or is nil (see setupPrefetch).
 	prefetcher *prefetch.Prefetcher
+	// objects reads table files in object storage for the prefetcher and
+	// the restore of fileCache.
+	objects *objectOpener
+	// fileCache keeps what DuckDB holds of table files in memory across
+	// restarts, or is nil (see filecache.go).
+	fileCache *fileCache
 	// history supplies the history functions; see SetHistory.
 	history atomic.Pointer[historyConfig]
 	// jobHistory supplies the job history functions; see SetJobHistory.
@@ -176,6 +182,9 @@ func Open(ctx context.Context, cfg config.Config, log *slog.Logger, opts ...Opti
 	if e.cache != nil && !e.isBackground {
 		// The first DuckDB keeps the cache they share to its size.
 		e.startCache(log)
+		if e.prefetcher != nil && e.bitmaps {
+			e.startFileCache(cfg.Cache.Dir, e.objects.open, log)
+		}
 	}
 
 	return e, nil
@@ -678,6 +687,7 @@ func (e *Engine) Close() error {
 		e.bg = nil
 	}
 	e.bgMu.Unlock()
+	e.stopFileCache(e.log)
 	if e.prefetcher != nil {
 		e.prefetcher.Close()
 	}

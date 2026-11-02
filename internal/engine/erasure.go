@@ -254,6 +254,12 @@ func (e *Engine) OnEmptyCache(purge func()) {
 // from rows an erasure request erased (see models.Runtime.Purge); and
 // whatever else OnEmptyCache was given, as kept query results.
 func (e *Engine) EmptyCache(ctx context.Context) error {
+	// What DuckDB held in memory is not restored after a restart either:
+	// the list of it goes, before and again after DuckDB drops it, so that
+	// no list made in between survives.
+	if err := e.forgetFileCache(); err != nil {
+		return err
+	}
 	if e.models != nil {
 		e.models.Purge()
 	}
@@ -278,6 +284,9 @@ func (e *Engine) EmptyCache(ctx context.Context) error {
 		if _, err := conn.ExecContext(ctx, stmt, nil); err != nil {
 			return err
 		}
+	}
+	if err := e.forgetFileCache(); err != nil {
+		return err
 	}
 	// The DuckDB for heavy statements keeps its own in memory (see
 	// background.go).

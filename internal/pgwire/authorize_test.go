@@ -128,6 +128,9 @@ func TestForbidden(t *testing.T) {
 		"SELECT cache_httpfs_wrap_cache_filesystem('LocalFileSystem')",
 		"SELECT cache_httpfs_add_exclusion_regex('.*')",
 		"SELECT cache_httpfs_reset_exclusion_regex()",
+		"SELECT igloo_file_cache_put('s3://b/w/f.parquet', 0, '\\x00'::BLOB, 'e', 0, 1)",
+		"SELECT * FROM system.main.igloo_file_cache_ranges()",
+		`SELECT * FROM "igloo_file_cache_ranges"()`,
 		// query_table with a name built at run time, which could resolve to
 		// a GDAL dataset without a check of the text seeing it.
 		"SELECT * FROM query_table('lake.public.' || 't')",

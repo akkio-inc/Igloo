@@ -739,6 +739,38 @@ more than DuckDB alone.
   its workers a cache volume (`cacheVolume`, `workers.cacheVolume`), so
   both can read ahead.
 
+### Memory after a start
+
+DuckDB keeps the parts of table files that queries read in memory, in
+front of the disk cache, and a stopped machine loses them. Its first
+queries then read everything again from the disk cache, as fast as the
+disk is provisioned for: TPC-H at scale factor 100 reads 24 GB, which a
+gp3 volume of 500 MB/s gives in about 50 s. Object storage gives the
+same bytes several times faster to many requests at once, so Igloo reads
+them back from there when it starts:
+
+- While it runs, the server keeps a list of the ranges of files DuckDB
+  holds in memory, in the order queries first read them, in
+  `memory.json` beside the cache's blocks: written every 30 seconds while
+  they change, and when Igloo stops.
+- After a start, in the background, it reads the list's ranges from object
+  storage in that order, 256 requests of up to 8 MiB at a time, and hands
+  them to DuckDB, which uses them as if its queries had read them. A query
+  that reads a range before it is back reads it as it would have, from
+  the disk cache, and the restore skips it. On a c7g.16xlarge it read the
+  24 GB back in 7 to 8 s, at its network's 3.6 GB/s, and the first run of
+  the 22 queries took 22 s, against 58 s from the disk alone.
+- It takes at most three quarters of DuckDB's memory, and stops when
+  DuckDB has no memory to spare: the ranges are buffers DuckDB drops
+  first when queries need the room.
+- It reads only files DuckDB had: Iceberg's data files, which never
+  change, and other files only while their ETag is the one DuckDB had.
+  Emptying the cache, as [erasure requests](#erasure-requests) do, deletes
+  the list too.
+- It runs on the server, with `IGLOO_PREFETCH` on, as it is by default; the
+  log says `restored what DuckDB held in memory from object storage`, with
+  how much and how long it took.
+
 ## Result cache
 
 A dashboard that several people open at once, or that asks the same

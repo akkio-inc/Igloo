@@ -46,6 +46,9 @@ void RegisterDivide(ExtensionLoader &loader);
 //! igloo_sf_flatten_values, _strings, _keys and _indexes, FLATTEN's lists as Igloo's sf_flatten_ macros give them,
 //! bound as one function each (rb_flatten.cpp).
 void RegisterFlatten(ExtensionLoader &loader);
+//! igloo_file_cache_ranges and igloo_file_cache_put, which list DuckDB's external file cache and put ranges back
+//! into it (rb_filecache.cpp).
+void RegisterFileCache(ExtensionLoader &loader);
 
 } // namespace rb
 } // namespace duckdb

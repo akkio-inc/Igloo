@@ -231,6 +231,10 @@ func forbidden(query string) error {
 	case queryTableComputed(query):
 		err = errors.New("permission denied: query_table needs a table name written out as text; a name built at run time " +
 			"could resolve to a file, including spatial's GDAL formats, that reads outside Igloo's sandbox")
+	case mentionsPrefix(query, words, "igloo_file_cache_"):
+		// They list and fill DuckDB's cache of file contents, which every
+		// session reads: Igloo's own (see package engine's filecache.go).
+		err = errors.New("permission denied: the igloo_file_cache_ functions are Igloo's own")
 	case mentionsFunction(query, words, remoteSQLFunctions...):
 		err = errors.New("permission denied: the functions that run SQL on other databases (postgres_query, mysql_query and the like) " +
 			"are not available, as Igloo cannot check that SQL against grants; query connections' tables by name instead, " +
