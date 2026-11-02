@@ -71,6 +71,38 @@ func TestTotal(t *testing.T) {
 	}
 }
 
+// TestOthersHold checks that what others on a machine hold comes out of what the process
+// may use, by what MemAvailable says, its own memory not counted; and that a limit of the
+// process's own takes no account of them.
+func TestOthersHold(t *testing.T) {
+	const gib = int64(1) << 30
+	for _, c := range []struct {
+		name    string
+		meminfo string
+		status  string
+		want    int64
+	}{
+		{"a metadata database beside it", "MemTotal: 8388608 kB\nMemAvailable: 6291456 kB\n", "VmRSS: 1048576 kB\n", 7 * gib},
+		{"nothing but itself", "MemTotal: 8388608 kB\nMemAvailable: 7340032 kB\n", "VmRSS: 1048576 kB\n", 8 * gib},
+		{"at most half", "MemTotal: 8388608 kB\nMemAvailable: 1048576 kB\n", "", 4 * gib},
+		{"no MemAvailable", "MemTotal: 8388608 kB\n", "", 8 * gib},
+	} {
+		got, source := total(files(t, map[string]string{"proc/meminfo": c.meminfo, "proc/self/status": c.status}))
+		if got != c.want || source != "machine" {
+			t.Errorf("%s: %d from %s, want %d", c.name, got, source, c.want)
+		}
+	}
+	got, source := total(files(t, map[string]string{
+		"proc/meminfo":              "MemTotal: 8388608 kB\nMemAvailable: 1048576 kB\n",
+		"proc/self/cgroup":          "0::/\n",
+		"sys/fs/cgroup/memory.max":  "1073741824\n",
+		"sys/fs/cgroup/memory.stat": "inactive_file 0\n",
+	}))
+	if got != gib || source != "cgroup" {
+		t.Errorf("a container's limit: %d from %s", got, source)
+	}
+}
+
 func TestPlan(t *testing.T) {
 	// The incident's machine: 30 GiB, DuckDB at its default of 80%.
 	total := int64(30 << 30)

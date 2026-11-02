@@ -14,6 +14,7 @@ import (
 	"runtime/debug"
 	"strconv"
 	"strings"
+	"sync"
 )
 
 const (
@@ -115,11 +116,19 @@ func GoLimit(total, duckdb int64) int64 {
 }
 
 // Total returns the memory the process may use: the least of its cgroups'
-// limits (a container's memory limit) and the machine's memory. It returns
-// 0 when neither can be read, as outside Linux.
+// limits (a container's memory limit) and the machine's memory less what others
+// on it hold as the process starts. It returns 0 when neither can be read, as
+// outside Linux. It is the first answer, for as long as the process runs.
 func Total() (int64, string) {
-	return total("/")
+	totalOnce.Do(func() { totalBytes, totalSource = total("/") })
+	return totalBytes, totalSource
 }
+
+var (
+	totalOnce   sync.Once
+	totalBytes  int64
+	totalSource string
+)
 
 func total(root string) (int64, string) {
 	machine := memTotal(filepath.Join(root, "proc/meminfo"))
@@ -128,10 +137,25 @@ func total(root string) (int64, string) {
 	case limit > 0 && (machine == 0 || limit < machine):
 		return limit, "cgroup"
 	case machine > 0:
-		return machine, "machine"
+		return machine - othersHold(root, machine), "machine"
 	default:
 		return 0, ""
 	}
+}
+
+// othersHold is what others on a machine with no limit for the process hold, by what
+// MemAvailable leaves of it, at most half of it: the metadata database and the catalog
+// beside a replica, and the system. Nothing else gives way for them. On a machine of
+// 7.6 GiB, with 1.2 GiB held so, DuckDB's limit took 5.5 GiB, what it holds beyond its
+// limit and Go 1.1 GiB more: the first read of a file of 7 GB, which fills the limit with
+// what it could evict, left 480 MiB, and the memory watch canceled it.
+func othersHold(root string, machine int64) int64 {
+	available, ok := meminfoField(filepath.Join(root, "proc/meminfo"), "MemAvailable:")
+	if !ok {
+		return 0
+	}
+	own, _ := meminfoField(filepath.Join(root, "proc/self/status"), "VmRSS:")
+	return min(max(machine-available-own, 0), machine/2)
 }
 
 // cgroupLimit returns the least memory limit of the process's cgroup and its
