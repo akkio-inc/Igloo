@@ -923,6 +923,19 @@ floating-point sums and averages can differ in their last digits, as they
 do in DuckDB on one machine between runs with different numbers of threads.
 Rows without `ORDER BY` come in no particular order, as on one machine.
 
+A stage keeps only some groups early (those `HAVING` keeps, the first under
+`ORDER BY ... LIMIT`, those a ranking may keep) only where it applies first
+everything SQL applies before that cut: the whole `HAVING`, and no window
+function that sees every group on the way. Otherwise it sends every group and
+the coordinator cuts them, as one machine would. Two tests run in the full
+suites to hold the planner to this. One runs all 22 TPC-H and 99 TPC-DS queries
+on one machine and on workers, forced with the planner's joins, forced with
+every join partitioned, and in auto mode, and compares the rows. The other
+writes random queries in the shapes the planner rewrites, in combination:
+groups ranked, limited and filtered by `HAVING` with subqueries, windows,
+`QUALIFY`, `DISTINCT`, set operations, outer joins, `IN`, `ANY`, `ALL` and
+`EXISTS` subqueries, over `NULL`s and ties.
+
 A statement reads each table at one snapshot, its current one when the
 statement's parts start, everywhere: workers read that snapshot's data
 files, and where the part the coordinator runs itself reads the same table
@@ -940,9 +953,9 @@ clones do: workers read the files the metadata lists, wherever they lie in
 the warehouse.
 
 If a worker cannot be reached, stops in the middle of a statement or stops
-answering its status (three checks 10 seconds apart) while it runs a task,
-its share runs on another worker, and the failed worker is left out for 30
-seconds. A worker that answers a task with an error ran it and is healthy:
+answering its status (three answers missed, a second apart, about 7 seconds)
+while it runs a task, what it held runs again on the others, and the failed
+worker is left out for 30 seconds. A worker that answers a task with an error ran it and is healthy:
 the statement then runs on the coordinator at once, without trying other
 workers or leaving any out. Object storage turning requests away for now
 (S3's 503 SlowDown) is not such an error: DuckDB tries the request again

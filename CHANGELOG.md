@@ -571,6 +571,16 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
 
 ### Distributed execution
 
+- Statements on workers return the rows one machine does in cases they did not. TPC-DS
+  q44 returned no rows where one machine returned 10: a stage kept the groups a later
+  ranking could keep before `HAVING`, which read a subquery, filtered them. A ranking's
+  cut also fed window functions over the groups, and `ORDER BY` a name that was both an
+  alias and a column ordered by the column. Every early cut now waits for what SQL
+  applies before it. Tests compare all of TPC-H and TPC-DS, and random queries in the
+  shapes the planner rewrites, with one machine's rows; see [same results as one
+  machine](docs/distributed-execution.md#same-results-as-one-machine). TPC-DS q33, q56,
+  q58, q60 and q83 run on workers too, where they stayed on the coordinator, and so does
+  q24, which failed on workers when the coordinator had 16 cores.
 - A worker that stops answering is found in about 7 seconds, not a minute. Powered off,
   closing no socket, one of 16 workers took 69 s to find. Whoever waits on a worker,
   the coordinator on its tasks and readers on its exchange files, now asks it for its
