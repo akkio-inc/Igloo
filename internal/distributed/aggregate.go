@@ -1647,10 +1647,10 @@ func (a *aggregation) wholeFirstRows() ([]any, bool) {
 				if k, ok := intConstant(e); ok && k >= 1 && int(k) <= len(a.items) {
 					e = bare(a.items[k-1])
 				} else if str(e["class"]) == "COLUMN_REF" && len(columnNames(e)) == 1 {
+					// ORDER BY binds a bare name to the select list's alias before a
+					// column of FROM by that name, as firstRows reads it.
 					if i, isAlias := a.aliases[strings.ToLower(columnNames(e)[0])]; isAlias {
-						if has, _ := a.c.scope.hasColumn(strings.ToLower(columnNames(e)[0])); !has {
-							e = bare(a.items[i])
-						}
+						e = bare(a.items[i])
 					}
 				} else if str(e["class"]) == "STAR" {
 					return nil, false
