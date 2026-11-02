@@ -411,7 +411,9 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   rows, and fails whole with the line and column of a value that does not
   convert. psql loads a dump's settings too: `set_config('search_path', ...)`
   and the settings Igloo has no use for, as `row_security`.
-
+- `DROP SCHEMA ... CASCADE` drops a schema of the catalog with its tables,
+  views, materialized views and dynamic tables, as their own `DROP`s would,
+  having first checked that the user may drop all of them.
 - `COPY INTO table FROM 'location'` loads CSV, TSV, Parquet, JSON and
   NDJSON files, gzip- or zstd-compressed or not (detected from the name or
   the file), from the warehouse and `IGLOO_ALLOWED_LOCATIONS`: a prefix, a

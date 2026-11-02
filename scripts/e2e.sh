@@ -1956,7 +1956,7 @@ else
   fail "SHOW CONNECTIONS before the restart: $got"
 fi
 
-echo "PostgreSQL's COPY FROM STDIN and pg_dump"
+echo "PostgreSQL's COPY FROM STDIN, pg_dump and DROP SCHEMA CASCADE"
 psql_admin -c "CREATE SCHEMA pgload" -c "CREATE TABLE pgload.notes (id INTEGER, body VARCHAR)" \
   -c "GRANT INSERT ON SCHEMA pgload TO walt" >/dev/null
 got="$(printf '1\talpha\n2\t\\N\n3\tback\\\\slash\n' | psql_as walt walt-password-1 -c '\copy pgload.notes FROM STDIN')"
@@ -1989,7 +1989,10 @@ expect "and holds what PostgreSQL's does" "1|ann|10.50|2026-01-01 10:00:00|true|
 3|o'brien|0.00|2026-06-30 21:59:59.5|-|-||\\." igloo "$admin_password" \
   "SELECT id, coalesce(who, '-'), amount, coalesce(CAST(paid_at AT TIME ZONE 'UTC' AS VARCHAR), '-'), coalesce(ok::VARCHAR, '-'),
      coalesce(array_to_string(tags, ';'), '-'), coalesce(hex(data), '-'), replace(note, chr(10), '\\n') FROM pgload.ledger ORDER BY id"
-psql_admin -c "DROP TABLE pgload.notes" -c "DROP TABLE pgload.ledger" -c "DROP SCHEMA pgload" >/dev/null
+got="$(psql_admin -c "DROP SCHEMA pgload")" && fail "DROP SCHEMA of a schema with tables went through" || pass "a schema with tables is kept without CASCADE"
+expect "DROP SCHEMA ... CASCADE drops it with its tables" "DROP SCHEMA" igloo "$admin_password" "DROP SCHEMA pgload CASCADE"
+expect "and they are gone" "0" igloo "$admin_password" \
+  "SELECT count(*) FROM information_schema.tables WHERE table_catalog = 'lake' AND table_schema = 'pgload'"
 
 echo "restart"
 # Read a table once so its files land in the read cache.

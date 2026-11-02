@@ -28,6 +28,7 @@ import (
 	"time"
 
 	icecat "github.com/apache/iceberg-go/catalog"
+	"github.com/apache/iceberg-go/table"
 	"github.com/duckdb/duckdb-go/v2"
 
 	"github.com/akkio-inc/igloo/internal/catalog"
@@ -787,4 +788,17 @@ func quoteList(names []string) string {
 		quoted[i] = quoteIdent(n)
 	}
 	return strings.Join(quoted, ", ")
+}
+
+// TableNames returns the names of the catalog's tables in schema, as the
+// catalog lists them now.
+func (m *Manager) TableNames(ctx context.Context, schema string) ([]string, error) {
+	var out []string
+	for ident, err := range m.cat.ListTables(ctx, table.Identifier{schema}) {
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, ident[len(ident)-1])
+	}
+	return out, nil
 }

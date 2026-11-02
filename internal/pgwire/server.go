@@ -1766,6 +1766,11 @@ func (s *Server) parse(ctx context.Context, q wire.Query) (wire.PreparedStatemen
 			return nil, pgerror.WithCode(errors.New(`invalid byte sequence for encoding "UTF8": 0x00`), codes.CharacterNotInRepertoire)
 		}
 	}
+	// DROP SCHEMA ... CASCADE of the catalog's schema, which Igloo carries
+	// out drop by drop.
+	if c, ok := s.parseSchemaCascade(ctx, sess, q.Query); ok {
+		return s.schemaCascadeStatement(sess, q.Query, c), nil
+	}
 	if tr == nil || tr.Untranslated {
 		ps, err := s.parseDuckDB(ctx, sess, user, q, tr)
 		if err != nil || tr == nil {

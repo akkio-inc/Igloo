@@ -79,7 +79,7 @@ Snowflake databases are catalogs of their own, such as
 | `CREATE TABLE`, `CREATE TABLE AS SELECT` | Yes |
 | `INSERT`, `INSERT ... SELECT`, `INSERT ... RETURNING`, `MERGE INTO` | Yes |
 | `UPDATE`, `DELETE` | Yes |
-| `DROP TABLE`, `CREATE SCHEMA`, `DROP SCHEMA` | Yes; `CASCADE` drops only the table, see below |
+| `DROP TABLE`, `CREATE SCHEMA`, `DROP SCHEMA` | Yes; `DROP TABLE ... CASCADE` drops only the table, `DROP SCHEMA ... CASCADE` what is in the schema, see below |
 | `ALTER TABLE ... RENAME TO`, `ADD COLUMN`, `DROP COLUMN` | Yes |
 | `CREATE OR REPLACE TABLE` | Yes; see below |
 | `CREATE [OR REPLACE] VIEW`, `DROP VIEW`, `ALTER VIEW ... RENAME TO` | Yes; see [views](#views) |
@@ -116,6 +116,15 @@ as are those of a table `CREATE OR REPLACE TABLE` replaces, `... CLONE`
 included, unless [clones](#clones) read them. What a drop leaves,
 erasure requests delete ([privacy](privacy.md#what-is-left-of-dropped-tables)).
 A dropped table cannot be restored.
+
+`DROP SCHEMA ... CASCADE` drops what the schema holds, one object at a time,
+each as its own `DROP` would: its materialized views and dynamic tables with
+their tables and state, its views, and its tables, whose files go as `DROP
+TABLE`'s do; then the schema. Before it drops anything it checks that the
+user may drop all of it (a materialized view only its owner or an admin
+may drop). Something refused after that, as a table an erasure request is
+erasing from, stops it there, and the error names it; what came before it
+is dropped. Without `CASCADE`, a schema that holds anything is kept.
 
 ### Sort orders and clustering
 
