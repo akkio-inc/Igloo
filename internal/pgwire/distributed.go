@@ -619,7 +619,7 @@ func (s *Server) afterGuard(ctx context.Context, sess *session, st *statement, a
 		return s.runLocal(ctx, sess, st, args, w)
 	}
 	p.since = since
-	p.placement = fmt.Sprintf("moved by the guard after %.0f s on this replica, estimated at %.0f s; %s", ran.Seconds(), parts.local.Seconds(), p.placement)
+	p.placement = s.dist.GuardPlacement(ran, parts.local, p.placement)
 	*parts = p
 	return err
 }
@@ -1064,6 +1064,12 @@ func (e *sessionEnv) Others() int { return e.s.othersRunning(e.sess) }
 func (e *sessionEnv) Footprint() (allocated int64, ok bool) {
 	// The session's path is read already, for the statement's shape.
 	return e.s.workload.Completed(e.s.workloadShape(context.Background(), e.sess, e.st.prepared))
+}
+
+// LocalRun is how long statements of the shape of the one planned took on
+// this replica, in runs they completed (see distributed.LocalRuns).
+func (e *sessionEnv) LocalRun() (time.Duration, bool) {
+	return e.s.workload.Took(e.s.workloadShape(context.Background(), e.sess, e.st.prepared))
 }
 
 func (e *sessionEnv) Setting(ctx context.Context, name string) (string, error) {

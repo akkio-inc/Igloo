@@ -41,6 +41,7 @@ type Controller struct {
 	// history estimates reservations from what statements allocated (see
 	// footprints.go).
 	history footprints
+	took    localTimes
 
 	// forms pick the form of each statement shape's FLATTENs (see forms.go).
 	forms flattenForms

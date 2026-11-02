@@ -3,7 +3,10 @@ package distributed
 import (
 	"cmp"
 	clist "container/list"
+	"fmt"
 	"maps"
+	"regexp"
+	"strconv"
 	"sync"
 	"time"
 )
@@ -214,6 +217,9 @@ type Run struct {
 	// Duration (see ObserveFailure), at At.
 	Failed bool
 	At     time.Time
+	// Guarded says the guard moved it to workers, after Duration on one
+	// machine of Memory (see ObserveGuard).
+	Guarded bool
 	// Memory is the memory it ran with (see RunMemory); a run that does not
 	// say is not taken.
 	Memory int64
@@ -354,13 +360,48 @@ func (co *Coordinator) observeExchanges(key string, run *execution, stages []*St
 // runs it on workers next time, without trying one machine again (see
 // choose), so the guard cannot move it back and forth.
 func (co *Coordinator) ObserveGuard(key string, d time.Duration) {
+	co.observeGuard(key, d, co.opts.MemoryBytes)
+	co.opts.Metrics.guard()
+}
+
+func (co *Coordinator) observeGuard(key string, d time.Duration, memory int64) {
 	if key != "" {
 		co.history.update(key, func(r *runs) {
-			r.guarded = true
+			r.guarded, r.localMemory = true, memory
 			r.local = max(r.local, d.Seconds())
 		})
 	}
-	co.opts.Metrics.guard()
+}
+
+// GuardPlacement is the placement (Plan.Placement) of a statement the guard
+// moved to workers, on, after ran on this replica, estimated at estimate: the
+// query history keeps it, and GuardedRun reads back what the guard learned
+// when the server starts. Its row otherwise says only that it ran on workers,
+// and a restart could try on one machine again what the guard had moved.
+func (co *Coordinator) GuardPlacement(ran, estimate time.Duration, on string) string {
+	return fmt.Sprintf("moved by the guard after %.0f s on this replica of %.1f GB, estimated at %.0f s; %s", ran.Seconds(),
+		float64(co.opts.MemoryBytes)/1e9, estimate.Seconds(), on)
+}
+
+// guardPlaced matches what GuardedRun reads of GuardPlacement.
+var guardPlaced = regexp.MustCompile(`^moved by the guard after (\d+) s on this replica of ([\d.]+) GB,`)
+
+// GuardedRun reads a placement the query history recorded: how long the
+// statement ran on this replica before the guard moved it, on how much memory.
+func GuardedRun(placement string) (ran time.Duration, memory int64, ok bool) {
+	m := guardPlaced.FindStringSubmatch(placement)
+	if m == nil {
+		return 0, 0, false
+	}
+	seconds, err := strconv.ParseFloat(m[1], 64)
+	if err != nil {
+		return 0, 0, false
+	}
+	gb, err := strconv.ParseFloat(m[2], 64)
+	if err != nil {
+		return 0, 0, false
+	}
+	return time.Duration(seconds * float64(time.Second)), int64(gb * 1e9), true
 }
 
 // Seed records past runs, oldest first, as from the query history when
@@ -370,6 +411,8 @@ func (co *Coordinator) Seed(rs []Run) {
 	for _, r := range rs {
 		switch {
 		case r.Key == "" || r.Memory == 0:
+		case r.Guarded:
+			co.observeGuard(r.Key, r.Duration, r.Memory)
 		case r.Failed:
 			co.history.observeFailure(r.Key, r.Workers, r.Large, r.Duration.Seconds(), r.Memory, cmp.Or(r.At, time.Now()))
 		case r.OutOfMemory:

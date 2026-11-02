@@ -88,6 +88,42 @@ func TestSeedHistory(t *testing.T) {
 			t.Errorf("seeded footprint of %s completed %v", shape, ok)
 		}
 	}
+	// What a shape's completed runs took here, past what they waited, whatever
+	// ran them: a's lower of two, of which one has no plan key; e's, not h's or
+	// i's, cancelled, nor c's, on another memory, or d's, which does not say.
+	wantTook := map[string]time.Duration{"a": time.Second, "e": time.Minute, "g": time.Minute, "f": time.Minute}
+	for _, shape := range []string{"a", "b", "c", "d", "e", "f", "g", "h", "i"} {
+		got, ok := footprints.Took(shape)
+		if w, learned := wantTook[shape]; ok != learned || got != w {
+			t.Errorf("seeded time of %s %s (%v), want %s", shape, got, ok, w)
+		}
+	}
+	queued := workload.NewController(22 * gb)
+	queuedStore := audit.NewMemoryStore(audit.MemoryQueries, audit.MemoryLogins)
+	if err := queuedStore.WriteQueries(context.Background(), []audit.Query{{ID: "1", Start: now.Add(-time.Minute), Outcome: audit.OutcomeOK,
+		Duration: 714 * time.Second, Queued: 14 * time.Second, Shape: "j", Resources: used(gb), Memory: 22 * gb}}); err != nil {
+		t.Fatal(err)
+	}
+	seedHistory(context.Background(), nil, queued, 22*gb, queuedStore, slog.New(slog.DiscardHandler))
+	if got, ok := queued.Took("j"); !ok || got != 700*time.Second {
+		t.Errorf("seeded time past its wait: %s (%v)", got, ok)
+	}
+	// What the guard learned of a run it moved, by the placement of that run on
+	// workers: not of one the history does not say so of.
+	guarded := audit.NewMemoryStore(audit.MemoryQueries, audit.MemoryLogins)
+	placement := (&distributed.Coordinator{}).GuardPlacement(88*time.Second, 47*time.Second, "8 workers: x")
+	if err := guarded.WriteQueries(context.Background(), []audit.Query{
+		{ID: "1", Start: now.Add(-time.Minute), PlanKey: "g", Outcome: audit.OutcomeOK, Workers: 8, Duration: 2 * time.Minute, Memory: 6 * gb, Placement: placement},
+		{ID: "2", Start: now.Add(-time.Second), PlanKey: "w", Outcome: audit.OutcomeOK, Workers: 8, Duration: time.Minute, Memory: 6 * gb, Placement: "8 workers: x"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var seeded []distributed.Run
+	seedHistory(context.Background(), func(rs []distributed.Run) { seeded = rs }, workload.NewController(22*gb), 22*gb, guarded, slog.New(slog.DiscardHandler))
+	if want := []distributed.Run{{Key: "g", Guarded: true, Duration: 88 * time.Second}, {Key: "g", Workers: 8, Duration: 2 * time.Minute, Memory: 6 * gb},
+		{Key: "w", Workers: 8, Duration: time.Minute, Memory: 6 * gb}}; !slices.Equal(seeded, want) {
+		t.Errorf("seeded a guarded run: %+v, want %+v", seeded, want)
+	}
 	// A shape's FLATTEN forms, both seen, take the faster.
 	forms := workload.NewController(22 * gb)
 	formStore := audit.NewMemoryStore(audit.MemoryQueries, audit.MemoryLogins)

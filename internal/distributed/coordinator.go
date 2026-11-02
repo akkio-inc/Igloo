@@ -666,6 +666,11 @@ func (co *Coordinator) planOn(ctx context.Context, query string, env Env, mode M
 		return plan, d, nil
 	}
 	now := time.Now()
+	if r.local == 0 {
+		if took, ok := localRun(env); ok {
+			r.local, found = took.Seconds(), true
+		}
+	}
 	if found && r.exchangeBytes > 0 && m.memory > 0 {
 		r.heavy = float64(heldFactor*r.exchangeBytes) > memoryShare*float64(m.memory)
 	}

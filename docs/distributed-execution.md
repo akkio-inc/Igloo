@@ -626,12 +626,16 @@ it made 12 million. Where DuckDB's plan ran far off at ten times the data,
 Igloo corrects it: the branches of a `UNION` hold no more than the largest
 of them, as DuckDB runs them one after another where memory is short (16
 branches, each joining 400 million rows to 400 million, were estimated at
-793 GB by their sum and held 33 GB); an inner join of rows to keys it knows
-nothing of keeps no fewer of the side with more rows than the other side's
+793 GB by their sum and held 33 GB), while the operators above it take all
+their rows, and the most any branch's filters keep (a report joining its
+events to a union of an audience and everyone, taken for the audience
+alone, was estimated at 5.6 GB and 15 s, and took 714 s, spilling 235 GB);
+an inner join of rows to keys it knows nothing of keeps no fewer of the side with more rows than the other side's
 filters keep, rather than the fifth DuckDB takes (157 million events
 joined to an audience of everyone kept every row); a join to one row, as
 of a scalar subquery's latest version, keeps what a filter by a constant
-does, where DuckDB keeps every row; a cross product with a small source of
+does, where DuckDB keeps every row, but one group by DuckDB's estimate of
+keys nothing knows is not one row; a cross product with a small source of
 its own, as `FLATTEN` over a list of objects becomes, makes a row for each
 pair; a grouping makes no more groups where its input has more rows than
 DuckDB took; and a window over the whole input without an order (`OVER
@@ -746,10 +750,18 @@ its room (see spilling, below); past that, one that ran only on
 the replica, well within its estimate, stays there, and one that ran only
 on workers stays there if it beat its estimates, or if the replica should
 run short of memory, unless it took more than ten times the replica's
-estimate there, and its working set is not four or more times the
-replica's room: that one is tried on the replica once a day, and may take
-as long there as it took on workers before the guard (below) runs it on
-them again. The replica is not short of memory for a statement whose
+estimate there, and its working set should fit the replica: that one is
+tried on the replica once a day, and may take as long there as it took on
+workers before the guard (below) runs it on them again. Where its working
+set should spill, so far over its estimate says the estimate is wrong, not
+that the replica is better: a report estimated at 15 s that took 200 s on
+workers took 714 s on the replica. A statement run on the replica with
+`distributed_execution = 'off'`, or whose planning gave up, has no
+`plan_key`; what it took stands, by its shape, its text with its literals
+masked, as read back from the query history too, where its `plan_key` has
+no run on the replica of its own, so that it is not estimated again. So does
+what the guard (below) learned, which `query_history.placement` keeps. The
+replica is not short of memory for a statement whose
 shape, its text with its literals masked, ran to its end there, whatever
 its estimate (a run cut short, as by the guard, says only that it needed at
 least what it held, and does not count: one the guard stopped on a replica

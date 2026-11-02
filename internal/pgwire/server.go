@@ -2257,6 +2257,7 @@ func (s *Server) preparedQuery(ctx context.Context, sess *session, user auth.Use
 			// What it held here, for the next statement like it.
 			s.workload.Observe(shape, workload.FootprintOf(used.MemoryAllocated, peak, sampled))
 			s.workload.ObserveCost(shape, used.CPUTime)
+			s.workload.ObserveTook(shape, time.Since(start)-sess.wl.queued)
 		case used != nil:
 			s.workload.ObserveEmpty(shape)
 		case err != nil && sampled:
