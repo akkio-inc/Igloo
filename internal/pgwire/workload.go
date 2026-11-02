@@ -161,16 +161,16 @@ func (sess *session) admit(ctx context.Context) (release, leave func(), err erro
 	var elsewhere func()
 	l.Elsewhere = &elsewhere
 	if controller := sess.wl.controller; l.Counted {
-		key := controller.Alike(sess.wl.exact, sess.wl.shape)
-		l.Expect = controller.Expect(key)
+		var light bool
+		l.Expect, light = controller.Cost(sess.wl.exact, sess.wl.shape)
 		switch {
-		case controller.Light(key), controller.RunsOnWorkers(sess.wl.exact, sess.wl.shape):
+		case light, controller.RunsOnWorkers(sess.wl.exact, sess.wl.shape):
 			l.Counted = false
 		case l.Memory == 0:
 			// What statements like it held, when its role reserves nothing.
-			l.Memory, l.Estimated = controller.Estimate(key), true
-			_, seen := controller.Footprint(key)
-			l.Unseen = !seen
+			var seen bool
+			l.Memory, seen = controller.Reserve(sess.wl.exact, sess.wl.shape)
+			l.Estimated, l.Unseen = true, !seen
 		}
 	}
 	done, waited, err := sess.wl.controller.Admit(ctx, l)

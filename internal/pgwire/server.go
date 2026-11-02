@@ -2301,7 +2301,6 @@ func (s *Server) preparedQuery(ctx context.Context, sess *session, user auth.Use
 			}
 			s.workload.ObserveTook(shape, time.Since(start)-sess.wl.queued)
 		case used != nil:
-			s.workload.ObserveEmpty(shape)
 			s.workload.ObserveEmpty(exact)
 		case err != nil && sampled:
 			// It ended before its end, holding at least that much, or, if it

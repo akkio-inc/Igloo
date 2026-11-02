@@ -752,13 +752,38 @@ func TestUnseenStopsWaiting(t *testing.T) {
 	if err != nil || waited < c.patience {
 		t.Fatalf("an unseen statement with the memory full: waited %s: %v", waited, err)
 	}
-	defer first()
-	// The next waits for what that one holds to show.
-	short, cancel := context.WithTimeout(ctx, 100*time.Millisecond)
-	defer cancel()
-	if _, _, err := c.Admit(short, Limits{Counted: true, Unseen: true}); !errors.Is(err, context.DeadlineExceeded) {
-		t.Errorf("the next, just after it: %v", err)
+	// The next waits for that one to end, however long past its patience.
+	next := make(chan func() (int64, bool), 1)
+	go func() {
+		r, _, err := c.Admit(ctx, Limits{Counted: true, Unseen: true})
+		if err != nil {
+			t.Error(err)
+		}
+		next <- r
+	}()
+	c.mu.Lock()
+	c.lastLate = time.Now().Add(-unseenGrows)
+	c.mu.Unlock()
+	select {
+	case <-next:
+		t.Fatal("a second late statement started beside the first")
+	case <-time.After(100 * time.Millisecond):
 	}
+	c.mu.Lock()
+	c.lastLate = time.Now().Add(-unseenGrows)
+	c.mu.Unlock()
+	first()
+	select {
+	case r := <-next:
+		r()
+	case <-time.After(5 * time.Second):
+		t.Fatal("the next late statement did not start once the first ended")
+	}
+	c.mu.Lock()
+	if c.lateRunning != 0 {
+		t.Errorf("%d late statements running, with none", c.lateRunning)
+	}
+	c.mu.Unlock()
 }
 
 // TestLeavingEarly checks that a statement that lets go before it ends, as a canceled
@@ -1203,5 +1228,46 @@ func TestRunsOnWorkers(t *testing.T) {
 	}
 	if !c.RunsOnWorkers("large", "shape") {
 		t.Error("the same literals ran on workers")
+	}
+}
+
+// TestUnseenLiterals checks what a statement whose text with its literals has not run
+// goes by: the most a run alike but for its literals took, not what most of them took.
+func TestUnseenLiterals(t *testing.T) {
+	const gb = int64(1) << 30
+	c := NewController(16 * gb)
+	c.EstimateFromHistory(1)
+	c.WeighCosts(8, LightCPU)
+	// The value nothing has, twice, and an audience of some size once.
+	for _, r := range []struct {
+		exact string
+		held  int64
+		cpu   time.Duration
+	}{{"none-a", gb / 4, 2 * time.Second}, {"none-b", gb / 4, 2 * time.Second}, {"some", 12 * gb, 400 * time.Second}} {
+		for _, key := range []string{"shape", r.exact} {
+			c.Observe(key, r.held)
+			c.ObserveCost(key, r.cpu)
+		}
+	}
+	if memory, seen := c.Reserve("new", "shape"); memory != 12*gb || !seen {
+		t.Errorf("a new value reserves %d, seen %v", memory, seen)
+	}
+	if expect, light := c.Cost("new", "shape"); expect != 50*time.Second || light {
+		t.Errorf("a new value expected to take %s, light %v", expect, light)
+	}
+	// Its own runs, once it has any.
+	if memory, _ := c.Reserve("none-a", "shape"); memory != 0 {
+		t.Errorf("the value nothing has reserves %d", memory)
+	}
+	if expect, _ := c.Cost("none-a", "shape"); expect != time.Second/4 {
+		t.Errorf("the value nothing has expected to take %s", expect)
+	}
+	// One that reads nothing is light the next time, and says nothing of the others.
+	c.ObserveEmpty("folded")
+	if _, light := c.Cost("folded", "other"); !light {
+		t.Error("a statement that read nothing is not light the next time")
+	}
+	if _, seen := c.Reserve("new", "other"); seen {
+		t.Error("a statement that read nothing says something of others alike")
 	}
 }

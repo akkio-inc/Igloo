@@ -26,6 +26,14 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   each on one thread. A maintenance pass now rewrites one that has too few, into
   row groups of about a sixteenth of it, of at least 122,880 rows.
 
+- A dashboard's first run, with no history, no longer runs its heavy statements
+  together. Statements of shapes not seen yet that have waited a minute for the
+  memory start one at a time, not one every 30 s, and a statement whose text with
+  its literals has not run goes by the most a run alike took, not the median, of
+  which runs over values with no rows had been most. Its 324 queries at ten times
+  the data, on 8 cores, took 3,145 s rather than 3,928, and none ran past its
+  timeout, where three had.
+
 - A canceled statement holds nobody up. Statements behind one waited until DuckDB
   had stopped it, for its slots and its memory, and a statement of a shape not seen
   yet waited for memory for as long as what held it ran: behind a report estimated

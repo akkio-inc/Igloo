@@ -421,7 +421,6 @@ func seedHistory(ctx context.Context, seed func([]distributed.Run), fp footprint
 			continue
 		}
 		if f.empty {
-			fp.ObserveEmpty(f.shape)
 			fp.ObserveEmpty(f.exact)
 			continue
 		}
