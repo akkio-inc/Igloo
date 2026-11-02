@@ -135,7 +135,7 @@ func countsOnReplica(sess *session, st *statement) bool {
 
 // admit waits until the session's limits let a statement start, and
 // returns the function to call when it ends.
-func (sess *session) admit(ctx context.Context) (func(), error) {
+func (sess *session) admit(ctx context.Context) (release, leave func(), err error) {
 	l := sess.wl.limits
 	l.Counted = sess.wl.counted
 	l.Apart = sess.wl.apart
@@ -151,11 +151,11 @@ func (sess *session) admit(ctx context.Context) (func(), error) {
 			l.Unseen = !seen
 		}
 	}
-	release, waited, err := sess.wl.controller.Admit(ctx, l)
+	done, waited, err := sess.wl.controller.Admit(ctx, l)
 	sess.wl.queued = waited
 	sess.wl.peak, sess.wl.sampled = 0, false
 	if err == nil {
-		return func() { sess.wl.peak, sess.wl.sampled = release() }, nil
+		return func() { sess.wl.peak, sess.wl.sampled = done() }, func() { done() }, nil
 	}
 	behind := []string{}
 	if n := sess.wl.controller.ReplicaLimit(); l.Counted && n > 0 {
@@ -179,7 +179,7 @@ func (sess *session) admit(ctx context.Context) (func(), error) {
 	if errors.Is(err, context.DeadlineExceeded) {
 		why = "statement queued timeout"
 	}
-	return nil, pgerror.WithCode(fmt.Errorf("canceling statement due to %s: it waited %s to start, behind %s",
+	return nil, nil, pgerror.WithCode(fmt.Errorf("canceling statement due to %s: it waited %s to start, behind %s",
 		why, waited.Round(time.Millisecond), strings.Join(behind, " and ")), codes.QueryCanceled)
 }
 

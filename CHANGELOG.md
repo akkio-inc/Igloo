@@ -13,6 +13,13 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
 
 ### SQL and tables
 
+- A canceled statement holds nobody up. Statements behind one waited until DuckDB
+  had stopped it, for its slots and its memory, and a statement of a shape not seen
+  yet waited for memory for as long as what held it ran: behind a report estimated
+  at 16 hours, it waited before it was even planned for workers. Canceled, past its
+  timeout or with its client gone, a statement now gives up its place at once, and a
+  shape not seen yet waits for memory for at most a minute.
+
 - A statement stops when its client goes away. Nothing read a client's
   connection while its statement ran, so a report whose client was killed went on
   spilling, from 302 GB to 355 GB in two minutes, until Igloo was restarted. The

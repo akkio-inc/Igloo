@@ -233,6 +233,65 @@ func TestClientGoneInLine(t *testing.T) {
 	<-held
 }
 
+// TestCanceledStatementHoldsNobodyUp checks that a statement behind one that was
+// canceled starts at once, while DuckDB has not stopped that one, whether its client
+// went away or it asked.
+func TestCanceledStatementHoldsNobodyUp(t *testing.T) {
+	t.Parallel()
+	ctl := workload.NewController(0)
+	ctl.LimitReplica(1)
+	cs := startCatalogServer(t, func(o *Options) { o.Workload = ctl })
+	unblock := make(chan struct{})
+	// Before the server's cleanup, which waits for its sessions.
+	t.Cleanup(func() { close(unblock) })
+	cs.srv.failLocal = func(_ context.Context, st *statement) error {
+		if strings.Contains(st.query, "holds_marker") {
+			// It goes on, whatever its context says.
+			<-unblock
+		}
+		return nil
+	}
+	next := cs.testServer.admin(t, pgx.QueryExecModeSimpleProtocol)
+	for _, how := range []string{"client gone", "cancel request"} {
+		name := strings.ReplaceAll(how, " ", "_")
+		marker := "holds_marker_" + name
+		conn := cs.testServer.admin(t, pgx.QueryExecModeSimpleProtocol)
+		if how == "client gone" {
+			conn = killable(t, cs.testServer, pgx.QueryExecModeSimpleProtocol)
+		}
+		done := make(chan error, 1)
+		go func() {
+			_, err := conn.Exec(context.Background(), "SELECT 42 AS "+marker)
+			done <- err
+		}()
+		if !comesTrue(goneWithin, func() bool { return statementRunning(cs.srv, marker) }) {
+			t.Fatalf("%s: the statement did not start", how)
+		}
+		// It holds the replica's one slot.
+		mustExec(t, next, "SET statement_queued_timeout = '100ms'")
+		if !comesTrue(goneWithin, func() bool {
+			_, err := next.Exec(context.Background(), "SELECT 7 AS probe_"+name)
+			return pgCode(err) == "57014"
+		}) {
+			t.Fatalf("%s: the statement holds no slot", how)
+		}
+		if how == "client gone" {
+			_ = conn.PgConn().Conn().Close()
+		} else {
+			_ = conn.PgConn().CancelRequest(context.Background())
+		}
+		mustExec(t, next, "SET statement_queued_timeout = '5s'")
+		if got := count(t, next, "SELECT 1 AS next_"+name); got != 1 {
+			t.Errorf("%s: the next statement: %d", how, got)
+		}
+		if !statementRunning(cs.srv, marker) {
+			t.Errorf("%s: the statement stopped, which it should not have", how)
+		}
+		_ = conn.PgConn().Conn().Close()
+		<-done
+	}
+}
+
 // TestClientGoneOnWorkers checks that a statement running on workers, and its tasks,
 // stop when its client goes away.
 func TestClientGoneOnWorkers(t *testing.T) {

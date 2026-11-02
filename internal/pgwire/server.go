@@ -1490,7 +1490,7 @@ func (sess *session) runCancelable(ctx context.Context, query string, fn func(co
 	if timeout := sess.queuedTimeout(); timeout > 0 {
 		queued, cancelQueued = context.WithTimeout(ctx, timeout)
 	}
-	release, err := sess.admit(queued)
+	release, leave, err := sess.admit(queued)
 	cancelQueued()
 	if err != nil {
 		return err
@@ -1504,6 +1504,20 @@ func (sess *session) runCancelable(ctx context.Context, query string, fn func(co
 		ctx, cancelRun = context.WithTimeout(ctx, timeout)
 		defer cancelRun()
 	}
+	// Once canceled or past its timeout it holds nobody up, however long DuckDB
+	// takes to stop it, its slots and what it reserved or holds of the memory:
+	// statements behind a report that went on after its client had gone started
+	// only when it was stopped. One the memory watch canceled keeps them, as what
+	// it holds is why, and it may run again (see rearm).
+	stopLeaving := context.AfterFunc(ctx, func() {
+		sess.mu.Lock()
+		shed := sess.shed
+		sess.mu.Unlock()
+		if !shed {
+			leave()
+		}
+	})
+	defer stopLeaving()
 	stopWatch := sess.watchStuck(ctx)
 	err = fn(ctx)
 	stopWatch()
