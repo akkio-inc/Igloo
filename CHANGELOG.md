@@ -2001,6 +2001,12 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   the same statements over a small one did, and spilled, once they had run over one.
   A dashboard's 324 queries at ten times the data, on 8 cores, took 1,708 s rather
   than 2,207 after one of 96 over small audiences.
+- Auto mode keeps a statement of seconds on the replica however busy it is, by its
+  last run there or on workers, rather than go by an estimate of one machine that
+  runs far past both: a dashboard's statements of 1.5 s ran on workers for good.
+- A statement that runs on workers no longer holds the replica's memory or a place
+  among its statements at once, and one whose latest run went there does not wait
+  for them.
 - A run that read nothing, as DuckDB plans a statement to no rows for some values
   of its literals, says nothing of what other statements of its shape reserve and
   take, or which `FLATTEN` form suits them.

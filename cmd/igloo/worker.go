@@ -303,6 +303,7 @@ type footprints interface {
 	ObserveCost(shape string, cpu time.Duration)
 	ObserveTook(shape string, took time.Duration)
 	ObserveEmpty(shape string)
+	ObserveOnWorkers(key string)
 }
 
 // longUnmeasured is how long a run that ended early must have run, without
@@ -340,6 +341,8 @@ func seedHistory(ctx context.Context, seed func([]distributed.Run), fp footprint
 		took time.Duration
 		// exact is its key with its literals (see workload.Controller.Alike).
 		exact string
+		// workers says it ran on workers.
+		workers bool
 	}
 	var fs []footprint
 	type form struct {
@@ -377,6 +380,10 @@ func seedHistory(ctx context.Context, seed func([]distributed.Run), fp footprint
 				// as these are read newest first.
 				rs = append(rs, distributed.Run{Key: q.PlanKey, Guarded: true, Duration: ran, Memory: memory})
 			}
+			if q.Shape != "" && q.Workers > 0 && q.Outcome == audit.OutcomeOK {
+				fs = append(fs, footprint{shape: q.Shape, exact: q.Exact, workers: true})
+				continue
+			}
 			if q.Shape == "" || q.Workers > 0 || !sameMemory(q.Memory, memory) {
 				continue
 			}
@@ -384,11 +391,11 @@ func seedHistory(ctx context.Context, seed func([]distributed.Run), fp footprint
 			switch {
 			case q.Outcome == audit.OutcomeOK && q.Resources != nil:
 				fs = append(fs, footprint{q.Shape, workload.FootprintOf(q.Resources.MemoryAllocated, q.Peak, q.Peak > 0), false, q.Resources.CPUTime, empty,
-					q.Duration - q.Queued, q.Exact})
+					q.Duration - q.Queued, q.Exact, false})
 			case early && q.Peak > 0:
-				fs = append(fs, footprint{q.Shape, q.Peak, true, -1, false, 0, q.Exact})
+				fs = append(fs, footprint{q.Shape, q.Peak, true, -1, false, 0, q.Exact, false})
 			case early && q.Duration-q.Queued >= longUnmeasured:
-				fs = append(fs, footprint{q.Shape, q.Memory, true, -1, false, 0, q.Exact})
+				fs = append(fs, footprint{q.Shape, q.Memory, true, -1, false, 0, q.Exact, false})
 			}
 		}
 		if len(qs) < pageSize {
@@ -408,6 +415,11 @@ func seedHistory(ctx context.Context, seed func([]distributed.Run), fp footprint
 		seed(rs)
 	}
 	for _, f := range fs {
+		if f.workers {
+			fp.ObserveOnWorkers(f.shape)
+			fp.ObserveOnWorkers(f.exact)
+			continue
+		}
 		if f.empty {
 			fp.ObserveEmpty(f.shape)
 			fp.ObserveEmpty(f.exact)

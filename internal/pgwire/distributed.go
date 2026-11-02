@@ -310,6 +310,9 @@ func (s *Server) startDistributed(ctx context.Context, sess *session, user auth.
 		// made (see runFinal).
 		plan.StreamMerged()
 	}
+	if sess.wl.elsewhere != nil {
+		sess.wl.elsewhere()
+	}
 	ex, err := s.dist.Execute(ctx, plan, settings)
 	if err != nil {
 		// Released now if the statement is done; otherwise once it has run

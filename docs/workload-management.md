@@ -299,6 +299,11 @@ cache](operations.md#result-cache) answers, or a query ending in `LIMIT 0`,
 which tools send to learn its columns and runs nothing. A statement waiting for this
 limit says so: `behind the replica's limit of 8 statements at once`.
 
+A statement that runs on [workers](distributed-execution.md) stops counting, and gives
+back what its history reserved of the replica's memory, as it goes there, and one
+whose latest run went there waits for neither: it uses neither. What a role or user
+set, of statements at once or of memory, still counts it.
+
 ### The line
 
 Statements held back by the replica's limit, a role's or the memory wait in the

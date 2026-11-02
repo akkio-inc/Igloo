@@ -2282,6 +2282,10 @@ func (s *Server) preparedQuery(ctx context.Context, sess *session, user auth.Use
 		switch {
 		case parts.workers > 0:
 			// One that ran on workers held most of its memory there.
+			if err == nil {
+				s.workload.ObserveOnWorkers(shape)
+				s.workload.ObserveOnWorkers(exact)
+			}
 		case measured:
 			// What it held here, for the next statement like it, and the next the same.
 			for _, key := range []string{shape, exact} {

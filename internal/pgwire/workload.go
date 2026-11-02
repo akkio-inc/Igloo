@@ -65,6 +65,9 @@ type workloadState struct {
 	// exact is the statement's text with its literals, as a key like shape's;
 	// see workload.Controller.Alike.
 	exact string
+	// elsewhere gives back what the running statement holds of this replica, once it
+	// runs on workers (see workload.Limits.Elsewhere); nil for none.
+	elsewhere func()
 	// peak is the most memory the latest statement was seen holding while
 	// it ran, and sampled says a sample fell within its run (see
 	// workload.Controller.SampleMemory).
@@ -142,15 +145,17 @@ func (sess *session) admit(ctx context.Context) (release, leave func(), err erro
 	l := sess.wl.limits
 	l.Counted = sess.wl.counted
 	l.Apart = sess.wl.apart
+	var elsewhere func()
+	l.Elsewhere = &elsewhere
 	if controller := sess.wl.controller; l.Counted {
 		key := controller.Alike(sess.wl.exact, sess.wl.shape)
 		l.Expect = controller.Expect(key)
 		switch {
-		case controller.Light(key):
+		case controller.Light(key), controller.RunsOnWorkers(sess.wl.exact, sess.wl.shape):
 			l.Counted = false
 		case l.Memory == 0:
 			// What statements like it held, when its role reserves nothing.
-			l.Memory = controller.Estimate(key)
+			l.Memory, l.Estimated = controller.Estimate(key), true
 			_, seen := controller.Footprint(key)
 			l.Unseen = !seen
 		}
@@ -159,7 +164,11 @@ func (sess *session) admit(ctx context.Context) (release, leave func(), err erro
 	sess.wl.queued = waited
 	sess.wl.peak, sess.wl.sampled = 0, false
 	if err == nil {
-		return func() { sess.wl.peak, sess.wl.sampled = done() }, func() { done() }, nil
+		sess.wl.elsewhere = elsewhere
+		return func() {
+			sess.wl.peak, sess.wl.sampled = done()
+			sess.wl.elsewhere = nil
+		}, func() { done() }, nil
 	}
 	behind := []string{}
 	if n := sess.wl.controller.ReplicaLimit(); l.Counted && n > 0 {
