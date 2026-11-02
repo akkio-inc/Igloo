@@ -135,9 +135,17 @@ func countsOnReplica(sess *session, st *statement) bool {
 func (sess *session) admit(ctx context.Context) (func(), error) {
 	l := sess.wl.limits
 	l.Counted = sess.wl.counted
-	if l.Memory == 0 && l.Counted {
-		// What statements like it held, when its role reserves nothing.
-		l.Memory = sess.wl.controller.Estimate(sess.wl.shape)
+	if controller := sess.wl.controller; l.Counted {
+		l.Expect = controller.Expect(sess.wl.shape)
+		switch {
+		case controller.Light(sess.wl.shape):
+			l.Counted = false
+		case l.Memory == 0:
+			// What statements like it held, when its role reserves nothing.
+			l.Memory = controller.Estimate(sess.wl.shape)
+			_, seen := controller.Footprint(sess.wl.shape)
+			l.Unseen = !seen
+		}
 	}
 	release, waited, err := sess.wl.controller.Admit(ctx, l)
 	sess.wl.queued = waited

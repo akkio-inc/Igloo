@@ -162,7 +162,9 @@ counts against the user or role it came from.
 
 How limits are enforced:
 
-- **In line, in order.** Statements that must wait do so in arrival order.
+- **In line, in order.** Statements that must wait do so in the order they
+  would end if each ran alone (see [the line](#the-line)), which is arrival
+  order for those with no history.
   A statement never overtakes an earlier one that waits for the same slots,
   nor, if it reserves memory, one that waits for memory, so a large
   reservation is not starved by small ones. Statements of other users and
@@ -277,8 +279,8 @@ statements beyond that.
 
 `IGLOO_MAX_CONCURRENT_STATEMENTS` limits the queries and changes of data
 running at once on a replica, whoever runs them, as a Snowflake warehouse's
-`MAX_CONCURRENCY_LEVEL` does; further ones wait in line, in arrival order,
-as for the limits above. A number sets it, `auto` makes it the replica's
+`MAX_CONCURRENCY_LEVEL` does; further ones wait in line, as for the limits
+above (see [the line](#the-line)). A number sets it, `auto` makes it the replica's
 cores, and `off`, the default, means no limit.
 
 DuckDB runs every statement on all of its threads, so a hundred statements
@@ -291,6 +293,26 @@ other DDL do not, and neither does a result the [result
 cache](operations.md#result-cache) answers, or a query ending in `LIMIT 0`,
 which tools send to learn its columns and runs nothing. A statement waiting for this
 limit says so: `behind the replica's limit of 8 statements at once`.
+
+### The line
+
+Statements held back by the replica's limit, a role's or the memory wait in the
+order they would end if each started when it came and ran alone, as their
+shape's latest runs say (the least of its latest eight, what DuckDB measured over
+its threads, over the replica's cores); one with no runs yet is taken to take no
+time, so statements with no history keep their arrival order. A short statement
+therefore goes before a long one that came just before it, and a long one before
+a short one that comes after it would have ended, so nothing starves. A shape
+that took under a second of CPU in one of those runs does not wait at all: it
+neither counts against the replica's limit nor reserves memory. A statement of a
+shape not seen yet, of which nothing is known, waits while DuckDB holds three
+quarters of the memory for the statements running, so that a dashboard's heavy
+statements do not start together on its first run.
+
+On a dashboard's 96 queries at ten times the data, on 8 cores, the slowest tenth
+took 94 s rather than 102 and the slowest hundredth 127 s rather than 135, and
+they ran 2,800 s in all rather than 3,370, without its build taking longer (224 s
+rather than 230); at the data's size its median took 1.1 s, as before.
 
 ### Reservations from history
 

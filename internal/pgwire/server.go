@@ -2243,6 +2243,7 @@ func (s *Server) preparedQuery(ctx context.Context, sess *session, user auth.Use
 		case used != nil:
 			// What it held here, for the next statement like it.
 			s.workload.Observe(shape, workload.FootprintOf(used.MemoryAllocated, peak, sampled))
+			s.workload.ObserveCost(shape, used.CPUTime)
 		case err != nil && sampled:
 			// It ended before its end, holding at least that much, or, if it
 			// ran a while, all the memory: it may have held any of what the

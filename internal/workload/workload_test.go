@@ -567,3 +567,169 @@ func TestFormsFromTheHistory(t *testing.T) {
 	var none *Controller
 	none.ObserveForm("x", true, time.Second)
 }
+
+// TestControllerLineByExpected checks that statements wait in the order they
+// would end if each ran alone from when it came: a short one goes before a
+// long one that came just before it, a long one before a short one that comes
+// after it would have ended, and those with no history in arrival order.
+func TestControllerLineByExpected(t *testing.T) {
+	c := NewController(0)
+	c.LimitReplica(1)
+	ctx := context.Background()
+	first, _, err := c.Admit(ctx, Limits{Counted: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var mu sync.Mutex
+	var order []string
+	var wg sync.WaitGroup
+	start := func(name string, expect time.Duration) {
+		before := func() int {
+			c.mu.Lock()
+			defer c.mu.Unlock()
+			return len(c.queue)
+		}
+		n := before()
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			release, _, err := c.Admit(ctx, Limits{Counted: true, Expect: expect})
+			if err != nil {
+				t.Error(err)
+				return
+			}
+			mu.Lock()
+			order = append(order, name)
+			mu.Unlock()
+			release()
+		}()
+		for deadline := time.Now().Add(5 * time.Second); before() == n && time.Now().Before(deadline); time.Sleep(time.Millisecond) {
+		}
+	}
+	start("long", time.Hour)
+	start("short", time.Second)
+	start("unknown", 0)
+	start("unknown too", 0)
+	start("medium", time.Minute)
+	first()
+	wg.Wait()
+	if got := strings.Join(order, ","); got != "unknown,unknown too,short,medium,long" {
+		t.Errorf("order %s", got)
+	}
+
+	// A statement that comes long after a long one's start does not pass it:
+	// the long one is due first.
+	c = NewController(0)
+	c.LimitReplica(1)
+	first, _, _ = c.Admit(ctx, Limits{Counted: true})
+	order = nil
+	start("long", 10*time.Millisecond)
+	time.Sleep(30 * time.Millisecond)
+	start("short", time.Millisecond)
+	first()
+	wg.Wait()
+	if got := strings.Join(order, ","); got != "long,short" {
+		t.Errorf("order %s", got)
+	}
+}
+
+// TestCosts checks what the controller learns of what statements cost: the
+// least of a shape's latest runs, over the cores, and which are light.
+func TestCosts(t *testing.T) {
+	c := NewController(0)
+	if c.Expect("a") != 0 || c.Light("a") {
+		t.Error("costs before WeighCosts")
+	}
+	c.ObserveCost("a", time.Second)
+	if c.Expect("a") != 0 || c.Light("a") {
+		t.Error("costs without WeighCosts")
+	}
+	c.WeighCosts(8, 8*time.Second)
+	if c.Expect("b") != 0 || c.Light("b") {
+		t.Error("a shape not seen has a cost")
+	}
+	c.ObserveCost("b", 160*time.Second)
+	if c.Expect("b") != 20*time.Second || c.Light("b") {
+		t.Errorf("b: expected %s, light %v", c.Expect("b"), c.Light("b"))
+	}
+	// A run beside others takes more than it would alone: the least counts.
+	c.ObserveCost("b", 4*time.Second)
+	c.ObserveCost("b", 160*time.Second)
+	if c.Expect("b") != 500*time.Millisecond || !c.Light("b") {
+		t.Errorf("b: expected %s, light %v", c.Expect("b"), c.Light("b"))
+	}
+	// Until it is no longer among the latest.
+	for range costRuns {
+		c.ObserveCost("b", 160*time.Second)
+	}
+	if c.Expect("b") != 20*time.Second || c.Light("b") {
+		t.Errorf("b later: expected %s, light %v", c.Expect("b"), c.Light("b"))
+	}
+	c.WeighCosts(8, 0)
+	c.ObserveCost("c", 0)
+	if c.Light("c") {
+		t.Error("light with no threshold")
+	}
+}
+
+// TestUnseenWaitsWhileMemoryIsFull checks that a statement nothing is known of
+// waits while DuckDB holds nearly all the memory for those running, and that
+// one known to hold little does not.
+func TestUnseenWaitsWhileMemoryIsFull(t *testing.T) {
+	const gb = int64(1) << 30
+	c := NewController(8 * gb)
+	c.LimitReplica(8)
+	ctx := context.Background()
+	// Nothing runs yet: however much DuckDB held, an unseen one starts.
+	c.sample(7 * gb)
+	first, waited, err := c.Admit(ctx, Limits{Counted: true, Unseen: true})
+	if err != nil || waited != 0 {
+		t.Fatalf("with nothing running: waited %s: %v", waited, err)
+	}
+	// Below the mark, another starts too.
+	c.sample(gb)
+	second, waited, err := c.Admit(ctx, Limits{Counted: true, Unseen: true})
+	if err != nil || waited != 0 {
+		t.Fatalf("below the mark: waited %s: %v", waited, err)
+	}
+	second()
+	c.sample(7 * gb)
+	// A known one starts whatever is held.
+	known, waited, err := c.Admit(ctx, Limits{Counted: true})
+	if err != nil || waited != 0 {
+		t.Fatalf("a known statement waited %s: %v", waited, err)
+	}
+	known()
+	started := make(chan struct{})
+	go func() {
+		r, _, err := c.Admit(ctx, Limits{Counted: true, Unseen: true})
+		if err != nil {
+			t.Error(err)
+		}
+		close(started)
+		r()
+	}()
+	select {
+	case <-started:
+		t.Fatal("an unseen statement started with the memory full")
+	case <-time.After(50 * time.Millisecond):
+	}
+	// The next sample that finds room lets it start.
+	c.sample(2 * gb)
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("an unseen statement did not start once there was room")
+	}
+	first()
+	// Without a replica's limit, it waits all the same.
+	free := NewController(8 * gb)
+	r, _, _ := free.Admit(ctx, Limits{Memory: gb})
+	free.sample(7 * gb)
+	short, cancel := context.WithTimeout(ctx, 20*time.Millisecond)
+	defer cancel()
+	if _, _, err := free.Admit(short, Limits{Counted: true, Unseen: true}); !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("without a limit, with the memory full: %v", err)
+	}
+	r()
+}

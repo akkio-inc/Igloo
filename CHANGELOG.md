@@ -1930,6 +1930,12 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
 - A replica keeps the forms of `FLATTEN`s through a restart, from the query
   history, rather than try them again: a dashboard's first build after one took
   half as long again as the next.
+- Statements wait in the order they would end if each ran alone from when it
+  came, as their shape's runs say, rather than in arrival order; a shape that took
+  under a second of CPU does not wait at all; and a statement of a shape not seen
+  yet waits while the memory is nearly full (see [the
+  line](docs/workload-management.md#the-line)). The slowest tenth of a dashboard's
+  96 queries at ten times the data took 94 s rather than 102.
 - A `FLATTEN` of a column takes the form DuckDB's estimates point to, then
   whichever form its shape's latest runs took the less CPU time in at best (see
   [Snowflake SQL](docs/snowflake-sql.md)): two dashboard queries over tens

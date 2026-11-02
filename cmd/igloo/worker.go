@@ -300,6 +300,7 @@ type footprints interface {
 	Observe(shape string, footprint int64)
 	ObserveUnfinished(shape string, held int64)
 	ObserveForm(key string, lists bool, cpu time.Duration)
+	ObserveCost(shape string, cpu time.Duration)
 }
 
 // longUnmeasured is how long a run that ended early must have run, without
@@ -328,6 +329,8 @@ func seedHistory(ctx context.Context, seed func([]distributed.Run), fp footprint
 		shape      string
 		held       int64
 		unfinished bool
+		// cpu is what a run it completed took; -1 for none.
+		cpu time.Duration
 	}
 	var fs []footprint
 	type form struct {
@@ -365,11 +368,11 @@ func seedHistory(ctx context.Context, seed func([]distributed.Run), fp footprint
 			early := q.Outcome == audit.OutcomeCanceled || q.SQLState == "53200"
 			switch {
 			case q.Outcome == audit.OutcomeOK && q.Resources != nil:
-				fs = append(fs, footprint{q.Shape, workload.FootprintOf(q.Resources.MemoryAllocated, q.Peak, q.Peak > 0), false})
+				fs = append(fs, footprint{q.Shape, workload.FootprintOf(q.Resources.MemoryAllocated, q.Peak, q.Peak > 0), false, q.Resources.CPUTime})
 			case early && q.Peak > 0:
-				fs = append(fs, footprint{q.Shape, q.Peak, true})
+				fs = append(fs, footprint{q.Shape, q.Peak, true, -1})
 			case early && q.Duration-q.Queued >= longUnmeasured:
-				fs = append(fs, footprint{q.Shape, q.Memory, true})
+				fs = append(fs, footprint{q.Shape, q.Memory, true, -1})
 			}
 		}
 		if len(qs) < pageSize {
@@ -393,6 +396,9 @@ func seedHistory(ctx context.Context, seed func([]distributed.Run), fp footprint
 			fp.ObserveUnfinished(f.shape, f.held)
 		} else {
 			fp.Observe(f.shape, f.held)
+		}
+		if f.cpu >= 0 {
+			fp.ObserveCost(f.shape, f.cpu)
 		}
 	}
 	log.Debug("read past statements' runs", "runs", len(rs), "footprints", len(fs))
