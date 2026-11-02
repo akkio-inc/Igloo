@@ -207,15 +207,14 @@ func (c *Controller) wait(ctx context.Context, w *waiter) {
 			return
 		case <-late:
 			c.mu.Lock()
-			next := unseenGrows
-			if since := time.Since(c.lastLate); since >= unseenGrows {
-				c.lastLate, w.late = time.Now(), true
-				c.admit()
+			if next := unseenGrows - time.Since(c.lastLate); next > 0 {
+				late = time.After(next)
 			} else {
-				next -= since
+				c.lastLate, w.late = time.Now(), true
+				late = nil
+				c.admit()
 			}
 			c.mu.Unlock()
-			late = time.After(next)
 		}
 	}
 }
