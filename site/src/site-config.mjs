@@ -29,9 +29,9 @@ export const siteUrl = (path) => (SITE_URL ? new URL(path, SITE_URL).href : path
 export const SHARE = {
 	title: 'Igloo: the open source replacement for Snowflake and Databricks',
 	description:
-		'3× faster and 20× lower cost than Snowflake and Databricks: an open source SQL warehouse on Apache Iceberg, in your own cloud.',
+		'3× faster and 25× lower cost than Snowflake and Databricks: an open source SQL warehouse on Apache Iceberg, in your own cloud.',
 	image: '/og.jpg',
-	imageAlt: 'Igloo, the open source replacement for Snowflake and Databricks: 3× faster, 20× lower cost.',
+	imageAlt: 'Igloo, the open source replacement for Snowflake and Databricks: 3× faster, 25× lower cost.',
 };
 
 /**
