@@ -1067,3 +1067,141 @@ func TestUnseenStartAFewAtATime(t *testing.T) {
 	running[1]()
 	running[2]()
 }
+
+// TestAlike checks that a statement goes by the runs of the same text with the same
+// literals if there are any, and otherwise by those alike but for its literals.
+func TestAlike(t *testing.T) {
+	const gb = int64(1) << 30
+	c := NewController(16 * gb)
+	c.EstimateFromHistory(1)
+	if got := c.Alike("large", "shape"); got != "shape" {
+		t.Errorf("with no runs: %q", got)
+	}
+	for _, key := range []string{"shape", "small"} {
+		c.Observe(key, 2*gb)
+	}
+	if got := c.Alike("large", "shape"); got != "shape" {
+		t.Errorf("with runs of others alike: %q", got)
+	}
+	for _, key := range []string{"shape", "large"} {
+		c.Observe(key, 10*gb)
+	}
+	if got := c.Alike("large", "shape"); got != "large" || c.Estimate(got) != 10*gb {
+		t.Errorf("with its own runs: %q, %d", got, c.Estimate(got))
+	}
+	if got := c.Alike("small", "shape"); got != "small" || c.Estimate(got) != 2*gb {
+		t.Errorf("with its own runs: %q, %d", got, c.Estimate(got))
+	}
+	if got := c.Alike("", "shape"); got != "shape" {
+		t.Errorf("with no exact key: %q", got)
+	}
+}
+
+// TestElsewhere checks that a statement that goes on to run on workers gives back what
+// it reserved and its place among the statements at once, but not its role's slots.
+func TestElsewhere(t *testing.T) {
+	const gb = int64(1) << 30
+	c := NewController(16 * gb)
+	c.LimitReplica(1)
+	ctx := context.Background()
+	var elsewhere func()
+	slots := Slots{Key: "role analysts", Max: 1}
+	report, _, err := c.Admit(ctx, Limits{Counted: true, Memory: 16 * gb, Estimated: true, Slots: slots, Elsewhere: &elsewhere})
+	if err != nil || elsewhere == nil {
+		t.Fatalf("admitted: %v, %v", elsewhere != nil, err)
+	}
+	dashboard := make(chan func() (int64, bool), 1)
+	go func() {
+		r, _, err := c.Admit(ctx, Limits{Counted: true, Memory: 2 * gb})
+		if err != nil {
+			t.Error(err)
+		}
+		dashboard <- r
+	}()
+	same := make(chan func() (int64, bool), 1)
+	go func() {
+		r, _, err := c.Admit(ctx, Limits{Slots: slots})
+		if err != nil {
+			t.Error(err)
+		}
+		same <- r
+	}()
+	select {
+	case <-dashboard:
+		t.Fatal("a statement started behind what the report reserved")
+	case <-time.After(50 * time.Millisecond):
+	}
+	elsewhere()
+	var r func() (int64, bool)
+	select {
+	case r = <-dashboard:
+	case <-time.After(5 * time.Second):
+		t.Fatal("a statement did not start once the report ran on workers")
+	}
+	select {
+	case <-same:
+		t.Fatal("the report's role's limit let another start")
+	case <-time.After(50 * time.Millisecond):
+	}
+	// The report's end gives back nothing twice.
+	report()
+	sameRole := <-same
+	sameRole()
+	c.mu.Lock()
+	if c.reserved != 2*gb || c.replicaRunning != 1 {
+		t.Errorf("reserved %d, running %d, with the dashboard's statement alone", c.reserved, c.replicaRunning)
+	}
+	c.mu.Unlock()
+	elsewhere()
+	r()
+	c.mu.Lock()
+	if c.reserved != 0 || c.replicaRunning != 0 {
+		t.Errorf("reserved %d, running %d, with nothing running", c.reserved, c.replicaRunning)
+	}
+	c.mu.Unlock()
+}
+
+// TestElsewhereKeepsWhatARoleSet checks that what a role or user set of the memory
+// stays reserved, wherever the statement runs.
+func TestElsewhereKeepsWhatARoleSet(t *testing.T) {
+	const gb = int64(1) << 30
+	c := NewController(16 * gb)
+	ctx := context.Background()
+	var elsewhere func()
+	report, _, err := c.Admit(ctx, Limits{Memory: 12 * gb, Elsewhere: &elsewhere})
+	if err != nil {
+		t.Fatal(err)
+	}
+	elsewhere()
+	c.mu.Lock()
+	if c.reserved != 12*gb {
+		t.Errorf("reserved %d, with a user's 12 GiB", c.reserved)
+	}
+	c.mu.Unlock()
+	report()
+}
+
+// TestRunsOnWorkers checks where statements are taken to run: where the latest with
+// the same literals ran, or with none of those, the latest alike.
+func TestRunsOnWorkers(t *testing.T) {
+	c := NewController(1 << 30)
+	if c.RunsOnWorkers("large", "shape") {
+		t.Error("with no runs")
+	}
+	c.ObserveOnWorkers("shape")
+	c.ObserveOnWorkers("large")
+	if !c.RunsOnWorkers("large", "shape") || !c.RunsOnWorkers("other", "shape") {
+		t.Error("after runs on workers")
+	}
+	c.Observe("small", 1<<20)
+	if c.RunsOnWorkers("small", "shape") {
+		t.Error("the same literals ran here")
+	}
+	c.Observe("shape", 1<<20)
+	if c.RunsOnWorkers("other", "shape") {
+		t.Error("the latest alike ran here")
+	}
+	if !c.RunsOnWorkers("large", "shape") {
+		t.Error("the same literals ran on workers")
+	}
+}

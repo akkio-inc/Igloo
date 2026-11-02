@@ -13,6 +13,14 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
 
 ### SQL and tables
 
+- Reads of the read cache start no threads of their own. The extension started one
+  for each block of each read, warm or cold, and with dashboards, ELT and reports
+  beside each other a replica of 16 cores reached 20,394 threads and a load of 240,
+  and no statement finished for 20 minutes. Blocks are now read as DuckDB's tasks,
+  on its threads, and `igloo_process_threads` tells how many the process has.
+  Workers, which read nothing ahead, start up to `IGLOO_CACHE_READ_THREADS` a read,
+  8 by default, as reading cold on their own threads took a quarter as long again.
+
 - A small table's row groups no longer limit the threads that scan it. A table
   under 256 MiB loaded in row groups of half a million rows has few, and DuckDB reads
   each on one thread. A maintenance pass now rewrites one that has too few, into
@@ -1987,6 +1995,23 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
 - Snowflake's `x LIKE ANY ('%a%', '%b%', ...)` is one regular expression where that
   is faster, rather than a comparison for each pattern that works out `x` again:
   over `TRIM(LOWER(x))`, 25 patterns took 0.7 s of 10 million strings, not 6.4.
+- A statement goes by the runs of the same text with the same literals, if there are
+  any, for what it reserves and its place in line, and otherwise by those alike but
+  for its literals: statements over a large audience allocated up to 12 times what
+  the same statements over a small one did, and spilled, once they had run over one.
+  A dashboard's 324 queries at ten times the data, on 8 cores, took 1,708 s rather
+  than 2,207 after one of 96 over small audiences.
+- Auto mode keeps a statement of seconds on the replica however busy it is, by its
+  last run there or on workers, rather than go by an estimate of one machine that
+  runs far past both: a dashboard's statements of 1.5 s ran on workers for good.
+- Statements running on workers no longer count as sharing the replica's cores when
+  auto mode weighs where another runs, or as what a heavy statement gives way to.
+- A worker gives its task slots to the statement that has started the fewest tasks
+  there, rather than in the order they came, so that a short statement's tasks do not
+  wait for all of a long one's.
+- A statement that runs on workers no longer holds the replica's memory or a place
+  among its statements at once, and one whose latest run went there does not wait
+  for them.
 - A run that read nothing, as DuckDB plans a statement to no rows for some values
   of its literals, says nothing of what other statements of its shape reserve and
   take, or which `FLATTEN` form suits them.

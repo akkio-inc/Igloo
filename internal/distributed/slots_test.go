@@ -6,8 +6,6 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
-
-	"golang.org/x/sync/semaphore"
 )
 
 // TestRetryShape runs a statement again after a task ran out of memory in
@@ -49,7 +47,7 @@ func TestRetryShape(t *testing.T) {
 func TestTaskSlots(t *testing.T) {
 	h := newHarness(t, 0.01, 1, 1)
 	w := h.workers[0]
-	w.slotCount, w.slots = 2, semaphore.NewWeighted(2)
+	w.slotCount, w.slots = 2, newFairSlots(2)
 	holding, release, started := make(chan struct{}), make(chan struct{}), make(chan int, 2)
 	taskFault = func(req *taskRequest) error {
 		started <- req.Task

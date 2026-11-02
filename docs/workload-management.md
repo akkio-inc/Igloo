@@ -299,6 +299,11 @@ cache](operations.md#result-cache) answers, or a query ending in `LIMIT 0`,
 which tools send to learn its columns and runs nothing. A statement waiting for this
 limit says so: `behind the replica's limit of 8 statements at once`.
 
+A statement that runs on [workers](distributed-execution.md) stops counting, and gives
+back what its history reserved of the replica's memory, as it goes there, and one
+whose latest run went there waits for neither: it uses neither. What a role or user
+set, of statements at once or of memory, still counts it.
+
 ### The line
 
 Statements held back by the replica's limit, a role's or the memory wait in the
@@ -353,7 +358,8 @@ replica saw it hold if that is more: every 100 ms the replica reads what
 DuckDB holds for running statements (their hash tables, sorts and the like,
 not its caches) and shares it among them by what they reserved, which is
 exact only for a statement alone. A shape's footprint is the median of its
-latest eight runs. A run that ends early, cancelled or out of memory, raises
+latest eight runs, and the runs of the same text with the same literals, if there
+are any, go before those of its shape, here and in [the line](#the-line). A run that ends early, cancelled or out of memory, raises
 it to what it was seen holding, or, if it ran ten seconds or more, to all
 the memory, so that heavy statements cancelled at their timeout do not start
 together again, unseen, next time. When it starts, a replica reads what the

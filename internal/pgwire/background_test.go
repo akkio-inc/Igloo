@@ -2,6 +2,7 @@ package pgwire
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -423,9 +424,11 @@ func TestMostOfSize(t *testing.T) {
 	h.after = 5 * time.Second
 	short := aStatement{expect: time.Second, ran: 2 * time.Second}
 	unseen := aStatement{ran: 2 * time.Second}
-	sized := aStatement{expect: 30 * time.Second, ran: time.Second}
+	sized := aStatement{expect: 30 * time.Second, ran: time.Minute}
+	starting := aStatement{expect: 30 * time.Second, ran: time.Second}
 	long := aStatement{ran: time.Minute}
 	slowed := aStatement{expect: time.Second, ran: time.Minute}
+	waiting := aStatement{expect: time.Second, waiting: true}
 	for _, c := range []struct {
 		beside []aStatement
 		want   bool
@@ -441,6 +444,10 @@ func TestMostOfSize(t *testing.T) {
 		{[]aStatement{sized, sized, sized, sized, long, long, short}, true},
 		{[]aStatement{slowed}, false},
 		{[]aStatement{slowed, slowed, slowed, sized}, false},
+		{[]aStatement{starting}, false},
+		{[]aStatement{waiting}, true},
+		{[]aStatement{short, short, waiting, waiting, waiting}, true},
+		{[]aStatement{short, short, short, waiting}, false},
 	} {
 		if got := h.mostOfSize(c.beside); got != c.want {
 			t.Errorf("beside %v: %v, want %v", c.beside, got, c.want)
@@ -488,5 +495,17 @@ func TestHeavyStaysBesideHeavy(t *testing.T) {
 	}
 	if n := backgrounds(m); n != 2 {
 		t.Errorf("%v ran in the background, with nothing beside it", n)
+	}
+}
+
+// TestOutOfSpillSpace checks what says the disk is full of a statement's spill files.
+func TestOutOfSpillSpace(t *testing.T) {
+	t.Parallel()
+	full := errors.New("Out of Memory Error: failed to offload data block of size 256.0 KiB (30.4 GiB/30.4 GiB used).")
+	if !outOfSpillSpace(full) {
+		t.Error("a full disk not recognized")
+	}
+	if outOfSpillSpace(errors.New("Out of Memory Error: could not allocate block")) || outOfSpillSpace(nil) {
+		t.Error("something else taken for a full disk")
 	}
 }

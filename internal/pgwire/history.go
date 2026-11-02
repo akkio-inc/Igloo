@@ -76,6 +76,8 @@ type queryRecord struct {
 	// shape its key for the workload controller (see shapeKey), if any.
 	parts distParts
 	shape string
+	// exact is the same with its literals (see workload.Controller.Alike).
+	exact string
 	// form is what its FLATTENs took, if they could take either.
 	form statementForm
 	// peak is the most memory it was seen holding, if sampled (see
@@ -151,6 +153,7 @@ func (s *Server) recordQuery(sess *session, r queryRecord) {
 		FlattenKey:      r.form.key,
 		FlattenLists:    r.form.lists,
 		Shape:           r.shape,
+		Exact:           r.exact,
 		Memory:          s.runMemory(r.parts.workers, r.parts.large),
 		Peak:            r.peak,
 	}

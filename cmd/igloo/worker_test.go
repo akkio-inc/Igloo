@@ -192,3 +192,61 @@ func TestSeedHistoryRunsThatReadNothing(t *testing.T) {
 		t.Errorf("expected to take %s", got)
 	}
 }
+
+// TestSeedHistoryExact checks that a restarted server has what ran of the same text
+// with the same literals, apart from what ran of others alike.
+func TestSeedHistoryExact(t *testing.T) {
+	store := audit.NewMemoryStore(audit.MemoryQueries, audit.MemoryLogins)
+	now := time.Now()
+	const gb = int64(1) << 30
+	limits := workload.NewController(22 * gb)
+	limits.EstimateFromHistory(1)
+	var qs []audit.Query
+	for i, r := range []struct {
+		exact     string
+		allocated int64
+	}{{"small", 3 * gb}, {"large", 12 * gb}, {"small", 3 * gb}} {
+		qs = append(qs, audit.Query{ID: fmt.Sprint(i), Start: now.Add(time.Duration(i-10) * time.Minute), Outcome: audit.OutcomeOK,
+			Duration: time.Second, Shape: "s", Exact: r.exact, Memory: 22 * gb,
+			Resources: &audit.Resources{BytesRead: 1, CPUTime: time.Minute, MemoryAllocated: r.allocated}})
+	}
+	if err := store.WriteQueries(context.Background(), qs); err != nil {
+		t.Fatal(err)
+	}
+	seedHistory(context.Background(), nil, limits, 22*gb, store, slog.New(slog.DiscardHandler))
+	if got := limits.Estimate("large"); got != 8*gb {
+		t.Errorf("large reserves %d, want %d", got, 8*gb)
+	}
+	if got := limits.Estimate("small"); got != 2*gb {
+		t.Errorf("small reserves %d, want %d", got, 2*gb)
+	}
+}
+
+// TestSeedHistoryOnWorkers checks that a restarted server knows which statements ran on
+// workers last, whatever their memory, and takes a later run here over one there.
+func TestSeedHistoryOnWorkers(t *testing.T) {
+	store := audit.NewMemoryStore(audit.MemoryQueries, audit.MemoryLogins)
+	now := time.Now()
+	const gb = int64(1) << 30
+	limits := workload.NewController(22 * gb)
+	qs := []audit.Query{
+		{ID: "1", Start: now.Add(-3 * time.Minute), Outcome: audit.OutcomeOK, Duration: time.Second, Shape: "there", Exact: "there1", Workers: 4, Memory: 8 * gb},
+		{ID: "2", Start: now.Add(-3 * time.Minute), Outcome: audit.OutcomeOK, Duration: time.Second, Shape: "back", Exact: "back1", Workers: 4, Memory: 8 * gb},
+		{ID: "3", Start: now.Add(-2 * time.Minute), Outcome: audit.OutcomeOK, Duration: time.Second, Shape: "back", Exact: "back1", Memory: 22 * gb,
+			Resources: &audit.Resources{BytesRead: 1, CPUTime: time.Minute, MemoryAllocated: 3 * gb}},
+		{ID: "4", Start: now.Add(-time.Minute), Outcome: audit.OutcomeError, Duration: time.Second, Shape: "failed", Workers: 4, Memory: 8 * gb},
+	}
+	if err := store.WriteQueries(context.Background(), qs); err != nil {
+		t.Fatal(err)
+	}
+	seedHistory(context.Background(), nil, limits, 22*gb, store, slog.New(slog.DiscardHandler))
+	if !limits.RunsOnWorkers("there1", "there") {
+		t.Error("a run on workers was not seen")
+	}
+	if limits.RunsOnWorkers("back1", "back") {
+		t.Error("a later run here was not taken over one on workers")
+	}
+	if limits.RunsOnWorkers("", "failed") {
+		t.Error("a run that failed on workers was taken for one that ran there")
+	}
+}

@@ -172,6 +172,8 @@ services:
       IGLOO_CACHE_SIZE: ${IGLOO_CACHE_SIZE:-}
       # Workers read ahead only if told to (see docs/operations.md, prefetch).
       IGLOO_PREFETCH: ${IGLOO_WORKER_PREFETCH:-false}
+      # Threads a read of a worker's read cache may start (see docs/operations.md).
+      IGLOO_CACHE_READ_THREADS: ${IGLOO_WORKER_CACHE_READ_THREADS:-8}
       IGLOO_S3_ENDPOINT: ${S3_ENDPOINT:-}
       IGLOO_S3_REGION: ${S3_REGION:?}
       IGLOO_S3_URL_STYLE: ${S3_URL_STYLE:?}

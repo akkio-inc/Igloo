@@ -55,7 +55,7 @@ const LongUnfinished = 10 * time.Second
 const minReservationShare = 16
 
 // maxFootprints bounds the shapes kept; they are forgotten all at once.
-const maxFootprints = 4096
+const maxFootprints = 1 << 16
 
 // footprints are what statements of each shape held at once, as of their
 // latest runs.
@@ -63,6 +63,9 @@ type footprints struct {
 	mu       sync.Mutex
 	fraction float64
 	held     map[string]*footprint
+	// onWorkers says the latest run of each key, of those that have run, ran on
+	// workers rather than here.
+	onWorkers map[string]bool
 }
 
 // footprint is what statements of a shape held at once: what its latest
@@ -125,6 +128,62 @@ func (c *Controller) ObserveEmpty(shape string) {
 	}
 }
 
+// Alike returns which of a statement's two keys to go by, what it reserves and how
+// long it takes: exact, for the same text with the same literals, if statements of it
+// have run, and otherwise shape, for those alike but for their literals. A dashboard's
+// statements over a large audience allocated 3.7 times, at the median, and up to 12
+// times, what the same statements over a small one did, so once it had run over a small
+// one the statements over a large one reserved next to nothing, started together and
+// spilled: a burst of 324 queries took 2,207 s after one over small audiences, and with
+// their own runs to go by, 1,708 s.
+func (c *Controller) Alike(exact, shape string) string {
+	if c == nil || exact == "" {
+		return shape
+	}
+	if _, _, ok := c.footprint(exact); ok {
+		return exact
+	}
+	return shape
+}
+
+// setOnWorkers records where key's latest run ran. f.mu is held.
+func (f *footprints) setOnWorkers(key string, on bool) {
+	if f.onWorkers == nil || len(f.onWorkers) >= maxFootprints {
+		f.onWorkers = make(map[string]bool)
+	}
+	f.onWorkers[key] = on
+}
+
+// ObserveOnWorkers records a run of key that ran on workers: it says nothing of what
+// statements of it hold here.
+func (c *Controller) ObserveOnWorkers(key string) {
+	if c == nil || key == "" {
+		return
+	}
+	f := &c.history
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.setOnWorkers(key, true)
+}
+
+// RunsOnWorkers says whether a statement of these keys is likely to run on workers:
+// its latest run with the same literals did, or with none of those, its latest run
+// alike. It then has nothing to wait for here: auto mode looks at where a statement
+// runs only once it is admitted, and such statements waited in line for memory they
+// would not use, ahead of what would.
+func (c *Controller) RunsOnWorkers(exact, shape string) bool {
+	if c == nil {
+		return false
+	}
+	f := &c.history
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if on, ok := f.onWorkers[exact]; ok && exact != "" {
+		return on
+	}
+	return f.onWorkers[shape]
+}
+
 // EstimateFromHistory makes the controller reserve, for a statement that
 // reserves nothing of its own, fraction of what the latest statement of its
 // shape held (see Estimate). Zero or less turns that off. It is set
@@ -147,6 +206,7 @@ func (c *Controller) Observe(shape string, footprint int64) {
 		// A run that read nothing is only ever all it has (see ObserveEmpty).
 		fp.runs = slices.DeleteFunc(fp.runs, func(n int64) bool { return n == 0 })
 	}
+	c.history.setOnWorkers(shape, false)
 	fp.runs = append(fp.runs, footprint)
 	if len(fp.runs) > footprintRuns {
 		fp.runs = fp.runs[len(fp.runs)-footprintRuns:]

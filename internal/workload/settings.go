@@ -186,6 +186,13 @@ type Limits struct {
 	// known of what it holds (see Controller.full). It is the statement's,
 	// not the user's.
 	Unseen bool
+	// Estimated says Memory is what statements like it held, not what its role or
+	// user set. It is the statement's, not the user's.
+	Estimated bool
+	// Elsewhere, if set, receives once the statement is admitted what to call if
+	// it goes on to run on workers (see Controller.elsewhere). It is the
+	// statement's, not the user's.
+	Elsewhere *func()
 }
 
 // Slots is a limit on statements running at once, shared by everyone

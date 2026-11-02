@@ -62,6 +62,12 @@ type workloadState struct {
 	// controller estimates what it reserves (see statementShape); "" for
 	// none.
 	shape string
+	// exact is the statement's text with its literals, as a key like shape's;
+	// see workload.Controller.Alike.
+	exact string
+	// elsewhere gives back what the running statement holds of this replica, once it
+	// runs on workers (see workload.Limits.Elsewhere); nil for none.
+	elsewhere func()
 	// peak is the most memory the latest statement was seen holding while
 	// it ran, and sampled says a sample fell within its run (see
 	// workload.Controller.SampleMemory).
@@ -133,21 +139,37 @@ func countsOnReplica(sess *session, st *statement) bool {
 	return false
 }
 
+// onWorkers says the running statement goes on to run on workers: it holds nothing of
+// this replica from now on, beside the statements here. They counted it as sharing
+// the replica's cores, so that beside 56 statements on workers, 3 of them heavy for
+// each that ran here, a statement of seconds went to workers too.
+func (sess *session) onWorkers() {
+	if sess.wl.elsewhere != nil {
+		sess.wl.elsewhere()
+	}
+	sess.mu.Lock()
+	sess.elsewhere = true
+	sess.mu.Unlock()
+}
+
 // admit waits until the session's limits let a statement start, and
 // returns the function to call when it ends.
 func (sess *session) admit(ctx context.Context) (release, leave func(), err error) {
 	l := sess.wl.limits
 	l.Counted = sess.wl.counted
 	l.Apart = sess.wl.apart
+	var elsewhere func()
+	l.Elsewhere = &elsewhere
 	if controller := sess.wl.controller; l.Counted {
-		l.Expect = controller.Expect(sess.wl.shape)
+		key := controller.Alike(sess.wl.exact, sess.wl.shape)
+		l.Expect = controller.Expect(key)
 		switch {
-		case controller.Light(sess.wl.shape):
+		case controller.Light(key), controller.RunsOnWorkers(sess.wl.exact, sess.wl.shape):
 			l.Counted = false
 		case l.Memory == 0:
 			// What statements like it held, when its role reserves nothing.
-			l.Memory = controller.Estimate(sess.wl.shape)
-			_, seen := controller.Footprint(sess.wl.shape)
+			l.Memory, l.Estimated = controller.Estimate(key), true
+			_, seen := controller.Footprint(key)
 			l.Unseen = !seen
 		}
 	}
@@ -155,7 +177,11 @@ func (sess *session) admit(ctx context.Context) (release, leave func(), err erro
 	sess.wl.queued = waited
 	sess.wl.peak, sess.wl.sampled = 0, false
 	if err == nil {
-		return func() { sess.wl.peak, sess.wl.sampled = done() }, func() { done() }, nil
+		sess.wl.elsewhere = elsewhere
+		return func() {
+			sess.wl.peak, sess.wl.sampled = done()
+			sess.wl.elsewhere = nil
+		}, func() { done() }, nil
 	}
 	behind := []string{}
 	if n := sess.wl.controller.ReplicaLimit(); l.Counted && n > 0 {
@@ -220,6 +246,26 @@ func (s *Server) workloadShape(ctx context.Context, sess *session, text string) 
 	}
 	sum := sha256.Sum256([]byte(statementShape(text) + "\x00" + sess.shapePath))
 	return hex.EncodeToString(sum[:12])
+}
+
+// workloadExact is the key of the statements of text with its literals, in the session's
+// search path, as workloadShape is of those alike but for them. workloadShape has run.
+func (s *Server) workloadExact(sess *session, text string) string {
+	sum := sha256.Sum256([]byte("exact\x00" + statementExact(text) + "\x00" + sess.shapePath))
+	return hex.EncodeToString(sum[:12])
+}
+
+// statementExact is text with its comments left out and its white space collapsed.
+func statementExact(text string) string {
+	var b strings.Builder
+	for _, seg := range sqllex.Segments(text) {
+		if seg.Kind == sqllex.Comment {
+			b.WriteString(" ")
+			continue
+		}
+		b.WriteString(seg.Text)
+	}
+	return strings.Join(strings.Fields(b.String()), " ")
 }
 
 // statementShape is text with its string and number literals masked, its

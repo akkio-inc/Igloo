@@ -453,3 +453,19 @@ func TestReplicaLimitCountsCreateTableAs(t *testing.T) {
 		t.Errorf("after the wait: %d rows", n)
 	}
 }
+
+// TestStatementExact checks what makes statements the same text: their literals do,
+// and their comments and white space do not.
+func TestStatementExact(t *testing.T) {
+	a := statementExact("SELECT  x FROM t /* run 1 */ WHERE a = 'one' AND b = 2")
+	for _, same := range []string{"SELECT x FROM t WHERE a = 'one' AND b = 2", "SELECT x\nFROM t -- run 2\nWHERE a = 'one' AND b = 2"} {
+		if got := statementExact(same); got != a {
+			t.Errorf("%q: %q, want %q", same, got, a)
+		}
+	}
+	for _, other := range []string{"SELECT x FROM t WHERE a = 'two' AND b = 2", "SELECT x FROM t WHERE a = 'one' AND b = 3"} {
+		if statementExact(other) == a {
+			t.Errorf("%q is the same as %q", other, a)
+		}
+	}
+}

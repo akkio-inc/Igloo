@@ -90,6 +90,9 @@ type waiter struct {
 	apart bool
 	// due is its place in line: when it came, plus how long it takes alone.
 	due time.Time
+	// released says it has ended, and estimated that history set its memory, not
+	// its role or user.
+	released, estimated bool
 	// started is when it started, for one that is unseen.
 	started time.Time
 	ready   chan struct{}
@@ -151,7 +154,7 @@ func (c *Controller) Admit(ctx context.Context, l Limits) (release func() (peak 
 	if c == nil || !l.Limited() && !(l.Counted && c.replicaMax > 0) && !l.Unseen {
 		return unlimited, 0, nil
 	}
-	w := &waiter{slots: l.Slots, memory: c.reservation(l.Memory), counted: l.Counted && c.replicaMax > 0, unseen: l.Unseen, apart: l.Apart, ready: make(chan struct{})}
+	w := &waiter{slots: l.Slots, memory: c.reservation(l.Memory), estimated: l.Estimated, counted: l.Counted && c.replicaMax > 0, unseen: l.Unseen, apart: l.Apart, ready: make(chan struct{})}
 	if w.slots.Max == 0 && w.memory == 0 && !w.counted && !w.unseen {
 		return unlimited, 0, nil
 	}
@@ -183,11 +186,38 @@ func (c *Controller) Admit(ctx context.Context, l Limits) (release func() (peak 
 		}
 		c.mu.Unlock()
 	}
+	if l.Elsewhere != nil {
+		*l.Elsewhere = func() { c.elsewhere(w) }
+	}
 	var once sync.Once
 	return func() (int64, bool) {
 		once.Do(func() { c.release(w) })
 		return w.peak, w.sampled
 	}, waited, nil
+}
+
+// elsewhere has w, running, hold nothing of this replica from now on: it runs on
+// workers, and what history said it would hold here and its place among the
+// statements at once keep nobody from starting here. Its role's or user's limits
+// stay, its slots and the memory they set, as they go by what its statements do
+// wherever they run.
+func (c *Controller) elsewhere(w *waiter) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if w.released {
+		return
+	}
+	if w.estimated {
+		c.reserved -= w.memory
+		w.memory = 0
+	}
+	if w.counted {
+		c.replicaRunning--
+		w.counted = false
+	}
+	delete(c.active, w)
+	delete(c.unseen, w)
+	c.admit()
 }
 
 // wait waits until w may start, or ctx ends. One nothing is known of stops waiting
@@ -358,6 +388,7 @@ func (c *Controller) remove(w *waiter) {
 func (c *Controller) release(w *waiter) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	w.released = true
 	if w.slots.Max > 0 {
 		if c.running[w.slots.Key]--; c.running[w.slots.Key] <= 0 {
 			delete(c.running, w.slots.Key)

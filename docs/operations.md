@@ -330,6 +330,13 @@ using all of its cores.
   120–139 s on 16 threads, spilling, and 46–51 s on the 9 the limit allows.
   Fewer threads also read object storage cold more slowly; where cold scans
   matter more than such aggregates, set `IGLOO_DUCKDB_THREADS`.
+- **Threads.** Beside each DuckDB's threads, the process has a thread for each
+  statement in DuckDB at the moment and a few of Go's: on a replica, reads of the
+  [read cache](#read-cache) run as DuckDB's tasks, on its threads, and start
+  none. Where nothing is read ahead that slows reading cold: a worker's reads
+  start up to `IGLOO_CACHE_READ_THREADS` threads each, 8 by default, about 104 on
+  11 threads and 2 tasks at once. On a replica, whose reads are as many as its
+  sessions, that is not bounded. `igloo_process_threads` says how many there are.
 - **Cache disk.** The [read cache](#read-cache) keeps table files on local
   disk. Size the disk so your frequently read tables fit in half of its free
   space; `IGLOO_CACHE_SIZE` can cap the cache lower, or raise the 100 GiB

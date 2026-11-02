@@ -262,19 +262,25 @@ type aStatement struct {
 	// workload.Controller.Expect), zero for a shape not seen yet, and ran how long
 	// it has run.
 	expect, ran time.Duration
+	// waiting says it waits in line, for what is held: what makes a heavy statement
+	// give way, the cores, is not what it waits for.
+	waiting bool
 }
 
-// mostOfSize says whether most of beside are of some size: known to take as much
-// alone as makes a statement heavy at the least, or, of a shape not seen yet, running
-// for half as long as a statement not known to be heavy would before it could have
-// used that much. A statement known to be short counts as short however long it has
+// mostOfSize says whether most of beside are of some size: waiting in line, or
+// running for half as long as a statement not known to be heavy would before it could
+// have used that much, and not known to take less alone than makes a statement heavy
+// at the least. A statement known to be short counts as short however long it has
 // run: a heavy statement beside dashboards slows them, and were that to make them of
-// some size, it would stay beside them. Their p95 went from 9 s to 119 s.
+// some size, it would stay beside them. Their p95 went from 9 s to 119 s. And what a
+// statement is known to take alone counts only once it has run that long: their first
+// runs on a replica, beside the heavy statement, measured many times what they take,
+// which kept it in the first with them, where it ran out of memory, and them with it.
 func (h *heavyHistory) mostOfSize(beside []aStatement) bool {
 	long := h.moveAfter(len(beside)) / 2
 	sized := 0
 	for _, b := range beside {
-		if b.expect >= h.after || b.expect == 0 && b.ran >= long {
+		if b.waiting || b.ran >= long && (b.expect == 0 || b.expect >= h.after) {
 			sized++
 		}
 	}
@@ -300,10 +306,10 @@ func (s *Server) besideIsHeavy(sess *session) bool {
 	beside := make([]aStatement, 0, len(all))
 	for _, other := range all {
 		other.mu.Lock()
-		running, shape, started := other.statement != "" && !other.inBackground, other.runShape, other.started
+		running, waiting, shape, started := other.statement != "" && !other.inBackground && !other.elsewhere, other.queued, other.runShape, other.started
 		other.mu.Unlock()
 		if running {
-			beside = append(beside, aStatement{expect: s.workload.Expect(shape), ran: now.Sub(started)})
+			beside = append(beside, aStatement{expect: s.workload.Expect(shape), ran: now.Sub(started), waiting: waiting})
 		}
 	}
 	return s.heavy.mostOfSize(beside)
@@ -628,6 +634,11 @@ func (sess *session) setInBackground(on bool) {
 	sess.mu.Unlock()
 }
 
+// outOfSpillSpace says DuckDB could write no more to its spill files.
+func outOfSpillSpace(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "failed to offload data block")
+}
+
 // runInBackground runs st in the second DuckDB. ran false says it did not,
 // and nothing was sent: it runs in the first.
 func (s *Server) runInBackground(ctx context.Context, sess *session, st *statement, args []driver.NamedValue, tw *tagWriter, parts *distParts) (ran bool, err error) {
@@ -657,8 +668,10 @@ func (s *Server) runInBackground(ctx context.Context, sess *session, st *stateme
 		return true, nil
 	}
 	// Whatever failed there, unless the statement was canceled, the first
-	// DuckDB may do better, if the client has seen nothing yet.
-	if ctx.Err() != nil || tw.Written() > 0 || distributed.DataError(err) {
+	// DuckDB may do better, if the client has seen nothing yet. Not with its spill
+	// files where the disk is full: run again in the first, a report that had filled
+	// the disk from the second took the dashboards' p95 from 8 s to 108 s, and failed.
+	if ctx.Err() != nil || tw.Written() > 0 || distributed.DataError(err) || outOfSpillSpace(err) {
 		return true, err
 	}
 	s.log.Debug("a heavy statement failed in the second DuckDB; running it in the first", "err", err)
