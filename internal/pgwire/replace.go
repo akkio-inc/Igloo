@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/apache/iceberg-go/table"
 	"github.com/duckdb/duckdb-go/v2"
 	wire "github.com/jeroenrinzema/psql-wire"
 	"github.com/jeroenrinzema/psql-wire/codes"
@@ -336,9 +337,19 @@ func (s *Server) runStagedCreate(ctx context.Context, sess *session, st *stateme
 		return err
 	}
 	dropStaging := func() {
+		// What the fill had uploaded and not finished, which goes with the name of
+		// no file: the staging table's location is the statement's alone.
+		bg := context.WithoutCancel(ctx)
+		var tbl *table.Table
+		if s.ddl != nil {
+			tbl, _ = s.ddl.LoadTable(bg, c.target.Schema, c.staging[len(c.staging)-1])
+		}
 		release := s.holdCatalog(sess)
 		defer release()
-		_ = exec(context.WithoutCancel(ctx), "DROP TABLE IF EXISTS "+quoteName(c.staging))
+		_ = exec(bg, "DROP TABLE IF EXISTS "+quoteName(c.staging))
+		if tbl != nil {
+			s.abortUploads(bg, tbl, strings.TrimSuffix(tbl.Location(), "/"))
+		}
 	}
 
 	release := s.holdCatalog(sess)
@@ -581,12 +592,16 @@ func (s *Server) runStatement(ctx context.Context, sess *session, st *statement,
 			})
 		})
 	}
+	writing := s.replicaInsert(st)
+	defer writing.end()
 	// An INSERT INTO ... SELECT runs its query on workers where auto mode
 	// runs it there as a read (see fillOn).
 	if done, err := s.runInsertFill(ctx, sess, st, len(args), w, run); done {
+		writing.failed(ctx, sess, err)
 		return err
 	}
 	err := run(ctx)
+	writing.failed(ctx, sess, err)
 	if err == nil && st.ids != nil {
 		// And then those of the values that had none.
 		s.fillIDs(ctx, sess, st.ids, written)

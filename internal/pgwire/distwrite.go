@@ -14,6 +14,7 @@ import (
 
 	"github.com/apache/iceberg-go"
 	"github.com/apache/iceberg-go/table"
+	"github.com/duckdb/duckdb-go/v2"
 	"golang.org/x/sync/errgroup"
 
 	"github.com/akkio-inc/igloo/internal/catalog"
@@ -340,23 +341,149 @@ func (w *tableWrite) end(ctx context.Context) {
 	}()
 }
 
-// abortUploads ends what tasks had uploaded under dir and not finished, as a
-// worker killed in its COPY leaves, which no listing of files shows: a directory
-// of no use to anyone, and files of the table's rows that could still be made.
-func (s *Server) abortUploads(ctx context.Context, tbl *table.Table, dir string) {
+// uploadStore is the store of unfinished writes of dir, under tbl's file system; nil
+// for one with none.
+func (s *Server) uploadStore(ctx context.Context, tbl *table.Table, dir string) (uploads.Store, error) {
+	if s.uploadStoreFor != nil {
+		return s.uploadStoreFor(dir)
+	}
 	fsys, err := tbl.FS(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return uploads.For(fsys, dir, s.uploadKeys)
+}
+
+// abortUploads ends what a statement had uploaded under dir and not finished, as a
+// worker killed in its COPY or a statement that failed on this replica leaves, which
+// no listing of files shows: a directory of no use to anyone, and files of the
+// table's rows that could still be made.
+func (s *Server) abortUploads(ctx context.Context, tbl *table.Table, dir string) {
+	store, err := s.uploadStore(ctx, tbl, dir)
 	if err == nil {
-		var store uploads.Store
-		if store, err = uploads.For(fsys, dir, s.uploadKeys); err == nil {
-			var n int
-			if n, err = uploads.AbortUnder(ctx, store, dir+"/", time.Time{}); n > 0 {
-				s.log.Info("aborted uploads a statement's tasks did not finish", "dir", dir, "uploads", n)
-			}
+		var n int
+		if n, err = uploads.AbortUnder(ctx, store, dir+"/", time.Time{}); n > 0 {
+			s.log.Info("aborted uploads a statement did not finish", "dir", dir, "uploads", n)
 		}
 	}
 	if err != nil {
-		s.log.Warn("could not abort uploads a statement's tasks did not finish; the bucket's lifecycle rule or an erasure request does", "dir", dir, "err", err)
+		s.log.Warn("could not abort uploads a statement did not finish; the bucket's lifecycle rule or an erasure request does", "dir", dir, "err", err)
 	}
+}
+
+// replicaWrite is an INSERT running on this replica, for what it leaves if it fails.
+type replicaWrite struct {
+	s      *Server
+	st     *statement
+	target string
+	name   []string
+	start  time.Time
+}
+
+// replicaInsert notes st, if it is an INSERT into a table, as running.
+func (s *Server) replicaInsert(st *statement) *replicaWrite {
+	if st.stmtType != duckdb.STATEMENT_TYPE_INSERT || s.ddl == nil {
+		return nil
+	}
+	p, ok := insertParsed(st.query)
+	if !ok {
+		return nil
+	}
+	name, ok := (&scanner{s: p.target}).name()
+	if !ok || len(name) == 0 {
+		return nil
+	}
+	// By the table's name alone, in any schema: two tables of one name take each
+	// other for one, which only leaves their uploads to the lifecycle rule.
+	w := &replicaWrite{s: s, st: st, name: name, target: strings.ToLower(name[len(name)-1]), start: time.Now()}
+	s.replicaWritesMu.Lock()
+	if s.replicaWrites == nil {
+		s.replicaWrites = map[string]int{}
+	}
+	s.replicaWrites[w.target]++
+	s.replicaWritesMu.Unlock()
+	return w
+}
+
+// end notes that the statement has ended.
+func (w *replicaWrite) end() {
+	if w == nil {
+		return
+	}
+	w.s.replicaWritesMu.Lock()
+	defer w.s.replicaWritesMu.Unlock()
+	if w.s.replicaWrites[w.target]--; w.s.replicaWrites[w.target] <= 0 {
+		delete(w.s.replicaWrites, w.target)
+	}
+}
+
+// uploadClockSkew is how far a store's clock may be behind this replica's.
+const uploadClockSkew = 5 * time.Second
+
+// failed aborts what the statement had uploaded of the table's files and not finished,
+// if err says it failed. The files of a table have no statement's name on them, so it
+// goes by when: uploads begun since it began. It leaves all of them to the lifecycle
+// rule if another INSERT into the table runs on this replica. Another replica's, begun
+// meanwhile, would fail for it, and be run again, with no rows lost or written twice:
+// that takes one statement failing as another writes the same table elsewhere, and the
+// alternative is a person's rows left where they could be recovered, until the rule.
+func (w *replicaWrite) failed(ctx context.Context, sess *session, err error) {
+	if w == nil || err == nil {
+		return
+	}
+	s := w.s
+	s.replicaWritesMu.Lock()
+	others := s.replicaWrites[w.target] > 1
+	s.replicaWritesMu.Unlock()
+	if others {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), time.Minute)
+	defer cancel()
+	target, terr := s.newTableTarget(ctx, sess, w.name)
+	if terr != nil {
+		return
+	}
+	tbl, terr := s.ddl.LoadTable(ctx, target.Schema, target.Table)
+	if terr != nil {
+		return
+	}
+	dir := strings.TrimSuffix(tbl.Location(), "/") + "/data"
+	n, aerr := s.abortUploadsSince(ctx, tbl, dir, w.start.Add(-uploadClockSkew))
+	switch {
+	case aerr != nil:
+		s.log.Warn("could not abort uploads a failed statement did not finish; the bucket's lifecycle rule or an erasure request does",
+			"table", target.Schema+"."+target.Table, "err", aerr)
+	case n > 0:
+		s.log.Info("aborted uploads a failed statement did not finish", "table", target.Schema+"."+target.Table, "uploads", n)
+	}
+}
+
+// abortUploadsSince ends the unfinished writes under dir begun since since, but those of
+// statements' own directories, which their statements see to.
+func (s *Server) abortUploadsSince(ctx context.Context, tbl *table.Table, dir string, since time.Time) (int, error) {
+	store, err := s.uploadStore(ctx, tbl, dir)
+	if err != nil || store == nil {
+		return 0, err
+	}
+	list, err := store.List(ctx, dir+"/")
+	if err != nil {
+		return 0, err
+	}
+	var errs []error
+	n := 0
+	for _, u := range list {
+		if u.Initiated.Before(since) || strings.Contains(u.Path, "/"+distributed.WriteDirMark) || strings.Contains(u.Path, "/"+distributed.SealedDirMark) ||
+			strings.Contains(u.Path, "/"+overwriteDir) {
+			continue
+		}
+		if err := store.Abort(ctx, u); err != nil {
+			errs = append(errs, err)
+			continue
+		}
+		n++
+	}
+	return n, errors.Join(errs...)
 }
 
 // sealCopies is how many files a statement copies at a time.

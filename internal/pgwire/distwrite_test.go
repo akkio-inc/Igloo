@@ -30,6 +30,7 @@ import (
 	"github.com/akkio-inc/igloo/internal/distributed"
 	"github.com/akkio-inc/igloo/internal/icebergtest"
 	"github.com/akkio-inc/igloo/internal/policy"
+	"github.com/akkio-inc/igloo/internal/uploads"
 )
 
 // writeFault stands in front of a worker, as a network or a worker gone

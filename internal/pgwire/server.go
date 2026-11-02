@@ -571,6 +571,12 @@ type Server struct {
 	stopLateWrites sync.Once
 	// uploadKeys is Options.UploadKeys.
 	uploadKeys uploads.Keys
+	// uploadStoreFor, in tests, is the store of unfinished writes of a directory.
+	uploadStoreFor func(dir string) (uploads.Store, error)
+	// replicaWrites counts the INSERTs running on this replica by the names of their
+	// tables, under replicaWritesMu (see replicaWrite).
+	replicaWritesMu sync.Mutex
+	replicaWrites   map[string]int
 	// beforeWriteCommit, if set, runs before files workers wrote under dir
 	// are committed, and fails the commit with its error (see tableWrite).
 	beforeWriteCommit func(ctx context.Context, dir string) error
