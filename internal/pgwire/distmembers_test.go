@@ -14,8 +14,8 @@ import (
 // TestDistributedMemberTables: a statement over an ID domain's member
 // table, which the policy rewrite reads without its column of ids, runs on
 // workers like any other, with the same rows and no column of ids in them,
-// Igloo's own text that names that column too; once the table has a row
-// access policy of its own, it runs here.
+// Igloo's own text that names that column too; and so it does once the
+// table has a row access policy of its own, through the policy.
 func TestDistributedMemberTables(t *testing.T) {
 	ctx := context.Background()
 	ids := iddomain.NewMemoryStore()
@@ -88,13 +88,14 @@ func TestDistributedMemberTables(t *testing.T) {
 		t.Errorf("SELECT * on workers has columns %q", cols)
 	}
 
-	// A row access policy of the table's own: here.
+	// A row access policy of the table's own: on workers too, which read
+	// the table through it (see distributed's governed.go).
 	mustExec(t, conn, "CREATE ROW ACCESS POLICY some_people AS (p VARCHAR) RETURNS BOOLEAN -> p < 'p2'")
 	mustExec(t, conn, "ALTER TABLE lake.public.visits ADD ROW ACCESS POLICY some_people ON (person)")
-	if n := rowsOn("counts under a policy", counts); n != 0 {
-		t.Errorf("counts over a member table with a row access policy ran on %d workers, want 0", n)
+	if n := rowsOn("counts under a policy", counts); n != 2 {
+		t.Errorf("counts over a member table with a row access policy ran on %d workers, want 2", n)
 	}
-	if plan := explained(counts); !strings.Contains(plan, "runs on|this replica") {
+	if plan := explained(counts); !strings.Contains(plan, "runs on|workers") || !strings.Contains(plan, "< 'p2'") || strings.Contains(plan, personID) {
 		t.Errorf("EXPLAIN DISTRIBUTED of counts under a policy:\n%s", plan)
 	}
 }

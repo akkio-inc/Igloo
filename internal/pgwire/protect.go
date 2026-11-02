@@ -955,6 +955,14 @@ type guard struct {
 	// names them, so workers may run it as they run a statement over tables
 	// with nothing to hide (see policyReason).
 	hiddenOnly bool
+	// read are the catalog's tables with rules it reads, by lower-case
+	// schema.table: true for those it reads through the rewrite's
+	// subqueries, which apply their policies, false for those whose
+	// policies leave them as they are for the user. room says a clean
+	// room's confinement, or an external table's rules, concern what it
+	// reads (see policyReason).
+	read map[string]bool
+	room bool
 }
 
 func newNonce() string {
@@ -1092,7 +1100,7 @@ func (s *Server) policyRewrite(ctx context.Context, sess *session, user auth.Use
 			return "", nil, ran, err
 		}
 	}
-	g.touched, g.applied, g.nonce, g.privs = rw.touched, rw.applied, rw.nonce, privs
+	g.touched, g.applied, g.nonce, g.privs, g.read, g.room = rw.touched, rw.applied, rw.nonce, privs, rw.read, rw.room
 	g.hiddenOnly = rw.touched && !rw.beyondHiding && len(rw.applied) == 0
 	return text, g, ran, nil
 }
@@ -2087,6 +2095,16 @@ func (st *statement) policies() []string {
 		return nil
 	}
 	return st.guard.applied
+}
+
+// shapeText is the text DuckDB prepared without the mark of the policies'
+// rewrite, which is new each time they rewrite the statement: its shape is
+// the same from one run to the next (see workloadShape).
+func (st *statement) shapeText() string {
+	if g := st.guard; g != nil && g.nonce != "" {
+		return strings.ReplaceAll(st.prepared, g.nonce, "")
+	}
+	return st.prepared
 }
 
 // policyMarker is the alias prefix of the tables policies read in the

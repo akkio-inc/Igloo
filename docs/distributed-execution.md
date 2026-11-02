@@ -328,19 +328,44 @@ read through a name mapping) or that nest a struct's fields otherwise
 than the table does now (a field renamed, or dropped and added again,
 since they were written), tables of Iceberg format version 3 with a
 column or nested field that has an initial default (workers would read it
-as `NULL` from the files written before it was added), tables with
-[masking or row access policies](security-policies.md) and statements that
-read them (directly or through a view), views that group, sort or
-limit, [connections](federation.md)' tables and Delta
-Sharing's [external tables](sharing.md). Workers read table files
-directly and could not apply policies; a connection's table or an external
-table may still be read in the part of a statement the coordinator runs
-itself, such as a scalar subquery over a distributed part, but never on a
-worker. An [ID domain](sql.md#id-domains)'s member table is not one of these
-for its columns of ids alone: statements read it without them, and
-workers run them as they run any other. Igloo's own text names those
-columns where it counts through ids. A member table with a policy of its
-own stays on the replica.
+as `NULL` from the files written before it was added), tables a [clean
+room](clean-rooms.md) keeps to its party and statements that read them,
+views that group, sort or limit, [connections](federation.md)' tables and
+Delta Sharing's [external tables](sharing.md). A connection's table or an
+external table may still be read in the part of a statement the
+coordinator runs itself, such as a scalar subquery over a distributed
+part, but never on a worker. An [ID domain](sql.md#id-domains)'s member
+table is not one of these for its columns of ids alone: statements read it
+without them, and workers run them as they run any other. Igloo's own text
+names those columns where it counts through ids. Tables with masking or row
+access policies run on workers through their policies (below).
+
+### Masking and row access policies
+
+Statements that [masking and row access policies](security-policies.md)
+apply to run on workers as any other does, for every user. Igloo writes the
+policies into the statement as it does on one machine: each protected
+table is read through a subquery that masks its columns and leaves out the
+rows its row access policy hides, with the user's name, roles and tags
+written in as values. Every stage that reads a protected table reads it
+through that subquery as written, from the table's files, and the tables a
+policy reads only inside it. So a stage writes nothing to an exchange or to
+the coordinator but masked values of the rows the user may see, however
+the statement joins, partitions, windows or aggregates them; the planner
+checks every stage for that before any runs. Where a join or a window would
+partition a protected table's rows by a key, or a statement reads the table
+twice, the stages partition the rows the subquery makes instead: they
+compute it as a relation, applying the policies where they read the table.
+A part whose stages the planner cannot keep so runs on the replica.
+
+A row access policy that reads a table, as one that looks up the roles a
+client's rows belong to, has every worker read that table in full, as a
+filter's subquery does. One too large for that keeps the part of the
+statement on the replica. A user a policy exempts reads the table as
+written, on workers as anyone reads a table without policies. Fills from
+protected tables run where reads of them would and write what their user
+sees. Statements that read a table a clean room keeps to its party stay
+on the replica: what keeps it to its party is not in the statement.
 
 ### Fills
 
@@ -388,8 +413,8 @@ workers, into the table its run on the replica left empty; one that runs out
 of memory there goes to workers whatever kept it on the replica. One whose
 workers run out of memory goes on in passes on the replica where its
 query allows (see [aggregates too large for memory](sql.md#aggregates-too-large-for-memory)). A fill from a table
-masking or row access policies apply to, directly or through a view,
-stays on the replica, as reads of it do. `query_history.placement` says
+masking or row access policies apply to runs where a read of it would,
+through the policies (see [above](#masking-and-row-access-policies)). `query_history.placement` says
 where the fill's query ran, and a refresh's detail says so where it ran
 on workers. Fills of tables of member columns of ID domains, sorted
 writes and fills in a transaction block run on the replica, as before.
@@ -461,7 +486,8 @@ statement's rows are in the table when that commit is, or not at all.
   auto mode, which would make small files; an `INSERT` that leaves out a column
   with a default.
   So do fills of ID domains' member tables, sorted writes and fills in a
-  transaction block, on the replica, and fills from tables with policies. A
+  transaction block, on the replica, and fills from tables a clean room
+  keeps to its party. A
   commit that fails after workers wrote runs the fill on the replica, unless
   the commit may have been made.
 
@@ -1047,17 +1073,21 @@ give the workers more memory.
   other than `unnest`, `json_each` and `json_tree` of values and `range`
   and `generate_series` of literals, a table by name). Their DuckDB is locked down as the server's is: no local
   files, no other locations, no SQL from strings.
-- **Policies keep a statement on one machine.** A statement that reads a
-  table masking or row access policies apply to, directly or through a
-  view, runs on the replica, where Igloo applies them. Workers never see a
-  masked column's raw values or a hidden row. So does one that reads a
-  table a [clean room](clean-rooms.md) keeps to its party, a room's runs
-  included. What a statement reads is what applying the policies finds,
-  resolving its names: one that only spells a protected table's name, as a
-  column named like it does, or a column named like an ID domain, whose
-  dictionary is Igloo's own protected table, or that reads a view whose
-  text does, runs on workers when it reads none. The planner refuses a
-  protected table besides, whatever reaches it.
+- **Policies apply where a table is read.** A statement that reads a table
+  masking or row access policies apply to reads it through the policies'
+  subquery on every machine, and the planner checks that every stage reads
+  the table there, from its files, before any runs (see [masking and row
+  access policies](#masking-and-row-access-policies)). No exchange, and no
+  result a worker sends the coordinator, holds a masked column's raw value
+  or anything of a hidden row. One that reads a table a [clean
+  room](clean-rooms.md) keeps to its party runs on the replica, a room's
+  runs included. What a statement reads is what applying the policies
+  finds, resolving its names: one that only spells a protected table's
+  name, as a column named like it does, or a column named like an ID
+  domain, whose dictionary is Igloo's own protected table, or that reads a
+  view whose text does, runs on workers as written when it reads none. The
+  planner refuses a protected table the policies did not apply to, whatever
+  reaches it.
 - **Workers accept no one but Igloo.** Coordinators and workers talk TLS 1.3
   and authenticate each other with keys derived from `IGLOO_WORKER_SECRET`;
   without the secret, neither SQL users nor anything else on the network

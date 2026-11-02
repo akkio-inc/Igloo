@@ -675,35 +675,69 @@ func (s *Server) afterOutOfMemory(outer, ctx context.Context, sess *session, st 
 	return err
 }
 
-// policyReason says why masking and row access policies keep st on this
-// replica, or is empty. Workers read table files directly and know nothing
-// of the requesting user, so they cannot apply policies: a statement that
-// reads a protected table, directly or through a view, is not distributed.
+// policyReason says why the rules of the tables st reads keep it on this
+// replica, in its first DuckDB, or is empty.
+//
+// Masking and row access policies apply in st's text: the rewrite reads
+// each protected table through a subquery that masks its columns and
+// leaves out the rows its row access policy hides, with the user, roles
+// and tags the policies ask for written in as values. The second DuckDB
+// runs that text as the first would. Workers run it too, and the planner
+// keeps each stage's read of a protected table, and of the tables its
+// policies read, in the rewrite's subquery as written, so that a stage
+// writes only masked values of the rows the user may see to an exchange or
+// to this replica (see distributed's governed.go, and sessionEnv.Table,
+// which marks the tables). A table read as written, its policies leaving it
+// as it is for the user, is read as any other.
 //
 // Which tables a statement reads is what the rewriter found resolving its
-// names (touched, applied), not what names it spells: a statement is
-// analyzed when any word of it, or of a view it reads, spells a protected
-// table's name, as a column named like one does, or one named like an ID
-// domain, whose dictionary, Igloo's own and protected, is named after it.
-// Analyzed and found to read none, it runs on workers as the text the
-// rewriter left, views it expanded included. sessionEnv.Table refuses
-// protected tables as well, should a statement reach the planner without
-// the rewriter having seen one.
+// names, not what names it spells: a statement is analyzed when any word
+// of it, or of a view it reads, spells a protected table's name, as a
+// column named like one does, or one named like an ID domain, whose
+// dictionary, Igloo's own and protected, is named after it. sessionEnv.Table
+// refuses protected tables the rewrite did not read, should a statement
+// reach the planner without the rewriter having seen one.
+//
+// A clean room's tables, and external tables with rules, stay here: what
+// confines them to their parties is not in the statement's text.
 func policyReason(st *statement) string {
 	g := st.guard
 	switch {
 	case g == nil && st.original != "":
 		return "masking or row access policies rewrote it"
-	case g == nil, g.hiddenOnly:
-		// Only ID domains' columns of ids left out: nothing a worker could
-		// fail to apply.
+	case g == nil:
 		return ""
-	case len(g.applied) > 0:
-		return "masking or row access policies apply to what it reads"
-	case g.touched:
-		return "masking or row access policies, or a clean room, concern a table it reads"
+	case g.room:
+		return "a clean room, or an external table's rules, concern a table it reads"
 	}
 	return ""
+}
+
+// RewriteMark is the mark of the policies' rewrite of the statement, for
+// the planner, which keeps stages' reads of protected tables in its
+// subqueries (see distributed.Governance); "" when the rewrite only left
+// out ID domains' columns of ids, which workers read as any statement's.
+func (e *sessionEnv) RewriteMark() string {
+	if g := e.st.guard; g != nil && !g.hiddenOnly {
+		return g.nonce
+	}
+	return ""
+}
+
+// policyRead reports how st reads the catalog table schema.table, which
+// has rules: through the rewrite's subquery, which applies its policies
+// (wrapped), or as written, its policies leaving it as it is for the
+// user. ok is false when the rewrite did not read it, or a clean room
+// concerns what st reads, or it is one of Igloo's own, an ID domain's
+// dictionary or a bitmap index, whose policy denies every user's statement
+// all of it: workers would read its files for nothing.
+func (st *statement) policyRead(schema, table string) (wrapped, ok bool) {
+	g := st.guard
+	if g == nil || g.room || strings.EqualFold(schema, iddomain.DictionarySchema) || strings.EqualFold(schema, iddomain.IndexSchema) {
+		return false, false
+	}
+	wrapped, ok = g.read[strings.ToLower(schema+"."+table)]
+	return wrapped, ok
 }
 
 // runFinal runs the part of a distributed statement that combines its
@@ -836,12 +870,22 @@ func (e *sessionEnv) Table(ctx context.Context, parts []string) (*distributed.Ta
 			return nil, false, nil
 		}
 	}
+	governed := false
 	if e.s.Protected(ctx, o.schema, o.name) {
-		return &distributed.Table{Schema: o.schema, Name: o.name, Unsupported: "masking or row access policies, or a clean room, apply to it"}, true, nil
+		wrapped, ok := e.st.policyRead(o.schema, o.name)
+		if !ok {
+			return &distributed.Table{Schema: o.schema, Name: o.name, Unsupported: "masking or row access policies, or a clean room, apply to it"}, true, nil
+		}
+		governed = wrapped
 	}
 	t, err := e.s.dist.Table(ctx, o.schema, o.name)
 	if err != nil {
 		return nil, false, err
+	}
+	if governed && t != nil {
+		c := *t
+		c.Governed = true
+		t = &c
 	}
 	// Workers must read the columns as DuckDB does here. The statement was
 	// bound, so DuckDB has loaded them. Listing them with duckdb_columns()

@@ -517,7 +517,7 @@ func (co *Coordinator) planOn(ctx context.Context, query string, env Env, mode M
 	// with relations' sizes plan for as long as planning takes.
 	shape := ""
 	if mode == ModeAuto && !dry && sizes == nil && onLarge == nil {
-		shape = planKey(stmt, nil)
+		shape = planKey(stmt, nil, rewriteMark(env))
 		if u := co.staysHere(shape, env, len(ws)); u != nil {
 			return nil, nil, u
 		}
@@ -567,7 +567,7 @@ func (co *Coordinator) planOn(ctx context.Context, query string, env Env, mode M
 		plan.final = restoreValues(clone(plan.final), values).(node)
 		keyed = restoreValues(clone(stmt), values).(node)
 	}
-	plan.Key = planKey(keyed, plan.Stages)
+	plan.Key = planKey(keyed, plan.Stages, rewriteMark(env))
 	if fe, ok := env.(Fills); ok && fe.Fill() {
 		// A fill's runs time its write too: apart from reads of its query.
 		plan.Key += "-fill"

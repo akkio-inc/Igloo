@@ -1275,7 +1275,7 @@ func chooseShared(e estimate, r runs, found bool, threshold time.Duration, now t
 // its stages read, each to a factor of two. A BI tool's statement run
 // again for another day is the same statement; one over tables that have
 // grown fourfold is not.
-func planKey(stmt node, stages []*Stage) string {
+func planKey(stmt node, stages []*Stage, mark string) string {
 	shape := rewrite(clone(stmt), func(n node) (node, bool) {
 		if at := child(n, "at_clause"); at != nil {
 			// The snapshot a pin names moves with every commit, as the
@@ -1292,7 +1292,12 @@ func planKey(stmt node, stages []*Stage) string {
 		return node{"class": "CONSTANT"}, true
 	})
 	h := sha256.New()
-	h.Write([]byte(canonical(shape)))
+	text := canonical(shape)
+	if mark != "" {
+		// The policies' rewrite marks it anew each time (see governed.go).
+		text = strings.ReplaceAll(text, mark, "")
+	}
+	h.Write([]byte(text))
 	sizes := map[string]int{}
 	for _, s := range stages {
 		for _, in := range s.Inputs {

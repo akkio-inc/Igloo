@@ -3,6 +3,7 @@ package pgwire
 import (
 	"context"
 	"errors"
+	"maps"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -176,6 +177,88 @@ func TestHeavyStatementsRunInBackground(t *testing.T) {
 	// An erasure request's emptying of the caches reaches both.
 	if err := r.eng.EmptyCache(ctx); err != nil {
 		t.Errorf("emptying the caches: %v", err)
+	}
+}
+
+// TestHeavyGovernedStatementsRunInBackground checks statements that masking
+// and row access policies apply to in the second DuckDB: for every kind of
+// user, a heavy one runs there from its second run on, its shape the same
+// though its rewrite is new each time, and gives what it gave in the first;
+// and so does a write that reads a protected table, and one whose target
+// has policies, which changes only the rows its user may see.
+func TestHeavyGovernedStatementsRunInBackground(t *testing.T) {
+	t.Parallel()
+	r, admin, m := backgroundReplica(t, "1000", time.Nanosecond)
+	for _, sql := range policyFixture {
+		mustExec(t, admin, sql)
+	}
+	mustExec(t, admin, `INSERT INTO lake.crm.contacts SELECT i, CASE WHEN i % 2 = 0 THEN 'acme' ELSE 'globex' END,
+		'user' || i || CASE WHEN i % 2 = 0 THEN '@acme.com' ELSE '@globex.com' END, 'dev-' || i, i FROM range(5, 100000) t(i)`)
+	ctx := context.Background()
+	conns := map[string]*pgx.Conn{"igloo": admin}
+	for _, u := range []struct{ name, roles string }{
+		{"rita", "acme_team"}, {"pia", "acme_team, pii_reader"}, {"gus", "globex_team"}, {"nemo", ""},
+	} {
+		if _, err := admin.Exec(ctx, "CREATE USER "+u.name+" WITH PASSWORD '"+u.name+"-password' ROLE writer"); err != nil {
+			t.Fatal(err)
+		}
+		for _, role := range strings.Split(u.roles, ", ") {
+			if role != "" {
+				mustExec(t, admin, "GRANT "+role+" TO "+u.name)
+			}
+		}
+		conns[u.name] = connect(t, r.url(u.name, u.name+"-password"), pgx.QueryExecModeSimpleProtocol)
+	}
+	for _, name := range slices.Sorted(maps.Keys(conns)) {
+		conn := conns[name]
+		for _, q := range []string{
+			"SELECT client, count(*), count(DISTINCT email), max(email), sum(spend)::BIGINT FROM lake.crm.contacts GROUP BY client",
+			"SELECT c.email, count(*) FROM lake.crm.contacts c JOIN lake.public.visits v ON v.id = c.id GROUP BY 1",
+		} {
+			heavy := r.srv.heavy
+			r.srv.heavy = nil
+			first := sortedTexts(t, conn, q)
+			r.srv.heavy = heavy
+			before := backgrounds(m)
+			for range 2 {
+				if got := sortedTexts(t, conn, q); !slices.Equal(got, first) {
+					t.Errorf("%s, %s: %q, in the first DuckDB %q", name, q, got, first)
+				}
+			}
+			if n := backgrounds(m) - before; n < 1 {
+				t.Errorf("%s, %s: none ran in the background", name, q)
+			}
+			for _, row := range first {
+				if name != "pia" && strings.Contains(row, "@") || name == "rita" && strings.Contains(row, "globex") {
+					t.Errorf("%s, %s: %s", name, q, row)
+				}
+			}
+		}
+	}
+
+	// Writes: a copy of what rita sees, then a change of the rows she may
+	// change, each a second time in the background.
+	rita := conns["rita"]
+	mustExec(t, admin, "CREATE TABLE lake.public.seen (id INTEGER, email VARCHAR)")
+	const copied = "INSERT INTO lake.public.seen SELECT id, email FROM lake.crm.contacts WHERE id % 100 = 0"
+	const changed = "UPDATE lake.crm.contacts SET spend = spend + 1 WHERE id % 1000 IN (0, 1) AND id > 4"
+	for _, q := range []string{copied, changed} {
+		mustExec(t, rita, q)
+		before := backgrounds(m)
+		mustExec(t, rita, q)
+		if n := backgrounds(m) - before; n != 1 {
+			t.Errorf("%s: %v ran in the background, want 1", q, n)
+		}
+	}
+	// Her rows of ids 100, 200, ... 99,900, twice, their emails masked.
+	if got := texts(t, admin, "SELECT count(*), count(DISTINCT email), max(email) FROM lake.public.seen"); !slices.Equal(got, []string{"1998|1|***"}) {
+		t.Errorf("what rita copied: %q", got)
+	}
+	// acme's rows of ids 1,000 to 99,000 changed twice, globex's of 1,001
+	// to 99,001 not at all.
+	if got := texts(t, admin, "SELECT client, count(*) FILTER (WHERE spend = id + 2), count(*) FILTER (WHERE spend = id) FROM lake.crm.contacts "+
+		"WHERE id % 1000 IN (0, 1) AND id > 4 GROUP BY 1 ORDER BY 1"); !slices.Equal(got, []string{"acme|99|0", "globex|0|99"}) {
+		t.Errorf("what rita changed: %q", got)
 	}
 }
 

@@ -588,6 +588,18 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
 
 ### Distributed execution
 
+- Statements that masking and row access policies apply to run on workers and in the
+  replica's second DuckDB, for every user, where they ran only in the first DuckDB of
+  the replica, so a team whose main tables have policies had neither. Every stage reads
+  a protected table through the subquery Igloo writes for its policies, and the tables
+  a row access policy reads only inside it; the planner checks each stage for that, from
+  the tables' files, before any runs, so no exchange, and nothing a worker sends the
+  coordinator, holds a masked column's raw value or a hidden row. A join or window that
+  would partition such a table's rows, or a join of it to itself, partitions the rows the
+  subquery makes instead. Across 17 statements and five users of a table with both kinds
+  of policy, results match one machine's, and every statement that runs on workers over
+  the table without policies does over it with them. A table a clean room keeps to its
+  party stays on the replica, in its first DuckDB.
 - Statements on workers return the rows one machine does in cases they did not. TPC-DS
   q44 returned no rows where one machine returned 10: a stage kept the groups a later
   ranking could keep before `HAVING`, which read a subquery, filtered them. A ranking's
@@ -712,10 +724,9 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   WHERE` that filters the large table by a column equal to a constant or a
   list, also as a subquery the coordinator reads; and scalar subqueries
   in an aggregation's select list, `HAVING` and `ORDER BY`, which the
-  coordinator computes over the combined groups. Masking and row access
-  policies keep a statement on one machine only when they apply to a
-  table it reads, not when it, or a view it reads, spells a protected
-  table's name, as a column named like an ID domain did.
+  coordinator computes over the combined groups. A statement that only
+  spells a protected table's name, or reads a view that does, as a column
+  named like an ID domain did, runs on workers as written.
 - Reports' last steps run on workers too, rather than on the coordinator
   over what workers sent: an `ORDER BY` without `LIMIT` that what reads it
   sorts again or aggregates is left out; inputs too large for every
@@ -778,9 +789,8 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   Auto mode counts the replica's writing of the rows on both sides, and
   their fetch from the workers, so a copy stays on the replica unless
   workers are clearly faster. The guard, a run out of memory, the failure
-  history and the fallbacks work as for reads, a fill whose workers run
-  out of memory goes on in passes, and a fill from a table with masking
-  or row access policies stays on the replica.
+  history and the fallbacks work as for reads, and a fill whose workers run
+  out of memory goes on in passes.
 - Workers write tables: where the tasks of such a fill hold its rows, as a
   copy's do, each writes its own as Parquet with the table's field IDs and
   partitions, under a directory of the statement's under the table's

@@ -36,9 +36,11 @@ import (
 // more, and dashboards see its later ones only as the cores they leave idle.
 //
 // Only what would give the same rows there runs there: a read outside a
-// transaction block, of what the catalog holds, with no policies on it, no
-// temporary objects or settings of the session's that the other DuckDB has
-// not got, and no function tied to the session. Anything else that the
+// transaction block, of what the catalog holds, with no temporary objects
+// or settings of the session's that the other DuckDB has not got, and no
+// function tied to the session. Masking and row access policies apply in
+// the statement's text, which runs there as here; a clean room's tables
+// stay here (see policyReason). Anything else that the
 // second DuckDB cannot bind, as Igloo's functions over its own state, a
 // connection's tables or a view not yet copied there, fails as it is
 // prepared, and runs in the first.

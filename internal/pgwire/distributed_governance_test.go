@@ -2,11 +2,15 @@ package pgwire
 
 import (
 	"context"
+	"database/sql/driver"
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"os"
 	"path/filepath"
+	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -28,70 +32,138 @@ import (
 // statement may read and how it runs: policies, grants, connections,
 // external tables and workload limits.
 
-// TestDistributedPolicies checks that statements that masking or row
-// access policies apply to run on one machine, directly or through a view:
-// workers read table files and could not apply the policies, so no raw
-// value and no hidden row's contribution may come back, however the
-// statement aggregates them.
+// TestDistributedPolicies checks statements that masking and row access
+// policies apply to on workers, for every kind of user: each gives what it
+// gives on one machine, and no stage of its plan writes a raw value of a
+// masked column, or anything of a row the policy hides, to an exchange or
+// to the coordinator, however the statement aggregates, joins, sorts or
+// windows them (see distributed's governed.go).
 func TestDistributedPolicies(t *testing.T) {
 	t.Parallel()
 	ds := startDistServer(t, 3)
 	for _, sql := range policyFixture {
 		mustExec(t, ds.admin, sql)
 	}
-	// Enough rows that every worker would get some.
+	// Enough rows that every worker gets some: acme's even ids, globex's
+	// odd ones, whose spend is 10^9 and more, so that a hidden row's
+	// contribution to a sum shows.
 	for _, sql := range []string{
 		`INSERT INTO lake.crm.contacts SELECT i, CASE WHEN i % 2 = 0 THEN 'acme' ELSE 'globex' END,
-			'user' || i || CASE WHEN i % 2 = 0 THEN '@acme.com' ELSE '@globex.com' END, 'dev-' || i, i FROM range(5, 3000) t(i)`,
+			'user' || i || CASE WHEN i % 2 = 0 THEN '@acme.com' ELSE '@globex.com' END, 'dev-' || i,
+			CASE WHEN i % 2 = 0 THEN i ELSE 1000000000 + i END FROM range(5, 3000) t(i)`,
+		"CREATE TABLE lake.public.visits_by (id INTEGER, contact_id INTEGER, amount INTEGER)",
+		"INSERT INTO lake.public.visits_by SELECT i, i % 3000, i % 13 FROM range(9000) t(i)",
 		"CREATE VIEW memory.main.contact_view AS SELECT id, client, email, spend FROM lake.crm.contacts",
 	} {
 		mustExec(t, ds.admin, sql)
 	}
-	rita := ds.user(t, "rita", auth.RoleReader, pgx.QueryExecModeSimpleProtocol)
-	mustExec(t, ds.admin, "GRANT acme_team TO rita")
-	mustExec(t, rita, "SET distributed_execution = on")
-	mustExec(t, ds.admin, "SET distributed_execution = on")
-
-	// acme's rows alone: ids 1 and 2, and the even ids from 6 to 2998.
-	acme := `SELECT count(*), sum(spend)::BIGINT FROM lake.crm.contacts WHERE client = 'acme'`
-	mustExec(t, ds.admin, "SET distributed_execution = off")
-	want := texts(t, ds.admin, acme)
-	mustExec(t, ds.admin, "SET distributed_execution = on")
-	if len(want) != 1 || want[0] != "1499|2248524" {
-		t.Fatalf("acme's rows: %q", want)
-	}
-	for _, c := range []struct {
-		conn  *pgx.Conn
-		user  string
-		query string
-		want  []string
-	}{
-		// A masked column, aggregated every way that could show it.
-		{rita, "rita", "SELECT count(DISTINCT email), min(email), max(email) FROM lake.crm.contacts", []string{"1|***|***"}},
-		{rita, "rita", "SELECT client, count(DISTINCT email), max(email) FROM lake.crm.contacts GROUP BY client ORDER BY client", []string{"acme|1|***"}},
-		// Rows the row access policy hides count nowhere.
-		{rita, "rita", "SELECT count(*), sum(spend)::BIGINT FROM lake.crm.contacts", want},
-		{rita, "rita", "SELECT client, count(*) FROM lake.crm.contacts GROUP BY ALL ORDER BY ALL", []string{"acme|1499"}},
-		// Through a view.
-		{rita, "rita", "SELECT count(DISTINCT email), sum(spend)::BIGINT FROM memory.main.contact_view", []string{"1|2248524"}},
-		// Joined to a table without policies.
-		{rita, "rita", "SELECT count(*) FROM lake.crm.contacts c JOIN lake.public.campaigns p ON c.client = p.client", []string{"1499"}},
-		// Admins see every row, and masked values too.
-		{ds.admin, "igloo", "SELECT count(DISTINCT email), min(email), count(*) FROM lake.crm.contacts", []string{"1|***|2999"}},
+	conns := map[string]*pgx.Conn{"igloo": ds.admin}
+	for _, u := range []struct{ name, roles string }{
+		{"rita", "acme_team"}, {"pia", "acme_team, pii_reader"}, {"gus", "globex_team"}, {"nemo", ""},
 	} {
-		got := texts(t, c.conn, c.query)
-		if strings.Join(got, ",") != strings.Join(c.want, ",") {
-			t.Errorf("%s: got %q, want %q", c.query, got, c.want)
-		}
-		for _, row := range got {
-			if strings.Contains(row, "@") || strings.Contains(row, "globex") {
-				t.Errorf("%s returned a raw value: %s", c.query, row)
+		conns[u.name] = ds.user(t, u.name, auth.RoleReader, pgx.QueryExecModeSimpleProtocol)
+		for _, role := range strings.Split(u.roles, ", ") {
+			if role != "" {
+				mustExec(t, ds.admin, "GRANT "+role+" TO "+u.name)
 			}
 		}
-		if q := lastQuery(t, ds.catalogServer, c.user, c.query); q.Workers != 0 || len(q.Policies) == 0 {
-			t.Errorf("%s: %d workers, policies %q", c.query, q.Workers, q.Policies)
-		}
 	}
+	// What no stage may write for each user: masked values, and the rows
+	// the row access policy hides, by their client and their spend.
+	hidden := map[string][]string{
+		"igloo": {"@"},
+		"rita":  {"@", "globex", "spend>=1e9"},
+		"pia":   {"globex", "spend>=1e9"},
+		"gus":   {"@", "acme"},
+		"nemo":  {"@", "acme", "globex", "spend>=1e9"},
+	}
+	// The same statements over a copy of the table without policies show
+	// what workers would do with them: wherever they run one there, they
+	// run it through the policies too, for everyone.
+	for _, sql := range []string{
+		"CREATE TABLE lake.public.contacts_plain (id INTEGER, client VARCHAR, email VARCHAR, device_id VARCHAR, spend INTEGER)",
+		`INSERT INTO lake.public.contacts_plain SELECT i, CASE WHEN i % 2 = 0 THEN 'acme' ELSE 'globex' END,
+			'user' || i || CASE WHEN i % 2 = 0 THEN '@acme.com' ELSE '@globex.com' END, 'dev-' || i,
+			CASE WHEN i % 2 = 0 THEN i ELSE 1000000000 + i END FROM range(1, 3000) t(i)`,
+		"CREATE VIEW memory.main.contact_plain_view AS SELECT id, client, email, spend FROM lake.public.contacts_plain",
+	} {
+		mustExec(t, ds.admin, sql)
+	}
+	plain := strings.NewReplacer("lake.crm.contacts", "lake.public.contacts_plain", "memory.main.contact_view", "memory.main.contact_plain_view")
+	queries := []string{
+		// A masked column, aggregated every way that could show it.
+		"SELECT count(DISTINCT email), min(email), max(email), count(*) FROM lake.crm.contacts",
+		"SELECT client, count(DISTINCT email), max(email), sum(spend)::BIGINT FROM lake.crm.contacts GROUP BY client",
+		"SELECT email, count(*) FROM lake.crm.contacts GROUP BY email ORDER BY 2 DESC, 1 LIMIT 3",
+		"SELECT count(*) FROM lake.crm.contacts WHERE email = '***'",
+		"SELECT string_agg(email, ',' ORDER BY id) FROM lake.crm.contacts WHERE id < 40",
+		// Rows the row access policy hides count nowhere.
+		"SELECT count(*), sum(spend)::BIGINT FROM lake.crm.contacts WHERE client = 'globex'",
+		"SELECT DISTINCT client FROM lake.crm.contacts",
+		"SELECT id, email, spend FROM lake.crm.contacts ORDER BY spend DESC, id LIMIT 5",
+		// Through a view and a common table expression.
+		"SELECT count(DISTINCT email), sum(spend)::BIGINT FROM memory.main.contact_view",
+		"WITH big AS (SELECT client, email, spend FROM lake.crm.contacts WHERE spend > 100) SELECT client, count(*), max(email) FROM big GROUP BY 1",
+		// Joined to a table without policies, and to itself by a masked
+		// column; in, and not in, a subquery.
+		"SELECT c.client, count(*), sum(v.amount)::BIGINT FROM lake.crm.contacts c JOIN lake.public.visits_by v ON v.contact_id = c.id GROUP BY 1",
+		"SELECT c.email, count(*) FROM lake.public.visits_by v JOIN lake.crm.contacts c ON v.contact_id = c.id GROUP BY 1",
+		"SELECT count(*) FROM lake.crm.contacts a JOIN lake.crm.contacts b ON a.email = b.email AND a.id = b.id",
+		"SELECT count(*) FROM lake.public.visits_by WHERE contact_id IN (SELECT id FROM lake.crm.contacts WHERE email LIKE '%@acme.com')",
+		"SELECT count(*), sum(v.amount)::BIGINT FROM lake.public.visits_by v WHERE NOT EXISTS (SELECT 1 FROM lake.crm.contacts c WHERE c.id = v.contact_id)",
+		// Windows, and a union.
+		"SELECT client, id, email FROM lake.crm.contacts QUALIFY row_number() OVER (PARTITION BY client ORDER BY spend DESC) <= 2",
+		"SELECT email FROM lake.crm.contacts WHERE id < 20 UNION ALL SELECT email FROM lake.crm.contacts WHERE id > 2980",
+	}
+	ctx := context.Background()
+	// Once as the table sizes have it, and once with every join partitioned
+	// by its key, as joins of large tables are: what each table's rows go
+	// through then is an exchange.
+	raw := 0
+	for _, broadcast := range []int64{0, 4096} {
+		ds.srv.dist.SetMaxBroadcast(broadcast)
+		onWorkers := map[string]int{}
+		for _, query := range queries {
+			mustExec(t, ds.admin, "SET distributed_execution = on")
+			sortedTexts(t, ds.admin, plain.Replace(query))
+			plainOn := lastQuery(t, ds.catalogServer, "igloo", "SELECT CAST(COLUMNS(*) AS VARCHAR) FROM ("+plain.Replace(query)).Workers > 0
+			if values, _ := ds.stageValues(t, ctx, "igloo", plain.Replace(query)); slices.ContainsFunc(values, func(v string) bool { return hiddenIn(v, hidden["igloo"]) != "" }) {
+				raw++
+			}
+			for _, name := range slices.Sorted(maps.Keys(conns)) {
+				conn := conns[name]
+				mustExec(t, conn, "SET distributed_execution = off")
+				want := sortedTexts(t, conn, query)
+				mustExec(t, conn, "SET distributed_execution = on")
+				got := sortedTexts(t, conn, query)
+				if !slices.Equal(got, want) {
+					t.Errorf("%s, %s: on workers %q, on one machine %q", name, query, got, want)
+				}
+				run := lastQuery(t, ds.catalogServer, name, "SELECT CAST(COLUMNS(*) AS VARCHAR) FROM ("+query)
+				values, local := ds.stageValues(t, ctx, name, query)
+				if run.Workers > 0 {
+					onWorkers[query]++
+				} else if plainOn {
+					t.Errorf("%s, %s: on one machine, though it runs on workers without policies: %v", name, query, local)
+				}
+				if len(run.Policies) == 0 {
+					t.Errorf("%s, %s: no policies applied", name, query)
+				}
+				for _, v := range values {
+					if leak := hiddenIn(v, hidden[name]); leak != "" {
+						t.Errorf("%s, %s: a stage writes %q (%s)", name, query, v, leak)
+						break
+					}
+				}
+			}
+		}
+		t.Logf("broadcast %d: on workers, of %d users: %v", broadcast, len(conns), onWorkers)
+	}
+	ds.srv.dist.SetMaxBroadcast(0)
+	if raw == 0 {
+		t.Error("no stage of the statements over the table without policies wrote a raw value: the check of the stages sees nothing")
+	}
+	rita := conns["rita"]
 
 	// Tables without policies still run on workers, for everyone: forced by
 	// an admin, on every worker; by anyone else, on as many as the table's
@@ -110,8 +182,9 @@ func TestDistributedPolicies(t *testing.T) {
 
 	// Statements that only spell a protected table's name, in a column, a
 	// string or the text of a view they read, which the rewriter analyzes
-	// and finds read none, run on workers, through the views it expanded
-	// too; one that reads the protected table besides stays here.
+	// and finds read none, run on workers as written, through the views it
+	// expanded too; one that reads the protected table besides runs there
+	// through its policies.
 	for _, sql := range []string{
 		"CREATE TABLE lake.public.visits (id INTEGER, contacts VARCHAR, spend INTEGER)",
 		"INSERT INTO lake.public.visits SELECT i, 'c' || (i % 7), i FROM range(3000) t(i)",
@@ -126,7 +199,7 @@ func TestDistributedPolicies(t *testing.T) {
 		{"SELECT contacts, count(*), sum(spend)::BIGINT FROM lake.public.visits GROUP BY 1 ORDER BY 1", true},
 		{"SELECT who, count(*), max(spend) FROM memory.main.visit_view GROUP BY 1 ORDER BY 1", true},
 		{"SELECT count(*), sum(spend)::BIGINT FROM lake.public.visits WHERE contacts <> 'contacts'", true},
-		{"SELECT v.contacts, count(*) FROM lake.public.visits v JOIN lake.crm.contacts c ON c.id = v.id GROUP BY 1 ORDER BY 1", false},
+		{"SELECT v.contacts, count(*) FROM lake.public.visits v JOIN lake.crm.contacts c ON c.id = v.id GROUP BY 1 ORDER BY 1", true},
 	} {
 		mustExec(t, rita, "SET distributed_execution = off")
 		want := texts(t, rita, c.query)
@@ -135,7 +208,7 @@ func TestDistributedPolicies(t *testing.T) {
 			t.Errorf("%s: got %q, want %q", c.query, got, want)
 		}
 		q := lastQuery(t, ds.catalogServer, "rita", c.query)
-		if (q.Workers > 0) != c.workers || c.workers && len(q.Policies) > 0 || !c.workers && len(q.Policies) == 0 {
+		if (q.Workers > 0) != c.workers || strings.Contains(c.query, "crm.contacts") != (len(q.Policies) > 0) {
 			t.Errorf("%s: %d workers, policies %q; want on workers %v", c.query, q.Workers, q.Policies, c.workers)
 		}
 		explain := strings.Join(texts(t, rita, "EXPLAIN DISTRIBUTED "+c.query), "\n")
@@ -146,7 +219,6 @@ func TestDistributedPolicies(t *testing.T) {
 
 	// Should a statement reach the planner without the rewriter having
 	// seen it, the planner still refuses a protected table.
-	ctx := context.Background()
 	user, err := ds.store.Get(ctx, "igloo")
 	if err != nil {
 		t.Fatal(err)
@@ -461,4 +533,116 @@ func TestDistributedArrow(t *testing.T) {
 	if n := lastWorkers(t, ds.history, query); n != 2 {
 		t.Errorf("%d workers", n)
 	}
+}
+
+// stageValues plans query as user does, on every worker, and runs each of
+// its stages as one task over the whole of its inputs, in order, on a
+// connection of the replica's that no policy applies to: their tables'
+// files are the tables, their exchanges what the stages before them wrote.
+// It returns every value the stages write, as text, or why the statement
+// does not run on workers.
+func (ds *distServer) stageValues(t *testing.T, ctx context.Context, name, query string) ([]string, error) {
+	t.Helper()
+	user, err := ds.store.Get(ctx, name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	es, err := ds.srv.OpenEmbedded(ctx, user, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer es.Close() //nolint:errcheck
+	if _, err := es.sess.conn.ExecContext(ctx, "SET search_path = 'lake.public,memory.main'", nil); err != nil {
+		t.Fatal(err)
+	}
+	st, err := ds.srv.prepareChecked(ctx, es.sess, user, query, nil)
+	if err != nil {
+		t.Fatalf("%s: %v", query, err)
+	}
+	defer st.close() //nolint:errcheck
+	plan, err := ds.srv.dist.Plan(ctx, st.query, &sessionEnv{s: ds.srv, sess: es.sess, user: user, st: st}, distributed.ModeOn)
+	if err != nil {
+		if !distributed.IsUnsupported(err) {
+			t.Errorf("planning %s: %v", query, err)
+		}
+		return nil, err
+	}
+	conn, err := ds.srv.engine.Connect(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close() //nolint:errcheck
+	exec := func(q string) {
+		t.Helper()
+		if _, err := conn.ExecContext(ctx, q, nil); err != nil {
+			t.Fatalf("%s: %v", q, err)
+		}
+	}
+	var out []string
+	made := map[string]bool{}
+	for _, s := range plan.Stages {
+		for _, in := range s.Inputs {
+			var from string
+			switch {
+			case in.Table != nil:
+				from = "lake." + quoteIdent(in.Table.Schema) + "." + quoteIdent(in.Table.Name)
+			case in.Exchange != nil:
+				from = fmt.Sprintf("__sim_x%d", in.Exchange.ID)
+			default:
+				t.Fatalf("stage %d of %s reads %s, neither a table nor an exchange", s.ID, query, in.View)
+			}
+			exec("CREATE OR REPLACE TEMP VIEW " + quoteIdent(in.View) + " AS SELECT * FROM " + from)
+		}
+		q := "SELECT * FROM (" + s.SQL + ") AS s"
+		if len(s.Columns) > 0 {
+			cols := make([]string, len(s.Columns))
+			for i, c := range s.Columns {
+				cols[i] = quoteIdent(c)
+			}
+			q += "(" + strings.Join(cols, ", ") + ")"
+		}
+		target := fmt.Sprintf("__sim_s%d", s.ID)
+		if s.Out != nil {
+			target = fmt.Sprintf("__sim_x%d", s.Out.ID)
+		}
+		if made[target] {
+			// Another branch of a union writes it too.
+			exec("INSERT INTO " + target + " " + q)
+		} else {
+			exec("CREATE TEMP TABLE " + target + " AS " + q)
+			made[target] = true
+		}
+		rows, err := conn.QueryContext(ctx, "SELECT CAST(COLUMNS(*) AS VARCHAR) FROM ("+q+") AS q", nil)
+		if err != nil {
+			t.Fatalf("stage %d of %s: %v\n%s", s.ID, query, err, s.SQL)
+		}
+		cols := rows.Columns()
+		dest := make([]driver.Value, len(cols))
+		for rows.Next(dest) == nil {
+			for _, v := range dest {
+				if v != nil {
+					out = append(out, fmt.Sprint(v))
+				}
+			}
+		}
+		_ = rows.Close()
+	}
+	return out, nil
+}
+
+// hiddenIn returns which of hidden, substrings or "spend>=1e9", value
+// shows, or "".
+func hiddenIn(value string, hidden []string) string {
+	for _, h := range hidden {
+		if h == "spend>=1e9" {
+			if f, err := strconv.ParseFloat(value, 64); err == nil && f >= 1e9 && f < 1e15 {
+				return h
+			}
+			continue
+		}
+		if strings.Contains(value, h) {
+			return h
+		}
+	}
+	return ""
 }

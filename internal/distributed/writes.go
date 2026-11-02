@@ -661,6 +661,11 @@ func (pl *planner) markWrites(final node) {
 	if hasClass(final, "PARAMETER") || pl.checkFunctions(final) != nil {
 		return
 	}
+	if pl.gov != nil && pl.gov.mentions(final) {
+		// It reads a protected table itself, which only stages' reads
+		// through its policies may (see governed.go).
+		return
+	}
 	sql, err := pl.p.print(final)
 	if err != nil {
 		return

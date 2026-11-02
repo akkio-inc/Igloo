@@ -29,9 +29,10 @@ import (
 // workers, the replica holds only its thousand rows.
 //
 // The fill runs on workers only as a read of its query by its user would:
-// not where masking or row access policies apply to, or concern, what the
-// query reads (see policyReason), nor over tables the user's grants were
-// not checked for. Erasure is as before: workers read table files as for
+// through the masking and row access policies that apply to what the query
+// reads, as its rewrite wrote them, and not where a clean room concerns it
+// (see policyReason), nor over tables the user's grants were not checked
+// for. Erasure is as before: workers read table files as for
 // any read, and their read caches are purged for erasure requests as for
 // reads; the table written is a table like any other.
 

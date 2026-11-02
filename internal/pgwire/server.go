@@ -2196,8 +2196,8 @@ func (s *Server) preparedQuery(ctx context.Context, sess *session, user auth.Use
 		sess.wl.counted = countsOnReplica(sess, st)
 		sess.wl.shape, sess.wl.exact = "", ""
 		if sess.wl.counted || st.staged != nil {
-			sess.wl.shape = s.workloadShape(ctx, sess, st.prepared)
-			sess.wl.exact = s.workloadExact(sess, st.prepared)
+			sess.wl.shape = s.workloadShape(ctx, sess, st.shapeText())
+			sess.wl.exact = s.workloadExact(sess, st.shapeText())
 		}
 		shape, exact := sess.wl.shape, sess.wl.exact
 		sess.wl.apart = s.runsApart(sess, st)

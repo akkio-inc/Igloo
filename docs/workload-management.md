@@ -265,12 +265,14 @@ case it no longer is. A write (`INSERT`, `UPDATE`, `DELETE`, `MERGE`, the fill o
 after it is known to be heavy, and commits as another replica's would.
 
 Only what gives the same result there runs there: a statement outside a
-transaction block, of what the catalog holds, on which no masking or row
-access policy applies, in a session with no temporary tables or views and
+transaction block, of what the catalog holds, not of a table a clean room
+keeps to its party, in a session with no temporary tables or views and
 none of the settings tasks do not take over, calling no function tied to the
 session, and not one that fills ID domains' ids; a statement the second
 DuckDB cannot bind, such as one of a connection's tables or a view not yet
-copied there, runs in the first. Materialized views' refreshes run in the
+copied there, runs in the first. Masking and row access policies apply
+there as in the first: they are in the statement's text, which runs there as
+Igloo rewrote it for its user. Materialized views' refreshes run in the
 first. `placement` in the history says which reads ran there, and
 `igloo_background_statements_total` counts them. A heavy statement stays in
 the first while most of what runs there or waits to is of some size itself, known to take
