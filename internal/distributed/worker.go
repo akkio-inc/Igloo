@@ -27,7 +27,6 @@ import (
 	"time"
 
 	"github.com/duckdb/duckdb-go/v2"
-	"golang.org/x/sync/semaphore"
 
 	"github.com/akkio-inc/igloo/internal/activity"
 	"github.com/akkio-inc/igloo/internal/config"
@@ -128,7 +127,7 @@ type Worker struct {
 	// task takes one or more (taskRequest.Slots), and slotCount is how
 	// many there are; running are those running, which ShedMemory may
 	// cancel.
-	slots     *semaphore.Weighted
+	slots     *fairSlots
 	slotCount int
 	runningMu sync.Mutex
 	running   map[*runningTask]bool
@@ -216,7 +215,7 @@ func NewWorker(opts WorkerOptions, log *slog.Logger) (*Worker, error) {
 			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 		},
 		boot: newID()}
-	w.slots = semaphore.NewWeighted(int64(w.slotCount))
+	w.slots = newFairSlots(int64(w.slotCount))
 	// What its read cache on disk says it was purged through, unless that has
 	// not come yet, which it says only if it was told so: it purges again.
 	if through := opts.Erasure.Through; !through.IsZero() && !through.After(opts.Erasure.now()) {
@@ -468,12 +467,12 @@ func (w *Worker) serveTask(rw http.ResponseWriter, r *http.Request) {
 	// Wait for its slots (see taskSlots); the coordinator's task waits
 	// with it.
 	take := int64(w.taskSlots(req.Slots))
-	if err := w.slots.Acquire(ctx, take); err != nil {
+	if err := w.slots.acquire(ctx, req.Query, take); err != nil {
 		log.Debug("task canceled while it waited to run")
 		w.opts.Metrics.task("canceled", start)
 		return
 	}
-	defer w.slots.Release(take)
+	defer w.slots.release(req.Query, take)
 	done, err := w.admit(ctx, &runningTask{query: req.Query, task: req.Task, started: time.Now(), cancel: cancel, erased: req.Erased})
 	if err != nil {
 		var te *taskErr
