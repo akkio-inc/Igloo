@@ -251,18 +251,22 @@ func (h *heavyHistory) moveAfter(others int) time.Duration {
 // aStatement is a statement running in the first DuckDB, as besideIsHeavy sees it.
 type aStatement struct {
 	// expect is how long statements of its shape take alone (see
-	// workload.Controller.Expect), and ran how long it has run.
+	// workload.Controller.Expect), zero for a shape not seen yet, and ran how long
+	// it has run.
 	expect, ran time.Duration
 }
 
 // mostOfSize says whether most of beside are of some size: known to take as much
-// alone as makes a statement heavy at the least, or running for half as long as a
-// statement not known to be heavy would before it could have used that much.
+// alone as makes a statement heavy at the least, or, of a shape not seen yet, running
+// for half as long as a statement not known to be heavy would before it could have
+// used that much. A statement known to be short counts as short however long it has
+// run: a heavy statement beside dashboards slows them, and were that to make them of
+// some size, it would stay beside them. Their p95 went from 9 s to 119 s.
 func (h *heavyHistory) mostOfSize(beside []aStatement) bool {
 	long := h.moveAfter(len(beside)) / 2
 	sized := 0
 	for _, b := range beside {
-		if b.expect >= h.after || b.ran >= long {
+		if b.expect >= h.after || b.expect == 0 && b.ran >= long {
 			sized++
 		}
 	}

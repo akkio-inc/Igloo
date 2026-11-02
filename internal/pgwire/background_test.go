@@ -425,6 +425,7 @@ func TestMostOfSize(t *testing.T) {
 	unseen := aStatement{ran: 2 * time.Second}
 	sized := aStatement{expect: 30 * time.Second, ran: time.Second}
 	long := aStatement{ran: time.Minute}
+	slowed := aStatement{expect: time.Second, ran: time.Minute}
 	for _, c := range []struct {
 		beside []aStatement
 		want   bool
@@ -438,6 +439,8 @@ func TestMostOfSize(t *testing.T) {
 		{[]aStatement{sized, long, short}, true},
 		{[]aStatement{sized, short, short, short, long}, false},
 		{[]aStatement{sized, sized, sized, sized, long, long, short}, true},
+		{[]aStatement{slowed}, false},
+		{[]aStatement{slowed, slowed, slowed, sized}, false},
 	} {
 		if got := h.mostOfSize(c.beside); got != c.want {
 			t.Errorf("beside %v: %v, want %v", c.beside, got, c.want)
