@@ -21,11 +21,14 @@ import (
 const (
 	peakThreads  = 8
 	peakSessions = 8
-	// peakOthers is what may start beside the read cache's threads: a thread of
-	// Go's for each session in DuckDB, a few more of its own, and DuckDB's threads
-	// where they had not started yet.
-	peakOthers = peakThreads + 2*peakSessions + 8
 )
+
+// peakOthers is what may start beside the read cache's threads: a thread of Go's
+// for each session in DuckDB, a few more of its own, DuckDB's threads where they had
+// not started yet, and a thread for each of Go's processors besides. Run with the rest
+// of the package, a worker's reads usually add 111 to 125 threads; once they added
+// 166, 6 past the limit without that last allowance. A storm adds thousands.
+func peakOthers() int { return peakThreads + 2*peakSessions + 8 + runtime.GOMAXPROCS(0) }
 
 // processThreads counts the threads of this process, Go's and DuckDB's.
 func processThreads(t *testing.T) int {
@@ -147,7 +150,7 @@ func cacheReadPeak(t *testing.T, readThreads int) (before, most int) {
 // of 240, and no statement finished for 20 minutes.
 func TestReadCacheStartsNoThreads(t *testing.T) {
 	before, most := cacheReadPeak(t, 0)
-	limit := before + peakOthers
+	limit := before + peakOthers()
 	t.Logf("threads: %d before, %d at most while they read, limit %d", before, most, limit)
 	if most > limit {
 		t.Errorf("the process reached %d threads reading %d sessions at once, from %d; at most %d should do", most, peakSessions, before, limit)
@@ -160,7 +163,7 @@ func TestReadCacheStartsNoThreads(t *testing.T) {
 func TestWorkerReadThreadsStayBounded(t *testing.T) {
 	n := config.DefaultWorkerCacheReadThreads
 	before, most := cacheReadPeak(t, n)
-	limit := before + (peakThreads+peakSessions)*n + peakOthers
+	limit := before + (peakThreads+peakSessions)*n + peakOthers()
 	t.Logf("threads: %d before, %d at most while they read, limit %d", before, most, limit)
 	if most > limit {
 		t.Errorf("the process reached %d threads reading %d sessions at once, from %d, at %d threads a read; at most %d should do", most, peakSessions, before, n, limit)
