@@ -1940,6 +1940,12 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   second held, the first took memory faster than the second's spill files could
   give it back: beside a burst of heavy statements the two held 134% of the limit,
   and the kernel killed the process.
+- A heavy statement stays in the first DuckDB while most of what runs there is of
+  some size itself, known to take 5 seconds of all the cores alone or having run
+  for a while, since there is nothing short for it to give way to. Under a
+  dashboard's burst at ten times its data, statements sent to the second had a tenth
+  of what the others left of the cores and ran past 15 minutes, and those moved
+  there threw away what they had done.
 - Statements wait in the order they would end if each ran alone from when it
   came, as their shape's runs say, rather than in arrival order; a shape that took
   under a second of CPU does not wait at all; and a statement of a shape not seen

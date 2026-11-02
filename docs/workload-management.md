@@ -272,7 +272,10 @@ session, and not one that fills ID domains' ids; a statement the second
 DuckDB cannot bind, such as one of a connection's tables or a view not yet
 copied there, runs in the first. Materialized views' refreshes run in the
 first. `placement` in the history says which reads ran there, and
-`igloo_background_statements_total` counts them.
+`igloo_background_statements_total` counts them. A heavy statement stays in
+the first while most of what runs there is of some size itself, known to take
+5 seconds of all the cores alone or having run for a while, since there is
+nothing short for it to give way to.
 `IGLOO_HEAVY_IN_BACKGROUND=false` runs everything in the first. Without
 workers, the replica's limit below and roles' limits hold back heavy
 statements beyond that.

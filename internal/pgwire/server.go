@@ -1064,9 +1064,13 @@ type session struct {
 	// because Igloo exits (see exitForMemory).
 	statement string
 	started   time.Time
-	shed      bool
-	shedAt    time.Time
-	exiting   bool
+	// runShape is the running statement's shape, and inBackground says it runs
+	// in the second DuckDB, for the statements beside it (see besideIsHeavy).
+	runShape     string
+	inBackground bool
+	shed         bool
+	shedAt       time.Time
+	exiting      bool
 	// stuck, set for a client's session, lets the client go when its
 	// statement does not stop once canceled; watched is the context of the
 	// statement's run it watches (see watchStuck).
@@ -1457,11 +1461,13 @@ func (sess *session) runCancelable(ctx context.Context, query string, fn func(co
 	ctx, cancel := context.WithCancel(ctx)
 	sess.mu.Lock()
 	sess.running, sess.statement, sess.started, sess.shed, sess.queued = cancel, redactQuery(query), time.Now(), false, true
+	sess.runShape = sess.wl.shape
 	sess.mu.Unlock()
 
 	defer func() {
 		sess.mu.Lock()
 		sess.running, sess.statement, sess.started, sess.queued = nil, "", time.Time{}, false
+		sess.runShape = ""
 		sess.mu.Unlock()
 		cancel()
 	}()
