@@ -85,6 +85,39 @@ func (f *footprint) held() (int64, bool) {
 	return max(median, f.unfinished), f.unfinished > median
 }
 
+// ReadNothing says that a run read no bytes and took next to no CPU, as a statement
+// does when DuckDB plans it to no rows for the values of its literals. That says
+// nothing of what statements of its shape, the text with its literals masked, use
+// otherwise: a shape whose runs for some values take a minute of all the cores, once
+// so learned from a run for a value with no rows, reserved nothing, waited for nothing
+// and started all together. So such a run is only ever what a shape has until one
+// that read something (see ObserveEmpty).
+func ReadNothing(bytesRead int64, cpu time.Duration) bool {
+	return bytesRead == 0 && cpu < LightCPU
+}
+
+// ObserveEmpty records a run of shape that ReadNothing says of: as holding and taking
+// nothing, if the shape has no other runs, and until it has one.
+func (c *Controller) ObserveEmpty(shape string) {
+	if c == nil || shape == "" {
+		return
+	}
+	fp := c.history.of(shape)
+	if len(fp.runs) == 0 {
+		fp.runs = append(fp.runs, 0)
+	}
+	c.history.mu.Unlock()
+	k := &c.costs
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	if k.runs == nil || len(k.runs) >= maxFootprints {
+		k.runs = make(map[string][]time.Duration)
+	}
+	if len(k.runs[shape]) == 0 {
+		k.runs[shape] = []time.Duration{0}
+	}
+}
+
 // EstimateFromHistory makes the controller reserve, for a statement that
 // reserves nothing of its own, fraction of what the latest statement of its
 // shape held (see Estimate). Zero or less turns that off. It is set
@@ -103,6 +136,10 @@ func (c *Controller) Observe(shape string, footprint int64) {
 	}
 	fp := c.history.of(shape)
 	defer c.history.mu.Unlock()
+	if footprint > 0 {
+		// A run that read nothing is only ever all it has (see ObserveEmpty).
+		fp.runs = slices.DeleteFunc(fp.runs, func(n int64) bool { return n == 0 })
+	}
 	fp.runs = append(fp.runs, footprint)
 	if len(fp.runs) > footprintRuns {
 		fp.runs = fp.runs[len(fp.runs)-footprintRuns:]

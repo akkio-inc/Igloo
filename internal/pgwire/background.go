@@ -195,6 +195,14 @@ func (h *heavyHistory) observe(shape string, cpu time.Duration, inBackground boo
 	}
 }
 
+// known says whether a statement of shape has run.
+func (h *heavyHistory) known(shape string) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	r := h.shapes[shape]
+	return r != nil && r.runs > 0
+}
+
 // heavy says whether statements of shape are known to be heavy.
 func (h *heavyHistory) heavy(shape string) bool {
 	h.mu.Lock()

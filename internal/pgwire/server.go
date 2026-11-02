@@ -2239,21 +2239,26 @@ func (s *Server) preparedQuery(ctx context.Context, sess *session, user auth.Use
 		if err == nil {
 			used = sess.measure(st)
 		}
-		if used != nil && tr != nil && tr.flattenKey != "" {
+		// A run planned to no rows says nothing of others of its shape (see
+		// workload.ReadNothing).
+		measured := used != nil && !workload.ReadNothing(used.BytesRead, used.CPUTime)
+		if measured && tr != nil && tr.flattenKey != "" {
 			s.workload.ObserveForm(tr.flattenKey, tr.flattenLists, used.CPUTime)
 		}
 		peak, sampled := sess.wl.peak, sess.wl.sampled
-		if used != nil && parts.workers == 0 && s.heavy != nil {
+		if used != nil && parts.workers == 0 && s.heavy != nil && (measured || !s.heavy.known(shape)) {
 			// Which of this replica's DuckDBs the next like it runs in.
 			s.heavy.observe(shape, used.CPUTime, sess.wl.ranInBackground)
 		}
 		switch {
 		case parts.workers > 0:
 			// One that ran on workers held most of its memory there.
-		case used != nil:
+		case measured:
 			// What it held here, for the next statement like it.
 			s.workload.Observe(shape, workload.FootprintOf(used.MemoryAllocated, peak, sampled))
 			s.workload.ObserveCost(shape, used.CPUTime)
+		case used != nil:
+			s.workload.ObserveEmpty(shape)
 		case err != nil && sampled:
 			// It ended before its end, holding at least that much, or, if it
 			// ran a while, all the memory: it may have held any of what the

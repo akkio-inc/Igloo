@@ -55,7 +55,12 @@ func (c *Controller) ObserveCost(shape string, cpu time.Duration) {
 	if k.runs == nil || len(k.runs) >= maxFootprints {
 		k.runs = make(map[string][]time.Duration)
 	}
-	runs := append(k.runs[shape], cpu)
+	runs := k.runs[shape]
+	if cpu > 0 {
+		// A run that read nothing is only ever all it has (see ObserveEmpty).
+		runs = slices.DeleteFunc(runs, func(d time.Duration) bool { return d == 0 })
+	}
+	runs = append(runs, cpu)
 	if len(runs) > costRuns {
 		runs = runs[len(runs)-costRuns:]
 	}

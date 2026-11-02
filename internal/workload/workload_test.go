@@ -863,3 +863,46 @@ func TestReservationsWaitForWhatIsHeld(t *testing.T) {
 	r()
 	long()
 }
+
+// TestRunsThatReadNothing checks that a run DuckDB planned to no rows for its
+// literals says nothing of a shape with runs that read something, whichever comes
+// first, and that a shape with no others has what such a run says.
+func TestRunsThatReadNothing(t *testing.T) {
+	const gb = int64(1) << 30
+	if !ReadNothing(0, 300*time.Millisecond) || ReadNothing(1, time.Millisecond) || ReadNothing(0, 2*time.Second) {
+		t.Error("what reads nothing")
+	}
+	c := NewController(16 * gb)
+	c.EstimateFromHistory(1)
+	c.WeighCosts(8, LightCPU)
+	seen := func(shape string, held int64, expect time.Duration, light bool) {
+		t.Helper()
+		if got := c.Estimate(shape); got != held {
+			t.Errorf("%s: reserves %d, want %d", shape, got, held)
+		}
+		if got := c.Expect(shape); got != expect {
+			t.Errorf("%s: expected to take %s, want %s", shape, got, expect)
+		}
+		if got := c.Light(shape); got != light {
+			t.Errorf("%s: light %v, want %v", shape, got, light)
+		}
+	}
+	// After a run that read something.
+	c.Observe("after", 4*gb)
+	c.ObserveCost("after", 80*time.Second)
+	c.ObserveEmpty("after")
+	seen("after", 4*gb, 10*time.Second, false)
+	// Before one: until it comes, a shape of next to nothing.
+	c.ObserveEmpty("before")
+	seen("before", 0, 0, true)
+	if _, ok := c.Footprint("before"); !ok {
+		t.Error("a shape with a run that read nothing is not seen")
+	}
+	c.Observe("before", 4*gb)
+	c.ObserveCost("before", 80*time.Second)
+	seen("before", 4*gb, 10*time.Second, false)
+	// Several, and nothing else.
+	c.ObserveEmpty("only")
+	c.ObserveEmpty("only")
+	seen("only", 0, 0, true)
+}

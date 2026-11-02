@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"log/slog"
 	"slices"
@@ -24,7 +25,7 @@ func TestSeedHistory(t *testing.T) {
 	store := audit.NewMemoryStore(audit.MemoryQueries, audit.MemoryLogins)
 	now := time.Now()
 	const gb = int64(1) << 30
-	used := func(n int64) *audit.Resources { return &audit.Resources{MemoryAllocated: n} }
+	used := func(n int64) *audit.Resources { return &audit.Resources{BytesRead: 1, MemoryAllocated: n} }
 	qs := []audit.Query{
 		{ID: "1", Start: now.Add(-8 * 24 * time.Hour), PlanKey: "k", Outcome: audit.OutcomeOK, Duration: time.Hour, Memory: 22 * gb},
 		{ID: "2", Start: now.Add(-3 * time.Hour), PlanKey: "k", Outcome: audit.OutcomeOK, Duration: 90 * time.Second, Memory: 22 * gb,
@@ -92,13 +93,13 @@ func TestSeedHistory(t *testing.T) {
 	formStore := audit.NewMemoryStore(audit.MemoryQueries, audit.MemoryLogins)
 	if err := formStore.WriteQueries(context.Background(), []audit.Query{
 		{ID: "1", Start: now.Add(-2 * time.Minute), Outcome: audit.OutcomeOK, FlattenKey: "k",
-			Resources: &audit.Resources{CPUTime: 5 * time.Second}},
+			Resources: &audit.Resources{BytesRead: 1, CPUTime: 5 * time.Second}},
 		{ID: "2", Start: now.Add(-time.Minute), Outcome: audit.OutcomeOK, FlattenKey: "k", FlattenLists: true,
-			Resources: &audit.Resources{CPUTime: 2 * time.Second}},
+			Resources: &audit.Resources{BytesRead: 1, CPUTime: 2 * time.Second}},
 		{ID: "3", Start: now.Add(-time.Second), Outcome: audit.OutcomeError, FlattenKey: "k",
-			Resources: &audit.Resources{CPUTime: time.Second}},
+			Resources: &audit.Resources{BytesRead: 1, CPUTime: time.Second}},
 		{ID: "4", Start: now.Add(-time.Second), Outcome: audit.OutcomeOK, FlattenKey: "k", Workers: 2,
-			Resources: &audit.Resources{CPUTime: time.Second}},
+			Resources: &audit.Resources{BytesRead: 1, CPUTime: time.Second}},
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -120,5 +121,38 @@ func TestPrefetchScans(t *testing.T) {
 	if len(got) != 1 || !got[0].Filtered || len(got[0].FieldIDs) != 2 || got[0].FieldIDs[1] != 4 ||
 		len(got[0].Files) != 2 || got[0].Files[1].Path != "s3://b/t/data/b.parquet" || got[0].Files[1].Size != 20 {
 		t.Errorf("prefetchScans: %+v", got)
+	}
+}
+
+// TestSeedHistoryRunsThatReadNothing checks that a run that read nothing says
+// nothing of a shape with one that read something, whichever came first.
+func TestSeedHistoryRunsThatReadNothing(t *testing.T) {
+	store := audit.NewMemoryStore(audit.MemoryQueries, audit.MemoryLogins)
+	now := time.Now()
+	const gb = int64(1) << 30
+	limits := workload.NewController(22 * gb)
+	limits.EstimateFromHistory(1)
+	limits.WeighCosts(8, workload.LightCPU)
+	var qs []audit.Query
+	for i, r := range []audit.Resources{
+		{BytesRead: 0, CPUTime: 100 * time.Millisecond, MemoryAllocated: 12 << 20},
+		{BytesRead: gb, CPUTime: 80 * time.Second, MemoryAllocated: 6 * gb},
+		{BytesRead: 0, CPUTime: 100 * time.Millisecond, MemoryAllocated: 12 << 20},
+	} {
+		qs = append(qs, audit.Query{ID: fmt.Sprint(i), Start: now.Add(time.Duration(i-10) * time.Minute),
+			Outcome: audit.OutcomeOK, Duration: time.Second, Shape: "s", Resources: &r, Memory: 22 * gb})
+	}
+	if err := store.WriteQueries(context.Background(), qs); err != nil {
+		t.Fatal(err)
+	}
+	seedHistory(context.Background(), nil, limits, 22*gb, store, slog.New(slog.DiscardHandler))
+	if got := limits.Estimate("s"); got != 4*gb {
+		t.Errorf("reserves %d, want %d", got, 4*gb)
+	}
+	if limits.Light("s") {
+		t.Error("light, for runs that read nothing")
+	}
+	if got := limits.Expect("s"); got != 10*time.Second {
+		t.Errorf("expected to take %s", got)
 	}
 }

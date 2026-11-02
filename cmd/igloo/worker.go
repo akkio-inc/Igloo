@@ -301,6 +301,7 @@ type footprints interface {
 	ObserveUnfinished(shape string, held int64)
 	ObserveForm(key string, lists bool, cpu time.Duration)
 	ObserveCost(shape string, cpu time.Duration)
+	ObserveEmpty(shape string)
 }
 
 // longUnmeasured is how long a run that ended early must have run, without
@@ -331,6 +332,8 @@ func seedHistory(ctx context.Context, seed func([]distributed.Run), fp footprint
 		unfinished bool
 		// cpu is what a run it completed took; -1 for none.
 		cpu time.Duration
+		// empty says it read nothing (see workload.ReadNothing).
+		empty bool
 	}
 	var fs []footprint
 	type form struct {
@@ -346,7 +349,8 @@ func seedHistory(ctx context.Context, seed func([]distributed.Run), fp footprint
 			break
 		}
 		for _, q := range qs {
-			if q.FlattenKey != "" && q.Outcome == audit.OutcomeOK && q.Resources != nil && q.Workers == 0 {
+			empty := q.Resources != nil && workload.ReadNothing(q.Resources.BytesRead, q.Resources.CPUTime)
+			if q.FlattenKey != "" && q.Outcome == audit.OutcomeOK && q.Resources != nil && q.Workers == 0 && !empty {
 				forms = append(forms, form{q.FlattenKey, q.FlattenLists, q.Resources.CPUTime})
 			}
 			switch {
@@ -368,11 +372,11 @@ func seedHistory(ctx context.Context, seed func([]distributed.Run), fp footprint
 			early := q.Outcome == audit.OutcomeCanceled || q.SQLState == "53200"
 			switch {
 			case q.Outcome == audit.OutcomeOK && q.Resources != nil:
-				fs = append(fs, footprint{q.Shape, workload.FootprintOf(q.Resources.MemoryAllocated, q.Peak, q.Peak > 0), false, q.Resources.CPUTime})
+				fs = append(fs, footprint{q.Shape, workload.FootprintOf(q.Resources.MemoryAllocated, q.Peak, q.Peak > 0), false, q.Resources.CPUTime, empty})
 			case early && q.Peak > 0:
-				fs = append(fs, footprint{q.Shape, q.Peak, true, -1})
+				fs = append(fs, footprint{q.Shape, q.Peak, true, -1, false})
 			case early && q.Duration-q.Queued >= longUnmeasured:
-				fs = append(fs, footprint{q.Shape, q.Memory, true, -1})
+				fs = append(fs, footprint{q.Shape, q.Memory, true, -1, false})
 			}
 		}
 		if len(qs) < pageSize {
@@ -392,6 +396,10 @@ func seedHistory(ctx context.Context, seed func([]distributed.Run), fp footprint
 		seed(rs)
 	}
 	for _, f := range fs {
+		if f.empty {
+			fp.ObserveEmpty(f.shape)
+			continue
+		}
 		if f.unfinished {
 			fp.ObserveUnfinished(f.shape, f.held)
 		} else {
