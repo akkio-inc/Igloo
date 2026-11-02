@@ -32,8 +32,31 @@ func TestBalancedLimits(t *testing.T) {
 		{90, 60, true, 75, 25},
 		{0, 0, true, 100, 88},
 	} {
-		if m, b := balancedLimits(total, c.mainHeld, c.bgHeld, c.reading); m != c.wantMain || b != c.wantBg {
+		if m, b := balancedLimits(total, total/backgroundLeadLeast, c.mainHeld, c.bgHeld, c.reading); m != c.wantMain || b != c.wantBg {
 			t.Errorf("holding %d and %d, reading %v: limits %d and %d, want %d and %d", c.mainHeld, c.bgHeld, c.reading, m, b, c.wantMain, c.wantBg)
+		}
+	}
+	// With more to spare, the first goes further at once.
+	if m, b := balancedLimits(total, total/backgroundLeadMost, 0, 90, true); m != 25 || b != 75 {
+		t.Errorf("a longer lead: limits %d and %d", m, b)
+	}
+}
+
+// TestLeadOf checks how far past what the background DuckDB has let go of the first
+// may go: what the machine has to spare, between an eighth and a quarter of the limit.
+func TestLeadOf(t *testing.T) {
+	t.Parallel()
+	const total = 800
+	for _, c := range []struct{ spare, want int64 }{
+		{-50, 100},
+		{0, 100},
+		{100, 100},
+		{150, 150},
+		{200, 200},
+		{5000, 200},
+	} {
+		if got := leadOf(total, c.spare); got != c.want {
+			t.Errorf("with %d to spare: %d, want %d", c.spare, got, c.want)
 		}
 	}
 }

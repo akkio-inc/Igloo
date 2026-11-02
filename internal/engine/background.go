@@ -13,6 +13,7 @@ import (
 	"github.com/duckdb/duckdb-go/v2"
 
 	"github.com/akkio-inc/igloo/internal/config"
+	"github.com/akkio-inc/igloo/internal/memlimit"
 )
 
 // A second DuckDB for heavy statements. DuckDB runs every statement of a
@@ -135,11 +136,17 @@ func openBackground(ctx context.Context, cfg config.Config, log *slog.Logger) (*
 //
 // What the background DuckDB holds it gives up only as fast as its spill files
 // take it, and what it cannot write out it keeps, while the first takes memory
-// faster than that. So the first gets what the background DuckDB has let go of
-// and backgroundLead more, and the background DuckDB is told to let go of that
-// much ahead of it. With the first free to take three quarters of the limit at
+// faster than that. So the first gets what the background DuckDB has let go of and
+// a lead more, and the background DuckDB is told to let go of that much ahead of
+// it, on a goroutine of its own, so that the first's limit follows what it lets go
+// of as it goes. The lead is what the machine has to spare past memlimit.High,
+// between an eighth and a quarter of the limit: on a machine with room to spare, a
+// dashboard's statements have their memory at once, and on one without, the two
+// keep to the limit. With the first free to take three quarters of the limit at
 // once, the two together held 134% of it beside a burst of heavy statements, and
-// the process 29.7 GiB of a machine's 30.8, until the kernel killed it.
+// the process 29.7 GiB of a machine's 30.8, until the kernel killed it. With an
+// eighth, and the first's limit waiting on what the second wrote to a slow disk,
+// dashboards' p95 beside a report went from 8.8 s to 23 s.
 //
 // Two DuckDBs hold more than their limits count, each its own metadata and what
 // its allocator keeps: a report over a billion rows and dashboards beside it took
@@ -156,9 +163,11 @@ const (
 	// backgroundMinShare is the least of the limit the background DuckDB
 	// keeps, as a divisor.
 	backgroundMinShare = 4
-	// backgroundLead is how far past what the background DuckDB has let go of
-	// the first may go while reading, as a divisor of the limit.
-	backgroundLead = 8
+	// backgroundLeadLeast and backgroundLeadMost bound how far past what the
+	// background DuckDB has let go of the first may go while reading, as divisors
+	// of the limit.
+	backgroundLeadLeast = 8
+	backgroundLeadMost  = 4
 	// foregroundIdle is how long after the first's last read its caches
 	// give way.
 	foregroundIdle = 30 * time.Second
@@ -281,10 +290,48 @@ func (e *Engine) balance(ctx context.Context) {
 		// the allocator hands back and takes again.
 		over := max(processRSS()-mainAll-bgHeld, e.bgOver.Load()-total/64, 0)
 		e.bgOver.Store(over)
-		wantMain, wantBg = balancedLimits(roomFor(total, over), mainHeld, bgHeld, reading)
+		room := roomFor(total, over)
+		wantMain, wantBg = balancedLimits(room, leadOf(room, spareMemory()), mainHeld, bgHeld, reading)
 	}
 	applyLimit(ctx, e, wantMain)
-	applyLimit(ctx, bg, wantBg)
+	e.applyBackgroundLimit(ctx, bg, wantBg)
+}
+
+// spareMemory is what the machine has left past what memlimit.Adapt keeps free.
+func spareMemory() int64 {
+	left, ok := memlimit.Available()
+	if !ok {
+		return 0
+	}
+	return left - memlimit.High(processMemory())
+}
+
+// leadOf is how far past what the background DuckDB has let go of the first may go,
+// of total, with spare to spare.
+func leadOf(total, spare int64) int64 {
+	return min(max(spare, total/backgroundLeadLeast), total/backgroundLeadMost)
+}
+
+// applyBackgroundLimit sets the background DuckDB's limit to want, as applyLimit
+// does. DuckDB writes out what it lets go of before it answers, which may take a
+// while, so one that lowers it runs apart, and balances again when it ends.
+func (e *Engine) applyBackgroundLimit(ctx context.Context, bg *Engine, want int64) {
+	have := bg.current.Load()
+	if have <= 0 || want >= have {
+		if !e.bgLowering.Load() {
+			applyLimit(ctx, bg, want)
+		}
+		return
+	}
+	if have-want < have/64 || !e.bgLowering.CompareAndSwap(false, true) {
+		return
+	}
+	e.bgLowers.Go(func() {
+		defer e.bgLowering.Store(false)
+		// Past the statement that called for it.
+		_ = bg.setLimit(context.WithoutCancel(ctx), want)
+		e.balanceNow()
+	})
 }
 
 // roomFor is what the two DuckDBs' limits share of total, when the process holds
@@ -295,10 +342,10 @@ func roomFor(total, over int64) int64 {
 
 // balancedLimits returns the two DuckDBs' limits, out of total, given what
 // they hold now: mainHeld, with its caches if reading says the first is
-// reading, and bgHeld, with its own.
-func balancedLimits(total, mainHeld, bgHeld int64, reading bool) (mainLimit, bgLimit int64) {
+// reading, and bgHeld, with its own. While the first reads, it may go lead past
+// what the background DuckDB has let go of.
+func balancedLimits(total, lead, mainHeld, bgHeld int64, reading bool) (mainLimit, bgLimit int64) {
 	if reading {
-		lead := total / backgroundLead
 		bgLimit = max(total-mainHeld-lead, total/backgroundMinShare)
 		// So that the two keep to total, the quarter the background DuckDB
 		// keeps is off the first's.

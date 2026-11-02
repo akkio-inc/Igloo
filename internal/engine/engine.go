@@ -115,7 +115,11 @@ type Engine struct {
 	bgStop       chan struct{}
 	bgUsers      atomic.Int64
 	bgWake       chan struct{}
-	balanceMu    sync.Mutex
+	// bgLowering says bgLowers runs a lowering of the background DuckDB's limit
+	// (see applyBackgroundLimit).
+	bgLowering atomic.Bool
+	bgLowers   sync.WaitGroup
+	balanceMu  sync.Mutex
 	// limit is the memory limit memlimit gives it, for the two together;
 	// current what it is now set to; fgRead when a statement that reads
 	// tables last ran in it, in Unix nanoseconds.
@@ -668,6 +672,7 @@ func (e *Engine) Close() error {
 	e.bgMu.Lock()
 	if e.bg != nil {
 		close(e.bgStop)
+		e.bgLowers.Wait()
 		err = e.bg.Close()
 		e.bg = nil
 	}
