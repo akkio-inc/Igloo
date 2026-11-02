@@ -350,6 +350,14 @@ func planOf(plan string, st planStats) (planEstimate, error) {
 	if w.unknown != "" {
 		return planEstimate{}, errors.New("no estimate of the rows of " + w.unknown)
 	}
+	if aggregated && w.scanned > 0 {
+		// DuckDB's guess at its groups, a client's to take on any way the
+		// statement runs: at a hundred times the data, an aggregate by a table's
+		// genre, of a few dozen rows, was estimated at 3,300 s of sending them
+		// on 2 workers or 16, which took 2 for 3,999 s as near 16's 3,375, and
+		// it took 449 s there and 25 s on 16.
+		result = min(result, aggregateKeeps*w.scanned)
+	}
 	out := planEstimate{parts: w.parts, work: w.work, bytes: w.bytes(), fields: result * float64(max(columns, 1))}
 	var joins, all float64
 	for _, p := range w.parts {

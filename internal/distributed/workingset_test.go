@@ -821,4 +821,32 @@ func TestPlanResult(t *testing.T) {
 	if p.fields != 4e9 || p.sorted < 1e9*24 || p.sorted != p.set {
 		t.Errorf("fields %g, sorted %g of %g", p.fields, p.sorted, p.set)
 	}
+
+	// An aggregate's result, by a table's column whose distinct count nothing
+	// knows and whose groups DuckDB takes for most of its input: no more than
+	// aggregateKeeps of its rows reach the client, so that the time to take them
+	// does not hide what more workers save. At a hundred times the data, a report
+	// that took 25 s on 16 workers was estimated at 3,375 s there and 3,999 s on
+	// 2, took 2 as within a fifth of the fastest, and took 449 to 619 s.
+	facts := &Table{Name: "facts", Rows: 3_600_000_000, Bytes: 36e9, Columns: []Column{{Name: "genre", Type: "VARCHAR"}, {Name: "viewer", Type: "VARCHAR"},
+		{Name: "seconds", Type: "BIGINT"}}}
+	st = newPlanStats([]*Stage{{Inputs: []Input{{Table: facts}}}}, 16)
+	byGenre := op("HASH_GROUP_BY", []map[string]any{op("PROJECTION", []map[string]any{op("ICEBERG_SCAN", nil, "Projections", []string{"genre", "viewer", "seconds"},
+		"Estimated Cardinality", "3600000000")}, "Projections", []string{"genre", "viewer", "seconds"}, "Estimated Cardinality", "3600000000")},
+		"Groups", []string{"#0"}, "Aggregates", []string{"count(DISTINCT #1)", "sum(#2)", "count_star()"}, "Estimated Cardinality", "2280000000")
+	if p, err = planOf(planJSON(t, byGenre), st); err != nil {
+		t.Fatal(err)
+	}
+	if want := aggregateKeeps * 3.6e9 * 4; p.fields != want {
+		t.Errorf("an aggregate's fields %g, want %g", p.fields, want)
+	}
+	x := features{bytes: 36e9, exchanged: 36e9, held: 36e9, rows: 1.45e10, levels: 3, stages: 3, planned: true, planSet: p.set, planBytes: p.bytes, planWork: p.work,
+		planKeeps: p.keeps, planFields: p.fields, planJoins: p.joins}
+	e := x.estimate(machine{cores: 16, threads: 16, memory: 44e9}, fleet{cores: 16, threads: 16, running: 16, most: 16, memory: 26 << 30})
+	if e.workers < 8 || e.large {
+		t.Errorf("%d workers, %.0f s: %s", e.workers, e.onWorkers, e.fleet)
+	}
+	if workers, explore, reason := choose(e, runs{}, false, DefaultThreshold, time.Now()); !workers || explore {
+		t.Errorf("on workers %v, trying %v: %s", workers, explore, reason)
+	}
 }
