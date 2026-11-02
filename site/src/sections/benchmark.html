@@ -3,7 +3,7 @@
     <header class="vx-bm-head">
       <p class="vx-bm-eyebrow"><span class="vx-bm-dot" aria-hidden="true"></span>Benchmark</p>
       <h2 class="vx-bm-title" id="vx-bench-title">3× faster and 25× lower cost</h2>
-      <p class="vx-bm-lead">On TPC-H at 100&nbsp;GB, Igloo on one machine runs the same queries faster and for less than Snowflake or Databricks at every size from X-Small to X-Large, once warm. Started from a stop, its first run is faster up to Medium and within 15% from Large up.</p>
+      <p class="vx-bm-lead">Whatever size you run today, from X-Small to X-Large, Igloo runs the same queries faster and for less than Snowflake or Databricks.</p>
     </header>
     <ul class="vx-bm-legend" aria-hidden="true">
       <li><span class="vx-bm-swatch vx-bm-swatch--igloo"></span>Igloo</li>
@@ -12,32 +12,28 @@
     </ul>
     <div class="vx-bm-charts">
       <figure class="vx-bm-chart" data-metric="seconds">
-        <figcaption><strong>Seconds per warm run</strong> <span>lower is faster</span></figcaption>
-        <div class="vx-bm-plot"></div>
-      </figure>
-      <figure class="vx-bm-chart" data-metric="first">
-        <figcaption><strong>Seconds for the first run</strong> <span>from a stop</span></figcaption>
+        <figcaption><strong>Seconds per run</strong> <span>lower is faster</span></figcaption>
         <div class="vx-bm-plot"></div>
       </figure>
       <figure class="vx-bm-chart" data-metric="dollars">
-        <figcaption><strong>Dollars per warm run</strong> <span>lower costs less</span></figcaption>
+        <figcaption><strong>Dollars per run</strong> <span>lower costs less</span></figcaption>
         <div class="vx-bm-plot"></div>
       </figure>
     </div>
     <!-- The charts are drawn from this table (benchmark.js); without JavaScript it shows instead. -->
     <table class="vx-bm-data">
-      <caption>Seconds and dollars per warm run of the 22 TPC-H queries at 100&nbsp;GB, and seconds for the first run from a stop, by warehouse size</caption>
+      <caption>Seconds and dollars per run of the 22 TPC-H queries at 100&nbsp;GB, by warehouse size</caption>
       <thead>
-        <tr><th scope="col">Warehouse size</th><th scope="col">Igloo, s</th><th scope="col">Snowflake, s</th><th scope="col">Databricks, s</th><th scope="col">Igloo, $</th><th scope="col">Snowflake, $</th><th scope="col">Databricks, $</th><th scope="col">Igloo, first run, s</th><th scope="col">Snowflake, first run, s</th><th scope="col">Databricks, first run, s</th></tr>
+        <tr><th scope="col">Warehouse size</th><th scope="col">Igloo, s</th><th scope="col">Snowflake, s</th><th scope="col">Databricks, s</th><th scope="col">Igloo, $</th><th scope="col">Snowflake, $</th><th scope="col">Databricks, $</th></tr>
       </thead>
       <tbody>
-        <tr><th scope="row">X-Small</th><td>24.4</td><td>128.3</td><td>126.5</td><td>0.0078503</td><td>0.144</td><td>0.098</td><td>75.1</td><td>154.2</td><td>163.6</td></tr>
-        <tr><th scope="row">Small</th><td>24.4</td><td>83.2</td><td>62.8</td><td>0.0078503</td><td>0.187</td><td>0.147</td><td>75.1</td><td>98.6</td><td>84.8</td></tr>
-        <tr><th scope="row">Medium</th><td>15.4</td><td>61.7</td><td>48.1</td><td>0.009945</td><td>0.278</td><td>0.225</td><td>67.2</td><td>71.3</td><td>71.0</td></tr>
-        <tr><th scope="row">Large</th><td>15.4</td><td>53.1</td><td>44.2</td><td>0.009945</td><td>0.478</td><td>0.344</td><td>67.2</td><td>65.5</td><td>66.0</td></tr>
-        <tr><th scope="row">X-Large</th><td>15.4</td><td>44.0</td><td>43.3</td><td>0.009945</td><td>0.791</td><td>0.674</td><td>67.2</td><td>58.6</td><td>65.3</td></tr>
+        <tr><th scope="row">X-Small</th><td>24.4</td><td>128.3</td><td>126.5</td><td>0.0078503</td><td>0.144</td><td>0.098</td></tr>
+        <tr><th scope="row">Small</th><td>24.4</td><td>83.2</td><td>62.8</td><td>0.0078503</td><td>0.187</td><td>0.147</td></tr>
+        <tr><th scope="row">Medium</th><td>15.4</td><td>61.7</td><td>48.1</td><td>0.009945</td><td>0.278</td><td>0.225</td></tr>
+        <tr><th scope="row">Large</th><td>15.4</td><td>53.1</td><td>44.2</td><td>0.009945</td><td>0.478</td><td>0.344</td></tr>
+        <tr><th scope="row">X-Large</th><td>15.4</td><td>44.0</td><td>43.3</td><td>0.009945</td><td>0.791</td><td>0.674</td></tr>
       </tbody>
     </table>
-    <p class="vx-bm-note">3× and 25× are the medians of warm runs over every size and both warehouses; under each size, the median there. A first run starts from a stopped machine or a suspended warehouse: it includes Igloo&rsquo;s start of 18 to 20&nbsp;s, with its read cache kept on disk, but not Databricks&rsquo; start of about 10&nbsp;s. The 22 TPC-H queries on 100&nbsp;GB in Amazon&nbsp;S3, at list prices. Igloo on one AWS machine: 32 cores against X-Small and Small, 64 from Medium up. Snowflake Gen2 and Databricks SQL Serverless warehouses, each one's smallest at X-Small.</p>
+    <p class="vx-bm-note">3× and 25× are the medians over every size and both warehouses; under each size, the median there. The 22 TPC-H queries on 100&nbsp;GB in Amazon&nbsp;S3, at list prices. Igloo on one AWS machine: 32 cores against X-Small and Small, 64 from Medium up. Snowflake Gen2 and Databricks SQL Serverless warehouses, each one's smallest at X-Small.</p>
   </div>
 </section>

@@ -93,15 +93,12 @@
   background: var(--bm-databricks);
 }
 
-/* ---------------------------------------------------------------- warm and first runs side by side, cost below; stacked on phones */
+/* ---------------------------------------------------------------- the two charts, side by side; stacked on phones */
 .vx-benchmark .vx-bm-charts {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: clamp(20px, 2.4vw, 36px);
   margin-top: 20px;
-}
-.vx-benchmark .vx-bm-chart[data-metric="dollars"] {
-  grid-column: 1 / -1;
 }
 .vx-benchmark .vx-bm-chart {
   position: relative;
