@@ -36,15 +36,16 @@ itself to run them on its 16 workers.
 Reruns returned the same rows. At a tenth of the data, both reports return the
 rows one machine returns.
 
-Losing a worker in the middle of a report costs about a third more time, and
-the report returns the same rows: the statement runs its parts again without
-that worker. A worker shut down gracefully, as on a Spot notice, costs about 3%.
-Here one of 16 workers stops about 40 s into a report at a tenth of the data:
+A machine lost with no warning can take a report up to about twice as long, and
+the report still returns the same rows: the statement runs its parts again
+without that worker. A graceful shutdown, such as a Spot notice, costs nothing
+measurable. Here one of 16 workers stops about 40 s into a report, at a tenth of
+the data:
 
 | How the worker stopped | Undisturbed | With it stopped |
 |---|---|---|
-| Machine force-stopped, with no notice | 116&nbsp;s | 153&nbsp;s (+31%) |
-| Shut down gracefully | 123&nbsp;s | 126&nbsp;s (+3%) |
+| Powered off, with no warning | 116.6 to 141.1&nbsp;s | 227.9&nbsp;s |
+| Shut down gracefully | 141.1&nbsp;s | 140.8&nbsp;s |
 
 The workers were `m7gd.2xlarge` (8 vCPUs) and the coordinator an `m7gd.4xlarge`
 (16 vCPUs), on demand in us-east-1. Cost is those machines at list price, $7.69
@@ -731,7 +732,7 @@ cheapest, so it never takes a way that another beats on both time and cost
 them). Where every way looks short of memory by its estimate it takes the one
 with the most memory, not the replica: tasks spill, and run again over more
 partitions with more memory each, and a report so estimated at a hundred
-times the data, which 16 workers took 521 to 825 s over, ran on the replica
+times the data, which 16 workers took 492 to 825 s over, ran on the replica
 until it was cancelled at 632 s, 302 GB spilled. A way costs its machines' seconds at their prices an hour
 (`IGLOO_WORKER_PRICE_PER_HOUR`, `IGLOO_LARGE_WORKER_PRICE_PER_HOUR` and
 `IGLOO_PRICE_PER_HOUR` for the replica, or else the list price of the

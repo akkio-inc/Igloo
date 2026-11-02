@@ -160,6 +160,7 @@
 	font-weight: 600;
 	line-height: 1.3;
 	letter-spacing: -0.01em;
+	text-wrap: balance;
 }
 .vx-features .vx-features__ttext {
 	margin: 8px 0 0;
