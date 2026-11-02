@@ -616,8 +616,19 @@ func TestPick(t *testing.T) {
 	if !ok || best.workers != 4 || best.large || !strings.Contains(why, "within a fifth of the fastest, 16 workers at 35 s, for 29% of its cost") {
 		t.Errorf("picked %s: %s", best, why)
 	}
-	if _, why, ok := pick(opts[3:], true); ok || why == "" {
+	if best, why, ok := pick(opts[3:], true); !ok || !best.large || !strings.Contains(why, "short of memory") {
 		t.Errorf("only a way that runs out of memory: %v %s", ok, why)
+	}
+	if _, why, ok := pick(nil, true); ok || why == "" {
+		t.Errorf("no way: %v %s", ok, why)
+	}
+	// Every way short of memory by its estimate: the one with the most, not
+	// none, nor the one that seems quickest.
+	short := spill{factor: 50, oom: true}
+	best, why, ok = pick([]option{{workers: 1, seconds: 100, spill: short}, {workers: 16, seconds: 900, spill: short}, {workers: 4, seconds: 300, spill: short},
+		{workers: 1, large: true, seconds: 30, spill: short}}, true)
+	if !ok || best.workers != 16 || best.large || !strings.Contains(why, "16 workers, 900 s") {
+		t.Errorf("every way short of memory: %v, picked %s: %s", ok, best, why)
 	}
 	opts[1].seconds = 43
 	if best, _, _ := pick(opts, true); best.workers != 16 {
@@ -887,7 +898,7 @@ func TestOrderWithoutLimit(t *testing.T) {
 	}{
 		{estimate{oneMachine: 30, onWorkers: 22, workers: 16}, "one machine should take 30 s, within the 60 s a statement must take for workers to be worth it"},
 		{estimate{oneMachine: 90, onWorkers: 70, workers: 16}, "workers should take 70 s, not 1.5 times as fast as one machine's 90 s"},
-		{estimate{oneMachine: 90, onWorkers: math.Inf(1)}, "no way on workers would finish"},
+		{estimate{oneMachine: 90, onWorkers: math.Inf(1)}, "there are no workers to run it"},
 	} {
 		if workers, _, reason := choose(c.e, runs{}, false, DefaultThreshold, now); workers || !strings.Contains(reason, c.want) {
 			t.Errorf("%+v: workers %v (%s), want %q", c.e, workers, reason, c.want)
