@@ -79,7 +79,7 @@ Snowflake databases are catalogs of their own, such as
 | `CREATE TABLE`, `CREATE TABLE AS SELECT` | Yes |
 | `INSERT`, `INSERT ... SELECT`, `INSERT ... RETURNING`, `MERGE INTO` | Yes |
 | `UPDATE`, `DELETE` | Yes |
-| `DROP TABLE`, `CREATE SCHEMA`, `DROP SCHEMA` | Yes; `CASCADE` drops only the table, see below |
+| `DROP TABLE`, `CREATE SCHEMA`, `DROP SCHEMA` | Yes; `DROP TABLE ... CASCADE` drops only the table, see below. `DROP SCHEMA ... CASCADE` does not drop a schema's tables and views yet: drop them first |
 | `ALTER TABLE ... RENAME TO`, `ADD COLUMN`, `DROP COLUMN` | Yes |
 | `CREATE OR REPLACE TABLE` | Yes; see below |
 | `CREATE [OR REPLACE] VIEW`, `DROP VIEW`, `ALTER VIEW ... RENAME TO` | Yes; see [views](#views) |
@@ -1158,23 +1158,27 @@ the others) are `BLOB`s, sent as `bytea`.
 
 ## Clients
 
-Tested with every release, by the test suite and `scripts/e2e.sh`, and
-weekly by `scripts/bi-e2e.sh` (marked BI):
+Run against Igloo by the Go tests and `scripts/e2e.sh`, which CI runs on
+pull requests and before each release but not on pushes to `main`, and
+weekly by `scripts/bi-e2e.sh` (marked BI). Each row runs the client itself,
+except where it says that another tool's calls are replayed: there the
+driver makes them, and the tool does not run
+([what each test runs](integrations.md)):
 
 | Client | Version | Notes |
 |---|---|---|
 | psql (libpq) | 17 | Including `\dt`, `\d`, `\d+`, `\dn`, `\l`, `\du`, `\password`, `\copy ... to` |
 | pgx (Go) | 5.11 | Simple protocol, and the extended protocol with named and unnamed statements |
 | psycopg (Python) | 3.3 | Including server-side prepared statements, server-side cursors, transactions and `copy()` out |
-| PostgreSQL JDBC | 42.7 | `DatabaseMetaData` as Tableau, Looker and DBeaver call it, result metadata of prepared and `LIMIT 0` queries, fetch-size paging |
-| Ibis (Python) | 10.8 | Through its PostgreSQL backend: `sql()`, `table()`, expressions, `to_pyarrow_batches()` |
+| PostgreSQL JDBC | 42.7 | `DatabaseMetaData` calls replayed as Tableau, Looker and DBeaver make them, result metadata of prepared and `LIMIT 0` queries, fetch-size paging |
+| Ibis (Python) | 10.8 | Replayed, not run: the Go tests send what its PostgreSQL backend needs (array parameters, temporary views in `pg_attribute`, `DEALLOCATE ALL`) |
 | ADBC Flight SQL driver (Python) | 1.12 | Over [Arrow Flight SQL](flight-sql.md): Arrow tables, pandas and polars, parameters, `adbc_get_objects` |
 | pyarrow.flight | 26.0 | Over Flight SQL: handshake, `get_flight_info`, `do_get` |
 | Arrow Flight SQL JDBC | 19.0 | Over Flight SQL: `getTables`, `getColumns`, prepared statements, `executeUpdate`, large results |
 | dbt Core with dbt-postgres | 1.12, 1.11 | Seeds, views, tables, incremental `append`, `merge` and `delete+insert`, snapshots, tests, `persist_docs`, `docs generate`, `source freshness`; see [integrations](integrations.md#dbt) |
 | SQLAlchemy with psycopg | 2.1 | The inspector and `MetaData.reflect`; pandas 3 `read_sql` and `to_sql` |
 | polars | 2.0 | `read_database` and `write_database` through SQLAlchemy, `read_database_uri` through connectorx 0.4 and ADBC 1.12 |
-| Npgsql (.NET, Power BI) | 4.0, 10.0 | BI: type loading, Power BI's navigator queries, `GetSchema`, `GetSchemaTable`, parameters |
+| Npgsql (.NET, Power BI) | 4.0, 10.0 | BI: type loading, Power BI's navigator queries replayed, `GetSchema`, `GetSchemaTable`, parameters |
 | Metabase | 0.64 | BI: sync, native and editor-built questions |
 | Apache Superset (psycopg2) | 6.1 | BI: datasets, time-series charts, SQL Lab |
 
@@ -1196,10 +1200,12 @@ the same users and grants; see [other engines](external-engines.md).
 
 ## Differences from PostgreSQL
 
-- The SQL dialect is DuckDB's (above). PostgreSQL-only features such as
-  stored procedures, triggers, sequences on Iceberg tables and
-  `LISTEN/NOTIFY` are not available. Row-level security is Snowflake's
-  kind: [row access policies](#policies-and-tags), not `CREATE POLICY`.
+- Igloo speaks PostgreSQL's wire protocol, not its SQL: PostgreSQL's drivers
+  and tools connect, and the SQL they send runs as DuckDB's (above), or
+  Snowflake's. PostgreSQL-only features such as stored procedures, triggers,
+  sequences on Iceberg tables and `LISTEN/NOTIFY` are not available.
+  Row-level security is Snowflake's kind: [row access
+  policies](#policies-and-tags), not `CREATE POLICY`.
 - Users, roles and passwords are managed with `CREATE USER`, `ALTER USER`,
   `DROP USER` and `SHOW USERS` (see [operations](operations.md#users-and-roles)),
   with Igloo's own options: `TYPE SERVICE`, `OWNER`, `EMAIL`, `LOGIN` and
@@ -1282,7 +1288,10 @@ the same users and grants; see [other engines](external-engines.md).
   changes (see [transactions](#transactions)).
 - `COPY (query) TO STDOUT` and `COPY table TO STDOUT` work, in text, CSV and
   binary format, with `HEADER`, `DELIMITER` and `NULL`; they need `SELECT`
-  on what they read, like the query. `COPY ... FROM STDIN` is not supported.
+  on what they read, like the query. `COPY ... FROM STDIN` is not supported
+  yet: load files with `COPY ... FROM` an allowed location.
+- `DROP SCHEMA ... CASCADE` does not drop a schema's tables and views yet:
+  drop them, then the schema.
 - `TO_CHAR` formats dates and timestamps; number formats are not supported.
 - `SET` of DuckDB settings that affect every session (memory, threads,
   secrets) is limited to admins, as are the read cache's functions and
