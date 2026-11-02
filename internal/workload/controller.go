@@ -59,6 +59,8 @@ type Controller struct {
 	// active are the statements running under the controller's limits,
 	// whose peaks SampleMemory keeps.
 	active map[*waiter]struct{}
+	// unseen are those of them nothing was known of when they started.
+	unseen map[*waiter]struct{}
 	// held is what DuckDB last held for running statements, as SampleMemory
 	// read it; zero before it has.
 	held int64
@@ -79,8 +81,10 @@ type waiter struct {
 	// apart says it runs in the second DuckDB (see Limits.Apart).
 	apart bool
 	// due is its place in line: when it came, plus how long it takes alone.
-	due   time.Time
-	ready chan struct{}
+	due time.Time
+	// started is when it started, for one that is unseen.
+	started time.Time
+	ready   chan struct{}
 	// admitted is set, under the controller's lock, once the statement
 	// holds its slot and reservation.
 	admitted bool
@@ -96,6 +100,7 @@ func NewController(budget int64) *Controller {
 		budget:  budget,
 		running: make(map[string]int),
 		active:  make(map[*waiter]struct{}),
+		unseen:  make(map[*waiter]struct{}),
 		waiting: prometheus.NewGauge(prometheus.GaugeOpts{
 			Name: "igloo_statements_waiting",
 			Help: "Statements waiting for the replica's or their role's concurrency or memory limit before they start.",
@@ -194,11 +199,10 @@ func (c *Controller) reservation(memory int64) int64 {
 func (c *Controller) admit() {
 	blocked := map[string]bool{}
 	memoryBlocked, replicaBlocked := false, false
-	full := c.full()
 	kept := c.queue[:0]
 	for _, w := range c.queue {
 		slotsFree := w.slots.Max == 0 || !blocked[w.slots.Key] && c.running[w.slots.Key] < w.slots.Max
-		memoryFree := w.memory == 0 && !(w.unseen && full) || w.memory > 0 && !memoryBlocked && c.reserved+w.memory <= c.budget && c.heldLeaves(w.memory)
+		memoryFree := w.memory == 0 && !(w.unseen && c.full()) || w.memory > 0 && !memoryBlocked && c.reserved+w.memory <= c.budget && c.heldLeaves(w.memory)
 		replicaFree := !w.counted || !replicaBlocked && c.replicaRunning < c.replicaMax
 		if slotsFree && memoryFree && replicaFree {
 			if w.slots.Max > 0 {
@@ -213,6 +217,10 @@ func (c *Controller) admit() {
 			} else {
 				// What SampleMemory reads is the first DuckDB's.
 				c.active[w] = struct{}{}
+			}
+			if w.unseen {
+				w.started = time.Now()
+				c.unseen[w] = struct{}{}
 			}
 			w.admitted = true
 			close(w.ready)
@@ -241,14 +249,33 @@ func (c *Controller) admit() {
 // count as nearly full.
 const fullShare = 0.75
 
+// unseenShare is the share of the budget a statement nothing is known of counts for
+// until unseenGrows has passed, by when what it holds shows in what DuckDB holds.
+const (
+	unseenShare = 0.25
+	unseenGrows = 30 * time.Second
+)
+
 // full reports whether DuckDB holds nearly all the budget for statements
-// running now: a statement nothing is known of then waits, since what it
+// running now, or will once those just started that nothing is known of hold
+// what they will: a statement nothing is known of then waits, since what it
 // holds would make those running spill. Reservations cannot say so the first
 // time a dashboard runs on a replica, when none of its statements has any:
 // its heavy ones started together and spilled, and it took half as long again
-// as the next time. The caller holds c.mu.
+// as the next time; five that started together at once when the memory emptied
+// held 39 GB of spill files between them, and two ran past 15 minutes. The caller
+// holds c.mu.
 func (c *Controller) full() bool {
-	return c.budget > 0 && len(c.active) > 0 && float64(c.held) >= fullShare*float64(c.budget)
+	if c.budget <= 0 || len(c.active) == 0 {
+		return false
+	}
+	share, now := float64(c.held)/float64(c.budget), time.Now()
+	for w := range c.unseen {
+		if now.Sub(w.started) < unseenGrows {
+			share += unseenShare
+		}
+	}
+	return share >= fullShare
 }
 
 // heldLeaves reports whether what DuckDB holds for the statements running leaves
@@ -300,6 +327,7 @@ func (c *Controller) release(w *waiter) {
 		c.apartRunning--
 	}
 	delete(c.active, w)
+	delete(c.unseen, w)
 	c.admit()
 }
 

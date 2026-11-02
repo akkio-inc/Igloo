@@ -311,8 +311,9 @@ a short one that comes after it would have ended, so nothing starves. A shape
 that took under a second of CPU in one of those runs does not wait at all: it
 neither counts against the replica's limit nor reserves memory. A statement of a
 shape not seen yet, of which nothing is known, waits while DuckDB holds three
-quarters of the memory for the statements running, so that a dashboard's heavy
-statements do not start together on its first run.
+quarters of the memory for the statements running, each such statement counting
+for a quarter of the memory until it has run 30 seconds or ended, so that a
+dashboard's heavy statements do not start together on its first run.
 
 On a dashboard's 96 queries at ten times the data, on 8 cores, the slowest tenth
 took 94 s rather than 102 and the slowest hundredth 127 s rather than 135, and

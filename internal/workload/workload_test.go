@@ -943,3 +943,64 @@ func TestRunsThatReadNothing(t *testing.T) {
 	c.ObserveEmpty("only")
 	seen("only", 0, 0, true)
 }
+
+// TestUnseenStartAFewAtATime checks that statements nothing is known of do not all
+// start at once while what they will hold cannot show yet, and that one that ends
+// leaves room for the next.
+func TestUnseenStartAFewAtATime(t *testing.T) {
+	const gb = int64(1) << 30
+	c := NewController(16 * gb)
+	c.LimitReplica(8)
+	ctx := context.Background()
+	// The first with nothing running; then until those just started make it full.
+	var running []func() (int64, bool)
+	for range 3 {
+		r, waited, err := c.Admit(ctx, Limits{Counted: true, Unseen: true})
+		if err != nil || waited != 0 {
+			t.Fatalf("waited %s: %v", waited, err)
+		}
+		running = append(running, r)
+	}
+	started := make(chan func() (int64, bool), 1)
+	go func() {
+		r, _, err := c.Admit(ctx, Limits{Counted: true, Unseen: true})
+		if err != nil {
+			t.Error(err)
+		}
+		started <- r
+	}()
+	select {
+	case <-started:
+		t.Fatal("a fourth started beside three just started")
+	case <-time.After(50 * time.Millisecond):
+	}
+	// One that knows what it reserves starts all the same.
+	known, waited, err := c.Admit(ctx, Limits{Counted: true})
+	if err != nil || waited != 0 {
+		t.Fatalf("a known statement waited %s: %v", waited, err)
+	}
+	known()
+	// One that ends leaves room.
+	running[0]()
+	var r func() (int64, bool)
+	select {
+	case r = <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the fourth did not start once one had ended")
+	}
+	r()
+	// Once they have had the time to grow, what is held says.
+	c.mu.Lock()
+	for w := range c.unseen {
+		w.started = time.Now().Add(-unseenGrows)
+	}
+	c.mu.Unlock()
+	c.sample(gb)
+	r, waited, err = c.Admit(ctx, Limits{Counted: true, Unseen: true})
+	if err != nil || waited != 0 {
+		t.Fatalf("with room, past their time to grow: waited %s: %v", waited, err)
+	}
+	r()
+	running[1]()
+	running[2]()
+}

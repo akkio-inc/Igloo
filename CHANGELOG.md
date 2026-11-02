@@ -1957,6 +1957,10 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   statements running leaves no room for it, whatever they reserved. A dashboard's
   324 queries at ten times the data took 1,945 s rather than 2,086, with a median
   of 392 s rather than 429.
+- Statements of a shape not seen yet start a few at a time, each counting for a
+  quarter of the memory until it has had 30 s to hold what it will, or has ended.
+  Five that started together when the memory emptied held 39 GB of spill files
+  between them, and two ran past 15 minutes.
 - A comparison with what a `CASE` of constants can never be, as of a view's `CASE`
   with a value it has none of, is false before DuckDB plans the statement, which
   then reads none of the tables behind it: a dashboard's statements that ask for
