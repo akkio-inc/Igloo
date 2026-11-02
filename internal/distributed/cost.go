@@ -1,6 +1,7 @@
 package distributed
 
 import (
+	"cmp"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -320,6 +321,11 @@ type features struct {
 	// workersWrite says tasks write the rows, on as many cores as they run
 	// on, and none cross to this replica (see writes.go).
 	workersWrite bool
+	// fillWidth is what a row a fill writes takes in memory, as its first
+	// rows took it (see fillWidth), zero where not measured; planRows the
+	// rows DuckDB's plan says its result has, and writeParts the partitions
+	// of the table it fills (see fillPartitions), zero for none or not known.
+	fillWidth, planRows, writeParts float64
 	// planFields are the fields of its result's rows, which a read sends
 	// the client (see clientFieldRate), and planSorted what its largest
 	// sort or window holds, by the plan (see riskyShare); planJoins the
@@ -412,10 +418,16 @@ func (x features) fillOut() float64 {
 	if x.planBytes > 0 {
 		read = float64(x.planBytes)
 	}
-	if !x.planned {
-		return read
+	out := read
+	if x.planned {
+		out = x.planKeeps * read
 	}
-	return x.planKeeps * read
+	if x.fillWidth > 0 && x.planRows > 0 {
+		// Or by what its rows take, measured, where an expression makes them
+		// wider than what it reads.
+		out = max(out, x.planRows*x.fillWidth*rowFileShare)
+	}
+	return out
 }
 
 // onWorkersWrite is what tasks on cores take to write a fill's rows.
@@ -437,30 +449,33 @@ const (
 	rowFileShare = 0.25
 )
 
-// rowBytes is the bytes a row a fill writes takes in memory, by what its scans
-// read a row; 0 where that is not known. What an expression makes of a row,
-// such as repeat(), no estimate says: a task bounds what it holds, and a fill
-// whose workers run out of memory runs elsewhere (see Plan.FitsHere).
+// rowBytes is the bytes a row a fill writes takes in memory: by what its scans
+// read a row, or as its first rows took it, where measured and more (see
+// fillWidth): what its scans read says nothing of what an expression makes of a
+// row, as repeat() does. It is 0 where neither is known.
 func (x features) rowBytes() float64 {
 	if x.rows <= 0 {
-		return 0
+		return x.fillWidth
 	}
 	read := float64(x.bytes)
 	if x.planBytes > 0 {
 		read = float64(x.planBytes)
 	}
-	return read / x.rows / rowFileShare
+	return max(read/x.rows/rowFileShare, x.fillWidth)
 }
 
 // writeFits reports whether a worker's task of f holds a fill's rows as it
-// writes them: at least what its threads' vectors take, within half of the
-// task's share of the worker's memory.
+// writes them: at least what its DuckDB threads' vectors take, within half of
+// the task's share of the worker's memory. Its threads, not its cores, where it
+// says: workers of 16 cores and 2 threads, which wrote rows of 10.8 KB in
+// tasks of 953 MiB, were taken for tasks that could not, and their rows came to
+// the replica, whose tasks ran out of memory sending them.
 func (x features) writeFits(f fleet) bool {
 	width := x.rowBytes()
 	if width <= 0 || f.memory <= 0 {
 		return true
 	}
-	threads := float64(max(f.threads, f.cores, 1))
+	threads := float64(max(cmp.Or(f.threads, f.cores), 1))
 	share := float64(f.memory) / float64(taskSlots(f.cores, f.memory))
 	return writeVectorRows*writeVectorHeld*threads*width <= share/2
 }
@@ -526,12 +541,85 @@ func (co *Coordinator) fillPartitions(ctx context.Context, env Env, query string
 	return partitionsOf(half, all, sampled, x.rows)
 }
 
+// fillWidthRows are the first rows of a fill's query whose width stands for its
+// rows': a vector of DuckDB's, which most reads give at once.
+const fillWidthRows = 2048
+
+// fillWidth is what a row of query, a fill's source, takes in memory, as its
+// first rows take it in env's session: its strings' bytes, and its other values
+// by their types; zero if the session cannot say within partitionSampleTime.
+// No type says what an expression makes of a row: repeat(l_comment, 400) makes
+// 10.8 KB of each row of a table of 205 MB, 65 GB of 6 million rows, which auto
+// mode took for a copy of the table.
+func (co *Coordinator) fillWidth(ctx context.Context, env Env, query string) float64 {
+	ve, ok := env.(ValueEnv)
+	if !ok {
+		return 0
+	}
+	ctx, cancel := context.WithTimeout(ctx, partitionSampleTime)
+	defer cancel()
+	cols, err := env.Describe(ctx, query)
+	if err != nil || len(cols) == 0 {
+		return 0
+	}
+	names, widths := make([]string, len(cols)), make([]string, len(cols))
+	for i, c := range cols {
+		names[i] = fmt.Sprintf("c%d", i)
+		widths[i] = valueWidth(names[i], c.Type)
+	}
+	v, err := ve.Value(ctx, fmt.Sprintf("SELECT avg(%s) FROM (SELECT * FROM (%s) LIMIT %d) AS t(%s)", strings.Join(widths, " + "), query,
+		fillWidthRows, strings.Join(names, ", ")))
+	if err != nil {
+		co.log.Debug("could not measure a fill's rows", "err", err)
+		return 0
+	}
+	w, _ := v.(float64)
+	return w
+}
+
+// valueWidth is SQL of what a value of col, of DuckDB type typ, takes in memory:
+// a string's 16 bytes and its text, a nested value's as its text has it, and
+// any other its type's width.
+func valueWidth(col, typ string) string {
+	t := strings.ToUpper(strings.TrimSpace(typ))
+	switch {
+	case strings.HasPrefix(t, "VARCHAR"):
+		return fmt.Sprintf("(16 + coalesce(strlen(%s), 0))", col)
+	case t == "BLOB":
+		return fmt.Sprintf("(16 + coalesce(octet_length(%s), 0))", col)
+	case strings.HasSuffix(t, "]"), strings.HasPrefix(t, "MAP"), strings.HasPrefix(t, "STRUCT"), strings.HasPrefix(t, "UNION"), t == "JSON":
+		return fmt.Sprintf("(16 + coalesce(strlen(CAST(%s AS VARCHAR)), 0))", col)
+	}
+	return strconv.FormatFloat(memoryBytes(t), 'f', -1, 64)
+}
+
 // replicaHoldsParts reports whether a replica of memory and threads holds what it
 // writes of parts partitions: a row group of each partition on each thread. 128
 // partitions of 16 columns took a replica of 5.5 GiB on 4 threads out of memory, where
 // workers wrote them.
 func (x features) replicaHoldsParts(parts float64, memory int64, threads int) bool {
-	return memory <= 0 || parts*parquetRowGroupRows*x.rowBytes()*float64(max(threads, 1)) <= float64(memory)
+	return memory <= 0 || x.writeHeldOf(parts, threads) <= memoryShare*float64(memory)
+}
+
+// writeHeld is what this replica holds as it writes a fill's rows on threads: a
+// row group of each partition on each thread, as many rows as there are at most,
+// which DuckDB's Parquet writer holds whole and cannot spill. A copy of 6 million
+// rows of 10.8 KB held 13 GB on 8 threads, past the replica's limit of 10.4 GiB,
+// and failed; on workers, whose tasks bound their row groups by bytes, it wrote.
+func (x features) writeHeld(threads int) float64 {
+	if !x.fill {
+		return 0
+	}
+	return x.writeHeldOf(x.writeParts, threads)
+}
+
+// writeHeldOf is writeHeld of a fill of parts partitions.
+func (x features) writeHeldOf(parts float64, threads int) float64 {
+	rows := max(parts, 1) * parquetRowGroupRows
+	if x.planRows > 0 {
+		rows = min(rows, x.planRows)
+	}
+	return float64(max(threads, 1)) * rows * x.rowBytes()
 }
 
 // partitionFilesFit reports whether the files workers would write of a fill of parts
@@ -673,6 +761,9 @@ func (x features) estimate(m machine, f fleet) estimate {
 	set := x.set()
 	e.farBeyond = m.memory > 0 && set > farBeyondRatio*memoryShare*float64(m.memory)
 	within := x.lenience()
+	// A fill's row groups as this replica writes them, which DuckDB cannot
+	// spill: past its room, it runs out of memory, however its query fares.
+	held := x.writeHeld(max(m.threads, m.cores))
 	switch {
 	case fits && !(x.planned && set > footprintTrust*float64(m.allocated) && set > slightSpill*memoryShare*float64(m.memory)):
 		// What a run of its shape allocated here, unless DuckDB's plan holds
@@ -680,12 +771,16 @@ func (x features) estimate(m machine, f fleet) estimate {
 		// that ran here at a tenth of the data allocated 53 GB, and its plan
 		// at a hundred times held 250 GB. It held that and completed: it
 		// fits.
-		set, within = float64(m.allocated), math.Inf(1)
+		set, within, held = float64(m.allocated), math.Inf(1), 0
 	case m.ranHere:
 		// It ran here at its memory limit, holding at least that.
 		set = max(set, float64(m.allocated))
 	}
-	e.local = spillLenient(set, m.memory, within)
+	e.local = spillLenient(set+held, m.memory, within)
+	if m.memory > 0 && held > memoryShare*float64(m.memory) {
+		e.farBeyond, e.local.oom = true, true
+		e.local.factor = max(e.local.factor, spillOn(set+held, m.memory).factor)
+	}
 	e.spills = e.local.factor > 1
 	e.oneMachine *= e.local.factor
 	// A fill's rows, written here wherever the query runs; a read's, sent

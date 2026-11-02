@@ -497,6 +497,9 @@ func (co *Coordinator) planOn(ctx context.Context, query string, env Env, mode M
 	opts.bitmaps = co.bitmapsOn(ctx, env)
 	fills, fill := env.(Fills)
 	opts.writes = fill && fills.Fill() && fills.FillWrites() && co.workersMayWrite()
+	// What a fill costs is in its rows, which no size of its tables says: a copy of
+	// 205 MB of a table, each row's text repeated 400 times, writes 65 GB.
+	opts.fill = fill && fills.Fill()
 	opts.sizes, opts.taskMemory, opts.workers = sizes, taskMemory(ws), len(ws)
 	if sizes == nil {
 		// Relations measured large lately are planned as such at once.
@@ -600,28 +603,34 @@ func (co *Coordinator) planOn(ctx context.Context, query string, env Env, mode M
 	f := co.fleet(ctx, ws, plan.mayStart, mode == ModeAuto)
 	x := planFeatures(plan.Stages)
 	r, found := co.history.get(plan.Key)
-	if mode == ModeAuto {
+	x.fill = fill && fills.Fill()
+	if mode == ModeAuto || x.fill {
 		// The working set by DuckDB's plan of the statement, as the
-		// session plans it, read once for a statement run again.
+		// session plans it, read once for a statement run again; a forced
+		// fill's too, for whether this replica could write it after its
+		// workers (see Plan.FitsHere).
 		p, ok := co.planSet(ctx, env, query, plan.Stages, r)
 		if ok && !dry && r.planSet != p.set {
 			co.history.update(plan.Key, func(r *runs) {
 				r.planSet, r.planBytes, r.planWork, r.planKeeps, r.planFields, r.planSorted = p.set, p.bytes, p.work, p.keeps, p.fields, p.sorted
-				r.planJoins = p.joins
+				r.planJoins, r.planRows = p.joins, p.rows
 			})
 		}
 		x.planSet, x.planParts, x.planned = p.set*co.memory.scale(), p.parts, ok
 		x.planBytes, x.planWork, x.planKeeps = p.bytes, p.work, p.keeps
-		x.planFields, x.planSorted, x.planJoins = p.fields, p.sorted*co.memory.scale(), p.joins
+		x.planFields, x.planSorted, x.planJoins, x.planRows = p.fields, p.sorted*co.memory.scale(), p.joins, p.rows
 	}
-	x.fill = fill && fills.Fill()
+	if x.fill && !dry && !(x.planned && x.planKeeps <= aggregateKeeps) {
+		// What its rows take, which their types do not say (see rowBytes).
+		x.fillWidth = co.fillWidth(ctx, env, query)
+	}
 	// Workers write the rows where their tasks hold them and there are
 	// enough to be worth their files.
 	x.workersWrite = opts.writes && slices.ContainsFunc(plan.Stages, func(s *Stage) bool { return s.writeSQL != "" }) &&
 		(opts.force || x.fillOut() >= co.minWorkerWrite())
 	if x.workersWrite && !dry {
 		parts := co.fillPartitions(ctx, env, query, x)
-		plan.writeParts = int64(parts)
+		plan.writeParts, x.writeParts = int64(parts), parts
 		if mode == ModeAuto && !co.partitionFilesFit(parts, x, f) {
 			x.workersWrite = false
 		}
@@ -786,7 +795,7 @@ func (co *Coordinator) fleet(ctx context.Context, ws []*worker, mayStart, large 
 func (co *Coordinator) planSet(ctx context.Context, env Env, query string, stages []*Stage, r runs) (planEstimate, bool) {
 	if r.planSet > 0 {
 		return planEstimate{set: r.planSet, bytes: r.planBytes, work: r.planWork, keeps: r.planKeeps, fields: r.planFields, sorted: r.planSorted,
-			joins: r.planJoins}, true
+			joins: r.planJoins, rows: r.planRows}, true
 	}
 	ex, can := env.(Explainer)
 	if !can {

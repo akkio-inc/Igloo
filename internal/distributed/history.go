@@ -74,6 +74,7 @@ type runs struct {
 	planFields float64
 	planSorted float64
 	planJoins  float64
+	planRows   float64
 	// localMemory, distMemory and largeMemory are the memory its runs had:
 	// the replica's limit on one machine, the smallest worker's on workers,
 	// the large worker's on it; zero when not known. Runs under other

@@ -666,7 +666,7 @@ func noWriteReason(table, may bool, stages []*Stage, x features, f fleet) string
 	case !slices.ContainsFunc(stages, func(s *Stage) bool { return s.writeSQL != "" }):
 		return "the statement's last step needs its rows together"
 	case !x.writeFits(f):
-		return fmt.Sprintf("its rows take about %d KB each, by %d rows in %d bytes of files, more than a worker's task holds of %d bytes of memory",
+		return fmt.Sprintf("its rows take about %d KB each, by %d rows in %d bytes of files or as its first rows took them, more than a worker's task holds of %d bytes of memory",
 			int64(x.rowBytes())>>10, int64(x.rows), x.bytes, f.memory)
 	}
 	return "unknown"

@@ -430,7 +430,7 @@ func (pl *planner) keyInputs(c *candidate) error {
 	if err := pl.outerPairs(c); err != nil {
 		return err
 	}
-	if !pl.opts.force && !c.relation && largest < pl.opts.minBytes {
+	if !pl.opts.force && !pl.opts.fill && !c.relation && largest < pl.opts.minBytes {
 		return unsupported("its inputs are small (%d bytes)", largest)
 	}
 	if len(c.keyed) == 0 {

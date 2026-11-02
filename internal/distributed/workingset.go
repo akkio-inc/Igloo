@@ -292,6 +292,8 @@ type planEstimate struct {
 	// the client; sorted is what its largest sort or window holds; joins
 	// the share of the working set its joins' hash tables hold.
 	fields, sorted, joins float64
+	// rows are its result's rows, which a fill writes.
+	rows float64
 }
 
 // maxKeeps is the most rows a result is taken to have for each row its
@@ -358,7 +360,7 @@ func planOf(plan string, st planStats) (planEstimate, error) {
 		// it took 449 s there and 25 s on 16.
 		result = min(result, aggregateKeeps*w.scanned)
 	}
-	out := planEstimate{parts: w.parts, work: w.work, bytes: w.bytes(), fields: result * float64(max(columns, 1))}
+	out := planEstimate{parts: w.parts, work: w.work, bytes: w.bytes(), fields: result * float64(max(columns, 1)), rows: result}
 	var joins, all float64
 	for _, p := range w.parts {
 		op := strings.ToUpper(p.op)

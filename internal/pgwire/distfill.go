@@ -134,12 +134,13 @@ func (s *Server) fillOn(f *stagedFill, src *statement, here func(context.Context
 	if err == nil || !f.again(err) {
 		return rows, p, false, err
 	}
-	if p.key == "" {
-		return rows, p, true, err
+	// It ran out of memory here: on workers, under what is left of the
+	// statement's time, whether auto mode chose this replica or did not
+	// plan it for workers at all, as for a table it took for small whose
+	// rows a fill makes far larger.
+	if p.key != "" {
+		s.dist.ObserveOutOfMemory(p.key)
 	}
-	// It ran out of memory here, where auto mode chose to run it: on
-	// workers, under what is left of the statement's time.
-	s.dist.ObserveOutOfMemory(p.key)
 	s.log.Warn("a fill ran out of memory on this replica; running its query on workers", "user", user.Name, "key", p.key, "err", err)
 	since := time.Now()
 	n, q, done, werr := s.fillOnWorkers(f.ctx, sess, src, distributed.ModeOn, from)

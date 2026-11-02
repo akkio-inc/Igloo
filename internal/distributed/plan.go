@@ -280,8 +280,10 @@ type view struct {
 
 // planOptions decide when a statement is worth distributing.
 type planOptions struct {
-	// force distributes whatever the tables' sizes.
-	force bool
+	// force distributes whatever the tables' sizes; so does fill, for a
+	// statement that fills a table, whose cost its rows decide (see
+	// features.fillOut).
+	force, fill bool
 	// minBytes is the smallest split table worth distributing.
 	minBytes int64
 	// maxBroadcast caps the total size of the tables every worker reads in
@@ -2094,7 +2096,7 @@ func (pl *planner) chooseSplit(c *candidate) error {
 			second = u
 		}
 	}
-	if !pl.opts.force && !c.relation && c.split.table.Bytes < pl.opts.minBytes {
+	if !pl.opts.force && !pl.opts.fill && !c.relation && c.split.table.Bytes < pl.opts.minBytes {
 		return unsupported("%s is small (%d bytes)", c.split.table, c.split.table.Bytes)
 	}
 	if broadcast+c.wholeBytes <= pl.opts.maxBroadcast {

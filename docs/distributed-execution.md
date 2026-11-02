@@ -368,10 +368,24 @@ the workers at 400 MB/s. So a copy workers write runs there where they are
 faster, and one the coordinator would write takes about as long either way
 and stays on the replica unless workers are faster still by the margin auto
 mode asks of any statement.
+No size of a fill's tables says what its rows take where an expression makes
+them: `repeat(l_comment, 400)` makes 10.8 KB of each row of a TPC-H lineitem
+of 205 MB, 65 GB of 6 million rows. So auto mode reads the first 2,048 rows of a
+fill's query, for up to 3 s, unless it is an aggregate's: what their strings
+take, and their other values by their types. Rows that take more than what the
+query reads say more of a fill's bytes, and of what the replica would hold
+writing them: a row group of 122,880 rows of each partition on each of its
+threads, which DuckDB's Parquet writer holds whole and cannot spill. Past the
+replica's room, the fill runs on workers, however small its tables: that copy
+held 13 GB on 8 threads of a replica of 10.4 GiB, and ran out of memory on one of
+7 GiB four times of four, beside 3 workers on one machine of 16 GB; its workers'
+tasks, which bound their row groups by bytes, wrote it in 17 to 23 s. A fill is
+planned for workers whatever its tables' sizes, and auto mode then decides.
 Fills keep their own history, apart from reads of the same query. A fill
 auto mode runs on the replica is guarded as a read is (see [when](#when)):
 past its time, or once it runs out of memory there, its query runs on
-workers, into the table its run on the replica left empty. One whose
+workers, into the table its run on the replica left empty; one that runs out
+of memory there goes to workers whatever kept it on the replica. One whose
 workers run out of memory goes on in passes on the replica where its
 query allows (see [aggregates too large for memory](sql.md#aggregates-too-large-for-memory)). A fill from a table
 masking or row access policies apply to, directly or through a view,
