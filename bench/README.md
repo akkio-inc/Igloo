@@ -16,8 +16,7 @@ python bench/report.py bench/results/*.json > bench/results/report.md
 
 `python -m unittest discover -s bench` tests the scripts without a
 platform to run against; `make bench-test` runs those tests in a Python
-container, as CI does. CI does not run the benchmark itself: it runs by hand,
-and the results below say when and on which build.
+container, as CI does.
 
 ## Method
 

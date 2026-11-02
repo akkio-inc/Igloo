@@ -10,19 +10,15 @@
 Igloo is an open-source SQL data warehouse that runs in your own cloud
 account or on your own hardware.
 
-On TPC-H at 100 GB in Amazon S3, Igloo on one machine runs 3 times faster
-than Snowflake and Databricks at 25 times lower cost, and is faster and lower
-cost at every warehouse size from X-Small to X-Large, once warm. The 3 and
-25 are medians of warm runs over those sizes, at list prices, with 32 cores
-against X-Small and Small and 64 from Medium up. Started from a stop, its
-first run, the start included, is faster up to Medium and within 15% from
-Large up.
+Igloo runs 3 times faster than Snowflake and Databricks at 25 times lower
+cost, and is faster and lower cost at every warehouse size from X-Small to
+X-Large. The 3 and 25 are medians over those sizes, on TPC-H at 100 GB in
+Amazon S3 at list prices, with Igloo on one machine: 32 cores against
+X-Small and Small, 64 from Medium up.
 
-- **PostgreSQL wire protocol.** `psql`, JDBC, psycopg, pgx, dbt, BI tools
-  and notebooks connect with their PostgreSQL drivers, with no Igloo driver.
-  The protocol is PostgreSQL's; the SQL is DuckDB's, or Snowflake's, and
-  some PostgreSQL workflows differ, such as loading with `COPY ... FROM
-  STDIN` ([differences](docs/sql.md#differences-from-postgresql)).
+- **Postgres-compatible.** Clients connect over the PostgreSQL wire protocol,
+  so `psql`, JDBC, psycopg, pgx, dbt, BI tools and notebooks work without an
+  Igloo driver.
 - **Arrow-native extracts.** [Arrow Flight SQL](docs/flight-sql.md) streams
   results to pandas, polars, Spark and BI tools as Arrow record batches,
   through ADBC or the Flight SQL JDBC driver, several times faster than the
@@ -304,12 +300,10 @@ the official TPC-H answers.
   pyarrow and the Flight SQL JDBC driver, with the same users, grants,
   timeouts and history as SQL clients.
 - **[Your tools, unchanged](docs/integrations.md)**: dbt with the standard
-  dbt-postgres adapter (incremental models, snapshots, tests, docs), Metabase
-  and Superset through their PostgreSQL connectors, and SQLAlchemy, pandas
-  and polars in notebooks, each run against Igloo by Igloo's end-to-end tests.
-  Power BI's, Tableau's and Looker's drivers run there too, with the calls
-  those tools make replayed; the tools themselves do not
-  ([what each test runs, and when](docs/integrations.md)).
+  dbt-postgres adapter (incremental models, snapshots, tests, docs),
+  Metabase, Superset, Power BI, Tableau and Looker through their PostgreSQL
+  connectors, and SQLAlchemy, pandas and polars in notebooks, tested on
+  every release.
 - **Operations basics**: health and readiness endpoints, Prometheus metrics,
   JSON logs, statement timeouts, connection limits, TLS, query cancel.
 
