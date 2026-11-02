@@ -405,6 +405,13 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
 
 ### Loading and scheduling
 
+- `COPY table FROM STDIN`, in PostgreSQL's text, CSV and binary formats, so
+  psql's `\copy`, psycopg's `copy`, pgx's `CopyFrom` and a `pg_dump`'s data
+  load. It is the user's own `INSERT`, checked before the client sends the
+  rows, and fails whole with the line and column of a value that does not
+  convert. psql loads a dump's settings too: `set_config('search_path', ...)`
+  and the settings Igloo has no use for, as `row_security`.
+
 - `COPY INTO table FROM 'location'` loads CSV, TSV, Parquet, JSON and
   NDJSON files, gzip- or zstd-compressed or not (detected from the name or
   the file), from the warehouse and `IGLOO_ALLOWED_LOCATIONS`: a prefix, a

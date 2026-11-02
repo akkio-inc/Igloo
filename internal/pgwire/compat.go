@@ -10,6 +10,8 @@ import (
 	"time"
 	"unicode"
 
+	"github.com/jackc/pgx/v5/pgtype"
+	wire "github.com/jeroenrinzema/psql-wire"
 	"github.com/jeroenrinzema/psql-wire/codes"
 	pgerror "github.com/jeroenrinzema/psql-wire/errors"
 
@@ -20,21 +22,60 @@ import (
 )
 
 // postgresOnlySettings are session settings Postgres drivers send when they
-// connect but DuckDB does not have. Igloo accepts them as no-ops so those
-// drivers can connect; the values Igloo reports at login already match what
-// the drivers ask for.
+// connect, and pg_dump writes at the top of a dump, but DuckDB does not have.
+// Igloo accepts them as no-ops so those drivers can connect and dumps load;
+// the values Igloo reports at login already match what they ask for, or
+// change nothing Igloo has (row_security: Igloo's row access policies apply
+// whatever it is set to).
 var postgresOnlySettings = map[string]bool{
 	"application_name":                    true,
 	"bytea_output":                        true,
+	"check_function_bodies":               true,
 	"client_encoding":                     true,
 	"client_min_messages":                 true,
 	"datestyle":                           true,
+	"default_table_access_method":         true,
+	"default_tablespace":                  true,
+	"default_with_oids":                   true,
 	"extra_float_digits":                  true,
 	"idle_in_transaction_session_timeout": true,
 	"intervalstyle":                       true,
 	"jit":                                 true,
 	"lock_timeout":                        true,
+	"row_security":                        true,
 	"standard_conforming_strings":         true,
+	"transaction_timeout":                 true,
+	"xmloption":                           true,
+}
+
+// setConfig matches SELECT [pg_catalog.]set_config('name', 'value', local),
+// as pg_dump writes to set the search path.
+var setConfig = regexp.MustCompile(`(?is)^\s*SELECT\s+(?:pg_catalog\.)?set_config\s*\(\s*'([a-z_.]+)'\s*,\s*'((?:[^']|'')*)'\s*,\s*(?:true|false)\s*\)\s*;?\s*$`)
+
+// setConfigCommand carries out set_config(name, value, local) as SET name =
+// value, which it is in PostgreSQL, and answers with the value. An empty
+// search path, which a dump sets so that only its qualified names resolve,
+// is the session's default one, by which they resolve too.
+func (s *Server) setConfigCommand(sess *session, text string) (wire.PreparedStatements, bool) {
+	m := setConfig.FindStringSubmatch(stripComments(text))
+	if m == nil {
+		return nil, false
+	}
+	name, value := strings.ToLower(m[1]), strings.ReplaceAll(m[2], "''", "'")
+	set := "SET " + name + " = " + quoteLiteral(value)
+	if name == "search_path" && strings.TrimSpace(value) == "" {
+		set = "RESET search_path"
+	}
+	cols := wire.Columns{{Name: "set_config", Oid: pgtype.TextOID, Width: -1}}
+	return wire.Prepared(wire.NewStatement(func(ctx context.Context, w wire.DataWriter, _ []wire.Parameter) error {
+		if err := s.runScriptStatement(ctx, set, &innerWriter{DataWriter: w}); err != nil {
+			return err
+		}
+		if err := w.Row([]any{value}); err != nil {
+			return err
+		}
+		return w.Complete("SELECT 1")
+	}, wire.WithColumns(cols))), true
 }
 
 var (

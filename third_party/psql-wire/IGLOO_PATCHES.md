@@ -53,6 +53,9 @@ otherwise unchanged except for these patches:
   DuckDB stream the statement's result: a portal with a row limit suspends
   the statement, and the client may run others on the session before it
   reads on, which would end a result DuckDB streams.
+- `igloo_writer.go`: `CopyInColumns`, which starts `COPY ... FROM STDIN` with
+  a CopyInResponse for as many columns as the table it fills, as a
+  statement that returns no rows describes none.
 
 Drop this copy and the `replace` directive once a psql-wire release includes
 equivalent fixes.

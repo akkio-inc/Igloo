@@ -1708,6 +1708,17 @@ func (s *Server) parse(ctx context.Context, q wire.Query) (wire.PreparedStatemen
 	if ps, ok := s.sessionResetCommand(sess, q.Query); ok {
 		return ps, nil
 	}
+	if ps, ok := s.setConfigCommand(sess, q.Query); ok {
+		return ps, nil
+	}
+	// COPY ... FROM STDIN, in either dialect: it is PostgreSQL's.
+	if c, ok, err := parseCopyFromStdin(q.Query); ok {
+		if err != nil {
+			s.recordQuery(sess, queryRecord{text: q.Query, start: time.Now(), err: err, rows: -1})
+			return nil, err
+		}
+		return s.copyFromStdinStatement(sess, q.Query, c), nil
+	}
 	if ps, ok := s.dialectCommand(sess, q.Query); ok {
 		return ps, nil
 	}

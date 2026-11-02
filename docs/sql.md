@@ -87,6 +87,7 @@ Snowflake databases are catalogs of their own, such as
 | `ALTER TABLE`, `VIEW`, `SCHEMA ... OWNER TO` | Yes; see [the catalog](catalog.md#owners) |
 | `CREATE TEMP TABLE`, `CREATE TEMP VIEW` | Yes; held in memory for the session only |
 | `COPY INTO table FROM 'location'` | Yes, outside transactions; see [loading](loading.md#copy-into) |
+| `COPY table [(columns)] FROM STDIN` | Yes, in text, CSV and binary; see [loading](loading.md#copy-from-stdin) |
 | `CREATE [OR REPLACE] MATERIALIZED VIEW`, `REFRESH MATERIALIZED VIEW` | Yes, outside transactions; see [materialized views](loading.md#materialized-views) |
 | `CREATE [OR REPLACE] DYNAMIC TABLE`, `ALTER DYNAMIC TABLE ... REFRESH` | Yes, outside transactions; see [dynamic tables](loading.md#dynamic-tables) |
 | `CREATE [OR REPLACE] TABLE ... CLONE`, `CREATE [OR REPLACE] SCHEMA ... CLONE` | Yes, outside transactions; see [clones](#clones) |
@@ -1283,7 +1284,8 @@ the same users and grants; see [other engines](external-engines.md).
   changes (see [transactions](#transactions)).
 - `COPY (query) TO STDOUT` and `COPY table TO STDOUT` work, in text, CSV and
   binary format, with `HEADER`, `DELIMITER` and `NULL`; they need `SELECT`
-  on what they read, like the query. `COPY ... FROM STDIN` is not supported.
+  on what they read, like the query. `COPY table FROM STDIN` loads what the
+  client sends ([loading](loading.md#copy-from-stdin)).
 - `TO_CHAR` formats dates and timestamps; number formats are not supported.
 - `SET` of DuckDB settings that affect every session (memory, threads,
   secrets) is limited to admins, as are the read cache's functions and

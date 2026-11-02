@@ -1956,6 +1956,41 @@ else
   fail "SHOW CONNECTIONS before the restart: $got"
 fi
 
+echo "PostgreSQL's COPY FROM STDIN and pg_dump"
+psql_admin -c "CREATE SCHEMA pgload" -c "CREATE TABLE pgload.notes (id INTEGER, body VARCHAR)" \
+  -c "GRANT INSERT ON SCHEMA pgload TO walt" >/dev/null
+got="$(printf '1\talpha\n2\t\\N\n3\tback\\\\slash\n' | psql_as walt walt-password-1 -c '\copy pgload.notes FROM STDIN')"
+if [ "$got" = "COPY 3" ]; then pass "psql's \\copy, in text"; else fail "\\copy text: $got"; fi
+got="$(printf 'id,body\n4,"comma, and ""quotes"""\n5,\n' | psql_as walt walt-password-1 -c '\copy pgload.notes FROM STDIN WITH (FORMAT csv, HEADER)')"
+if [ "$got" = "COPY 2" ]; then pass "psql's \\copy, in CSV"; else fail "\\copy CSV: $got"; fi
+expect "the rows as sent" '1|alpha|f
+2||t
+3|back\slash|f
+4|comma, and "quotes"|f
+5||t' rita rita-password-1 "SELECT id, coalesce(body, ''), body IS NULL FROM pgload.notes ORDER BY id"
+got="$(printf '6\tsix\n' | psql_as rita rita-password-1 -c '\copy pgload.notes FROM STDIN')" || true
+if grep -q "42501" <<<"$got"; then pass "a reader may not COPY into a table"; else fail "a reader's COPY: $got"; fi
+# A data-only pg_dump of a PostgreSQL table, loaded with psql as pg_dump
+# writes it: its settings, then COPY ... FROM stdin and the rows. The table
+# is in a database of its own, which no connection of Igloo's reads.
+docker exec "$project-crm" createdb -U crm pgsrc
+docker exec -i "$project-crm" psql -U crm -d pgsrc -v ON_ERROR_STOP=1 -qAt -c "CREATE SCHEMA pgload;
+  CREATE TABLE pgload.ledger (id int, who text, amount numeric(12,2), paid_at timestamptz, ok boolean, tags text[], data bytea, note text);
+  INSERT INTO pgload.ledger VALUES
+    (1, 'ann', 10.50, '2026-01-01 10:00:00+00', true, '{a,\"b c\"}', '\\x00ff', 'semi;colon'),
+    (2, NULL, -3.25, NULL, false, '{}', NULL, E'two\\nlines'),
+    (3, 'o''brien', 0, '2026-06-30 23:59:59.5+02', NULL, NULL, '\\x', '\\.');"
+docker exec "$project-crm" pg_dump -U crm -d pgsrc --data-only --table=pgload.ledger >"$work/ledger.sql"
+psql_admin -c "CREATE TABLE pgload.ledger (id INTEGER, who VARCHAR, amount DECIMAL(12,2), paid_at TIMESTAMPTZ, ok BOOLEAN,
+  tags VARCHAR[], data BLOB, note VARCHAR)" >/dev/null
+if got="$(psql_admin -f - <"$work/ledger.sql")"; then pass "a pg_dump of a PostgreSQL table loads with psql"; else fail "pg_dump load: $got"; fi
+expect "and holds what PostgreSQL's does" "1|ann|10.50|2026-01-01 10:00:00|true|a;b c|00FF|semi;colon
+2|-|-3.25|-|false||-|two\\nlines
+3|o'brien|0.00|2026-06-30 21:59:59.5|-|-||\\." igloo "$admin_password" \
+  "SELECT id, coalesce(who, '-'), amount, coalesce(CAST(paid_at AT TIME ZONE 'UTC' AS VARCHAR), '-'), coalesce(ok::VARCHAR, '-'),
+     coalesce(array_to_string(tags, ';'), '-'), coalesce(hex(data), '-'), replace(note, chr(10), '\\n') FROM pgload.ledger ORDER BY id"
+psql_admin -c "DROP TABLE pgload.notes" -c "DROP TABLE pgload.ledger" -c "DROP SCHEMA pgload" >/dev/null
+
 echo "restart"
 # Read a table once so its files land in the read cache.
 psql_admin -c "CREATE TABLE cached AS SELECT range AS n, md5(range::VARCHAR) AS s FROM range(200000)" >/dev/null

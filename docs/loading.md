@@ -184,6 +184,31 @@ amounts to, one file at a time, as the user's own statements:
   admins may not load from the warehouse, nor from a location that holds
   it: its files are the tables' own, read through the tables.
 
+## COPY FROM STDIN
+
+`COPY table [(column, ...)] FROM STDIN` loads rows the client sends, as in
+PostgreSQL: psql's `\copy`, psycopg's `cursor.copy`, pgx's `CopyFrom` and
+the `COPY ... FROM stdin` sections of a `pg_dump`, which psql loads with the
+settings a dump starts with. It takes the text format (tab-separated,
+`\N` for NULL, backslash escapes), CSV and binary, and PostgreSQL's options
+for them: `FORMAT`, `DELIMITER`, `NULL`, `HEADER` (or `HEADER MATCH`),
+`QUOTE`, `ESCAPE`, `FORCE_NOT_NULL`, `FORCE_NULL`, `ENCODING 'UTF8'`, the
+older `WITH CSV HEADER` form, and `WHERE`.
+
+```sh
+psql -c "\copy sales.leads FROM 'leads.csv' WITH (FORMAT csv, HEADER)"
+pg_dump --data-only --table=public.accounts appdb | psql -h igloo.example.com -d igloo
+```
+
+It is the user's own `INSERT` of the rows, checked before the client sends
+anything: it needs `INSERT` on the table, and writes it as an `INSERT` does,
+in a transaction block too. Values become the column's type as PostgreSQL
+writes them, booleans as `t` or `on`, `bytea` as `\x...`, arrays as
+`{a,b}`, intervals as `-1 days +02:00:00`; a value that does not convert
+fails the whole `COPY` with its line and column, and nothing is written.
+`DEFAULT` and `ON_ERROR ignore` are not supported. The rows wait in the
+session's memory, spilling to disk, until the client has sent them all.
+
 ## Pipes
 
 A pipe runs a `COPY INTO` again and again, so new files are loaded soon

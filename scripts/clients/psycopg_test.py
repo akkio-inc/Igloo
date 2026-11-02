@@ -29,6 +29,23 @@ with psycopg.connect() as conn:  # psycopg opens a transaction implicitly
     assert got == (1, 2), got
     print("  psycopg: transactions")
 
+# COPY ... FROM STDIN: psycopg's copy, in text and in binary.
+with psycopg.connect(autocommit=True) as conn:
+    conn.execute("CREATE TABLE IF NOT EXISTS psycopg_copy (id INTEGER, name VARCHAR, amount DECIMAL(10,2), seen TIMESTAMPTZ, ok BOOLEAN)")
+    seen = datetime.datetime(2026, 10, 15, 12, 30, tzinfo=datetime.timezone.utc)
+    with conn.cursor() as cur:
+        with cur.copy("COPY psycopg_copy (id, name, amount, seen, ok) FROM STDIN") as copy:
+            copy.write_row((1, "tab\there", decimal.Decimal("1.25"), seen, True))
+            copy.write_row((2, None, None, None, False))
+        with cur.copy("COPY psycopg_copy (id, name, amount, seen, ok) FROM STDIN (FORMAT BINARY)") as copy:
+            copy.set_types(["int4", "text", "numeric", "timestamptz", "bool"])
+            copy.write_row((3, "binary", decimal.Decimal("-2.50"), seen, None))
+    rows = conn.execute("SELECT id, name, amount, seen, ok FROM psycopg_copy ORDER BY id").fetchall()
+    want = [(1, "tab\there", decimal.Decimal("1.25"), seen, True), (2, None, None, None, False),
+            (3, "binary", decimal.Decimal("-2.50"), seen, None)]
+    assert rows == want, rows
+    print("  psycopg: COPY FROM STDIN, in text and binary")
+
 # Server-side cursors, which Ibis, SQLAlchemy's stream_results and pandas'
 # chunked reads use: DECLARE, a Describe of the cursor's portal, FETCH, CLOSE.
 with psycopg.connect() as conn:
