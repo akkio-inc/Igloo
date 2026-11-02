@@ -41,8 +41,7 @@ and makes migration cheap: Igloo reads existing tables where they are.
 A vectorized engine on one well-sized machine beats a cluster for most
 analytical work. Prefer local caches of hot data, fewer network round trips
 and less coordination. Distribution is the escape hatch for queries that do
-not fit, not the default. Benchmarks run in CI so that slowdowns are caught
-like bugs.
+not fit, not the default.
 
 ## 5. Feature parity by what blocks a migration, not by checklist
 
