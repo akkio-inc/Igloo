@@ -567,11 +567,13 @@ func (e *execution) groups(s *Stage) [][]int {
 			continue
 		}
 		x := e.exchanges[in.Exchange.ID]
+		x.mu.Lock()
 		per := rowMemory(x.columns)
 		for p, rows := range x.partRows {
 			mem[p] += rows * per
 			total += rows * per
 		}
+		x.mu.Unlock()
 	}
 	if s.completes && total <= smallCompletion && e.smaller == 0 {
 		all := make([]int, e.parts)

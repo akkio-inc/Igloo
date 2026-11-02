@@ -1126,9 +1126,14 @@ other manifests only with that port open between them, or say `object`.
   multiplies rows can exceed.
 - **A worker lost.** What a worker wrote to its disk goes with it. A task
   that cannot fetch a file fails; if the worker no longer answers, or
-  answers as a new run of itself, the statement's parts run again, once, on
-  the other workers. Otherwise, or if another is lost, the statement fails
-  (and runs on the server if it fits there). A worker too busy to send a
+  answers as a new run of itself, what it wrote that readers still need runs
+  again on the other workers, those tasks' inputs it held first, and the task
+  on what is there now: nothing else runs again. A statement with `LIMIT`,
+  samples or a volatile function among those tasks could not mix two runs of
+  them, and its parts all run again, once, as they do if a task writes other
+  rows than it did. One that still answers as the same run was busy, and the
+  task runs again a few times before the statement fails (and runs on the
+  server if it fits there). A worker too busy to send a
   file says so within five seconds and is asked again for up to five
   minutes; one that stops sending for a minute, or answering its status for
   about 7 seconds, counts as lost. A statement

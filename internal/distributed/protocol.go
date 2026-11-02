@@ -86,6 +86,9 @@ type taskRequest struct {
 	// instead of sending them back; the response lists the files (see
 	// writes.go).
 	Write *writeRequest `json:"write,omitempty"`
+	// round is how many times the task ran again for workers lost (see repair.go),
+	// not sent.
+	round int
 }
 
 // purgeRequest has a worker purge what erasure requests deleted through

@@ -124,6 +124,91 @@ func TestHeartbeats(t *testing.T) {
 
 func taskCheckMissesInt() int64 { return int64(taskCheckMisses) }
 
+// tasksRun counts the tasks h's workers are given.
+func tasksRun(h *harness) *atomic.Int64 {
+	var n atomic.Int64
+	for _, w := range h.workers {
+		w.beforeTask = func(http.ResponseWriter, *http.Request) bool {
+			n.Add(1)
+			return true
+		}
+	}
+	return &n
+}
+
+// TestLostWorkerRunsAgainOnlyWhatItHeld has a worker stop answering, closing no socket,
+// once its tasks wrote exchange files to its disk that readers have yet to read: the
+// tasks it ran of them run again on the others, and the readers' on what those wrote,
+// rather than the statement's parts all over, and the rows are what one machine returns.
+func TestLostWorkerRunsAgainOnlyWhatItHeld(t *testing.T) {
+	fastBeats(t, 50*time.Millisecond, 200*time.Millisecond, 5*time.Second)
+	for _, afterStages := range []int{1, 2} {
+		h := localHarness(t, 3)
+		f := frozenWorker(t, h, 1)
+		want, _, err := h.query(context.Background(), exchangeQuery)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// A run with nothing lost, for how many tasks it takes.
+		whole := tasksRun(h)
+		if _, _, _, _, err := h.run(context.Background(), exchangeQuery, ModeOn); err != nil {
+			t.Fatal(err)
+		}
+		tasks := tasksRun(h)
+		var ran, again, wholeAgain atomic.Int32
+		hook := func(r slog.Record) {
+			switch {
+			case strings.Contains(r.Message, "ran again only its tasks that readers still need"):
+				again.Add(1)
+			case strings.Contains(r.Message, "running the statement's parts again without it"):
+				wholeAgain.Add(1)
+			case strings.Contains(r.Message, "could not run again only what a lost worker held"):
+				t.Logf("%s: %s", r.Message, attr(r, "err"))
+			case r.Message == "ran a stage" && strings.Contains(attr(r, "stage"), " to exchange ") && int(ran.Add(1)) == afterStages:
+				f.frozen.Store(true)
+			}
+		}
+		h.hook.Store(&hook)
+		got, _, _, _, err := h.run(context.Background(), exchangeQuery, ModeOn)
+		if err != nil {
+			t.Fatalf("after %d stages: %v", afterStages, err)
+		}
+		if msg := compareRows(want, got, true); msg != "" {
+			t.Errorf("after %d stages: %s", afterStages, msg)
+		}
+		if again.Load() == 0 || wholeAgain.Load() != 0 {
+			t.Errorf("after %d stages: ran again only what it held %d times, and all of the statement's parts %d", afterStages, again.Load(), wholeAgain.Load())
+		}
+		t.Logf("after %d stages: %d tasks, %d with nothing lost", afterStages, tasks.Load(), whole.Load())
+		// All of its parts again would have been more than twice as many, less what ran before.
+		if tasks.Load() >= 2*whole.Load() {
+			t.Errorf("after %d stages: %d tasks, %d with nothing lost", afterStages, tasks.Load(), whole.Load())
+		}
+	}
+}
+
+// TestRepeatable checks which stages' tasks may run again beside what they wrote before.
+func TestRepeatable(t *testing.T) {
+	for sql, want := range map[string]bool{
+		"SELECT a, sum(b) FROM t GROUP BY a":             true,
+		"SELECT limit_of, sampled, random_id FROM t":     true,
+		"SELECT 'limit random()' AS note FROM t":         true,
+		"SELECT a, random() AS r FROM t":                 false,
+		"SELECT a FROM t WHERE uuid() IS NOT NULL":       false,
+		"SELECT a FROM t LIMIT 10":                       false,
+		"SELECT a FROM t ORDER BY a LIMIT 10":            false,
+		"SELECT a FROM t USING SAMPLE 10%":               false,
+		"SELECT a FROM t TABLESAMPLE reservoir(10 ROWS)": false,
+	} {
+		if got := repeatable(&Stage{SQL: sql}); got != want {
+			t.Errorf("%s: %v", sql, got)
+		}
+	}
+	if repeatable(&Stage{SQL: "SELECT a FROM t", enough: 10}) {
+		t.Error("a stage that takes any rows it needs")
+	}
+}
+
 // frozenWorker has h's worker i stop serving on the first freeze, its connections open
 // and its kernel taking what is sent, as a machine that lost power closes nothing:
 // not a killed process.
@@ -190,7 +275,7 @@ func TestUnresponsiveWorkerWithExchanges(t *testing.T) {
 	var ran atomic.Int32
 	var frozenAt, foundAt atomic.Int64
 	hook := func(r slog.Record) {
-		if strings.HasPrefix(r.Message, "a worker holding exchanged rows on its disk was lost") {
+		if strings.HasPrefix(r.Message, "a worker stopped answering; it is taken for lost") || strings.HasPrefix(r.Message, "a worker holding exchanged rows on its disk was lost") {
 			foundAt.CompareAndSwap(0, time.Now().UnixNano())
 		}
 		if r.Message == "ran a stage" && strings.Contains(attr(r, "stage"), " to exchange ") && ran.Add(1) == 2 {

@@ -1189,7 +1189,7 @@ func (co *Coordinator) Execute(ctx context.Context, plan *Plan, settings []Setti
 			// What the lost worker wrote to its disk is gone, and readers
 			// cannot have it: the statement's parts run again, once, on the
 			// other workers.
-			rest := slices.DeleteFunc(slices.Clone(ws), func(w *worker) bool { return w.addr == lost.worker })
+			rest := slices.DeleteFunc(slices.Clone(ws), func(w *worker) bool { return w.addr == lost.worker || run.wentWithout(w.addr) })
 			if len(rest) > 0 && len(rest) < len(ws) {
 				co.log.Warn("a worker holding exchanged rows on its disk was lost; running the statement's parts again without it",
 					"query", qid, "attempt", attempt+1, "worker", lost.worker, "err", err)
@@ -1523,15 +1523,18 @@ func (co *Coordinator) dispatch(ctx context.Context, task *taskRequest, ws []*wo
 			continue
 		}
 		t := *task
+		// Each round's attempts have names of their own, as those before may have
+		// left files.
+		attempt := strconv.Itoa(task.round*roundAttempts + runs)
 		if t.Shuffle != "" {
-			t.Shuffle += "/a" + strconv.Itoa(runs)
+			t.Shuffle += "/a" + attempt
 		}
 		if t.Local != "" {
-			t.Local += "/a" + strconv.Itoa(runs)
+			t.Local += "/a" + attempt
 		}
 		if t.Write != nil {
 			wr := *t.Write
-			wr.Dir += "/a" + strconv.Itoa(runs)
+			wr.Dir += "/a" + attempt
 			wr.Credentials = co.writeCredentials(ctx, wr.Dir)
 			t.Write = &wr
 		}
@@ -1591,6 +1594,10 @@ func (co *Coordinator) dispatch(ctx context.Context, task *taskRequest, ws []*wo
 	co.opts.Metrics.task("failed")
 	return nil, nil, fmt.Errorf("task %d failed on every worker tried: %w", task.Task, last)
 }
+
+// roundAttempts is how many attempts of a task's a round numbers (see repair.go), more
+// than dispatch makes.
+const roundAttempts = 100
 
 // throttleWait is the wait before a task object storage turned away runs
 // again the first time; a variable for tests.
