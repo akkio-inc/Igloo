@@ -140,7 +140,7 @@ func openBackground(ctx context.Context, cfg config.Config, log *slog.Logger) (*
 // a lead more, and the background DuckDB is told to let go of that much ahead of
 // it, on a goroutine of its own, so that the first's limit follows what it lets go
 // of as it goes. The lead is what the machine has to spare past memlimit.High,
-// between an eighth and a quarter of the limit: on a machine with room to spare, a
+// between a sixteenth and a quarter of the limit: on a machine with room to spare, a
 // dashboard's statements have their memory at once, and on one without, the two
 // keep to the limit. With the first free to take three quarters of the limit at
 // once, the two together held 134% of it beside a burst of heavy statements, and
@@ -166,7 +166,7 @@ const (
 	// backgroundLeadLeast and backgroundLeadMost bound how far past what the
 	// background DuckDB has let go of the first may go while reading, as divisors
 	// of the limit.
-	backgroundLeadLeast = 8
+	backgroundLeadLeast = 16
 	backgroundLeadMost  = 4
 	// foregroundIdle is how long after the first's last read its caches
 	// give way.
@@ -349,7 +349,7 @@ func balancedLimits(total, lead, mainHeld, bgHeld int64, reading bool) (mainLimi
 		bgLimit = max(total-mainHeld-lead, total/backgroundMinShare)
 		// So that the two keep to total, the quarter the background DuckDB
 		// keeps is off the first's.
-		return min(max(total-bgHeld, mainHeld+lead), total-min(bgHeld, total/backgroundMinShare)), bgLimit
+		return min(total-bgHeld+lead, total-min(bgHeld, total/backgroundMinShare)), bgLimit
 	}
 	bgLimit = max(total-mainHeld, total/backgroundMinShare)
 	return max(total-min(bgHeld, bgLimit), total/backgroundMinShare), bgLimit

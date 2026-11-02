@@ -7,10 +7,10 @@ import (
 
 // TestBalancedLimits checks how the two DuckDBs share the memory limit: a
 // heavy statement alone may use it all, the first's caches giving way to it;
-// while the first reads it keeps what it holds and may go an eighth past it, up
-// to three quarters, into what the heavy statement has let go of, which has what
-// is left, down to a quarter. So while the first reads, what they may go to
-// never adds up to more than what is left of the limit past what they hold.
+// while the first reads it may go a lead past what the heavy statement has let go
+// of, up to three quarters, and the heavy statement has what is left, less the lead,
+// down to a quarter. So what they hold never adds up to more than the limit and the
+// lead, whatever either of them lets go of.
 func TestBalancedLimits(t *testing.T) {
 	t.Parallel()
 	const total = 100
@@ -25,32 +25,33 @@ func TestBalancedLimits(t *testing.T) {
 		{40, 30, false, 70, 60},
 		{90, 10, false, 90, 25},
 		{90, 60, false, 75, 25},
-		{0, 90, true, 12, 88},
-		{0, 10, true, 90, 88},
-		{40, 60, true, 52, 48},
-		{60, 40, true, 72, 28},
-		{90, 60, true, 75, 25},
-		{0, 0, true, 100, 88},
+		{0, 90, true, 16, 94},
+		{0, 10, true, 90, 94},
+		{40, 60, true, 46, 54},
+		{46, 60, true, 46, 48},
+		{60, 40, true, 66, 34},
+		{90, 60, true, 46, 25},
+		{0, 0, true, 100, 94},
 	} {
 		if m, b := balancedLimits(total, total/backgroundLeadLeast, c.mainHeld, c.bgHeld, c.reading); m != c.wantMain || b != c.wantBg {
 			t.Errorf("holding %d and %d, reading %v: limits %d and %d, want %d and %d", c.mainHeld, c.bgHeld, c.reading, m, b, c.wantMain, c.wantBg)
 		}
 	}
 	// With more to spare, the first goes further at once.
-	if m, b := balancedLimits(total, total/backgroundLeadMost, 0, 90, true); m != 25 || b != 75 {
+	if m, b := balancedLimits(total, total/backgroundLeadMost, 0, 90, true); m != 35 || b != 75 {
 		t.Errorf("a longer lead: limits %d and %d", m, b)
 	}
 }
 
 // TestLeadOf checks how far past what the background DuckDB has let go of the first
-// may go: what the machine has to spare, between an eighth and a quarter of the limit.
+// may go: what the machine has to spare, between a sixteenth and a quarter of the limit.
 func TestLeadOf(t *testing.T) {
 	t.Parallel()
 	const total = 800
 	for _, c := range []struct{ spare, want int64 }{
-		{-50, 100},
-		{0, 100},
-		{100, 100},
+		{-50, 50},
+		{0, 50},
+		{50, 50},
 		{150, 150},
 		{200, 200},
 		{5000, 200},

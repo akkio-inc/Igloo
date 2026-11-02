@@ -1935,7 +1935,7 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   heavy statements, held to what those caches left them, spilled while the rest
   waited for them. Its 96 queries at ten times the data took 234 s rather than 260.
 - While the first DuckDB reads, it goes only what the machine has to spare,
-  between an eighth and a quarter of the memory limit, past what the second has let
+  between a sixteenth and a quarter of the memory limit, past what the second has let
   go of, and the second is told to let go of that much ahead of it. Free to take
   three quarters of the limit at once, whatever the
   second held, the first took memory faster than the second's spill files could
