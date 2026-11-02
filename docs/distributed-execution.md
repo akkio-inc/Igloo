@@ -41,8 +41,9 @@ GROUP BY ALL;
 Each worker reads a share of the large table's data files and all of the
 smaller tables, filters, joins and aggregates its rows, and sends back
 partial results; the coordinator combines them (sums of sums, counts of
-counts, minimums of minimums, and aggregates over `DISTINCT` values over the
-values the workers found) and runs the rest of the statement: `HAVING`,
+counts, minimums of minimums, variances and standard deviations from each
+part's count, mean and variance, and aggregates over `DISTINCT` values over
+the values the workers found) and runs the rest of the statement: `HAVING`,
 `ORDER BY`, `LIMIT`, window functions over the aggregates, other joins and
 subqueries. A statement that ranks the groups with `ROW_NUMBER()`, `RANK()`
 or `DENSE_RANK()` and keeps the first few of each partition (`WHERE rank <=
@@ -310,7 +311,7 @@ In detail, a part runs distributed when:
 
 Everything else runs on one machine: median and other aggregates that do
 not combine (`median`, `quantile`, `approx_count_distinct`, `string_agg`,
-`list(x ORDER BY y)`, `stddev`), except over a relation workers compute, which is then
+`list(x ORDER BY y)`), except over a relation workers compute, which is then
 partitioned by the groups so that each worker computes whole groups;
 aggregates over `DISTINCT` values of unrelated
 expressions in one `SELECT` (`count(DISTINCT a), count(DISTINCT b)`),

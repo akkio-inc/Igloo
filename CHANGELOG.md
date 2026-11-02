@@ -589,6 +589,11 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   machine](docs/distributed-execution.md#same-results-as-one-machine). TPC-DS q33, q56,
   q58, q60 and q83 run on workers too, where they stayed on the coordinator, and so does
   q24, which failed on workers when the coordinator had 16 cores.
+- Variances and standard deviations (`stddev_samp`, `stddev_pop`, `var_samp`,
+  `var_pop`, `stddev`, `variance`) are computed on workers: each part's count, mean
+  and variance merge pairwise, as DuckDB merges its threads', which keeps their digits
+  near a large mean where sums of squares would lose them. They kept the statement on
+  the coordinator.
 - A worker that stops answering is found in about 7 seconds, not a minute. Powered off,
   closing no socket, one of 16 workers took 69 s to find. Whoever waits on a worker,
   the coordinator on its tasks and readers on its exchange files, now asks it for its

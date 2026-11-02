@@ -104,6 +104,14 @@ func TestAggregationModes(t *testing.T) {
 		`SELECT l_partkey, count(*) AS n, bool_or(l_quantity > 45), bit_xor(l_linenumber), any_value(l_returnflag) IS NOT NULL FROM lineitem GROUP BY 1 ORDER BY 2 DESC, 1 LIMIT 20`,
 		// Partial sums of BIGINT are HUGEINT, which Parquet would make DOUBLE.
 		`SELECT l_partkey % 5 AS k, sum(l_orderkey * 100000000000 + l_linenumber) AS big, count(DISTINCT l_suppkey) FROM lineitem GROUP BY 1 ORDER BY 1`,
+		// Variances and standard deviations, by their parts' moments: near a
+		// mean of a million, where sums of squares would lose the variance's
+		// digits; of one value, NULL for a sample's; of none, NULL.
+		`SELECT l_returnflag, stddev_samp(l_quantity) AS s, var_pop(l_extendedprice) AS v, stddev_pop(l_discount) AS p, variance(l_tax) AS w,
+			stddev(l_quantity) FILTER (WHERE l_linenumber > 3) AS f, var_samp(l_quantity + 1000000) AS big, count(*) FROM lineitem GROUP BY 1 ORDER BY 1`,
+		`SELECT l_orderkey, stddev_samp(l_linenumber + 1000000) AS s, var_pop(l_quantity) AS v, var_samp(CASE WHEN l_linenumber = 1 THEN l_quantity END) AS one,
+			stddev_pop(CASE WHEN l_linenumber > 7 THEN l_quantity END) AS none FROM lineitem GROUP BY 1 HAVING stddev_samp(l_quantity) > 5 ORDER BY 1 LIMIT 50`,
+		`SELECT stddev_samp(l_extendedprice), var_pop(l_quantity + 1000000), stddev_pop(l_discount) FROM lineitem`,
 	}
 	for _, mode := range []string{aggGather, aggByGroup, ""} {
 		h.co.aggregation = mode
