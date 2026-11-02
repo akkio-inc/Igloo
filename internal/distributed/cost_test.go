@@ -109,16 +109,21 @@ func TestChoose(t *testing.T) {
 			runs{local: 38, dist: 228, heavy: true}, true, false, false},
 		{"ran out of memory, no workers", none, runs{outOfMemory: true}, true, false, false},
 		// A dashboard's statement at ten times the data, estimated at 14 s
-		// on one machine and short of memory, after 1,312 s split over two
-		// workers: tried on one machine once, not kept on workers for good.
-		{"ran on workers 90 times one machine's estimate, short of memory", estimate{oneMachine: 14, onWorkers: 30, workers: 2, memory: true, spills: true},
+		// on one machine and short of memory by what it exchanged, after
+		// 1,312 s split over two workers: tried on one machine once, not kept
+		// on workers for good.
+		{"ran on workers 90 times one machine's estimate, short of memory", estimate{oneMachine: 14, onWorkers: 30, workers: 2, memory: true},
 			runs{dist: 1312}, true, false, true},
-		{"ran on workers 90 times one machine's estimate, tried today", estimate{oneMachine: 14, onWorkers: 30, workers: 2, memory: true, spills: true},
+		{"ran on workers 90 times one machine's estimate, tried today", estimate{oneMachine: 14, onWorkers: 30, workers: 2, memory: true},
 			runs{dist: 1312, explored: now.Add(-time.Hour)}, true, true, false},
-		{"ran on workers 9 times one machine's estimate, short of memory", estimate{oneMachine: 14, onWorkers: 30, workers: 2, memory: true, spills: true},
+		{"ran on workers 9 times one machine's estimate, short of memory", estimate{oneMachine: 14, onWorkers: 30, workers: 2, memory: true},
 			runs{dist: 126}, true, true, false},
 		{"ran on workers 90 times one machine's estimate, exchanging more than it holds", estimate{oneMachine: 14, onWorkers: 30, workers: 2, memory: true},
 			runs{dist: 1312, heavy: true}, true, true, false},
+		// Far over an estimate that says it spills: the estimate is wrong, as
+		// a report's of 15 s, after 200 s on workers, that took 714 s there.
+		{"ran on workers 90 times one machine's estimate, which says it spills", estimate{oneMachine: 14, onWorkers: 30, workers: 2, memory: true, spills: true},
+			runs{dist: 1312}, true, true, false},
 		{"ran on workers 90 times one machine's estimate, its working set far beyond it", estimate{oneMachine: 14, onWorkers: 30, workers: 2, memory: true,
 			spills: true, farBeyond: true}, runs{dist: 1312}, true, true, false},
 	} {
