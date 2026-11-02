@@ -1452,9 +1452,10 @@ func (s *Service) purge(ctx context.Context, r *Request) error {
 		}
 	}
 	var waitUntil time.Time
-	later := func(at time.Time) {
-		if at = at.Add(orphanAge); waitUntil.IsZero() || at.Before(waitUntil) {
+	later := func(mod time.Time) {
+		if at := mod.Add(orphanAge); waitUntil.IsZero() || at.Before(waitUntil) {
 			waitUntil = at
+			r.recheck = s.now().Add(recheckIn(s.now().Sub(mod)))
 		}
 	}
 	for _, l := range tables {
@@ -1520,11 +1521,10 @@ func (s *Service) purge(ctx context.Context, r *Request) error {
 		// own once it is, or one a drop left, which may hold the person's
 		// rows in whatever columns it had then: none is read. The request
 		// waits until the oldest is old enough to delete, and lists the
-		// warehouse again every hour meanwhile, as one a table claims
-		// stops counting.
+		// warehouse again meanwhile (see recheckIn), as one a table claims,
+		// or a statement or the catalog removes, stops counting.
 		oldest := slices.MinFunc(slices.Collect(maps.Keys(u.young)), func(a, b string) int { return u.young[a].Compare(u.young[b]) })
 		later(u.young[oldest])
-		r.recheck = s.now().Add(recheckWait)
 		r.Error = scrub(r, fmt.Sprintf("waits for %d recent files in the warehouse under no table's location, as %s, which may be a table's "+
 			"being made, or what a drop left: they go once three days old, and the request goes on", len(u.young), oldest))
 	}
@@ -1548,8 +1548,17 @@ func (s *Service) purge(ctx context.Context, r *Request) error {
 	return nil
 }
 
-// recheckWait is how often a request that waits for recent files under no
-// table's location lists the warehouse again (see purge).
+// recheckIn is how soon a request that waits for a file of age looks again for
+// what it waits for. What a statement is making or has just dropped goes in moments:
+// the staging of a CREATE TABLE ... AS seconds before a request would otherwise hold it
+// up for the hour. Nothing else depends on it: each look goes through all of purge
+// and what follows it, verification too, however soon it comes.
+func recheckIn(age time.Duration) time.Duration {
+	return min(max(age/2, time.Minute), recheckWait)
+}
+
+// recheckWait is the longest a request that waits for recent files goes before it
+// lists them again (see purge).
 const recheckWait = time.Hour
 
 // iglooDir is where Igloo keeps files of its own in the warehouse, as
@@ -1994,13 +2003,24 @@ func (s *Service) sortOrphans(listed map[string]time.Time, referenced pathSet) *
 		case referenced.has(p):
 		case names[path.Base(p)]:
 			o.unsure = append(o.unsure, p)
-		case now.Sub(mod) >= orphanAge:
+		case oddKey(p) || now.Sub(mod) >= orphanAge:
 			o.old = append(o.old, p)
 		default:
 			o.young[p] = mod
 		}
 	}
 	return o
+}
+
+// oddKey reports whether p's key is one no writer of a table makes and no engine could
+// read, with a segment a path could not have: only someone with the right to write
+// there could have put it there, and it goes whatever its age.
+func oddKey(p string) bool {
+	if _, rest, ok := strings.Cut(p, "://"); ok {
+		p = rest
+	}
+	p += "/"
+	return strings.Contains(p, "/../") || strings.Contains(p, "/./") || strings.Contains(p, "//")
 }
 
 // parquet keeps the Parquet files of paths.

@@ -164,6 +164,32 @@ func TestPartitionFiles(t *testing.T) {
 			t.Errorf("%s: %v partitions, want %v", c.name, got, c.want)
 		}
 	}
+	const mib, gib = 1 << 20, 1 << 30
+	// As on real S3: 60 million rows of 34 bytes a row in files.
+	lineitem := features{rows: 60e6, bytes: 2 * gib}
+	if lineitem.replicaHoldsParts(128, 5500*mib, 4) {
+		t.Error("128 partitions took a replica of 5.5 GiB out of memory")
+	}
+	if !lineitem.replicaHoldsParts(3, 5500*mib, 4) || !lineitem.replicaHoldsParts(128, 64*gib, 16) || !lineitem.replicaHoldsParts(128, 0, 4) {
+		t.Error("a replica that has the room")
+	}
+	for _, c := range []struct {
+		memory int64
+		want   int
+	}{
+		{953 * mib, 59},
+		{2355 * mib, 147},
+		{64 * gib, 4096},
+		{100 * mib, leastWriteFiles},
+		{0, 100},
+	} {
+		if got := writeFilesFit(c.memory, true); got != c.want {
+			t.Errorf("%d MiB: %d files fit, want %d", c.memory/mib, got, c.want)
+		}
+	}
+	if got := writeFilesFit(953*mib, false); got != mostWriteFiles {
+		t.Errorf("%d files fit on disk", got)
+	}
 	for _, c := range []struct {
 		name  string
 		bytes int64

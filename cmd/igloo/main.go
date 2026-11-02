@@ -479,6 +479,7 @@ func serve() error {
 	}
 	limits.LimitReplica(replica)
 	limits.EstimateFromHistory(cfg.StatementReservations)
+	limits.WeighCosts(runtime.GOMAXPROCS(0), workload.LightCPU)
 	reg.MustRegister(limits.Metrics()...)
 	// What statements hold at once, for their reservations (see
 	// workload.Controller.SampleMemory).

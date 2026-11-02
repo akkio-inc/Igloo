@@ -162,7 +162,9 @@ counts against the user or role it came from.
 
 How limits are enforced:
 
-- **In line, in order.** Statements that must wait do so in arrival order.
+- **In line, in order.** Statements that must wait do so in the order they
+  would end if each ran alone (see [the line](#the-line)), which is arrival
+  order for those with no history.
   A statement never overtakes an earlier one that waits for the same slots,
   nor, if it reserves memory, one that waits for memory, so a large
   reservation is not starved by small ones. Statements of other users and
@@ -228,10 +230,24 @@ threads give way to the first's (a nice value of 10). Alone it takes about
 what it takes in the first; beside others it gets the cores they leave idle,
 and about a tenth of those they use.
 
+Measured on 12 cores with `bench/mixed.py`, its statements' results not cached,
+beside one session's reports:
+
+| | Dashboards alone: p50, p95 | Beside the reports, in one DuckDB | Beside the reports, in two |
+|---|---|---|---|
+| A billion rows, 2 users | 3.6 s, 8.1 s, 46 a minute | 13.7 s, 74 s, 10 a minute | 3.0 s, 8.1 s, 47 a minute |
+| 200 million rows, 4 users | 0.5 s, 1.7 s, 147 a minute | 1.1 s, 4.2 s, 128 a minute | 0.8 s, 2.7 s, 144 a minute |
+
+Those dashboards use all the cores they can have, and the longest report over a
+billion rows took 567 s beside them where it took 436 s in one DuckDB, with the
+dashboards at a fifth of the statements, and 267 s to 294 s alone in either.
+
 The two share the memory limit. A heavy statement alone may use it all, the
 first's caches giving way to it. While the first reads tables it keeps what
 it holds, up to three quarters of the limit, for its statements not to read
 their files again, and the heavy statement has what is left and spills.
+With statements in line behind the heavy one and none running in the first, the
+first's caches give way to it too: nothing will read them until it ends.
 
 A statement is heavy if its shape, its text with the literals masked, used 5
 seconds of all the replica's cores (`cpu_time_ms` in the
@@ -256,7 +272,10 @@ session, and not one that fills ID domains' ids; a statement the second
 DuckDB cannot bind, such as one of a connection's tables or a view not yet
 copied there, runs in the first. Materialized views' refreshes run in the
 first. `placement` in the history says which reads ran there, and
-`igloo_background_statements_total` counts them.
+`igloo_background_statements_total` counts them. A heavy statement stays in
+the first while most of what runs there is of some size itself, known to take
+5 seconds of all the cores alone or having run for a while, since there is
+nothing short for it to give way to.
 `IGLOO_HEAVY_IN_BACKGROUND=false` runs everything in the first. Without
 workers, the replica's limit below and roles' limits hold back heavy
 statements beyond that.
@@ -265,8 +284,8 @@ statements beyond that.
 
 `IGLOO_MAX_CONCURRENT_STATEMENTS` limits the queries and changes of data
 running at once on a replica, whoever runs them, as a Snowflake warehouse's
-`MAX_CONCURRENCY_LEVEL` does; further ones wait in line, in arrival order,
-as for the limits above. A number sets it, `auto` makes it the replica's
+`MAX_CONCURRENCY_LEVEL` does; further ones wait in line, as for the limits
+above (see [the line](#the-line)). A number sets it, `auto` makes it the replica's
 cores, and `off`, the default, means no limit.
 
 DuckDB runs every statement on all of its threads, so a hundred statements
@@ -276,8 +295,29 @@ and spill. In line, the first ones finish in the time they take alone.
 `SELECT`, `INSERT`, `UPDATE`, `DELETE`, `MERGE`, `COPY` and `CREATE TABLE
 ... AS` count; settings, transaction control, `SHOW`, catalog listings and
 other DDL do not, and neither does a result the [result
-cache](operations.md#result-cache) answers. A statement waiting for this
+cache](operations.md#result-cache) answers, or a query ending in `LIMIT 0`,
+which tools send to learn its columns and runs nothing. A statement waiting for this
 limit says so: `behind the replica's limit of 8 statements at once`.
+
+### The line
+
+Statements held back by the replica's limit, a role's or the memory wait in the
+order they would end if each started when it came and ran alone, as their
+shape's latest runs say (the least of its latest eight, what DuckDB measured over
+its threads, over the replica's cores); one with no runs yet is taken to take no
+time, so statements with no history keep their arrival order. A short statement
+therefore goes before a long one that came just before it, and a long one before
+a short one that comes after it would have ended, so nothing starves. A shape
+that took under a second of CPU in one of those runs does not wait at all: it
+neither counts against the replica's limit nor reserves memory. A statement of a
+shape not seen yet, of which nothing is known, waits while DuckDB holds three
+quarters of the memory for the statements running, so that a dashboard's heavy
+statements do not start together on its first run.
+
+On a dashboard's 96 queries at ten times the data, on 8 cores, the slowest tenth
+took 94 s rather than 102 and the slowest hundredth 127 s rather than 135, and
+they ran 2,800 s in all rather than 3,370, without its build taking longer (224 s
+rather than 230); at the data's size its median took 1.1 s, as before.
 
 ### Reservations from history
 
@@ -286,15 +326,18 @@ spill to disk, and on a busy disk take far longer than one after the other;
 a fixed limit, though, holds back the light statements with the heavy ones.
 Igloo instead learns what each statement holds at once, by its shape (its
 text with string and number literals masked, which a dashboard sends again
-with other audiences, dates and limits), and the next statement of that
+with other audiences, dates and limits, though `LIMIT 0` has a shape of its
+own), and the next statement of that
 shape reserves `IGLOO_STATEMENT_RESERVATIONS` of it (`auto`, the default,
 is all of it) of the replica's memory before it starts, as a role's
 `memory_limit` reserves (see [role limits](#role-limits)). A statement whose
 shape held more than the replica's memory waits until the others'
 reservations are released; one whose reservation would be under a
 sixteenth of the memory, or whose shape Igloo has not seen since the
-replica started, reserves nothing and starts at once. A role's own
-`memory_limit` comes first.
+replica started, reserves nothing and starts at once. A statement that
+reserves memory also waits while what DuckDB holds for the statements running
+leaves no room for what it reserves, up to three quarters of the memory, since
+reservations are estimates. A role's own `memory_limit` comes first.
 
 DuckDB measures what a statement allocated over its whole run, counting
 memory it freed and allocated again, and the peak of the whole process,

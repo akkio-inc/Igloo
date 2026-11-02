@@ -619,6 +619,61 @@ func firstRowArgs(ctx context.Context, conn *duckdb.Conn, q string, args []drive
 	return strings.Join(vals, "\t"), nil
 }
 
+// TestRBFoldsImpossibleComparisons checks that a comparison with what a CASE of
+// constants can never be takes the tables behind it out of the plan, a common table
+// expression that reads them too, and that one with what it can be does not.
+// extensions/rb/test/fold.test checks the rows.
+func TestRBFoldsImpossibleComparisons(t *testing.T) {
+	e, _ := openWithRB(t)
+	ctx := context.Background()
+	conn, err := e.Connect(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close() //nolint:errcheck
+	for _, stmt := range []string{
+		"CREATE TEMP TABLE visits AS SELECT range AS id, repeat('u', range % 8) AS url, ['a', 'b'] AS tags FROM range(1000)",
+		"CREATE TEMP TABLE members AS SELECT range AS id, 1.0 AS w FROM range(100)",
+	} {
+		if _, err := conn.ExecContext(ctx, stmt, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	const kinds = "(SELECT *, CASE WHEN length(url) % 4 IS NOT DISTINCT FROM 0 THEN 'search' WHEN length(url) % 4 IS NOT DISTINCT FROM 3 THEN 'other' ELSE 'page' END AS kind FROM visits) AS v"
+	report := func(kind string) string {
+		return "WITH weights AS (SELECT m.id, m.w FROM members AS m JOIN visits AS x ON x.id = m.id), " +
+			"seen AS (SELECT DISTINCT v.id FROM " + kinds + " WHERE v.id IS NOT NULL AND v.kind = '" + kind + "'), " +
+			"total AS (SELECT sum(w.w) AS t FROM seen AS s JOIN weights AS w ON w.id = s.id), " +
+			"tags AS (SELECT DISTINCT v.id, u.tag FROM " + kinds + " JOIN weights AS w ON w.id = v.id " +
+			"JOIN LATERAL (SELECT unnest(v.tags) AS tag) AS u ON v.id IS NOT NULL AND v.kind = '" + kind + "'), " +
+			"byTag AS (SELECT t.tag, sum(w.w) AS n FROM tags AS t JOIN weights AS w ON w.id = t.id GROUP BY t.tag) " +
+			"SELECT b.tag, b.n / total.t FROM byTag AS b CROSS JOIN total ORDER BY 2 DESC LIMIT 10"
+	}
+	explain := func(q string) string {
+		plan, err := firstRow(ctx, conn, "EXPLAIN "+q)
+		if err != nil {
+			t.Fatalf("%s: %v", q, err)
+		}
+		return plan
+	}
+	for _, c := range []struct {
+		name, query string
+		empty       bool
+	}{
+		{"a filter", "SELECT count(*) FROM " + kinds + " WHERE v.kind = 'click'", true},
+		{"a list", "SELECT count(*) FROM " + kinds + " WHERE v.kind IN ('click', 'share')", true},
+		{"a report", report("click"), true},
+		{"a kind there is", "SELECT count(*) FROM " + kinds + " WHERE v.kind = 'search'", false},
+		{"a list with one there is", "SELECT count(*) FROM " + kinds + " WHERE v.kind IN ('click', 'page')", false},
+		{"a report of one there is", report("page"), false},
+	} {
+		plan := explain(c.query)
+		if read := strings.Contains(plan, "visits"); read == c.empty {
+			t.Errorf("%s: reads the table %v:\n%s", c.name, read, plan)
+		}
+	}
+}
+
 func TestRBFunctions(t *testing.T) {
 	e, _ := openWithRB(t)
 	files, err := filepath.Glob(filepath.Join("..", "..", "extensions", "rb", "test", "*.test"))

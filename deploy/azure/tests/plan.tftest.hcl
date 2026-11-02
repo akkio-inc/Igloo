@@ -516,11 +516,12 @@ run "workers_have_an_identity_of_their_own" {
 
   assert {
     condition = (
-      tolist(azurerm_role_definition.worker_write[0].permissions)[0].data_actions == toset(["Microsoft.Storage/storageAccounts/blobServices/containers/blobs/add/action"]) &&
+      tolist(azurerm_role_definition.worker_write[0].permissions)[0].data_actions == toset(["Microsoft.Storage/storageAccounts/blobServices/containers/blobs/add/action", "Microsoft.Storage/storageAccounts/blobServices/containers/blobs/write"]) &&
+      strcontains(azurerm_role_assignment.worker_write[0].condition, "!(ActionMatches{'Microsoft.Storage/storageAccounts/blobServices/containers/blobs/write'})") &&
       length(coalesce(tolist(azurerm_role_definition.worker_write[0].permissions)[0].actions, [])) == 0 &&
       azurerm_role_assignment.worker_write[0].role_definition_name != "Storage Blob Data Contributor"
     )
-    error_message = "Workers' role may create blobs and do nothing else: no overwrite, move, delete or container action."
+    error_message = "Workers' role may write blobs where its condition says and do nothing else: no move, delete or container action."
   }
 }
 

@@ -55,6 +55,9 @@ type workloadState struct {
 	// counted says the statement about to run counts against the
 	// replica's limit of statements at once (see countsOnReplica).
 	counted bool
+	// apart says it is known to be heavy and runs in the second DuckDB (see
+	// workload.Limits.Apart).
+	apart bool
 	// shape is the statement's text with its literals masked, by which the
 	// controller estimates what it reserves (see statementShape); "" for
 	// none.
@@ -108,8 +111,12 @@ func (sess *session) queuedTimeout() time.Duration {
 // changes data, and holds nothing while it waits to start (see
 // catalogRunLock). Settings, transaction control, catalog listings and
 // DDL do not count, and neither does a result the cache sends (see
-// fromCache), which uses nothing.
+// fromCache), which uses nothing, nor a query that asks for no rows.
 func countsOnReplica(sess *session, st *statement) bool {
+	if noRows.MatchString(stripComments(st.prepared)) {
+		// It runs nothing, and waits for nothing (see limitZero).
+		return false
+	}
 	if st.stmtType == duckdb.STATEMENT_TYPE_CREATE && st.staged != nil {
 		// CREATE TABLE ... AS, carried out in steps that hold the catalog
 		// only to create and rename (see runStagedCreate).
@@ -131,9 +138,18 @@ func countsOnReplica(sess *session, st *statement) bool {
 func (sess *session) admit(ctx context.Context) (func(), error) {
 	l := sess.wl.limits
 	l.Counted = sess.wl.counted
-	if l.Memory == 0 && l.Counted {
-		// What statements like it held, when its role reserves nothing.
-		l.Memory = sess.wl.controller.Estimate(sess.wl.shape)
+	l.Apart = sess.wl.apart
+	if controller := sess.wl.controller; l.Counted {
+		l.Expect = controller.Expect(sess.wl.shape)
+		switch {
+		case controller.Light(sess.wl.shape):
+			l.Counted = false
+		case l.Memory == 0:
+			// What statements like it held, when its role reserves nothing.
+			l.Memory = controller.Estimate(sess.wl.shape)
+			_, seen := controller.Footprint(sess.wl.shape)
+			l.Unseen = !seen
+		}
 	}
 	release, waited, err := sess.wl.controller.Admit(ctx, l)
 	sess.wl.queued = waited
@@ -169,6 +185,14 @@ func (sess *session) admit(ctx context.Context) (func(), error) {
 
 // numberLiteral is a number in SQL code, not part of a name.
 var numberLiteral = regexp.MustCompile(`\b[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?\b`)
+
+// limitZero is a limit of no rows, which tools send to learn a statement's
+// columns: DuckDB plans it as an empty result, and runs none of the statement.
+var limitZero = regexp.MustCompile(`(?i)\bLIMIT\s+0\b`)
+
+// noRows reports whether the statement text is a query that ends in a limit of
+// no rows.
+var noRows = regexp.MustCompile(`(?i)\bLIMIT\s+0\s*;?\s*$`)
 
 // shapeKey identifies the statements of text's shape (statementShape) in
 // the workload controller and the query history, which keeps it.
@@ -208,7 +232,11 @@ func statementShape(text string) string {
 		case sqllex.String:
 			b.WriteString("?")
 		case sqllex.Code:
-			b.WriteString(numberLiteral.ReplaceAllString(seg.Text, "?"))
+			// A statement with no rows is not the same work as one with some,
+			// though only a number tells them apart: of a dashboard's 96
+			// queries, 32 asked for their columns that way, and the shape they
+			// shared with the ones that ran said they used next to nothing.
+			b.WriteString(numberLiteral.ReplaceAllString(limitZero.ReplaceAllString(seg.Text, "LIMIT NONE"), "?"))
 		case sqllex.Ident:
 			b.WriteString(seg.Text)
 		case sqllex.Comment:

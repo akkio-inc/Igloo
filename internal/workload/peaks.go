@@ -44,4 +44,9 @@ func (c *Controller) sample(held int64) {
 		w.peak = max(w.peak, int64(float64(held)*float64(weight(w))/float64(weights)))
 		w.sampled = true
 	}
+	c.held = held
+	if len(c.queue) > 0 {
+		// Those waiting for the memory to empty may start now.
+		c.admit()
+	}
 }

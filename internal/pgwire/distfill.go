@@ -120,8 +120,7 @@ func (s *Server) fillOn(f *stagedFill, src *statement, here func(context.Context
 			n, q, done, werr := s.fillOnWorkers(f.ctx, sess, src, distributed.ModeOn, from)
 			if done {
 				q.since = since
-				q.placement = fmt.Sprintf("moved by the guard after %.0f s on this replica, estimated at %.0f s; %s", ran.Seconds(),
-					p.local.Seconds(), q.placement)
+				q.placement = s.dist.GuardPlacement(ran, p.local, q.placement)
 				return n, q, false, werr
 			}
 			if q.release != nil {

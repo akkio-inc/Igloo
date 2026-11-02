@@ -124,6 +124,12 @@ func (s *Server) prefetchStatement(ctx context.Context, sess *session, st *state
 		return func() {}
 	}
 	env := &scanEnv{sessionEnv: &sessionEnv{s: s, sess: sess, user: sess.currentUser(), st: st}}
+	resolver, err := s.scanResolver(ctx, sess)
+	if err != nil {
+		s.log.Debug("prefetch: cannot resolve the statement's scans", "err", err)
+		return func() {}
+	}
+	env.resolver = resolver
 	plan, err := s.scanner.Resolve(ctx, text, env)
 	if err != nil {
 		s.log.Debug("prefetch: cannot resolve the statement's scans", "err", err)
@@ -178,6 +184,66 @@ func prefetchScans(scans []distributed.Scan) []prefetch.Scan {
 		out = append(out, ps)
 	}
 	return out
+}
+
+// scanNames are the catalog objects that names stand for, as of a catalog
+// generation, for what statements read ahead. Listing them takes the catalog
+// lock exclusively, and a statement's reads resolve a name for each table and
+// view: a dashboard's statements, about to run, took it several times each, and
+// held up every prepare beside them, for names that had not changed. What is
+// read ahead only ever costs requests, so a name that another replica changed
+// meanwhile does no harm until this one learns of it.
+type scanNames struct {
+	mu      sync.Mutex
+	gen     uint64
+	objects map[string][]object
+	// listing is held while one is listed, so that sessions that miss the
+	// same name at once list it once.
+	listing sync.Mutex
+}
+
+// scanResolver is a resolver for what sess's statement reads ahead. A session
+// with temporary objects of its own sees other names, and lists them.
+func (s *Server) scanResolver(ctx context.Context, sess *session) (*resolver, error) {
+	r, err := s.newResolver(ctx, sess)
+	if err != nil || sess.temps {
+		return r, err
+	}
+	cached := func(name string) ([]object, bool) {
+		n := &s.scanNames
+		n.mu.Lock()
+		defer n.mu.Unlock()
+		if gen := s.catalogGeneration(); n.objects == nil || n.gen != gen {
+			n.gen, n.objects = gen, map[string][]object{}
+		}
+		objs, ok := n.objects[name]
+		return objs, ok
+	}
+	r.lookup = func(name string) []object {
+		if objs, ok := cached(name); ok {
+			return objs
+		}
+		n := &s.scanNames
+		n.listing.Lock()
+		defer n.listing.Unlock()
+		if objs, ok := cached(name); ok {
+			return objs
+		}
+		gen := s.catalogGeneration()
+		list := *r
+		list.lookup, list.objects = nil, map[string][]object{}
+		if err := list.load([]string{name}); err != nil {
+			return nil
+		}
+		objs := list.objects[name]
+		n.mu.Lock()
+		defer n.mu.Unlock()
+		if n.gen == gen && n.objects != nil {
+			n.objects[name] = objs
+		}
+		return objs
+	}
+	return r, nil
 }
 
 // scanEnv resolves a statement's table names for the scanner as the

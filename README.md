@@ -10,9 +10,9 @@
 Igloo is an open-source SQL data warehouse that runs in your own cloud
 account or on your own hardware.
 
-Igloo runs 3 times faster than Snowflake and Databricks at 20 times lower
+Igloo runs 3 times faster than Snowflake and Databricks at 25 times lower
 cost, and is faster and lower cost at every warehouse size from X-Small to
-X-Large. The 3 and 20 are medians over those sizes, on TPC-H at 100 GB in
+X-Large. The 3 and 25 are medians over those sizes, on TPC-H at 100 GB in
 Amazon S3 at list prices, with Igloo on one machine: 32 cores against
 X-Small and Small, 64 from Medium up.
 

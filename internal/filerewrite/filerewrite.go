@@ -414,3 +414,36 @@ func Rewrite(ctx context.Context, tbl *table.Table, fs iceio.IO, tasks []table.F
 	}
 	return files, lay, nil
 }
+
+// RowWidth guesses the bytes a row of fields takes uncompressed, as DuckDB
+// holds it while it writes a row group.
+func RowWidth(fields []iceberg.NestedField) int64 {
+	var n int64
+	for _, f := range fields {
+		n += typeWidth(f.Type)
+	}
+	return n
+}
+
+func typeWidth(t iceberg.Type) int64 {
+	switch t := t.(type) {
+	case *iceberg.StructType:
+		return RowWidth(t.FieldList)
+	case *iceberg.ListType, *iceberg.MapType:
+		return 64
+	case iceberg.BooleanType:
+		return 1
+	case iceberg.Int32Type, iceberg.Float32Type, iceberg.DateType:
+		return 4
+	case iceberg.Int64Type, iceberg.Float64Type, iceberg.TimeType, iceberg.TimestampType, iceberg.TimestampTzType:
+		return 8
+	case iceberg.DecimalType, iceberg.UUIDType:
+		return 16
+	case iceberg.FixedType:
+		return int64(t.Len())
+	}
+	// Strings and binary: a short string inline, a long one out of line.
+	// Four short strings a row took 127 bytes more a row in groups of 4
+	// million rows than in DuckDB's (14.6 GB on 16 threads, not 6.7).
+	return 32
+}

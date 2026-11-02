@@ -30,6 +30,7 @@ import (
 	"github.com/akkio-inc/igloo/internal/distributed"
 	"github.com/akkio-inc/igloo/internal/icebergtest"
 	"github.com/akkio-inc/igloo/internal/policy"
+	"github.com/akkio-inc/igloo/internal/uploads"
 )
 
 // writeFault stands in front of a worker, as a network or a worker gone
@@ -178,6 +179,7 @@ func writeLog() *slog.Logger {
 // writeEnv is a replica on an Iceberg catalog with workers, which read and
 // write the files of its tables under dir as production's do.
 type writeEnv struct {
+	coOpts distributed.Options
 	*refreshEnv
 	faults []*writeFault
 	gate   *taskGate
@@ -256,6 +258,7 @@ func startWriteServerOn(t *testing.T, workers writeWorkers, coordinate func(*dis
 	if coordinate != nil {
 		coordinate(&opts)
 	}
+	env.coOpts = opts
 	env.co, err = distributed.NewCoordinator(opts, writeLog())
 	if err != nil {
 		t.Fatal(err)
@@ -1076,7 +1079,7 @@ func TestWorkersDoNotWrite(t *testing.T) {
 // auto mode, now that they write it.
 func TestWorkersWriteAuto(t *testing.T) {
 	t.Parallel()
-	env := startWriteServer(t)
+	env := startWriteServerOn(t, writeWorkers{cores: 8, memory: 64 << 30, claim: 3 << 30}, nil)
 	mustExec(t, env.admin, "CREATE TABLE w_auto AS SELECT id, x FROM src")
 	env.force(t)
 	if got, want := env.local(t, "SELECT count(*), sum(x) FROM w_auto"), env.local(t, "SELECT count(*), sum(x) FROM src"); got != want {
@@ -1123,6 +1126,132 @@ func TestWorkersWriteManyPartitionsAuto(t *testing.T) {
 	env.checkWrote(t, "w_forced")
 	if data, _ := liveFiles(t, env.admin, "w_forced"); len(data) > 2*2000+2 {
 		t.Errorf("%d files of 2,000 partitions on two workers", len(data))
+	}
+}
+
+// fakeUploads is a store of unfinished writes.
+type fakeUploads struct {
+	mu      sync.Mutex
+	list    []uploads.Upload
+	aborted []string
+}
+
+func (f *fakeUploads) List(_ context.Context, prefix string) ([]uploads.Upload, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var out []uploads.Upload
+	for _, u := range f.list {
+		if strings.HasPrefix(u.Path, prefix) {
+			out = append(out, u)
+		}
+	}
+	return out, nil
+}
+
+func (f *fakeUploads) Abort(_ context.Context, u uploads.Upload) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.aborted = append(f.aborted, u.Path)
+	return nil
+}
+
+// TestFailedStatementsAbortUploads checks that an INSERT that fails on this replica
+// ends what it had uploaded of the table's files: those begun since it began, but not
+// those of statements' own directories, nor any while another INSERT into the table
+// runs here; that one that succeeds ends none; and that a CREATE TABLE ... AS that fails
+// ends all under its staging table.
+func TestFailedStatementsAbortUploads(t *testing.T) {
+	t.Parallel()
+	env := startWriteServer(t)
+	mustExec(t, env.admin, "SET distributed_execution = off")
+	mustExec(t, env.admin, "CREATE TABLE w_fail AS SELECT id, x FROM src LIMIT 0")
+	dir := env.location(t, "w_fail") + "/data"
+	store := &fakeUploads{}
+	env.srv.uploadStoreFor = func(string) (uploads.Store, error) { return store, nil }
+	now := time.Now()
+	plant := func() {
+		store.list = []uploads.Upload{
+			{Path: dir + "/old.parquet", Initiated: now.Add(-time.Hour)},
+			{Path: dir + "/new.parquet", Initiated: now.Add(time.Minute)},
+			{Path: dir + "/k=1/new.parquet", Initiated: now.Add(time.Minute)},
+			{Path: dir + "/" + distributed.WriteDirMark + "ab/new.parquet", Initiated: now.Add(time.Minute)},
+			{Path: dir + "/" + distributed.SealedDirMark + "ab/new.parquet", Initiated: now.Add(time.Minute)},
+		}
+		store.aborted = nil
+	}
+	plant()
+	// Fails on the cast of its last rows, after it began.
+	bad := "INSERT INTO w_fail SELECT id, CASE WHEN id = 39999 THEN error('no') ELSE x END FROM src"
+	if _, err := env.admin.Exec(context.Background(), bad); err == nil {
+		t.Fatal("it did not fail")
+	}
+	slices.Sort(store.aborted)
+	if want := []string{dir + "/k=1/new.parquet", dir + "/new.parquet"}; !slices.Equal(store.aborted, want) {
+		t.Errorf("aborted %q, want %q", store.aborted, want)
+	}
+
+	plant()
+	mustExec(t, env.admin, "INSERT INTO w_fail SELECT id, x FROM src")
+	if len(store.aborted) != 0 {
+		t.Errorf("a statement that succeeded aborted %q", store.aborted)
+	}
+
+	plant()
+	env.srv.replicaWritesMu.Lock()
+	env.srv.replicaWrites["w_fail"] = 1
+	env.srv.replicaWritesMu.Unlock()
+	if _, err := env.admin.Exec(context.Background(), bad); err == nil {
+		t.Fatal("it did not fail")
+	}
+	if len(store.aborted) != 0 {
+		t.Errorf("with another running, aborted %q", store.aborted)
+	}
+	env.srv.replicaWritesMu.Lock()
+	delete(env.srv.replicaWrites, "w_fail")
+	env.srv.replicaWritesMu.Unlock()
+
+	// All under its staging table, which is the statement's alone.
+	seen := map[string]bool{}
+	env.srv.uploadStoreFor = func(dir string) (uploads.Store, error) {
+		seen[dir] = true
+		return &fakeUploads{}, nil
+	}
+	if _, err := env.admin.Exec(context.Background(), "CREATE TABLE w_fail2 AS SELECT id, CASE WHEN id = 39999 THEN error('no') ELSE x END AS x FROM src"); err == nil {
+		t.Fatal("it did not fail")
+	}
+	if len(seen) != 1 {
+		t.Errorf("looked under %v", seen)
+	}
+}
+
+// TestForcedWhenCoordinatorIsBehind checks that a statement a worker refuses for an
+// erasure request's deletion its coordinator had not heard of still runs on workers, and
+// they still write the table: planned again, it begins after the deletion.
+func TestForcedWhenCoordinatorIsBehind(t *testing.T) {
+	t.Parallel()
+	env := startWriteServer(t)
+	env.force(t)
+	// Another replica's coordinator has the workers purged, ahead of this one's.
+	other, err := distributed.NewCoordinator(env.coOpts, writeLog())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer other.Close()
+	if err := other.PurgeWorkers(context.Background(), erasedLedger{}); err != nil {
+		t.Fatal(err)
+	}
+	mustExec(t, env.admin, "CREATE TABLE w_behind AS SELECT id, x FROM src")
+	env.checkWrote(t, "w_behind")
+	if got, want := env.local(t, "SELECT count(*), sum(x) FROM w_behind"), env.local(t, "SELECT count(*), sum(x) FROM src"); got != want {
+		t.Errorf("%s, want %s", got, want)
+	}
+}
+
+// TestDirsOf checks which directories go with a statement's files, the deepest first.
+func TestDirsOf(t *testing.T) {
+	got := dirsOf("abfss://c@h/t/d", []string{"abfss://c@h/t/d/q/a/f", "abfss://c@h/t/d/q/b/g", "abfss://c@h/t/d/h"})
+	if want := []string{"abfss://c@h/t/d/q/a", "abfss://c@h/t/d/q/b", "abfss://c@h/t/d/q", "abfss://c@h/t/d"}; !slices.Equal(got, want) {
+		t.Errorf("directories %q, want %q", got, want)
 	}
 }
 

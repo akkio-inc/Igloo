@@ -1042,6 +1042,57 @@ type footprintEnv struct {
 
 func (e footprintEnv) Footprint() (int64, bool) { return e.allocated, true }
 
+// localRunEnv is harnessEnv whose session says statements of the planned one's
+// shape took took here.
+type localRunEnv struct {
+	harnessEnv
+	took time.Duration
+}
+
+func (e localRunEnv) LocalRun() (time.Duration, bool) { return e.took, true }
+
+// A statement that ran here with no plan key to keep its time by, as with
+// distributed_execution off, is not guessed at: what it took stands where its
+// key has no run here of its own, which comes first.
+func TestLocalRunStandsForTheEstimate(t *testing.T) {
+	h := newHarness(t, 0.01, 3, 2)
+	h.co.maxBroadcast = 1
+	h.tables["lineitem"].Bytes = 1 << 34
+	h.tables["orders"].Bytes = 1 << 32
+	h.noPlans = true
+	q := `SELECT o_orderpriority, count(*) FROM orders JOIN lineitem ON l_orderkey = o_orderkey GROUP BY 1`
+	ctx := t.Context()
+	env := harnessEnv{h}
+	plan, d, err := h.co.plan(ctx, q, localRunEnv{env, 10 * time.Second}, ModeAuto, true, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d.onWorkers || !strings.Contains(d.reason, "it ran in 10 s on one machine") {
+		t.Errorf("after 10 s here: on workers %v (%s)", d.onWorkers, d.reason)
+	}
+	if _, d, err = h.co.plan(ctx, q, localRunEnv{env, 714 * time.Second}, ModeAuto, true, nil); err != nil {
+		t.Fatal(err)
+	}
+	if !d.onWorkers || !strings.Contains(d.reason, "it ran in 714 s on one machine") {
+		t.Errorf("after 714 s here: on workers %v (%s)", d.onWorkers, d.reason)
+	}
+	// Its own key's run stands, as of tables of its sizes.
+	h.co.Observe(plan.Key, 0, 20*time.Second)
+	if _, d, err = h.co.plan(ctx, q, localRunEnv{env, 714 * time.Second}, ModeAuto, true, nil); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(d.reason, "714") || !strings.Contains(d.reason, "it ran in 20 s on one machine") {
+		t.Errorf("after its key's run: on workers %v (%s)", d.onWorkers, d.reason)
+	}
+	// Forced runs go where they are told, whatever ran here.
+	if _, d, err = h.co.plan(ctx, q, localRunEnv{env, 10 * time.Second}, ModeOn, true, nil); err != nil {
+		t.Fatal(err)
+	}
+	if !d.onWorkers {
+		t.Errorf("forced: on workers %v (%s)", d.onWorkers, d.reason)
+	}
+}
+
 // A statement that ran on workers and that auto mode estimates short of
 // memory on one machine stays on workers, but not where a statement of its
 // shape ran to its end on one machine (see Footprints).

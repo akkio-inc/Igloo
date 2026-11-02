@@ -413,3 +413,80 @@ func TestHeavyHistory(t *testing.T) {
 		t.Error("a report is not heavy beside small statements")
 	}
 }
+
+// TestMostOfSize checks when what runs beside a heavy statement gives it nothing
+// to give way to: most of it known to take as much as makes a statement heavy at
+// the least, or running long enough to have used that much.
+func TestMostOfSize(t *testing.T) {
+	t.Parallel()
+	h := newHeavyHistory()
+	h.after = 5 * time.Second
+	short := aStatement{expect: time.Second, ran: 2 * time.Second}
+	unseen := aStatement{ran: 2 * time.Second}
+	sized := aStatement{expect: 30 * time.Second, ran: time.Second}
+	long := aStatement{ran: time.Minute}
+	slowed := aStatement{expect: time.Second, ran: time.Minute}
+	for _, c := range []struct {
+		beside []aStatement
+		want   bool
+	}{
+		{nil, false},
+		{[]aStatement{short}, false},
+		{[]aStatement{unseen, unseen, unseen}, false},
+		{[]aStatement{sized}, true},
+		{[]aStatement{long}, true},
+		{[]aStatement{sized, short}, false},
+		{[]aStatement{sized, long, short}, true},
+		{[]aStatement{sized, short, short, short, long}, false},
+		{[]aStatement{sized, sized, sized, sized, long, long, short}, true},
+		{[]aStatement{slowed}, false},
+		{[]aStatement{slowed, slowed, slowed, sized}, false},
+	} {
+		if got := h.mostOfSize(c.beside); got != c.want {
+			t.Errorf("beside %v: %v, want %v", c.beside, got, c.want)
+		}
+	}
+}
+
+// TestHeavyStaysBesideHeavy checks that a heavy statement stays in the first DuckDB
+// beside a statement of some size, and goes to the second once that has ended.
+func TestHeavyStaysBesideHeavy(t *testing.T) {
+	r, admin, m := backgroundReplica(t, "200000", time.Nanosecond)
+	const q = "SELECT v, count(*) AS n, sum(id) AS s FROM lake.public.visits GROUP BY v ORDER BY v"
+	want := sortedTexts(t, admin, q)
+	if got := sortedTexts(t, admin, q); !slices.Equal(got, want) || backgrounds(m) != 1 {
+		t.Fatalf("alone: %q, %v ran in the background", got[:1], backgrounds(m))
+	}
+	// Whatever runs is of some size.
+	after := r.srv.heavy.after
+	r.srv.heavy.after = 0
+	defer func() { r.srv.heavy.after = after }()
+	other := r.admin(t, pgx.QueryExecModeSimpleProtocol)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_, _ = other.Exec(ctx, "SELECT count(*) FROM range(100000000000) x WHERE hash(x.range) = 1")
+	}()
+	deadline := time.Now().Add(20 * time.Second)
+	for !r.srv.besideIsHeavy(nil) && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := sortedTexts(t, admin, q); !slices.Equal(got, want) {
+		t.Errorf("beside it: %q", got[:1])
+	}
+	if n := backgrounds(m); n != 1 {
+		t.Errorf("%v ran in the background, beside a statement of some size", n)
+	}
+	cancel()
+	<-done
+	for r.srv.besideIsHeavy(nil) && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := sortedTexts(t, admin, q); !slices.Equal(got, want) {
+		t.Errorf("after it: %q", got[:1])
+	}
+	if n := backgrounds(m); n != 2 {
+		t.Errorf("%v ran in the background, with nothing beside it", n)
+	}
+}

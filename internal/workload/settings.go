@@ -175,6 +175,17 @@ type Limits struct {
 	// runs a query or changes data. It is the statement's, not the
 	// user's.
 	Counted bool
+	// Expect is how long the statement should take alone, zero if unknown,
+	// which sets its place in line (see Controller.Expect). It is the
+	// statement's, not the user's.
+	Expect time.Duration
+	// Apart says it is to run in the replica's second DuckDB, whose memory
+	// SampleMemory does not read. It is the statement's, not the user's.
+	Apart bool
+	// Unseen says no statement of its shape has run here, so that nothing is
+	// known of what it holds (see Controller.full). It is the statement's,
+	// not the user's.
+	Unseen bool
 }
 
 // Slots is a limit on statements running at once, shared by everyone

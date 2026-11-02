@@ -454,6 +454,7 @@ type Server struct {
 	idComplete idComplete
 	// scanner and prefetcher read ahead for statements, or are nil.
 	scanner    *distributed.Scanner
+	scanNames  scanNames
 	prefetcher *prefetch.Prefetcher
 	// bitmaps and bitmapMinRows choose the statements that count distinct
 	// IDs in roaring bitmaps, and bitmapReruns counts those run again with
@@ -502,10 +503,7 @@ type Server struct {
 	reportPlanned atomic.Int64
 	settings      auth.SettingStore
 	workload      *workload.Controller
-	// flattens picks the form of each statement shape's FLATTENs of
-	// columns (see flattenForms).
-	flattens flattenForms
-	pool     string
+	pool          string
 	// shares carries out Delta Sharing statements, and external are its
 	// external tables.
 	shares   *sharing.Service
@@ -573,6 +571,12 @@ type Server struct {
 	stopLateWrites sync.Once
 	// uploadKeys is Options.UploadKeys.
 	uploadKeys uploads.Keys
+	// uploadStoreFor, in tests, is the store of unfinished writes of a directory.
+	uploadStoreFor func(dir string) (uploads.Store, error)
+	// replicaWrites counts the INSERTs running on this replica by the names of their
+	// tables, under replicaWritesMu (see replicaWrite).
+	replicaWritesMu sync.Mutex
+	replicaWrites   map[string]int
 	// beforeWriteCommit, if set, runs before files workers wrote under dir
 	// are committed, and fails the commit with its error (see tableWrite).
 	beforeWriteCommit func(ctx context.Context, dir string) error
@@ -773,6 +777,9 @@ func New(engine Engine, opts Options, log *slog.Logger) (*Server, error) {
 	s.queryMemory = opts.QueryMemory
 	if opts.HeavyInBackground {
 		s.heavy = newHeavyHistory()
+		if e, ok := s.engine.(interface{ WatchForeground(func() bool) }); ok {
+			e.WatchForeground(s.workload.HeldBehindSecond)
+		}
 	}
 	s.scanner, s.prefetcher = opts.Scanner, opts.Prefetcher
 	s.bitmaps, s.bitmapMinRows, s.bitmapIndexesOn = opts.Bitmaps, opts.BitmapMinRows, opts.BitmapIndexes
@@ -1057,9 +1064,13 @@ type session struct {
 	// because Igloo exits (see exitForMemory).
 	statement string
 	started   time.Time
-	shed      bool
-	shedAt    time.Time
-	exiting   bool
+	// runShape is the running statement's shape, and inBackground says it runs
+	// in the second DuckDB, for the statements beside it (see besideIsHeavy).
+	runShape     string
+	inBackground bool
+	shed         bool
+	shedAt       time.Time
+	exiting      bool
 	// stuck, set for a client's session, lets the client go when its
 	// statement does not stop once canceled; watched is the context of the
 	// statement's run it watches (see watchStuck).
@@ -1450,11 +1461,13 @@ func (sess *session) runCancelable(ctx context.Context, query string, fn func(co
 	ctx, cancel := context.WithCancel(ctx)
 	sess.mu.Lock()
 	sess.running, sess.statement, sess.started, sess.shed, sess.queued = cancel, redactQuery(query), time.Now(), false, true
+	sess.runShape = sess.wl.shape
 	sess.mu.Unlock()
 
 	defer func() {
 		sess.mu.Lock()
 		sess.running, sess.statement, sess.started, sess.queued = nil, "", time.Time{}, false
+		sess.runShape = ""
 		sess.mu.Unlock()
 		cancel()
 	}()
@@ -2135,6 +2148,7 @@ func (s *Server) preparedQuery(ctx context.Context, sess *session, user auth.Use
 			sess.wl.shape = s.workloadShape(ctx, sess, st.prepared)
 		}
 		shape := sess.wl.shape
+		sess.wl.apart = s.runsApart(sess, st)
 		err = sess.runCancelable(ctx, q.Query, func(ctx context.Context) error {
 			runOnce := func() error {
 				p, done, err := s.runDistributed(ctx, sess, sess.currentUser(), st, args, tw, sessionMode(sess, sess.currentUser()))
@@ -2212,7 +2226,7 @@ func (s *Server) preparedQuery(ctx context.Context, sess *session, user auth.Use
 			spend = &sp
 			aiNotice(w, sp)
 		}
-		sess.wl.counted, sess.wl.shape = false, ""
+		sess.wl.counted, sess.wl.shape, sess.wl.apart = false, "", false
 		if st.filled != nil {
 			// A fill's query ran on workers, or here, as a read of it would
 			// (see fillOn): the history says where, and auto mode learns how
@@ -2225,20 +2239,27 @@ func (s *Server) preparedQuery(ctx context.Context, sess *session, user auth.Use
 		if err == nil {
 			used = sess.measure(st)
 		}
-		if used != nil && tr != nil && tr.flattenKey != "" {
-			s.flattens.observe(tr.flattenKey, tr.flattenLists, used.CPUTime)
+		// A run planned to no rows says nothing of others of its shape (see
+		// workload.ReadNothing).
+		measured := used != nil && !workload.ReadNothing(used.BytesRead, used.CPUTime)
+		if measured && tr != nil && tr.flattenKey != "" {
+			s.workload.ObserveForm(tr.flattenKey, tr.flattenLists, used.CPUTime)
 		}
 		peak, sampled := sess.wl.peak, sess.wl.sampled
-		if used != nil && parts.workers == 0 && s.heavy != nil {
+		if used != nil && parts.workers == 0 && s.heavy != nil && (measured || !s.heavy.known(shape)) {
 			// Which of this replica's DuckDBs the next like it runs in.
 			s.heavy.observe(shape, used.CPUTime, sess.wl.ranInBackground)
 		}
 		switch {
 		case parts.workers > 0:
 			// One that ran on workers held most of its memory there.
-		case used != nil:
+		case measured:
 			// What it held here, for the next statement like it.
 			s.workload.Observe(shape, workload.FootprintOf(used.MemoryAllocated, peak, sampled))
+			s.workload.ObserveCost(shape, used.CPUTime)
+			s.workload.ObserveTook(shape, time.Since(start)-sess.wl.queued)
+		case used != nil:
+			s.workload.ObserveEmpty(shape)
 		case err != nil && sampled:
 			// It ended before its end, holding at least that much, or, if it
 			// ran a while, all the memory: it may have held any of what the
@@ -2287,7 +2308,7 @@ func (s *Server) preparedQuery(ctx context.Context, sess *session, user auth.Use
 		}
 		s.recordQuery(sess, queryRecord{text: q.Query, start: start, err: err, rows: tw.rows(), acc: st.access,
 			policies: st.policies(), used: used, queued: queued, analyze: st.sourceText(), stmtType: st.stmtType, parts: parts, ai: spend,
-			shape: shape, peak: peak})
+			shape: shape, peak: peak, form: formOf(tr)})
 		if err != nil {
 			s.log.Debug("statement failed", "user", user.Name, "err", err)
 		}

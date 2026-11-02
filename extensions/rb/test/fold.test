@@ -1,0 +1,97 @@
+# Comparisons with what a CASE of constants can never be: the same rows as without
+# the pass, which TestRBFoldsImpossibleComparisons checks it takes out of the plan.
+
+statement ok
+CREATE TEMP TABLE visits AS SELECT range AS id, repeat('u', range % 8) AS url FROM range(1000)
+
+# Of a derived table, none of the kind
+query I
+SELECT count(*) FROM (SELECT *, CASE WHEN length(url) % 4 = 0 THEN 'search' WHEN length(url) % 4 = 3 THEN 'other' ELSE 'page' END AS kind FROM visits) v WHERE v.kind = 'click'
+----
+0
+
+# Of the kinds there are, as many as without it
+query I
+SELECT count(*) FROM (SELECT *, CASE WHEN length(url) % 4 = 0 THEN 'search' WHEN length(url) % 4 = 3 THEN 'other' ELSE 'page' END AS kind FROM visits) v WHERE v.kind = 'search'
+----
+250
+
+query I
+SELECT count(*) FROM (SELECT *, CASE WHEN length(url) % 4 = 0 THEN 'search' ELSE 'page' END AS kind FROM visits) v WHERE v.kind IN ('click', 'page')
+----
+750
+
+query I
+SELECT count(*) FROM (SELECT *, CASE WHEN length(url) % 4 = 0 THEN 'search' ELSE 'page' END AS kind FROM visits) v WHERE v.kind IN ('click', 'share')
+----
+0
+
+# With no ELSE, the rest are NULL, not false
+query T
+SELECT DISTINCT (kind = 'click')::VARCHAR FROM (SELECT CASE WHEN id = 0 THEN 'search' END AS kind FROM visits) v ORDER BY 1 NULLS LAST
+----
+false
+NULL
+
+# With an ELSE, false for every row, as a value too
+query T
+SELECT DISTINCT (kind = 'click')::VARCHAR FROM (SELECT CASE WHEN id = 0 THEN 'search' ELSE 'page' END AS kind FROM visits) v
+----
+false
+
+# NOT of it passes every row
+query I
+SELECT count(*) FROM (SELECT CASE WHEN id = 0 THEN 'search' ELSE 'page' END AS kind FROM visits) v WHERE NOT v.kind = 'click'
+----
+1000
+
+# Through a projection above it, and from a comparison the other way round
+query I
+SELECT count(*) FROM (SELECT kind AS k FROM (SELECT CASE WHEN id = 0 THEN 'search' ELSE 'page' END AS kind FROM visits) a) b WHERE 'click' = b.k
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT kind AS k FROM (SELECT CASE WHEN id = 0 THEN 'search' ELSE 'page' END AS kind FROM visits) a) b WHERE 'page' = b.k
+----
+999
+
+# A column of the table of the same name is not the CASE's
+query I
+SELECT count(*) FROM (SELECT v.id, v.kind, CASE WHEN v.id = 0 THEN 'a' ELSE 'b' END AS other FROM (SELECT id, 'click' AS kind FROM visits) v) x WHERE x.kind = 'click'
+----
+1000
+
+# In a comparison of another type, or under a collation, it is left alone
+query I
+SELECT count(*) FROM (SELECT CASE WHEN id = 0 THEN 1 ELSE 2 END AS kind FROM visits) v WHERE v.kind = 2.0
+----
+999
+
+query I
+SELECT count(*) FROM (SELECT CASE WHEN id = 0 THEN 'Search' ELSE 'Page' END AS kind FROM visits) v WHERE v.kind COLLATE NOCASE = 'page'
+----
+999
+
+# In a join's condition
+query I
+SELECT count(*) FROM (SELECT id, CASE WHEN id = 0 THEN 'search' ELSE 'page' END AS kind FROM visits) v JOIN visits w ON v.id = w.id AND v.kind = 'click'
+----
+0
+
+# An outer join keeps its rows
+query I
+SELECT count(*) FROM visits w LEFT JOIN (SELECT id, CASE WHEN id = 0 THEN 'search' ELSE 'page' END AS kind FROM visits) v ON v.id = w.id AND v.kind = 'click'
+----
+1000
+
+# Under a lateral unnest, as FLATTEN is written
+query I
+SELECT count(*) FROM (SELECT id, ['a', 'b'] AS l, CASE WHEN id = 0 THEN 'search' ELSE 'page' END AS kind FROM visits) v JOIN LATERAL (SELECT unnest(v.l) AS x) u ON v.kind = 'click'
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT id, ['a', 'b'] AS l, CASE WHEN id = 0 THEN 'search' ELSE 'page' END AS kind FROM visits) v JOIN LATERAL (SELECT unnest(v.l) AS x) u ON v.kind = 'page'
+----
+1998

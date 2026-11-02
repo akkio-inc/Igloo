@@ -24,6 +24,8 @@ import (
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
+	"github.com/aws/smithy-go/middleware"
+	smithyhttp "github.com/aws/smithy-go/transport/http"
 )
 
 // Upload is a file not finished in a store.
@@ -78,6 +80,7 @@ func For(fsys icebergio.IO, location string, keys Keys) (Store, error) {
 			Region:       "auto",
 			UsePathStyle: true,
 			Credentials:  credentials.NewStaticCredentialsProvider(keys.GCSKeyID, keys.GCSSecret, ""),
+			APIOptions:   []func(*middleware.Stack) error{unsignedAcceptEncoding},
 		})
 		return &s3Store{client: client, scheme: u.Scheme, bucket: u.Host}, nil
 	case "az", "azure", "abfs", "abfss", "wasb", "wasbs":
@@ -89,9 +92,35 @@ func For(fsys icebergio.IO, location string, keys Keys) (Store, error) {
 		if err != nil {
 			return nil, err
 		}
-		return &azureStore{client: client, base: base, dfs: u.Scheme == "abfs" || u.Scheme == "abfss"}, nil
+		return &azureStore{client: client, base: base}, nil
 	}
 	return nil, nil
+}
+
+// unsignedAcceptEncoding leaves the header the S3 client adds out of what it signs:
+// on GCS's XML API, what reaches the check is not what was signed, and every request
+// is refused with SignatureDoesNotMatch.
+func unsignedAcceptEncoding(stack *middleware.Stack) error {
+	type saved struct{}
+	drop := middleware.FinalizeMiddlewareFunc("dropAcceptEncoding", func(ctx context.Context, in middleware.FinalizeInput, next middleware.FinalizeHandler) (middleware.FinalizeOutput, middleware.Metadata, error) {
+		if req, ok := in.Request.(*smithyhttp.Request); ok {
+			ctx = middleware.WithStackValue(ctx, saved{}, req.Header.Get("Accept-Encoding"))
+			req.Header.Del("Accept-Encoding")
+		}
+		return next.HandleFinalize(ctx, in)
+	})
+	restore := middleware.FinalizeMiddlewareFunc("restoreAcceptEncoding", func(ctx context.Context, in middleware.FinalizeInput, next middleware.FinalizeHandler) (middleware.FinalizeOutput, middleware.Metadata, error) {
+		if req, ok := in.Request.(*smithyhttp.Request); ok {
+			if v, _ := middleware.GetStackValue(ctx, saved{}).(string); v != "" {
+				req.Header.Set("Accept-Encoding", v)
+			}
+		}
+		return next.HandleFinalize(ctx, in)
+	})
+	if err := stack.Finalize.Insert(drop, "Signing", middleware.Before); err != nil {
+		return err
+	}
+	return stack.Finalize.Insert(restore, "Signing", middleware.After)
 }
 
 // s3Store is S3's multipart uploads, and those of the stores that speak it.
@@ -154,29 +183,13 @@ func (s *s3Store) Abort(ctx context.Context, u Upload) error {
 // committed, which a listing that asks for them shows, of no length. A blob
 // committed before keeps what it has, with blocks staged since it.
 //
-// dfs says the location's files are written through the DFS endpoint (abfs:// and
-// abfss://), where a write left unfinished is a file of no length with its appended
-// data unflushed, which any listing of files shows, and which goes with the file.
-// So a store that is such an account, and refuses to list uncommitted blobs, has none
-// of this location's to list. Nothing else is taken for that: any other answer
-// fails, and with it the erasure request that asked. Azure's own answer has yet to be
-// seen here (the cloud test script's Azure run says what it is), so that until then
-// the failure is on the side of a request that does not complete.
+// A real account lists them, with or without a hierarchical namespace, and a write
+// through the DFS endpoint left unfinished, a file of no length with data appended
+// and not flushed, lists as a file, and goes with it. So any refusal is a failure, and
+// with it of the erasure request that asked.
 type azureStore struct {
 	client *container.Client
 	base   string
-	dfs    bool
-}
-
-// refusedListing reports whether err, from listing uncommitted blobs, is the refusal
-// of a filesystem with a hierarchical namespace: that query refused, by an account
-// that says it is one.
-func (s *azureStore) refusedListing(ctx context.Context, err error) bool {
-	if !s.dfs || !(bloberror.HasCode(err, bloberror.InvalidQueryParameterValue) || bloberror.HasCode(err, bloberror.UnsupportedQueryParameter)) {
-		return false
-	}
-	info, ierr := s.client.GetAccountInfo(ctx, nil)
-	return ierr == nil && info.IsHierarchicalNamespaceEnabled != nil && *info.IsHierarchicalNamespaceEnabled
 }
 
 // isDirectory reports whether a listed blob is a directory of a filesystem, which
@@ -208,9 +221,6 @@ func (s *azureStore) List(ctx context.Context, prefix string) ([]Upload, error) 
 	for pager.More() {
 		page, err := pager.NextPage(ctx)
 		if err != nil {
-			if s.refusedListing(ctx, err) {
-				return nil, nil
-			}
 			return nil, err
 		}
 		for _, b := range page.Segment.BlobItems {

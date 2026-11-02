@@ -111,10 +111,13 @@ const WriteSource = "__igloo_rows_source"
 // FileBytes bounds an unpartitioned file; RowGroup and Compression are the
 // table's, if set.
 type WriteTarget struct {
-	Dir         string
-	Select      string
-	Columns     []WriteColumn
-	Partitions  []string
+	Dir        string
+	Select     string
+	Columns    []WriteColumn
+	Partitions []string
+	// parts is how many partitions the statement's rows are estimated to have, zero
+	// for not known (see Plan.writeParts).
+	parts       int64
 	FileBytes   int64
 	RowGroup    int64
 	Compression string
@@ -139,6 +142,7 @@ type writeRequest struct {
 	Dir         string            `json:"dir"`
 	Columns     []WriteColumn     `json:"columns"`
 	Partitions  []string          `json:"partitions,omitempty"`
+	Parts       int64             `json:"parts,omitempty"`
 	AsTheyCome  bool              `json:"as_they_come,omitempty"`
 	FileBytes   int64             `json:"file_bytes,omitempty"`
 	RowGroup    int64             `json:"row_group,omitempty"`
@@ -272,6 +276,24 @@ func writeFilesOpen(memory int64, shares int, uploads bool) int {
 	return int(min(max(n, leastWriteFiles), mostWriteFiles))
 }
 
+// partitionFileHeld is about what a partition's file open on object storage holds at
+// the least: an upload's buffer and a row group of leastWriteRowGroup, with what the
+// writer holds beside it.
+const partitionFileHeld = 8 << 20
+
+// writeFilesFit is the most partitions' files a task can keep open if that is what
+// it needs: their least within half of a worker's memory, where one statement
+// writing is about all it does.
+func writeFilesFit(memory int64, uploads bool) int {
+	if memory <= 0 {
+		return 100
+	}
+	if !uploads {
+		return mostWriteFiles
+	}
+	return int(max(memory/2/partitionFileHeld, leastWriteFiles))
+}
+
 // writeFlush is how many rows each of a task's threads gathers before it hands
 // them to the partitions' writers: as shuffleFlush, but at wideWriteRow.
 func writeFlush(memory int64, shares, threads int) int64 {
@@ -324,11 +346,22 @@ func (w *Worker) writeFiles(ctx context.Context, conn *duckdb.Conn, req *taskReq
 	// at once.
 	shares := max(w.slotCount/w.taskSlots(req.Slots), 1)
 	threads := threadsOf(ctx, conn)
-	writers := threads
+	writers, sorted := threads, false
 	if len(wr.Partitions) > 0 {
 		// DuckDB cannot bound a partition's files by their size.
 		opts = append(opts, "PARTITION_BY ("+strings.Join(wr.Partitions, ", ")+")")
 		writers = writeFilesOpen(w.opts.MemoryBytes, shares, uploadsInParts(to))
+		// Past the files it keeps open, DuckDB closes one and later opens another
+		// for more of its rows. As rows of 128 partitions came, a task keeping 8
+		// open wrote 18 files of each, 40 KB a file, in a statement that took 32
+		// times as long as on one machine. So it keeps as many as the partitions
+		// the plan expects, if they fit, and otherwise sorts the rows by partition,
+		// which finishes each partition once: but that is no small thing, 4 times
+		// as long on a small worker where it was not needed.
+		if wr.Parts > int64(writers) {
+			writers = int(min(wr.Parts, int64(max(writeFilesFit(w.opts.MemoryBytes, uploadsInParts(to)), writers))))
+			sorted = wr.Parts > int64(writers) && !wr.AsTheyCome
+		}
 		if _, err := conn.ExecContext(ctx, fmt.Sprintf("SET SESSION partitioned_write_max_open_files = %d", writers), nil); err != nil {
 			return nil, err
 		}
@@ -347,13 +380,9 @@ func (w *Worker) writeFiles(ctx context.Context, conn *duckdb.Conn, req *taskReq
 		opts = append(opts, "COMPRESSION "+wr.Compression)
 	}
 	source := "SELECT " + strings.Join(names, ", ") + " FROM (" + query + ")"
-	if len(wr.Partitions) > 0 && !wr.AsTheyCome {
-		// A partition's rows together: past the files it keeps open, DuckDB closes
-		// one and later opens another for more of its rows. Taking 128 partitions
-		// as they came, a task of a small worker wrote 18 files of each, 40 KB a
-		// file, in a table that took 32 times as long to write as on one machine.
-		// Sorting rows of many kilobytes can take a small worker's memory, in
-		// which case the statement runs again with them as they come (see stage).
+	if sorted {
+		// Sorting rows of many kilobytes can take a small worker's memory, in which
+		// case the statement runs again with them as they come (see stage).
 		source += " ORDER BY " + strings.Join(wr.Partitions, ", ")
 	}
 	res, err := conn.QueryContext(ctx, "COPY ("+source+") TO "+quoteLiteral(to)+" ("+strings.Join(opts, ", ")+")", nil)
@@ -469,7 +498,10 @@ func (p *Plan) WorkersWrite() bool { return p.writes }
 
 // Write has the plan's tasks write its rows as target says. The target's
 // credentials, if any, are made by the coordinator when the statement runs.
-func (p *Plan) Write(target *WriteTarget) { p.target = target }
+func (p *Plan) Write(target *WriteTarget) {
+	target.parts = p.writeParts
+	p.target = target
+}
 
 // Wrote says the statement's tasks wrote its rows, Written lists the files,
 // and SQL is empty.
@@ -522,8 +554,8 @@ func (co *Coordinator) noteWriteDenied(err error) {
 // writeRequestFor is what a task of target is to write under dir; dispatch
 // names its attempts' directories, and makes their credentials.
 func writeRequestFor(target *WriteTarget, dir string) *writeRequest {
-	return &writeRequest{Dir: dir, Columns: target.Columns, Partitions: target.Partitions, FileBytes: target.FileBytes, RowGroup: target.RowGroup,
-		Compression: target.Compression}
+	return &writeRequest{Dir: dir, Columns: target.Columns, Partitions: target.Partitions, Parts: target.parts, FileBytes: target.FileBytes,
+		RowGroup: target.RowGroup, Compression: target.Compression}
 }
 
 // writeCredentials are the credentials the attempt that writes dir carries:
@@ -554,6 +586,10 @@ func (co *Coordinator) probeWrite(ctx context.Context, ws []*worker, target *Wri
 	if err != nil && ctx.Err() == nil {
 		if WriteDenied(err) {
 			co.noteWriteDenied(err)
+			return err
+		}
+		if Behind(err) {
+			// Nothing to do with writing.
 			return err
 		}
 		return errors.Join(ErrWriteDenied, err)
@@ -617,6 +653,23 @@ func (pl *planner) markWrites(final node) {
 		cols = "(" + strings.Join(names, ", ") + ")"
 	}
 	last.writeSQL = "WITH " + quoteIdent(last.placeholder) + cols + " AS (" + last.SQL + ") " + sql
+}
+
+// noWriteReason says why workers do not write a fill forced onto them, in the order
+// planning looks.
+func noWriteReason(table, may bool, stages []*Stage, x features, f fleet) string {
+	switch {
+	case !table:
+		return "the table is of a kind they do not write (the log says which)"
+	case !may:
+		return "a worker was refused a write within the last ten minutes"
+	case !slices.ContainsFunc(stages, func(s *Stage) bool { return s.writeSQL != "" }):
+		return "the statement's last step needs its rows together"
+	case !x.writeFits(f):
+		return fmt.Sprintf("its rows take about %d KB each, by %d rows in %d bytes of files, more than a worker's task holds of %d bytes of memory",
+			int64(x.rowBytes())>>10, int64(x.rows), x.bytes, f.memory)
+	}
+	return "unknown"
 }
 
 // rowWise reports whether final, a plan's combine step, reads s's rows and

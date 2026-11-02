@@ -166,6 +166,17 @@ compact large tables within `IGLOO_MAINTENANCE_MEMORY`:
   Arrow side's already did, instead of Arrow's default allocator, so a
   caller that counts memory through the context sees them.
 
+- `io/gocloud/blob.go`, `WalkDir`: goes by a flat listing, not fs.WalkDir. On an
+  Azure account with a hierarchical namespace a directory opens as a blob of no
+  length, and the walk listed one file; and a key with a `..` segment, which S3
+  and GCS allow, had the walk come back to where it was until the stack ran out.
+  `Remove` and `DeleteFiles` delete such a key by the store's own client, as
+  gocloud escapes what it asks for.
+
+- `io/gocloud/azure.go`, `SetDefaultAzureCredential` (new): Azure file systems whose
+  properties give no credentials take them from one provider for the process, as
+  `SetDefaultCredentials` does for S3.
+
 Drop this copy and the `replace` directive once an iceberg-go release reads
 DuckDB-written tables, lets callers choose these Parquet writer defaults,
 no longer needs an MPL-licensed dependency and can rewrite manifests.

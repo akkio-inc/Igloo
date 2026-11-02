@@ -82,6 +82,12 @@ type Query struct {
 	// runs (distributed.Plan.Key), so that where it ran faster decides where
 	// it runs next, after a restart too; empty for others.
 	PlanKey string
+	// FlattenKey identifies a statement whose FLATTENs can take either of two
+	// forms, and FlattenLists says which this one took, so that a restart keeps
+	// what their runs showed (see workload.Controller.ObserveForm); empty for
+	// others.
+	FlattenKey   string
+	FlattenLists bool
 	// Placement is where such a statement ran and why: this replica, how
 	// many workers, or the large worker, and auto mode's reason
 	// (distributed.Plan.Placement); empty for others.

@@ -50,10 +50,12 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -184,6 +186,10 @@ type Prefetcher struct {
 	wg     sync.WaitGroup
 	// writing is held, shared, by every fetch, and whole by Hold.
 	writing sync.RWMutex
+	// readAhead is what statements' scans have read ahead (see
+	// alreadyRead).
+	readAheadMu sync.Mutex
+	readAhead   map[string]time.Time
 
 	fetched, unread, present, failed prometheus.Counter
 	blocks                           prometheus.Counter
@@ -379,6 +385,10 @@ type openFile struct {
 	once sync.Once
 	r    Object
 	err  error
+	// key is what alreadyRead knows it by, for the columns its scan reads, and
+	// pending the blocks of those not yet fetched or found.
+	key     string
+	pending atomic.Int64
 }
 
 // statement is a statement's reading ahead.
@@ -491,6 +501,7 @@ func (s *statement) roomAtAll() bool {
 
 func (s *statement) run(scans []Scan) {
 	for _, sc := range scans {
+		columns := readColumns(sc)
 		ids := map[int32]bool{}
 		for _, id := range sc.FieldIDs {
 			ids[id] = true
@@ -506,7 +517,11 @@ func (s *statement) run(scans []Scan) {
 			if !s.roomAtAll() {
 				return
 			}
-			of := &openFile{File: f}
+			key := f.Path + "\x00" + columns
+			if s.p.alreadyRead(key) {
+				continue
+			}
+			of := &openFile{File: f, key: key}
 			s.files = append(s.files, of)
 			meta, ranges, err := s.columnRanges(of, ids, sc.Whole)
 			if err != nil {
@@ -517,7 +532,7 @@ func (s *statement) run(scans []Scan) {
 				continue
 			}
 			if filter == nil {
-				if !s.enqueueAll(s.p.blocksOf(of, ranges)) {
+				if !s.enqueueFile(of, ranges) {
 					return
 				}
 				continue
@@ -561,10 +576,61 @@ func (s *statement) release(h *heldFile, f *scanFilter) bool {
 	}
 	if skip {
 		f.footers++
+		s.p.markRead(h.file.key)
 		return true
 	}
 	f.whole++
-	return s.enqueueAll(s.p.blocksOf(h.file, h.ranges))
+	return s.enqueueFile(h.file, h.ranges)
+}
+
+// enqueueFile queues the blocks of f's ranges, reporting false when the
+// statement ends first. Once they are all fetched or found, f is read ahead
+// (see alreadyRead).
+func (s *statement) enqueueFile(f *openFile, ranges [][2]int64) bool {
+	bs := s.p.blocksOf(f, ranges)
+	f.pending.Store(int64(len(bs)))
+	return s.enqueueAll(bs)
+}
+
+// What statements' scans have read ahead. Knowing what to read ahead of a file
+// means reading its footer through the cache and parsing it, and asking the
+// file system for each of its blocks, for every statement that reads the file,
+// and a dashboard's statements read the same files: at the data's size, 96 of
+// them, in cache, took a median of 6.4 s, against 1.5 s with nothing read
+// ahead, and 770 s of run time against 330. So a statement reads ahead a file
+// only if none has for the same columns lately: what it read is in the cache,
+// as long as the cache keeps it, and DuckDB reads the rest itself.
+// readAheadFor bounds how long a file is taken to be there; maxReadAhead how
+// many are kept, forgotten all at once.
+const (
+	readAheadFor = time.Hour
+	maxReadAhead = 1 << 18
+)
+
+// readColumns says which of a file's blocks a scan reads ahead, as far as what
+// it is told says: its columns and whether it filters them.
+func readColumns(sc Scan) string {
+	ids := slices.Sorted(slices.Values(sc.FieldIDs))
+	filters := slices.Sorted(slices.Values(sc.Filters))
+	return fmt.Sprint(ids, sc.Whole, sc.Filtered, filters)
+}
+
+// alreadyRead reports whether a statement lately read ahead what key says.
+func (p *Prefetcher) alreadyRead(key string) bool {
+	p.readAheadMu.Lock()
+	defer p.readAheadMu.Unlock()
+	at, ok := p.readAhead[key]
+	return ok && time.Since(at) < readAheadFor
+}
+
+// markRead records that a statement read ahead what key says.
+func (p *Prefetcher) markRead(key string) {
+	p.readAheadMu.Lock()
+	defer p.readAheadMu.Unlock()
+	if p.readAhead == nil || len(p.readAhead) >= maxReadAhead {
+		p.readAhead = make(map[string]time.Time)
+	}
+	p.readAhead[key] = time.Now()
 }
 
 // enqueueAll queues blocks once there is room for them, reporting false
@@ -716,6 +782,9 @@ func (p *Prefetcher) work() {
 			b.done <- err
 			continue
 		}
+		if (err == nil || errors.Is(err, errPresent)) && b.file.pending.Add(-1) == 0 {
+			p.markRead(b.file.key)
+		}
 		s.mu.Lock()
 		if err == nil && s.ctx.Err() != nil {
 			// The statement ended, and may have finished its accounts.
@@ -737,6 +806,9 @@ func (p *Prefetcher) work() {
 func (p *Prefetcher) Hold(fn func() error) error {
 	p.writing.Lock()
 	defer p.writing.Unlock()
+	p.readAheadMu.Lock()
+	p.readAhead = nil
+	p.readAheadMu.Unlock()
 	return fn()
 }
 

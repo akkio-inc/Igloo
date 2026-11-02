@@ -117,15 +117,15 @@ const (
 	spillWithin = 1.5
 	// slowOnWorkers is how many times one machine's estimate a statement
 	// that ran only on workers must have taken there for auto mode to try
-	// one machine once, though one machine should run short of memory: an
-	// estimate short of memory ran four to five times short where the
-	// statement spilled (two reports estimated at 157 s took 809 s and 610
-	// s on one machine), so ten times it is past what spilling explains.
-	// A dashboard's statements at ten times the data, estimated at 14 s on
-	// one machine and short of memory, took 1,312 s split over two workers
-	// that shared the replica's machine, and stayed on workers after it
-	// from the query history, through a burst on workers of their own;
-	// the replica alone ran them in 25 s at the median, 96 at once.
+	// one machine once, though what it exchanged says one machine should run
+	// short of memory. A dashboard's statements at ten times the data,
+	// estimated at 14 s on one machine and short of memory, took 1,312 s
+	// split over two workers that shared the replica's machine, and stayed
+	// on workers after it from the query history, through a burst on workers
+	// of their own; the replica alone ran them in 25 s at the median, 96 at
+	// once. Not where its working set says it would spill: then so far over
+	// says the estimate is wrong, not that one machine is better. A report
+	// estimated at 15 s that took 200 s on workers took 714 s on one machine.
 	slowOnWorkers = 10.0
 )
 
@@ -232,6 +232,26 @@ type Loads interface {
 // in 20 s at the median, 96 at once.
 type Footprints interface {
 	Footprint() (allocated int64, ok bool)
+}
+
+// LocalRuns is an Env whose session knows how long statements of the shape of
+// the one being planned took on this replica, in runs they completed:
+// LocalRun returns that, and ok is false when none has. Auto mode's history
+// keeps such times by plan key, which a statement has only if it was planned
+// for workers; with distributed_execution off, or where planning gave up, one
+// ran here and its time said nothing to the next. That key's own runs here
+// come first, as of tables of its sizes. A report that took 714 s here so went
+// on being estimated at 15 s, and was tried there again.
+type LocalRuns interface {
+	LocalRun() (took time.Duration, ok bool)
+}
+
+// localRun is what env says of LocalRuns, if it says.
+func localRun(env Env) (time.Duration, bool) {
+	if lr, ok := env.(LocalRuns); ok {
+		return lr.LocalRun()
+	}
+	return 0, false
 }
 
 // fleet is what the coordinator knows of its workers for an estimate.
@@ -347,11 +367,12 @@ type Fills interface {
 }
 
 const (
-	// fillWriteRate is the bytes of table files a second a core of this
-	// replica writes, compressed as it reads them: one of 16 cores wrote a
-	// billion rows of four columns, about 10 GB of files, in 163 s, about
-	// 60 MB/s in all.
-	fillWriteRate = 3.75e6
+	// fillWriteRate is the bytes of table files a second a core writes,
+	// compressed as it reads them. On real S3, a COPY of 60 million rows of 16
+	// columns, 2.07 GB of files, made 57 MB/s on 1 thread, 107 on 2, 197 on 4, 323
+	// on 8 and 468 on 16, read included; a replica of 2 cores made 38 MB/s a core
+	// through Iceberg, workers 35 and, with their copies, 25.
+	fillWriteRate = 30e6
 	// fillFetchRate is the bytes of files a second this replica fetches of
 	// the workers' results, to write the table from them.
 	fillFetchRate = 400e6
@@ -458,6 +479,9 @@ const (
 	// nothing that long-running fills would notice, and most reads stop early.
 	partitionSample     = 1 << 20
 	partitionSampleTime = 3 * time.Second
+	// parquetRowGroupRows are the rows of a row group DuckDB's Parquet writer gathers
+	// where nothing bounds it.
+	parquetRowGroupRows = 122_880
 )
 
 // partitionsOf estimates the partitions of a fill of rows rows from a sample of
@@ -479,30 +503,47 @@ func writeTasks(bytes int64, f fleet) float64 {
 	return float64(min(max(want, min(2, most)), most))
 }
 
-// partitionFilesFit reports whether the files workers would write of a fill are
-// worth writing there: its tasks each write a file of each partition, so that a
-// table of many gets many small files. It looks at the rows only where the table
-// is partitioned, and goes by what it has if it cannot.
-func (co *Coordinator) partitionFilesFit(ctx context.Context, env Env, query string, x features, f fleet) bool {
+// fillPartitions estimates how many partitions a fill's rows have, by a look at them:
+// zero for a table with none, or if it cannot tell.
+func (co *Coordinator) fillPartitions(ctx context.Context, env Env, query string, x features) float64 {
 	pf, ok := env.(PartitionedFills)
 	if !ok {
-		return true
+		return 0
 	}
 	ctx, cancel := context.WithTimeout(ctx, partitionSampleTime)
 	defer cancel()
 	half, all, sampled, err := pf.FillPartitions(ctx, query, partitionSample)
 	if err != nil {
 		co.log.Debug("could not count a fill's partitions", "err", err)
+		return 0
 	}
-	if err != nil || all == 0 {
+	return partitionsOf(half, all, sampled, x.rows)
+}
+
+// replicaHoldsParts reports whether a replica of memory and threads holds what it
+// writes of parts partitions: a row group of each partition on each thread. 128
+// partitions of 16 columns took a replica of 5.5 GiB on 4 threads out of memory, where
+// workers wrote them.
+func (x features) replicaHoldsParts(parts float64, memory int64, threads int) bool {
+	return memory <= 0 || parts*parquetRowGroupRows*x.rowBytes()*float64(max(threads, 1)) <= float64(memory)
+}
+
+// partitionFilesFit reports whether the files workers would write of a fill of parts
+// partitions are worth writing there: its tasks each write a file of each partition,
+// so that a table of many gets many small files, and of more than a worker's task
+// can keep open they first sort the rows, which is more than a read of them takes.
+// Better those than a statement that fails on a replica without the memory for it.
+func (co *Coordinator) partitionFilesFit(parts float64, x features, f fleet) bool {
+	if parts == 0 || !x.replicaHoldsParts(parts, co.opts.MemoryBytes, max(co.opts.Threads, co.opts.Cores)) {
 		return true
 	}
-	parts, tasks := partitionsOf(half, all, sampled, x.rows), writeTasks(x.bytes, f)
-	if x.fillOut()/(tasks*parts) >= min(leastPartitionFile, co.minWorkerWrite()) {
+	tasks := writeTasks(x.bytes, f)
+	if x.fillOut()/(tasks*parts) >= min(leastPartitionFile, co.minWorkerWrite()) &&
+		(f.memory <= 0 || parts <= float64(writeFilesFit(f.memory, true))) {
 		return true
 	}
-	co.log.Info("this replica writes a partitioned table, whose files would be small on workers", "partitions", int64(parts), "tasks", int64(tasks),
-		"bytes", int64(x.fillOut()))
+	co.log.Info("this replica writes a partitioned table, whose files would be small on workers, or many for them", "partitions", int64(parts),
+		"tasks", int64(tasks), "bytes", int64(x.fillOut()), "worker_memory", f.memory)
 	return false
 }
 
@@ -946,10 +987,9 @@ func levels(stages []*Stage) int {
 // to learn how long it takes there, but never one that ran on one machine
 // within threshold on workers, nor on a side estimated at more than
 // exploreWithin times what it took on the other, nor on one machine where
-// its working set should spill (see spillOn), or, after a run on workers
-// far slower than one machine's estimate, where it is far beyond one
-// machine's memory; nor does pick try the large worker where its working
-// set would spill there (see option.unproven).
+// its working set should spill (see spillOn), however far past one machine's
+// estimate a run on workers went; nor does pick try the large worker where
+// its working set would spill there (see option.unproven).
 //
 // Statements running beside it on the replica (e.others) share its cores:
 // a statement takes 1 + e.others times as long there, up to shareCap + 1
@@ -1055,11 +1095,11 @@ func chooseShared(e estimate, r runs, found bool, threshold time.Duration, now t
 		switch {
 		case share == 1 && mayExplore && r.dist < exploreUnder.Seconds() && tryOne(r.dist):
 			return false, true, fmt.Sprintf("it ran in %.0f s on workers; trying one machine once, estimated at %.0f s", r.dist, e.oneMachine)
-		case share == 1 && mayExplore && !r.heavy && !e.farBeyond && r.dist > slowOnWorkers*e.oneMachine:
+		case share == 1 && mayExplore && !r.heavy && !e.spills && !e.farBeyond && r.dist > slowOnWorkers*e.oneMachine:
 			// Far slower on workers than one machine should take it, even
-			// short of memory: without this it stayed there for good. Not
-			// where its working set is far beyond one machine's memory,
-			// which it would spill for far longer than its estimate says.
+			// short of memory by what it exchanged: without this it stayed
+			// there for good. Not where its working set says it would spill,
+			// for far longer than its estimate says (see slowOnWorkers).
 			return false, true, fmt.Sprintf("it ran in %.0f s on workers, over %.0f times one machine's estimate of %.0f s; trying one machine once",
 				r.dist, slowOnWorkers, e.oneMachine)
 		case e.memory || e.spills:

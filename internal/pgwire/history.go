@@ -76,6 +76,8 @@ type queryRecord struct {
 	// shape its key for the workload controller (see shapeKey), if any.
 	parts distParts
 	shape string
+	// form is what its FLATTENs took, if they could take either.
+	form statementForm
 	// peak is the most memory it was seen holding, if sampled (see
 	// workload.Controller.SampleMemory); zero otherwise.
 	peak int64
@@ -146,6 +148,8 @@ func (s *Server) recordQuery(sess *session, r queryRecord) {
 		Exchanges:       r.parts.exchanges,
 		PlanKey:         r.parts.key,
 		Placement:       r.parts.placement,
+		FlattenKey:      r.form.key,
+		FlattenLists:    r.form.lists,
 		Shape:           r.shape,
 		Memory:          s.runMemory(r.parts.workers, r.parts.large),
 		Peak:            r.peak,

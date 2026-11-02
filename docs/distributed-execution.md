@@ -389,7 +389,7 @@ thousand rows to write.
 Auto mode counts a fill's writing on each side: about the share of the bytes
 the query reads that its rows are of the rows its scans read, by DuckDB's
 plan (an aggregate's result is taken for a hundredth of its rows at most, as
-DuckDB takes its groups for all of them), written at 3.75 MB of files a
+DuckDB takes its groups for all of them), written at 30 MB of files a
 second a core of whichever writes them, the replica's or, where tasks write
 them, the workers', with what a coordinator that writes them fetches from
 the workers at 400 MB/s. So a copy workers write runs there where they are
@@ -450,10 +450,13 @@ statement's rows are in the table when that commit is, or not at all.
 - **Partitions.** Identity of booleans, integers, dates, timestamps and
   strings, truncate of integers and strings, and year, month, day and hour are
   written by workers, one file per partition per task until compaction merges
-  them, each task sorting its rows by partition first. So a table of many
-  partitions gets many small files at first. Auto mode looks at a fill's first
-  rows, for up to 3 s, and has this replica write a table whose files would be
-  under 8 MiB on average; `distributed_execution = 'on'` still sends it to workers.
+  them. So a table of many partitions gets many small files at first. A look at
+  a fill's first rows, for up to 3 s, says how many partitions to expect: a task
+  keeps that many files open, if they fit in half of a worker's memory at about 8
+  MiB each, and otherwise sorts its rows by partition first, which takes longer but
+  makes a file of each. Auto mode has this replica write a table whose files would
+  be under 8 MiB on average, or need that sort; `distributed_execution = 'on'` still
+  sends it to workers.
 - **On the coordinator's way instead**, as the log says at debug level: tables
   partitioned by bucket, or identity of decimals, whose partition values
   cannot be read from a file's bounds or written to its manifest; tables with
@@ -652,12 +655,16 @@ it made 12 million. Where DuckDB's plan ran far off at ten times the data,
 Igloo corrects it: the branches of a `UNION` hold no more than the largest
 of them, as DuckDB runs them one after another where memory is short (16
 branches, each joining 400 million rows to 400 million, were estimated at
-793 GB by their sum and held 33 GB); an inner join of rows to keys it knows
-nothing of keeps no fewer of the side with more rows than the other side's
+793 GB by their sum and held 33 GB), while the operators above it take all
+their rows, and the most any branch's filters keep (a report joining its
+events to a union of an audience and everyone, taken for the audience
+alone, was estimated at 5.6 GB and 15 s, and took 714 s, spilling 235 GB);
+an inner join of rows to keys it knows nothing of keeps no fewer of the side with more rows than the other side's
 filters keep, rather than the fifth DuckDB takes (157 million events
 joined to an audience of everyone kept every row); a join to one row, as
 of a scalar subquery's latest version, keeps what a filter by a constant
-does, where DuckDB keeps every row; a cross product with a small source of
+does, where DuckDB keeps every row, but one group by DuckDB's estimate of
+keys nothing knows is not one row; a cross product with a small source of
 its own, as `FLATTEN` over a list of objects becomes, makes a row for each
 pair; a grouping makes no more groups where its input has more rows than
 DuckDB took; and a window over the whole input without an order (`OVER
@@ -772,10 +779,18 @@ its room (see spilling, below); past that, one that ran only on
 the replica, well within its estimate, stays there, and one that ran only
 on workers stays there if it beat its estimates, or if the replica should
 run short of memory, unless it took more than ten times the replica's
-estimate there, and its working set is not four or more times the
-replica's room: that one is tried on the replica once a day, and may take
-as long there as it took on workers before the guard (below) runs it on
-them again. The replica is not short of memory for a statement whose
+estimate there, and its working set should fit the replica: that one is
+tried on the replica once a day, and may take as long there as it took on
+workers before the guard (below) runs it on them again. Where its working
+set should spill, so far over its estimate says the estimate is wrong, not
+that the replica is better: a report estimated at 15 s that took 200 s on
+workers took 714 s on the replica. A statement run on the replica with
+`distributed_execution = 'off'`, or whose planning gave up, has no
+`plan_key`; what it took stands, by its shape, its text with its literals
+masked, as read back from the query history too, where its `plan_key` has
+no run on the replica of its own, so that it is not estimated again. So does
+what the guard (below) learned, which `query_history.placement` keeps. The
+replica is not short of memory for a statement whose
 shape, its text with its literals masked, ran to its end there, whatever
 its estimate (a run cut short, as by the guard, says only that it needed at
 least what it held, and does not count: one the guard stopped on a replica
@@ -1059,7 +1074,8 @@ give the workers more memory.
   the OpenTofu module for AWS gives it none. Google Cloud and Azure have nothing
   DuckDB could use of the kind: their modules give workers an identity that
   can only create files under `_igloo_shuffle/` and directories of that name
-  under tables' locations, with no overwrite, move or delete. A worker told no gets the
+  under tables' locations, with no move or delete, and on Google Cloud no overwrite;
+  on Azure, DuckDB's appends need the right to overwrite there. A worker told no gets the
   statement planned again, the coordinator writing the table
   (`IGLOO_WORKER_WRITES=off` always does), and no worker is asked for ten
   minutes.
@@ -1666,8 +1682,8 @@ several instance types and zones, so that capacity one lacks another has.
   expression one task, computes the sets from those groups: its memory grows
   with them, as a plain `GROUP BY`'s does not.
 - Where workers have no room on their disks, or with `IGLOO_EXCHANGES=object`,
-  partitioned joins, aggregations and every step of a multi-stage plan write
-  what they exchange to object storage and read it back: that costs
+  partitioned joins, aggregations and every step of a multi-stage plan
+  write what they exchange to object storage and read it back: that costs
   request charges and adds a few seconds per step, and
   leftovers of a coordinator that crashed mid-statement stay under
   `_igloo_shuffle/` for six hours or more, until a replica's sweep removes

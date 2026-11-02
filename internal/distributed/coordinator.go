@@ -619,8 +619,12 @@ func (co *Coordinator) planOn(ctx context.Context, query string, env Env, mode M
 	// enough to be worth their files.
 	x.workersWrite = opts.writes && slices.ContainsFunc(plan.Stages, func(s *Stage) bool { return s.writeSQL != "" }) &&
 		(opts.force || x.fillOut() >= co.minWorkerWrite())
-	if x.workersWrite && mode == ModeAuto && !dry && !co.partitionFilesFit(ctx, env, query, x, f) {
-		x.workersWrite = false
+	if x.workersWrite && !dry {
+		parts := co.fillPartitions(ctx, env, query, x)
+		plan.writeParts = int64(parts)
+		if mode == ModeAuto && !co.partitionFilesFit(parts, x, f) {
+			x.workersWrite = false
+		}
 	}
 	if x.fill && !x.writeFits(f) {
 		// Rows as wide as these are more than a task of theirs holds, in a file
@@ -631,6 +635,9 @@ func (co *Coordinator) planOn(ctx context.Context, query string, env Env, mode M
 		}
 	}
 	plan.writes = x.workersWrite
+	if opts.force && x.fill && !plan.writes {
+		co.log.Info("workers will not write a forced statement's table; this replica writes it", "reason", noWriteReason(fill && fills.FillWrites(), co.workersMayWrite(), plan.Stages, x, f))
+	}
 	e := x.estimate(m, f)
 	e.others = others
 	if found {
@@ -659,6 +666,11 @@ func (co *Coordinator) planOn(ctx context.Context, query string, env Env, mode M
 		return plan, d, nil
 	}
 	now := time.Now()
+	if r.local == 0 {
+		if took, ok := localRun(env); ok {
+			r.local, found = took.Seconds(), true
+		}
+	}
 	if found && r.exchangeBytes > 0 && m.memory > 0 {
 		r.heavy = float64(heldFactor*r.exchangeBytes) > memoryShare*float64(m.memory)
 	}
@@ -1744,7 +1756,7 @@ func (co *Coordinator) fetchTask(ctx context.Context, w *worker, body []byte, pa
 			// was purged for: it runs on the coordinator, and the next
 			// statements carry the deletion (see erasure.go).
 			co.noteErased(res.Error.Erased)
-			return nil, &errUnsupported{reason: res.Error.Message}
+			return nil, &errUnsupported{reason: res.Error.Message, behind: true}
 		}
 		switch {
 		case res.Error.Bitmap:

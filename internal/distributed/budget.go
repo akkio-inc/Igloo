@@ -204,13 +204,16 @@ func (co *Coordinator) staysHere(shape string, env Env, workers int) *errUnsuppo
 
 // expectedLocal is how many seconds the statement of shape is expected to
 // take on one machine: what it took here, by the history of the plan its
-// shape got last, or what one machine reads of its tables cold. ok is
-// false when neither is known.
+// shape got last or by what ran it here (see LocalRuns), or what one machine
+// reads of its tables cold. ok is false when none is known.
 func (co *Coordinator) expectedLocal(pl *planner, stmt node, shape string) (float64, bool) {
 	if key, ok := co.shapes.key(shape); ok {
 		if r, ok := co.history.get(key); ok && r.local > 0 {
 			return r.local, true
 		}
+	}
+	if took, ok := localRun(pl.env); ok {
+		return took.Seconds(), true
 	}
 	bytes, ok := pl.statementReads(stmt)
 	if !ok {

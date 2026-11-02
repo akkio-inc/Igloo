@@ -58,13 +58,15 @@ resource "azurerm_role_assignment" "catalog_storage" {
 }
 
 # Workers (with workers_enabled): an identity of their own, which reads the
-# warehouse and may only create files, and only those they exchange and those in
-# statements' directories of table files, named igloo-write-<hex> under a table's
-# data/. It can overwrite, move or delete no file, nor touch a container: a role
-# of its own holds that one action, as a built-in role with a condition would leave
-# it the role's container actions, and a path condition would leave it renames.
-# Azure has no credentials limited to one statement's directory that DuckDB could
-# use, so Igloo checks every file a worker says it wrote, on its own copy
+# warehouse and may only write files they exchange and those in statements'
+# directories of table files, named igloo-write-<hex> under a table's data/. It can
+# move or delete no file, nor touch a container: a role of its own holds those two
+# actions, as a built-in role with a condition would leave it the role's container
+# actions, and a path condition would leave it renames. DuckDB creates a file and
+# then appends to it, so that it needs write, and with it overwrite, in those
+# directories: on a real account, add alone creates an empty file and refuses the
+# rest. Azure has no credentials limited to one statement's directory that DuckDB
+# could use, so Igloo checks every file a worker says it wrote, on its own copy
 # (docs/distributed-execution.md#security).
 locals {
   worker_subject = "system:serviceaccount:${var.namespace}:${var.worker_service_account_name}"
@@ -72,7 +74,7 @@ locals {
   blob_action = "Microsoft.Storage/storageAccounts/blobServices/containers/blobs"
   blob_path   = "@Resource[${local.blob_action}:path]"
   worker_write_condition = join(" ", [
-    "((!(ActionMatches{'${local.blob_action}/add/action'}))",
+    "((!(ActionMatches{'${local.blob_action}/add/action'}) AND !(ActionMatches{'${local.blob_action}/write'}))",
     "OR",
     "(${local.blob_path} StringLike 'warehouse/_igloo_shuffle/*' OR ${local.blob_path} StringLike 'warehouse/*/data/igloo-write-*'))",
   ])
@@ -81,12 +83,14 @@ locals {
 resource "azurerm_role_definition" "worker_write" {
   count = var.workers_enabled ? 1 : 0
 
-  name        = "${var.name}-igloo-worker-create"
+  name        = "${var.name}-igloo-worker-write"
   scope       = azurerm_resource_group.this.id
-  description = "Creates blobs, with a condition on where. Igloo's workers: no overwrite, move, delete or container action."
+  description = "Creates and writes blobs, with a condition on where. Igloo's workers: no move, delete or container action."
 
   permissions {
-    data_actions = ["${local.blob_action}/add/action"]
+    # DuckDB creates a file and then appends to it, which a real account refuses
+    # without write, with add alone.
+    data_actions = ["${local.blob_action}/add/action", "${local.blob_action}/write"]
   }
 
   assignable_scopes = [azurerm_resource_group.this.id]

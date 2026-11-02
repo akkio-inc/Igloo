@@ -1,6 +1,7 @@
 package pgwire
 
 import (
+	"cmp"
 	"context"
 	"crypto/rand"
 	"database/sql/driver"
@@ -9,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	iofs "io/fs"
+	"maps"
 	mrand "math/rand/v2"
 	"regexp"
 	"slices"
@@ -17,7 +19,9 @@ import (
 	"time"
 
 	"github.com/apache/iceberg-go"
+	icebergio "github.com/apache/iceberg-go/io"
 	"github.com/apache/iceberg-go/table"
+	"golang.org/x/sync/errgroup"
 
 	"github.com/akkio-inc/igloo/internal/catalog"
 	"github.com/akkio-inc/igloo/internal/catalogproxy"
@@ -648,44 +652,77 @@ func (s *Server) deleteRefreshFiles(ctx context.Context, tbl *table.Table, dir s
 	if parent, name := splitDir(dir); !writeDirName.MatchString(name) || !strings.HasSuffix(parent, "/data") {
 		return fmt.Errorf("%s is not a refresh's directory, nor a statement's", dir)
 	}
-	conn, err := s.engine.Connect(ctx)
-	if err != nil {
-		return err
-	}
-	defer conn.Close() //nolint:errcheck
-	// Tasks write in directories of their own under it.
-	res, err := conn.QueryContext(ctx, "SELECT file FROM glob("+quoteLiteral(dir+"/**")+")", nil)
-	if err != nil {
-		return err
-	}
-	var files []string
-	dest := make([]driver.Value, 1)
-	for {
-		err := res.Next(dest)
-		if errors.Is(err, io.EOF) {
-			break
-		}
-		if err != nil {
-			_ = res.Close()
-			return err
-		}
-		f, _ := dest[0].(string)
-		files = append(files, f)
-	}
-	_ = res.Close()
-	if len(files) == 0 {
-		return nil
-	}
 	fs, err := tbl.FS(ctx)
 	if err != nil {
 		return err
 	}
+	lister, ok := fs.(icebergio.ListableIO)
+	if !ok {
+		return errors.New("the table's storage cannot list files")
+	}
+	// By the store's own listing: DuckDB's glob spells abfss:// paths otherwise, fails
+	// on a directory not there on an Azure account with a hierarchical namespace, and on
+	// any on one without. Tasks write in directories of their own under it.
+	var files []string
+	err = lister.WalkDir(dir, func(p string, d iofs.DirEntry, err error) error {
+		if err != nil {
+			if errors.Is(err, iofs.ErrNotExist) {
+				return iofs.SkipAll
+			}
+			return err
+		}
+		if !d.IsDir() {
+			files = append(files, p)
+		}
+		return nil
+	})
+	if err != nil && !errors.Is(err, iofs.ErrNotExist) {
+		return err
+	}
+	if len(files) == 0 {
+		return nil
+	}
+	g := new(errgroup.Group)
+	g.SetLimit(sealCopies)
 	for _, f := range files {
-		if err := fs.Remove(f); err != nil && !errors.Is(err, iofs.ErrNotExist) {
-			return fmt.Errorf("delete %s: %w", f, err)
+		g.Go(func() error {
+			if err := fs.Remove(f); err != nil && !errors.Is(err, iofs.ErrNotExist) {
+				return fmt.Errorf("delete %s: %w", f, err)
+			}
+			return nil
+		})
+	}
+	if err := g.Wait(); err != nil {
+		return err
+	}
+	if strings.HasPrefix(dir, "abfss://") {
+		for _, d := range dirsOf(dir, files) {
+			// One that holds something, as a late write's, stays for the second look.
+			_ = fs.Remove(d)
 		}
 	}
 	return nil
+}
+
+// dirsOf lists the directories from dir down to files, the deepest first: on an Azure
+// account with a hierarchical namespace, a directory is a thing of its own, and stays
+// when its files go, a dozen of them for every statement otherwise.
+func dirsOf(dir string, files []string) []string {
+	seen := map[string]bool{}
+	for _, f := range files {
+		for p := f; strings.HasPrefix(p, dir+"/"); {
+			p = p[:strings.LastIndexByte(p, '/')]
+			seen[p] = true
+		}
+	}
+	dirs := slices.Collect(maps.Keys(seen))
+	slices.SortFunc(dirs, func(a, b string) int {
+		if c := cmp.Compare(len(b), len(a)); c != 0 {
+			return c
+		}
+		return cmp.Compare(a, b)
+	})
+	return dirs
 }
 
 // writeDirName is the name of a refresh's directory, or a statement's.

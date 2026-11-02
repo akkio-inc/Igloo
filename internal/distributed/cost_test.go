@@ -109,16 +109,21 @@ func TestChoose(t *testing.T) {
 			runs{local: 38, dist: 228, heavy: true}, true, false, false},
 		{"ran out of memory, no workers", none, runs{outOfMemory: true}, true, false, false},
 		// A dashboard's statement at ten times the data, estimated at 14 s
-		// on one machine and short of memory, after 1,312 s split over two
-		// workers: tried on one machine once, not kept on workers for good.
-		{"ran on workers 90 times one machine's estimate, short of memory", estimate{oneMachine: 14, onWorkers: 30, workers: 2, memory: true, spills: true},
+		// on one machine and short of memory by what it exchanged, after
+		// 1,312 s split over two workers: tried on one machine once, not kept
+		// on workers for good.
+		{"ran on workers 90 times one machine's estimate, short of memory", estimate{oneMachine: 14, onWorkers: 30, workers: 2, memory: true},
 			runs{dist: 1312}, true, false, true},
-		{"ran on workers 90 times one machine's estimate, tried today", estimate{oneMachine: 14, onWorkers: 30, workers: 2, memory: true, spills: true},
+		{"ran on workers 90 times one machine's estimate, tried today", estimate{oneMachine: 14, onWorkers: 30, workers: 2, memory: true},
 			runs{dist: 1312, explored: now.Add(-time.Hour)}, true, true, false},
-		{"ran on workers 9 times one machine's estimate, short of memory", estimate{oneMachine: 14, onWorkers: 30, workers: 2, memory: true, spills: true},
+		{"ran on workers 9 times one machine's estimate, short of memory", estimate{oneMachine: 14, onWorkers: 30, workers: 2, memory: true},
 			runs{dist: 126}, true, true, false},
 		{"ran on workers 90 times one machine's estimate, exchanging more than it holds", estimate{oneMachine: 14, onWorkers: 30, workers: 2, memory: true},
 			runs{dist: 1312, heavy: true}, true, true, false},
+		// Far over an estimate that says it spills: the estimate is wrong, as
+		// a report's of 15 s, after 200 s on workers, that took 714 s there.
+		{"ran on workers 90 times one machine's estimate, which says it spills", estimate{oneMachine: 14, onWorkers: 30, workers: 2, memory: true, spills: true},
+			runs{dist: 1312}, true, true, false},
 		{"ran on workers 90 times one machine's estimate, its working set far beyond it", estimate{oneMachine: 14, onWorkers: 30, workers: 2, memory: true,
 			spills: true, farBeyond: true}, runs{dist: 1312}, true, true, false},
 	} {
@@ -414,6 +419,38 @@ func TestHistory(t *testing.T) {
 	}
 	if _, ok := h.get("k1"); !ok {
 		t.Error("lost a key used since")
+	}
+
+	// What the guard learned, from the placement the query history keeps, on
+	// a replica of about this one's memory.
+	guardedBy := &Coordinator{history: newHistory(), opts: Options{MemoryBytes: 47e9}}
+	placement := guardedBy.GuardPlacement(88*time.Second, 47*time.Second, "8 workers: it ran on one machine")
+	ran, memory, ok := GuardedRun(placement)
+	if !ok || ran != 88*time.Second || memory != 47e9 {
+		t.Errorf("guarded run from %q: %s, %d, %v", placement, ran, memory, ok)
+	}
+	for _, other := range []string{"8 workers: one machine should take 88 s", "moved by the guard after 88 s on this replica, estimated at 47 s; 8 workers: x", ""} {
+		if _, _, ok := GuardedRun(other); ok {
+			t.Errorf("guarded run from %q", other)
+		}
+	}
+	guardedBy.Seed([]Run{{Key: "g", Workers: 8, Duration: 100 * time.Second, Memory: 6e9}, {Key: "g", Guarded: true, Duration: ran, Memory: memory},
+		{Key: "g", Guarded: true, Duration: ran}})
+	r, _ := guardedBy.history.get("g")
+	if !r.guarded || r.local != 88 || r.dist != 100 {
+		t.Errorf("seeded runs of g: %+v", r)
+	}
+	if r = comparable(r, 47e9, 6e9, 0); !r.guarded {
+		t.Errorf("on a replica of the memory it was guarded on: %+v", r)
+	}
+	if r = comparable(r, 200e9, 6e9, 0); r.guarded || r.local != 0 {
+		t.Errorf("on a far larger replica: %+v", r)
+	}
+	if e := (estimate{oneMachine: 47, onWorkers: 60, workers: 8}); true {
+		r, _ := guardedBy.history.get("g")
+		if workers, explore, why := choose(e, comparable(r, 47e9, 6e9, 0), true, DefaultThreshold, time.Now()); !workers || explore {
+			t.Errorf("seeded guarded: on workers %v, trying %v (%s)", workers, explore, why)
+		}
 	}
 
 	// Out of memory on one machine until it runs there again.

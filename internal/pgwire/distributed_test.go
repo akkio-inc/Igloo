@@ -27,6 +27,7 @@ import (
 	"github.com/akkio-inc/igloo/internal/auth"
 	"github.com/akkio-inc/igloo/internal/config"
 	"github.com/akkio-inc/igloo/internal/distributed"
+	"github.com/akkio-inc/igloo/internal/workload"
 )
 
 const testWorkerSecret = "the-test-worker-secret-0123456789abcdef"
@@ -886,12 +887,13 @@ func TestHeavyBesideShort(t *testing.T) {
 	}
 	guarded := "SELECT amount, count(*) AS n FROM orders GROUP BY amount ORDER BY amount"
 	placed := "SELECT amount, sum(id) AS s FROM orders GROUP BY amount ORDER BY amount"
+	// Of other shapes: what these take here would stand for their estimates.
 	mustExec(t, heavyConn, "SET distributed_execution = off")
-	wantGuarded, err := read(heavyConn, guarded)
+	wantGuarded, err := read(heavyConn, strings.Replace(guarded, "FROM orders", "FROM orders AS reference", 1))
 	if err != nil {
 		t.Fatal(err)
 	}
-	wantPlaced, err := read(heavyConn, placed)
+	wantPlaced, err := read(heavyConn, strings.Replace(placed, "FROM orders", "FROM orders AS reference", 1))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1050,6 +1052,66 @@ func TestDistributedNoFallbackShortOfMemory(t *testing.T) {
 	ds.source.size = 0
 	if got := count(t, conn, "SELECT count(*) FROM (SELECT a.amount, count(*) FROM orders AS a JOIN orders AS b ON a.id = b.id GROUP BY a.amount)"); got != 9 {
 		t.Errorf("got %d groups", got)
+	}
+}
+
+// A statement run here with distributed_execution off has no plan key, and
+// what it took stands for auto mode's estimate of it all the same.
+func TestLocalRunStands(t *testing.T) {
+	t.Parallel()
+	ds := startDistServer(t, 2)
+	ds.source.size = 300 << 20
+	conn := ds.testServer.admin(t, pgx.QueryExecModeSimpleProtocol)
+	mustExec(t, conn, "SET search_path = 'lake.public,memory.main'")
+	query := "SELECT amount, count(*) AS n FROM orders GROUP BY amount ORDER BY amount"
+	reason := func() string {
+		t.Helper()
+		rows, err := conn.Query(context.Background(), "EXPLAIN DISTRIBUTED "+query)
+		if err != nil {
+			t.Fatal(err)
+		}
+		why := ""
+		for rows.Next() {
+			var k, v string
+			if err := rows.Scan(&k, &v); err != nil {
+				t.Fatal(err)
+			}
+			if k == "reason" {
+				why = v
+			}
+		}
+		if err := rows.Err(); err != nil {
+			t.Fatal(err)
+		}
+		return why
+	}
+	if why := reason(); strings.Contains(why, "it ran in") {
+		t.Errorf("before any run: %s", why)
+	}
+	mustExec(t, conn, "SET distributed_execution = off")
+	mustExec(t, conn, query)
+	q := lastRun(t, ds.history, query)
+	if q.PlanKey != "" || q.Workers != 0 {
+		t.Errorf("forced here: plan key %q, %d workers", q.PlanKey, q.Workers)
+	}
+	// So small a table reads nothing to speak of, which says nothing of its
+	// shape (see workload.ReadNothing): a run that did not, as a report's.
+	if _, ok := ds.srv.workload.Took(q.Shape); ok {
+		t.Error("a time from a run that read nothing")
+	}
+	busy := "SELECT sum(i * i % 7) FROM range(500000000) AS t(i)"
+	mustExec(t, conn, busy)
+	mustExec(t, conn, "RESET distributed_execution")
+	b := lastRun(t, ds.history, busy)
+	if b.Resources == nil || b.Resources.CPUTime < workload.LightCPU {
+		t.Fatalf("a busy statement took %+v", b.Resources)
+	}
+	if took, ok := ds.srv.workload.Took(b.Shape); !ok || took <= 0 || took > b.Duration {
+		t.Errorf("took %s here (%v), of a run of %s", took, ok, b.Duration)
+	}
+	ds.srv.workload.ObserveTook(q.Shape, 714*time.Second)
+	if why := reason(); !strings.Contains(why, "it ran in 714 s on one machine") {
+		t.Errorf("after 714 s here: %s", why)
 	}
 }
 

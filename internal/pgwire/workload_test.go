@@ -360,6 +360,12 @@ func TestStatementShape(t *testing.T) {
 			t.Errorf("%q has the same shape", other)
 		}
 	}
+	// A limit's number masks but for none, which runs nothing.
+	if statementShape("SELECT * FROM t LIMIT 10") != statementShape("SELECT * FROM t LIMIT 10000") ||
+		statementShape("SELECT * FROM t LIMIT 0") == statementShape("SELECT * FROM t LIMIT 10") ||
+		statementShape("SELECT * FROM t LIMIT 0") != statementShape("SELECT * FROM t  limit  0") {
+		t.Error("limits' shapes")
+	}
 	if statementShape(`SELECT * FROM demo_x10.t`) == statementShape(`SELECT * FROM demo_x11.t`) ||
 		statementShape(`SELECT "c1" FROM t`) == statementShape(`SELECT "c2" FROM t`) {
 		t.Error("names with other digits have the same shape")

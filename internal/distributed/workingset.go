@@ -39,6 +39,14 @@ import (
 // GB where it held 51 GB in hash tables and spilled 55 GB, and another's
 // for 439 GB where it held 9.5 GB.
 //
+// A UNION's rows are all its branches' rows, though they do not run at
+// once, and what its branches' filters keep the most any of them keeps. It
+// took its first branch's: of a union of an audience, one version's rows of
+// a lookup, and everyone, the audience's hundredth of the rows, so that a
+// report joining its events to that union, which held hundreds of
+// gigabytes and took 714 s on one machine, was estimated at 5.6 GB and 15
+// s, and stayed there.
+//
 // The plan also says what one machine reads (each table's columns that
 // its scans project, once: the read cache serves them again) and the
 // rows its hash tables take in, at hashMissRate a core where a table is
@@ -475,6 +483,12 @@ func (w *setWalker) walk(n *planNode) (rowsEstimate, []column) {
 		for _, r := range rows {
 			card = max(card, r.duck)
 		}
+		if name == "CROSS_PRODUCT" && len(rows) == 2 {
+			// Every pair, as DuckDB takes it in the operators above, which
+			// say so where it does not: took for its larger side's rows, what
+			// they say counted the product's other side twice.
+			card = rows[0].duck * rows[1].duck
+		}
 	}
 	child := func(i int) (rowsEstimate, []column) {
 		if i >= 0 && i < len(rows) {
@@ -488,6 +502,8 @@ func (w *setWalker) walk(n *planNode) (rowsEstimate, []column) {
 		est.ours, est.kept = card, 1
 	}
 	switch {
+	case name == "UNION" && len(rows) > 1:
+		return unionRows(rows, card, ok), unionColumns(outs)
 	case name == "CTE_SCAN":
 		// The common table expression's rows, as corrected.
 		if c, found := w.ctes[strings.Join(n.strs("CTE Index"), "")]; found {
@@ -564,6 +580,12 @@ func (w *setWalker) walk(n *planNode) (rowsEstimate, []column) {
 		}
 		if ndv := product(groups); ndv > 0 {
 			est.ours = min(est.ours, ndv)
+		} else if len(groups) > 0 {
+			// One group by DuckDB's estimate, of keys nothing knows, is no
+			// one row to join to (see joinRows): it took a report's two
+			// cohorts' sizes for one, and the report's scans below that join
+			// for a filter's hundredth of what they read.
+			est.ours = max(est.ours, 2)
 		}
 		est.ours = min(est.ours, max(in.ours, 1))
 		// Each thread aggregates its share of the rows apart, all the
@@ -604,6 +626,44 @@ func (w *setWalker) walk(n *planNode) (rowsEstimate, []column) {
 		return est, inCols
 	}
 	return est, inCols
+}
+
+// unionRows is a UNION's rows, of its branches' rows: DuckDB's estimate of
+// them, card, if ok says it has one, or else their sum, as the operators
+// above it take it (a scan of it as a common table expression does), and
+// ours their sum, of which its branches' filters keep the most any keeps.
+func unionRows(rows []rowsEstimate, card float64, ok bool) rowsEstimate {
+	var est rowsEstimate
+	for _, r := range rows {
+		est.duck += r.duck
+		est.ours += r.ours
+		est.kept = max(est.kept, r.kept)
+	}
+	if ok {
+		est.duck = card
+	}
+	return est
+}
+
+// unionColumns are a UNION's columns: its first branch's, named and as wide,
+// each of as many distinct values as its branches' come to, if all know
+// theirs.
+func unionColumns(branches [][]column) []column {
+	out := slices.Clone(branches[0])
+	for _, b := range branches[1:] {
+		for i := range out {
+			switch {
+			case i >= len(b) || b[i].distinct <= 0:
+				out[i].distinct = 0
+			default:
+				out[i].distinct += b[i].distinct
+			}
+			if i < len(b) {
+				out[i].width = max(out[i].width, b[i].width)
+			}
+		}
+	}
+	return out
 }
 
 // equality matches a join condition of equal columns.

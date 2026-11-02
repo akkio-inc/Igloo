@@ -501,6 +501,118 @@ func heldPeak(t *testing.T, h *harness, query string) float64 {
 	return float64(max(peak.Load(), 1))
 }
 
+// TestWorkingSetOfUnion checks a report that joins its events, made a row for
+// each of seven channels, to a union of an audience, one version's rows of a
+// lookup, and everyone: the union's rows are its branches', what its filters
+// keep the most any branch keeps, so the join keeps every event, and the
+// operators above the cross product count its seven once. The cohorts' sizes,
+// grouped by a key nothing knows and one group by DuckDB's estimate, are not a
+// scalar subquery's one row, whose scans would read a hundredth; the audience's
+// version is. It was estimated at 5.6 GB, reading 0.4 GB, and 15 s on one
+// machine, where its like took 714 s and spilled 235 GB.
+func TestWorkingSetOfUnion(t *testing.T) {
+	cols := func(names ...string) []Column {
+		var out []Column
+		for _, n := range names {
+			out = append(out, Column{Name: n, Type: "VARCHAR"})
+		}
+		return out
+	}
+	lookup := &Table{Name: "lookup", Rows: 1_400_000_000, Bytes: 75e9, Columns: cols("audience", "version", "person")}
+	versions := &Table{Name: "versions", Rows: 2000, Bytes: 1e5, Columns: cols("audience", "ver_no")}
+	people := &Table{Name: "people", Rows: 10_000_000, Bytes: 1e9, Columns: cols("person", "age")}
+	events := &Table{Name: "events", Rows: 360_000_000, Bytes: 12e9, Columns: cols("person", "seconds", "channel", "title")}
+	st := newPlanStats([]*Stage{{Inputs: []Input{{Table: lookup}, {Table: versions}, {Table: people}, {Table: events}}}}, 16)
+
+	audience := op("ICEBERG_SCAN", nil, "Projections", []string{"version", "person"}, "Filters", "audience='a'", "Estimated Cardinality", "1500000")
+	latest := op("PROJECTION", []map[string]any{op("UNGROUPED_AGGREGATE", []map[string]any{
+		op("ICEBERG_SCAN", nil, "Projections", []string{"ver_no"}, "Filters", "audience='a'", "Estimated Cardinality", "186")}, "Aggregates", []string{"max(#0)"})},
+		"Projections", []string{"#0"}, "Estimated Cardinality", "1")
+	inAudience := op("HASH_GROUP_BY", []map[string]any{op("HASH_JOIN", []map[string]any{audience, latest},
+		"Join Type", "INNER", "Conditions", "version = SUBQUERY", "Estimated Cardinality", "1500000")},
+		"Groups", []string{"#1"}, "Aggregates", []string{}, "Estimated Cardinality", "1500000")
+	everyone := op("HASH_GROUP_BY", []map[string]any{op("ICEBERG_SCAN", nil, "Projections", []string{"person"}, "Filters", "(NOT (person IS NULL))",
+		"Estimated Cardinality", "2000000")}, "Groups", []string{"#0"}, "Aggregates", []string{}, "Estimated Cardinality", "2000000")
+	cohort := func(card string) map[string]any {
+		return op("CTE_SCAN", nil, "CTE Index", "6", "Estimated Cardinality", card)
+	}
+	channels := op("FILTER", []map[string]any{op("PROJECTION", []map[string]any{op("CROSS_PRODUCT", []map[string]any{
+		op("ICEBERG_SCAN", nil, "Projections", []string{"person", "seconds", "channel", "title"}, "Estimated Cardinality", "360000000"),
+		op("RANGE", nil, "Estimated Cardinality", "7")})},
+		"Projections", []string{"person", "seconds", "#2"}, "Estimated Cardinality", "2520000000")}, "Estimated Cardinality", "2520000000")
+	signals := op("HASH_GROUP_BY", []map[string]any{op("PROJECTION", []map[string]any{op("HASH_JOIN", []map[string]any{channels, cohort("3500000")},
+		"Join Type", "INNER", "Conditions", "person = person", "Estimated Cardinality", "890000000")},
+		"Projections", []string{"#2", "#0", "#1"}, "Estimated Cardinality", "890000000")},
+		"Groups", []string{"#0"}, "Aggregates", []string{"count(DISTINCT #1)", "sum(#2)"}, "Estimated Cardinality", "330000000")
+	traits := op("HASH_GROUP_BY", []map[string]any{op("PROJECTION", []map[string]any{op("HASH_JOIN", []map[string]any{
+		op("ICEBERG_SCAN", nil, "Projections", []string{"person", "age"}, "Estimated Cardinality", "10000000"), cohort("3500000")},
+		"Join Type", "INNER", "Conditions", "person = person", "Estimated Cardinality", "3500000")},
+		"Projections", []string{"#1", "#0"}, "Estimated Cardinality", "3500000")},
+		"Groups", []string{"#0"}, "Aggregates", []string{"count(DISTINCT #1)"}, "Estimated Cardinality", "100")
+	sizes := op("HASH_GROUP_BY", []map[string]any{op("PROJECTION", []map[string]any{cohort("3500000")}, "Projections", []string{"#0", "#1"},
+		"Estimated Cardinality", "3500000")}, "Groups", []string{"#0"}, "Aggregates", []string{"count(DISTINCT #1)"}, "Estimated Cardinality", "1")
+	report := op("CTE", []map[string]any{
+		op("UNION", []map[string]any{inAudience, everyone}),
+		op("HASH_JOIN", []map[string]any{op("UNION", []map[string]any{signals, traits}), sizes},
+			"Join Type", "INNER", "Conditions", "upper(cohort) = upper(cohort)", "Estimated Cardinality", "53"),
+	}, "CTE Name", "cohorts", "Table Index", "6", "Estimated Cardinality", "0")
+
+	p, err := planOf(planJSON(t, report), st)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var grouped, distinct float64
+	for _, h := range p.parts {
+		switch h.op {
+		case "HASH_GROUP_BY":
+			grouped = max(grouped, h.rows)
+		case "HASH_GROUP_BY DISTINCT":
+			distinct = max(distinct, h.rows)
+		}
+	}
+	// Seven rows for each of 360 million events, all of them joined, once.
+	if distinct != 2.52e9 || grouped != 2.52e9 {
+		t.Errorf("the events' grouping holds %g rows and its distinct pairs %g, want 2.52e9: %+v", grouped, distinct, p.parts)
+	}
+	// The events' columns and everyone's in full, and of the lookup, read for
+	// one version of an audience, a hundredth.
+	wantBytes := int64(float64(events.Bytes) + float64(people.Bytes) + float64(lookup.Bytes)*2/3*filterSelectivity)
+	if p.bytes < wantBytes/10*9 || p.bytes > wantBytes/10*11 {
+		t.Errorf("reads %d bytes, want about %d", p.bytes, wantBytes)
+	}
+	if p.set < 200e9 || p.work < 500 {
+		t.Errorf("working set %g, hash tables' work %g core-seconds", p.set, p.work)
+	}
+
+	x := features{bytes: 12e9, exchanged: 50e9, held: 12e9, rows: 2e10, levels: 11, stages: 24, planned: true, planSet: p.set, planBytes: p.bytes,
+		planWork: p.work, planKeeps: p.keeps, planFields: p.fields, planSorted: p.sorted, planJoins: p.joins}
+	m := machine{cores: 16, threads: 16, memory: 47 << 30}
+	e := x.estimate(m, fleet{cores: 16, threads: 16, running: 4, most: 4, memory: 26 << 30})
+	if !e.spills || e.oneMachine < 200 {
+		t.Errorf("one machine %.0f s, spills %v, %s", e.oneMachine, e.spills, e.local)
+	}
+	now := time.Now()
+	if workers, explore, reason := choose(e, runs{}, false, DefaultThreshold, now); !workers || explore {
+		t.Errorf("its first run: on workers %v, trying %v: %s", workers, explore, reason)
+	}
+	if workers, explore, reason := choose(e, runs{dist: 200}, true, DefaultThreshold, now); !workers || explore {
+		t.Errorf("after 200 s on workers: on workers %v, trying %v: %s", workers, explore, reason)
+	}
+
+	// One row by what the plan says of its keys is one row still.
+	st.distinct["age"] = 1
+	one := op("HASH_GROUP_BY", []map[string]any{op("ICEBERG_SCAN", nil, "Projections", []string{"age"}, "Estimated Cardinality", "1000")},
+		"Groups", []string{"#0"}, "Aggregates", []string{}, "Estimated Cardinality", "1")
+	joined := op("HASH_JOIN", []map[string]any{op("ICEBERG_SCAN", nil, "Projections", []string{"person", "seconds", "channel", "title"}, "Estimated Cardinality", "360000000"), one},
+		"Join Type", "INNER", "Conditions", "title = age", "Estimated Cardinality", "360000000")
+	if p, err = planOf(planJSON(t, joined), st); err != nil {
+		t.Fatal(err)
+	}
+	if want := int64(float64(events.Bytes)*filterSelectivity + float64(people.Bytes)/2); p.bytes != want {
+		t.Errorf("joined to a key of one value: reads %d bytes, want the events' hundredth and a column of people, %d", p.bytes, want)
+	}
+}
+
 // TestPlanKeeps checks the share of the rows a plan's scans read that its
 // result keeps, which a fill writes (see fillCost): all of them for a
 // copy, a filter's share for a filtered one, and no more than a hundredth

@@ -995,6 +995,16 @@ func policyRules(t duckdb.StmtType, query string) error {
 // its own (see refEdit).
 func (s *Server) policyRewrite(ctx context.Context, sess *session, user auth.User, t duckdb.StmtType, query string, oids []uint32,
 	pins []indexPin) (string, *guard, bool, error) {
+	snap := s.gov.snapshot(ctx)
+	g := &guard{policyGen: s.gov.gen.Load(), catalogGen: s.catalogGeneration(), settingGen: sess.settingGen}
+	ddl := t == duckdb.STATEMENT_TYPE_DROP || t == duckdb.STATEMENT_TYPE_ALTER || t == duckdb.STATEMENT_TYPE_CREATE
+	if !ddl && snap.Empty() {
+		// Nothing to apply and nothing to read of the catalog. Holding it
+		// exclusively here, as below, had every query prepared under the
+		// shared lock wait for the others' to end and hold up the next ones:
+		// of 60 s that a dashboard's 136 prepares took, 50 s went here.
+		return query, g, false, nil
+	}
 	// Applying policies resolves names and runs DESCRIBE and sensitivity
 	// checks, all of which walk the catalog's in-memory set. Most callers
 	// already hold the catalog (preparing or rechecking a statement); a
@@ -1002,12 +1012,9 @@ func (s *Server) policyRewrite(ctx context.Context, sess *session, user auth.Use
 	// side so none of it runs while a table is renamed or dropped on this
 	// instance (reentrant; see holdCatalog).
 	defer s.holdCatalog(sess)()
-	snap := s.gov.snapshot(ctx)
-	g := &guard{policyGen: s.gov.gen.Load(), catalogGen: s.catalogGeneration(), settingGen: sess.settingGen}
 	// Tags and data retentions follow names too, policies or not: a
 	// renamed table would escape erasure (see package erasure).
 	checked := false
-	ddl := t == duckdb.STATEMENT_TYPE_DROP || t == duckdb.STATEMENT_TYPE_ALTER || t == duckdb.STATEMENT_TYPE_CREATE
 	if (s.erasure != nil || snap.Classified()) && ddl {
 		ran, err := s.checkErasingDDL(ctx, sess, snap, t, query)
 		checked = checked || ran

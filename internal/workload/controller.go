@@ -2,6 +2,8 @@ package workload
 
 import (
 	"context"
+	"slices"
+	"sort"
 	"sync"
 	"time"
 
@@ -14,11 +16,13 @@ import (
 // limit), and, if it is Counted, against the replica's own limit of
 // statements at once (see LimitReplica).
 //
-// Statements that must wait do so in arrival order. A statement never
-// overtakes an earlier one that waits for the same slots, nor, if it
-// reserves memory, one that waits for memory, so a large reservation is not
-// starved by a stream of small ones. Statements whose limits differ do not
-// hold each other up.
+// Statements that must wait do so in the order they would end if each started
+// when it came and ran alone (see Limits.Expect, costs.go), which is arrival
+// order for statements with no history. A statement never overtakes one ahead
+// of it that waits for the same slots, nor, if it reserves memory, one that
+// waits for memory, so a large reservation is not starved by a stream of
+// small ones: a later statement goes first only if it would end first.
+// Statements whose limits differ do not hold each other up.
 //
 // DuckDB has one memory pool per process and cannot stop a statement at
 // its reservation: one that needs more spills to disk once the replica's
@@ -37,16 +41,27 @@ type Controller struct {
 	// history estimates reservations from what statements allocated (see
 	// footprints.go).
 	history footprints
+	took    localTimes
+
+	// forms pick the form of each statement shape's FLATTENs (see forms.go).
+	forms flattenForms
+	// costs say how long statements take and which are light (see costs.go).
+	costs costs
 
 	mu       sync.Mutex
 	reserved int64
 	running  map[string]int
 	// replicaRunning counts the counted statements running.
 	replicaRunning int
-	queue          []*waiter
+	// apartRunning counts the statements running in the second DuckDB.
+	apartRunning int
+	queue        []*waiter
 	// active are the statements running under the controller's limits,
 	// whose peaks SampleMemory keeps.
 	active map[*waiter]struct{}
+	// held is what DuckDB last held for running statements, as SampleMemory
+	// read it; zero before it has.
+	held int64
 
 	waiting prometheus.Gauge
 	waited  prometheus.Counter
@@ -58,7 +73,14 @@ type waiter struct {
 	memory int64
 	// counted says it counts against the replica's limit.
 	counted bool
-	ready   chan struct{}
+	// unseen says nothing is known of what it holds, so that it waits while
+	// the memory is nearly full (see full).
+	unseen bool
+	// apart says it runs in the second DuckDB (see Limits.Apart).
+	apart bool
+	// due is its place in line: when it came, plus how long it takes alone.
+	due   time.Time
+	ready chan struct{}
 	// admitted is set, under the controller's lock, once the statement
 	// holds its slot and reservation.
 	admitted bool
@@ -111,15 +133,19 @@ func (c *Controller) Metrics() []prometheus.Collector {
 // long it was held back.
 func (c *Controller) Admit(ctx context.Context, l Limits) (release func() (peak int64, sampled bool), waited time.Duration, err error) {
 	unlimited := func() (int64, bool) { return 0, false }
-	if c == nil || !l.Limited() && !(l.Counted && c.replicaMax > 0) {
+	if c == nil || !l.Limited() && !(l.Counted && c.replicaMax > 0) && !l.Unseen {
 		return unlimited, 0, nil
 	}
-	w := &waiter{slots: l.Slots, memory: c.reservation(l.Memory), counted: l.Counted && c.replicaMax > 0, ready: make(chan struct{})}
-	if w.slots.Max == 0 && w.memory == 0 && !w.counted {
+	w := &waiter{slots: l.Slots, memory: c.reservation(l.Memory), counted: l.Counted && c.replicaMax > 0, unseen: l.Unseen, apart: l.Apart, ready: make(chan struct{})}
+	if w.slots.Max == 0 && w.memory == 0 && !w.counted && !w.unseen {
 		return unlimited, 0, nil
 	}
+	w.due = time.Now().Add(l.Expect)
 	c.mu.Lock()
-	c.queue = append(c.queue, w)
+	// After those due at the same time, so that statements with no history
+	// keep their order.
+	at := sort.Search(len(c.queue), func(i int) bool { return c.queue[i].due.After(w.due) })
+	c.queue = slices.Insert(c.queue, at, w)
 	c.admit()
 	admitted := w.admitted
 	c.mu.Unlock()
@@ -163,15 +189,16 @@ func (c *Controller) reservation(memory int64) int64 {
 	return min(memory, c.budget)
 }
 
-// admit starts every waiting statement that may start, in arrival order.
+// admit starts every waiting statement that may start, in the line's order.
 // The caller holds c.mu.
 func (c *Controller) admit() {
 	blocked := map[string]bool{}
 	memoryBlocked, replicaBlocked := false, false
+	full := c.full()
 	kept := c.queue[:0]
 	for _, w := range c.queue {
 		slotsFree := w.slots.Max == 0 || !blocked[w.slots.Key] && c.running[w.slots.Key] < w.slots.Max
-		memoryFree := w.memory == 0 || !memoryBlocked && c.reserved+w.memory <= c.budget
+		memoryFree := w.memory == 0 && !(w.unseen && full) || w.memory > 0 && !memoryBlocked && c.reserved+w.memory <= c.budget && c.heldLeaves(w.memory)
 		replicaFree := !w.counted || !replicaBlocked && c.replicaRunning < c.replicaMax
 		if slotsFree && memoryFree && replicaFree {
 			if w.slots.Max > 0 {
@@ -181,7 +208,12 @@ func (c *Controller) admit() {
 				c.replicaRunning++
 			}
 			c.reserved += w.memory
-			c.active[w] = struct{}{}
+			if w.apart {
+				c.apartRunning++
+			} else {
+				// What SampleMemory reads is the first DuckDB's.
+				c.active[w] = struct{}{}
+			}
 			w.admitted = true
 			close(w.ready)
 			continue
@@ -193,7 +225,7 @@ func (c *Controller) admit() {
 		if w.slots.Max > 0 {
 			blocked[w.slots.Key] = true
 		}
-		if !memoryFree {
+		if !memoryFree && w.memory > 0 {
 			memoryBlocked = true
 		}
 		if !replicaFree {
@@ -203,6 +235,44 @@ func (c *Controller) admit() {
 	}
 	clear(c.queue[len(kept):])
 	c.queue = kept
+}
+
+// fullShare is the share of the budget DuckDB must hold for the memory to
+// count as nearly full.
+const fullShare = 0.75
+
+// full reports whether DuckDB holds nearly all the budget for statements
+// running now: a statement nothing is known of then waits, since what it
+// holds would make those running spill. Reservations cannot say so the first
+// time a dashboard runs on a replica, when none of its statements has any:
+// its heavy ones started together and spilled, and it took half as long again
+// as the next time. The caller holds c.mu.
+func (c *Controller) full() bool {
+	return c.budget > 0 && len(c.active) > 0 && float64(c.held) >= fullShare*float64(c.budget)
+}
+
+// heldLeaves reports whether what DuckDB holds for the statements running leaves
+// room for a reservation of memory, of which a statement that reserves more than
+// three quarters of the budget needs only that much, so that it does not wait for
+// the short statements that reserve nothing to stop altogether. Reservations are
+// estimates, and those under a sixteenth of the budget count for nothing: 8
+// statements of a dashboard at ten times its data reserved 15.6 GiB of 20.4, held all
+// of it and spilled 10 GiB more. Its 324 queries took 1,945 s with this, not 2,086.
+// The caller holds c.mu.
+func (c *Controller) heldLeaves(memory int64) bool {
+	return len(c.active) == 0 || c.held+min(memory, c.budget/4*3) <= c.budget
+}
+
+// HeldBehindSecond reports whether statements wait in line while all that run
+// run in the second DuckDB: what they wait for is that one's memory, so the
+// first's caches keep nothing for anyone.
+func (c *Controller) HeldBehindSecond() bool {
+	if c == nil {
+		return false
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.apartRunning > 0 && len(c.active) == 0 && len(c.queue) > 0
 }
 
 func (c *Controller) remove(w *waiter) {
@@ -226,6 +296,9 @@ func (c *Controller) release(w *waiter) {
 		c.replicaRunning--
 	}
 	c.reserved -= w.memory
+	if w.apart {
+		c.apartRunning--
+	}
 	delete(c.active, w)
 	c.admit()
 }

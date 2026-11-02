@@ -2,7 +2,12 @@ package catalogproxy
 
 import (
 	"encoding/json"
+	"strconv"
 	"strings"
+
+	"github.com/apache/iceberg-go"
+
+	"github.com/akkio-inc/igloo/internal/filerewrite"
 )
 
 // Igloo gives each table its SQL creates a target data file size, unless
@@ -17,16 +22,66 @@ import (
 //
 // It also marks the table as Igloo's to size the row groups of
 // (rowGroupsProperty): table maintenance sets the row group size DuckDB's
-// inserts write from the table's bytes a row (see package maintenance).
+// inserts write from the table's bytes a row (see package maintenance). But
+// maintenance can do that only once the table has rows, and the statement
+// that loads a table writes most of the rows it will ever have, which then
+// stay in DuckDB's 122,880 rows a row group, a request each for a cold scan,
+// as files of that size are not compacted. So a table starts with row groups
+// of firstRowGroups rows, before anyone knows its bytes a row.
 const (
 	targetFileSizeProperty = "write.target-file-size-bytes"
 	targetFileSize         = "536870912"
 	rowGroupsProperty      = "igloo.row-groups"
 	rowGroupsAuto          = "auto"
+	rowGroupSizeProperty   = "write.parquet.row-group-size"
 )
 
-// defaults are the properties Igloo gives each table its SQL creates.
-var defaults = map[string]string{targetFileSizeProperty: targetFileSize, rowGroupsProperty: rowGroupsAuto}
+// firstRowGroupRows and firstRowGroupMemory bound the rows of a new table's
+// row groups. A type's width says little about its bytes in Parquet, 2.5 to
+// 43 times fewer in the tables tried, so the rows are flat rather than aimed
+// at compaction's 16 MiB from the schema: half a million made 4 to 26 MiB of
+// those tables, and 1.5 MiB of one of 3 bytes a row. Over copies of TPC-H at
+// scale factor 100, a cold pass took 115 s where DuckDB's row groups took
+// 197 s, warm passes within 2% and inserts as long. DuckDB holds a row group,
+// uncompressed, on each thread while an insert writes, so wide rows get
+// fewer: at most firstRowGroupMemory a thread as filerewrite.RowWidth counts
+// them, against 33 MiB for DuckDB's row groups of TPC-H's lineitem.
+const (
+	firstRowGroupRows   = 1 << 19
+	firstRowGroupMemory = 128 << 20
+)
+
+// firstRowGroups returns the rows of a row group a new table of the schema
+// and partition spec given, as a catalog request spells them, starts with,
+// or 0 if it should start with DuckDB's: if that is as many, if either
+// cannot be read, or if the table is partitioned, as an insert holds a row
+// group of every partition open.
+func firstRowGroups(schema, spec json.RawMessage) int64 {
+	if len(schema) == 0 {
+		return 0
+	}
+	var s iceberg.Schema
+	if json.Unmarshal(schema, &s) != nil {
+		return 0
+	}
+	if len(spec) > 0 {
+		var parts struct {
+			Fields []json.RawMessage `json:"fields"`
+		}
+		if json.Unmarshal(spec, &parts) != nil || len(parts.Fields) > 0 {
+			return 0
+		}
+	}
+	width := filerewrite.RowWidth(s.Fields())
+	if width <= 0 {
+		return 0
+	}
+	rows := min(firstRowGroupRows, firstRowGroupMemory/width)
+	if rows <= filerewrite.DefaultRowGroupRows {
+		return 0
+	}
+	return rows
+}
 
 // withDefaults returns body, a change DuckDB asked of the catalog at rest,
 // with Igloo's default properties added to each table it creates: in the
@@ -46,7 +101,7 @@ func withDefaults(rest string, body []byte) []byte {
 		if raw, ok := req["properties"]; ok && json.Unmarshal(raw, &props) != nil {
 			return body
 		}
-		if !addDefaults(props) {
+		if !addDefaults(props, firstRowGroups(req["schema"], req["partition-spec"])) {
 			return body
 		}
 		return remarshal(body, req, "properties", props)
@@ -100,11 +155,18 @@ func createDefaults(change json.RawMessage) (json.RawMessage, bool) {
 	// The defaults go in the last set-properties update, unless one sets
 	// them already.
 	var last map[string]string
+	var schema, spec json.RawMessage
 	at := -1
 	for i, u := range updates {
 		var action string
 		if json.Unmarshal(u["action"], &action) != nil {
 			return nil, false
+		}
+		switch action {
+		case "add-schema":
+			schema = u["schema"]
+		case "add-spec":
+			spec = u["spec"]
 		}
 		if action != "set-properties" {
 			continue
@@ -122,7 +184,7 @@ func createDefaults(change json.RawMessage) (json.RawMessage, bool) {
 		updates = append(updates, map[string]json.RawMessage{"action": json.RawMessage(`"set-properties"`)})
 		last, at = map[string]string{}, len(updates)-1
 	}
-	addDefaults(last)
+	addDefaults(last, firstRowGroups(schema, spec))
 	raw, err := json.Marshal(last)
 	if err != nil {
 		return nil, false
@@ -133,23 +195,30 @@ func createDefaults(change json.RawMessage) (json.RawMessage, bool) {
 
 // hasDefaults reports whether props sets all of Igloo's default properties.
 func hasDefaults(props map[string]string) bool {
-	for k := range defaults {
-		if _, ok := props[k]; !ok {
-			return false
-		}
-	}
-	return true
+	_, size := props[targetFileSizeProperty]
+	_, groups := props[rowGroupsProperty]
+	return size && groups
 }
 
 // addDefaults adds Igloo's default properties that props lacks to it, and
-// reports whether there were any.
-func addDefaults(props map[string]string) bool {
+// reports whether there were any. firstRows is the size of the table's row
+// groups to start with, 0 for DuckDB's; a size the statement set stays, and
+// the marker without a size says it is not one of Igloo's, which maintenance
+// then leaves alone.
+func addDefaults(props map[string]string, firstRows int64) bool {
 	added := false
-	for k, v := range defaults {
-		if _, ok := props[k]; !ok {
-			props[k] = v
-			added = true
+	if _, ok := props[targetFileSizeProperty]; !ok {
+		props[targetFileSizeProperty] = targetFileSize
+		added = true
+	}
+	if _, ok := props[rowGroupsProperty]; !ok {
+		props[rowGroupsProperty] = rowGroupsAuto
+		if _, set := props[rowGroupSizeProperty]; !set && firstRows > 0 {
+			rows := strconv.FormatInt(firstRows, 10)
+			props[rowGroupSizeProperty] = rows
+			props[rowGroupsProperty] = rowGroupsAuto + ":" + rows
 		}
+		added = true
 	}
 	return added
 }

@@ -135,3 +135,29 @@ func TestRequestCannotListUploads(t *testing.T) {
 	got = settle(f, r.ID, 10)
 	f.completed(got)
 }
+
+// TestOddKeys checks that a file with a key no path could be counts as old whatever its
+// age: DuckDB cannot read it to tell what it holds, and a request would otherwise wait on
+// it, or fail for it.
+func TestOddKeys(t *testing.T) {
+	for p, want := range map[string]bool{
+		"s3://b/w/t/data/igloo-write-a/x/../evil.parquet": true,
+		"s3://b/w/t/data/./evil.parquet":                  true,
+		"s3://b/w/t/data//evil.parquet":                   true,
+		"s3://b/w/t/data/..":                              true,
+		"s3://b/w/t/data/a..b.parquet":                    false,
+		"s3://b/w/t/data/x=1/part_0.parquet":              false,
+		"abfss://c@a.host/w/t/data/part_0.parquet":        false,
+		"/local/w/t/data/part_0.parquet":                  false,
+	} {
+		if got := oddKey(p); got != want {
+			t.Errorf("%s: %v", p, got)
+		}
+	}
+	s := &Service{opts: Options{}}
+	s.now = time.Now
+	o := s.sortOrphans(map[string]time.Time{"s3://b/w/x/../evil.parquet": time.Now(), "s3://b/w/new.parquet": time.Now()}, pathSet{})
+	if !slices.Equal(o.old, []string{"s3://b/w/x/../evil.parquet"}) || len(o.young) != 1 {
+		t.Errorf("old %q, young %v", o.old, o.young)
+	}
+}

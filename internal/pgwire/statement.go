@@ -130,6 +130,9 @@ type statement struct {
 	// here, as for a read of it (see fillOn): for the query history, and
 	// for auto mode's history of the query.
 	filled *distParts
+	// behindOnce says it was planned again after a worker refused it for an erasure
+	// request's deletion its coordinator had not heard of (see distributed.Behind).
+	behindOnce bool
 }
 
 // prepare compiles query on conn. clientOIDs are parameter types the client

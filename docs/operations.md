@@ -704,6 +704,10 @@ more than DuckDB alone.
   warning: each statement then reads ahead at most 256 MiB in all, and
   never more than its share of the cache's free room, so reading ahead
   evicts nothing; with a full cache it reads nothing ahead.
+- A statement reads ahead a file only if no statement has for the same
+  columns within the hour: what was read is in the cache, as long as the cache
+  keeps it, and looking again means parsing the file's footer and asking the
+  file system for each of its blocks.
 - A block it has not fetched yet, or fails to, DuckDB fetches itself:
   prefetch only ever costs requests. Overfetch, blocks it read that the
   scans did not, shows in `igloo_prefetch_unread_bytes_total`, next to
@@ -1218,23 +1222,35 @@ twice as much at 90 MiB as at 15.
 
 Most of a table's rows are written by inserts, though, which DuckDB writes
 in row groups of the table's `write.parquet.row-group-size` rows, 122,880
-by default. So Igloo marks the tables its SQL creates (property
-`igloo.row-groups`), and maintenance sets their
-`write.parquet.row-group-size` from the table's bytes a row as compaction
-would, once the table has rows, and again when that size moves by more
-than 15%. DuckDB holds a row group, uncompressed, on each of its threads
-while an insert writes, so maintenance sets no more rows than fit in
-`IGLOO_MAINTENANCE_MEMORY` over `IGLOO_DUCKDB_THREADS` (and never fewer
-than 122,880). Your own large inserts into such a table therefore hold
-more memory than before, up to about `IGLOO_MAINTENANCE_MEMORY` more across
-DuckDB's threads: on 16 threads, an insert of 832 million narrow rows took
-the container to 6.7 GB in row groups of 122,880 rows and to 14.6 GB in
+by default. So a table Igloo's SQL creates starts with row groups of 524,288
+rows (`igloo.row-groups` says it is Igloo's to size): fewer for wide rows,
+as many as make 128 MiB by the widths of the columns' types, 209,715 for
+twenty strings; and DuckDB's for a partitioned table, as an insert holds a
+row group of every partition open, or for rows wider than a kilobyte. The
+statement that loads a table writes most of the rows it will ever have,
+in files too large for compaction to rewrite, so the size counts from the
+first row. Over copies of TPC-H at scale factor 100, a cold pass took 115 s
+in these row groups and 197 s in DuckDB's, and six reports 52 s and 60 s;
+warm, they took within 2% of each other, and the inserts as long, with a
+little more memory: 600 million rows took the container to 29.5 GiB rather
+than 25.9 GiB. The types do not show how long a table's strings are, and
+long ones cost more: copying 4 million rows of 2 KB took 6 s rather than
+4.4 s, and 15.8 GiB rather than 12.1 GiB. If a table's rows are like that,
+set its `write.parquet.row-group-size` before you load it.
+
+Maintenance then sets a table's `write.parquet.row-group-size` from its
+bytes a row as compaction would, once it has rows, and again when that size
+moves by more than 15%. DuckDB holds a row group, uncompressed, on each of
+its threads while an insert writes, so maintenance sets no more rows than
+fit in `IGLOO_MAINTENANCE_MEMORY` over `IGLOO_DUCKDB_THREADS` (and never
+fewer than 122,880). Your own large inserts into such a table therefore
+hold more memory than before, up to about `IGLOO_MAINTENANCE_MEMORY` more
+across DuckDB's threads: on 16 threads, an insert of 832 million narrow rows
+took the container to 6.7 GB in row groups of 122,880 rows and to 14.6 GB in
 row groups of 4 million. Lower `IGLOO_MAINTENANCE_MEMORY` if they need that
 memory back, or set a table's `write.parquet.row-group-size` yourself:
 maintenance leaves alone a size it did not set, as it does tables other
-engines created. The rows a table gets before maintenance first sizes its
-row groups, such as those of the `CREATE TABLE ... AS` that loads it, keep
-DuckDB's row groups until compaction or clustering rewrites their files.
+engines created.
 
 ### Compaction memory
 

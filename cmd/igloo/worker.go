@@ -299,6 +299,10 @@ func workerWriteCredentials(ctx context.Context, cfg config.Config, log *slog.Lo
 type footprints interface {
 	Observe(shape string, footprint int64)
 	ObserveUnfinished(shape string, held int64)
+	ObserveForm(key string, lists bool, cpu time.Duration)
+	ObserveCost(shape string, cpu time.Duration)
+	ObserveTook(shape string, took time.Duration)
+	ObserveEmpty(shape string)
 }
 
 // longUnmeasured is how long a run that ended early must have run, without
@@ -309,11 +313,12 @@ const longUnmeasured = 10 * time.Second
 // oldest last, and tells seed, if any, how long statements that could run on
 // workers took, by their plan keys, so that auto mode keeps choosing the
 // faster after a restart (see distributed.Run), and fp what statements that
-// ran here held, by their shapes, so that heavy ones reserve memory from
-// the first after it (see workload.Controller.Observe) and auto mode knows
-// they ran here (see distributed.Footprints). Runs that ended early,
-// cancelled or out of memory, count too, at least what they were seen
-// holding; one from before the history kept that, which ran a while, at
+// ran here held and took, by their shapes, so that heavy ones reserve memory
+// from the first after it (see workload.Controller.Observe) and auto mode
+// knows they ran here (see distributed.Footprints and LocalRuns), whatever
+// ran them here: only statements planned for workers have plan keys. Runs
+// that ended early, cancelled or out of memory, count too, at least what they
+// were seen holding; one from before the history kept that, which ran a while, at
 // least all the memory it ran with: it ran its next time alone, rather than
 // beside others like it, all spilling, as runs cancelled at their timeout
 // did when nothing learned from them. A run is taken only with the memory
@@ -327,8 +332,20 @@ func seedHistory(ctx context.Context, seed func([]distributed.Run), fp footprint
 		shape      string
 		held       int64
 		unfinished bool
+		// cpu is what a run it completed took; -1 for none.
+		cpu time.Duration
+		// empty says it read nothing (see workload.ReadNothing).
+		empty bool
+		// took is how long a run it completed took, past what it waited.
+		took time.Duration
 	}
 	var fs []footprint
+	type form struct {
+		key   string
+		lists bool
+		cpu   time.Duration
+	}
+	var forms []form
 	for read := 0; read < most; read += pageSize {
 		qs, err := store.Queries(ctx, audit.Viewer{All: true}, page)
 		if err != nil {
@@ -336,6 +353,10 @@ func seedHistory(ctx context.Context, seed func([]distributed.Run), fp footprint
 			break
 		}
 		for _, q := range qs {
+			empty := q.Resources != nil && workload.ReadNothing(q.Resources.BytesRead, q.Resources.CPUTime)
+			if q.FlattenKey != "" && q.Outcome == audit.OutcomeOK && q.Resources != nil && q.Workers == 0 && !empty {
+				forms = append(forms, form{q.FlattenKey, q.FlattenLists, q.Resources.CPUTime})
+			}
 			switch {
 			case q.PlanKey == "":
 			case q.Outcome == audit.OutcomeOK:
@@ -349,17 +370,23 @@ func seedHistory(ctx context.Context, seed func([]distributed.Run), fp footprint
 				// It ran out of memory on one machine.
 				rs = append(rs, distributed.Run{Key: q.PlanKey, OutOfMemory: true, Memory: q.Memory})
 			}
+			if ran, memory, ok := distributed.GuardedRun(q.Placement); ok {
+				// What came before the run on workers that its row is about,
+				// as these are read newest first.
+				rs = append(rs, distributed.Run{Key: q.PlanKey, Guarded: true, Duration: ran, Memory: memory})
+			}
 			if q.Shape == "" || q.Workers > 0 || !sameMemory(q.Memory, memory) {
 				continue
 			}
 			early := q.Outcome == audit.OutcomeCanceled || q.SQLState == "53200"
 			switch {
 			case q.Outcome == audit.OutcomeOK && q.Resources != nil:
-				fs = append(fs, footprint{q.Shape, workload.FootprintOf(q.Resources.MemoryAllocated, q.Peak, q.Peak > 0), false})
+				fs = append(fs, footprint{q.Shape, workload.FootprintOf(q.Resources.MemoryAllocated, q.Peak, q.Peak > 0), false, q.Resources.CPUTime, empty,
+					q.Duration - q.Queued})
 			case early && q.Peak > 0:
-				fs = append(fs, footprint{q.Shape, q.Peak, true})
+				fs = append(fs, footprint{q.Shape, q.Peak, true, -1, false, 0})
 			case early && q.Duration-q.Queued >= longUnmeasured:
-				fs = append(fs, footprint{q.Shape, q.Memory, true})
+				fs = append(fs, footprint{q.Shape, q.Memory, true, -1, false, 0})
 			}
 		}
 		if len(qs) < pageSize {
@@ -371,15 +398,27 @@ func seedHistory(ctx context.Context, seed func([]distributed.Run), fp footprint
 	// Newest first: oldest first, so the last run weighs most.
 	slices.Reverse(rs)
 	slices.Reverse(fs)
+	slices.Reverse(forms)
+	for _, f := range forms {
+		fp.ObserveForm(f.key, f.lists, f.cpu)
+	}
 	if seed != nil {
 		seed(rs)
 	}
 	for _, f := range fs {
+		if f.empty {
+			fp.ObserveEmpty(f.shape)
+			continue
+		}
 		if f.unfinished {
 			fp.ObserveUnfinished(f.shape, f.held)
 		} else {
 			fp.Observe(f.shape, f.held)
 		}
+		if f.cpu >= 0 {
+			fp.ObserveCost(f.shape, f.cpu)
+		}
+		fp.ObserveTook(f.shape, f.took)
 	}
 	log.Debug("read past statements' runs", "runs", len(rs), "footprints", len(fs))
 }

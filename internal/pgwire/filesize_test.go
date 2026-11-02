@@ -63,38 +63,48 @@ func TestNewTablesWriteLargeFiles(t *testing.T) {
 		if got := props["write.target-file-size-bytes"]; got != "536870912" {
 			t.Errorf("%s: write.target-file-size-bytes %q", name, got)
 		}
-		if got := props["igloo.row-groups"]; got != "auto" {
+		if got := props["write.parquet.row-group-size"]; got != "524288" {
+			t.Errorf("%s: write.parquet.row-group-size %q", name, got)
+		}
+		if got := props["igloo.row-groups"]; got != "auto:524288" {
 			t.Errorf("%s: igloo.row-groups %q", name, got)
 		}
 	}
 
-	// Maintenance sizes the row groups of the tables Igloo marks with
-	// write.parquet.row-group-size, which DuckDB's inserts follow.
+	// The statement that loads a table follows the size the table starts
+	// with, as a later one follows the size maintenance sets on the tables
+	// Igloo marks.
+	firstRowGroup := func(name string) int64 {
+		t.Helper()
+		var files []string
+		loc := strings.TrimPrefix(vc.fake.Metadata("public", name).Location(), "file://")
+		_ = filepath.WalkDir(loc, func(p string, d fs.DirEntry, err error) error {
+			if err == nil && !d.IsDir() && strings.HasSuffix(p, ".parquet") {
+				files = append(files, p)
+			}
+			return nil
+		})
+		if len(files) != 1 {
+			t.Fatalf("%s: data files %v under %s", name, files, loc)
+		}
+		f, err := os.Open(files[0])
+		if err != nil {
+			t.Fatal(err)
+		}
+		rdr, err := file.NewParquetReader(f)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer rdr.Close() //nolint:errcheck
+		return rdr.MetaData().RowGroup(0).NumRows()
+	}
 	mustExec(t, admin, "CREATE TABLE lake.public.grouped AS SELECT * FROM seed LIMIT 0")
 	mustExec(t, admin, "SELECT * FROM set_iceberg_table_properties(lake.public.grouped, {'write.parquet.row-group-size': '400000'})")
 	mustExec(t, admin, "INSERT INTO lake.public.grouped SELECT * FROM seed")
-	var grouped []string
-	loc := strings.TrimPrefix(vc.fake.Metadata("public", "grouped").Location(), "file://")
-	_ = filepath.WalkDir(loc, func(p string, d fs.DirEntry, err error) error {
-		if err == nil && !d.IsDir() && strings.HasSuffix(p, ".parquet") {
-			grouped = append(grouped, p)
+	for _, name := range []string{"grouped", "made", "filled"} {
+		if n := firstRowGroup(name); n <= 122_880 {
+			t.Errorf("%s: a row group of %d rows", name, n)
 		}
-		return nil
-	})
-	if len(grouped) != 1 {
-		t.Fatalf("grouped: data files %v under %s", grouped, loc)
-	}
-	f, err := os.Open(grouped[0])
-	if err != nil {
-		t.Fatal(err)
-	}
-	rdr, err := file.NewParquetReader(f)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer rdr.Close() //nolint:errcheck
-	if n := rdr.MetaData().RowGroup(0).NumRows(); n <= 122_880 {
-		t.Errorf("grouped: a row group of %d rows, in %d groups", n, rdr.NumRowGroups())
 	}
 
 	// DuckDB refuses to write a partitioned table that has a target file

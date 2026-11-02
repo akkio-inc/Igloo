@@ -73,6 +73,13 @@ type footprint struct {
 	unfinished int64
 }
 
+// localTimes are how long the latest completed runs of each shape took (see
+// ObserveTook).
+type localTimes struct {
+	mu   sync.Mutex
+	runs map[string][]time.Duration
+}
+
 // held is what statements of the shape hold, and whether a run that ended
 // before its end says so: the median of its latest runs, the lower one of two,
 // or more, what a run that ended early held.
@@ -83,6 +90,39 @@ func (f *footprint) held() (int64, bool) {
 		median = sorted[(len(sorted)-1)/2]
 	}
 	return max(median, f.unfinished), f.unfinished > median
+}
+
+// ReadNothing says that a run read no bytes and took next to no CPU, as a statement
+// does when DuckDB plans it to no rows for the values of its literals. That says
+// nothing of what statements of its shape, the text with its literals masked, use
+// otherwise: a shape whose runs for some values take a minute of all the cores, once
+// so learned from a run for a value with no rows, reserved nothing, waited for nothing
+// and started all together. So such a run is only ever what a shape has until one
+// that read something (see ObserveEmpty).
+func ReadNothing(bytesRead int64, cpu time.Duration) bool {
+	return bytesRead == 0 && cpu < LightCPU
+}
+
+// ObserveEmpty records a run of shape that ReadNothing says of: as holding and taking
+// nothing, if the shape has no other runs, and until it has one.
+func (c *Controller) ObserveEmpty(shape string) {
+	if c == nil || shape == "" {
+		return
+	}
+	fp := c.history.of(shape)
+	if len(fp.runs) == 0 {
+		fp.runs = append(fp.runs, 0)
+	}
+	c.history.mu.Unlock()
+	k := &c.costs
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	if k.runs == nil || len(k.runs) >= maxFootprints {
+		k.runs = make(map[string][]time.Duration)
+	}
+	if len(k.runs[shape]) == 0 {
+		k.runs[shape] = []time.Duration{0}
+	}
 }
 
 // EstimateFromHistory makes the controller reserve, for a statement that
@@ -103,11 +143,57 @@ func (c *Controller) Observe(shape string, footprint int64) {
 	}
 	fp := c.history.of(shape)
 	defer c.history.mu.Unlock()
+	if footprint > 0 {
+		// A run that read nothing is only ever all it has (see ObserveEmpty).
+		fp.runs = slices.DeleteFunc(fp.runs, func(n int64) bool { return n == 0 })
+	}
 	fp.runs = append(fp.runs, footprint)
 	if len(fp.runs) > footprintRuns {
 		fp.runs = fp.runs[len(fp.runs)-footprintRuns:]
 	}
 	fp.unfinished = 0
+}
+
+// ObserveTook records how long a statement of shape took on this replica in a
+// run it completed, past what it waited to start; the server seeds them from
+// the query history when it starts. Auto mode's history keeps such times by
+// plan key, which a statement has only if it was planned for workers: one run
+// here with distributed_execution off, or whose planning gave up, took 714 s
+// and left auto mode to go on estimating it at 15 s (see
+// distributed.LocalRuns).
+func (c *Controller) ObserveTook(shape string, took time.Duration) {
+	if c == nil || shape == "" || took <= 0 {
+		return
+	}
+	k := &c.took
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	if k.runs == nil || len(k.runs) >= maxFootprints {
+		k.runs = make(map[string][]time.Duration)
+	}
+	runs := append(k.runs[shape], took)
+	if len(runs) > footprintRuns {
+		runs = runs[len(runs)-footprintRuns:]
+	}
+	k.runs[shape] = runs
+}
+
+// Took is how long statements of shape take on this replica, the median of
+// its latest completed runs, the lower one of two; ok is false when none of
+// its shape has completed here.
+func (c *Controller) Took(shape string) (took time.Duration, ok bool) {
+	if c == nil || shape == "" {
+		return 0, false
+	}
+	k := &c.took
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	runs := k.runs[shape]
+	if len(runs) == 0 {
+		return 0, false
+	}
+	sorted := slices.Sorted(slices.Values(runs))
+	return sorted[(len(sorted)-1)/2], true
 }
 
 // ObserveUnfinished records what a statement of shape was seen holding in a

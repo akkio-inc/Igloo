@@ -1830,8 +1830,10 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   used 5 seconds of all its cores) in a second DuckDB of its process, whose
   threads give way to the first's, and a read not yet known to be heavy starts
   again there when it runs long beside others. Beside one analyst's long reports
-  a dashboard's statement had little more than its own thread: over a billion
-  rows their p95 rose from 10 s to 245 s. Nothing needs setting, and
+  a dashboard's statement had little more than its own thread. Over a billion
+  rows on 12 cores dashboards take 3.0 s at the median and 8.1 s at p95 beside them,
+  47 statements a minute, as they do alone, where they took 13.7 s, 74 s and 10 a
+  minute. Nothing needs setting, and
   `IGLOO_HEAVY_IN_BACKGROUND=false` runs everything in the first (see [heavy
   statements beside short ones](docs/workload-management.md#heavy-statements-beside-short-ones)).
 - The result cache sends a dashboard's repeated queries again more often:
@@ -1906,12 +1908,62 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   large dashboard's statements learned under a twentieth of what they
   allocated, started beside the heavy ones next time and spilled. Runs
   cancelled after ten seconds or more count as needing all the memory.
+- A query ending in `LIMIT 0`, which tools send to learn its columns, has a
+  shape of its own, and does not wait behind the replica's limit: 32 of a
+  dashboard's 96 queries were such, and the shape they shared with the ones
+  that ran said those used next to nothing.
+- Reading ahead for a statement lists a table or view's name once, not each
+  time: listing takes the catalog lock exclusively, several times a statement,
+  which held up every prepare beside it.
+- A statement reads ahead only the files no statement has lately for the same
+  columns: a dashboard's 96 queries, in cache, each parsed the footers of every
+  file they read and asked for each of their blocks.
+- Queries with no policies to apply are prepared side by side from start to
+  end, rather than each take the catalog lock exclusively at the last step:
+  of the 60 s a dashboard's 136 prepares took, 50 s went waiting there.
 - DuckDB keeps table files' parsed footers in memory: a dashboard's 96 queries
   at ten times the data took 214 s rather than 233, the slowest tenth 107 s
   rather than 132.
 - A statement's thread sleeps while DuckDB's workers hold all its tasks,
   rather than ask for one again and again without a pause, a core for every
   statement waiting on its workers.
+- A replica keeps the forms of `FLATTEN`s through a restart, from the query
+  history, rather than try them again: a dashboard's first build after one took
+  half as long again as the next.
+- A heavy statement in the second DuckDB gets the memory of the first's caches
+  when statements wait in line behind it and none runs in the first: a dashboard's
+  heavy statements, held to what those caches left them, spilled while the rest
+  waited for them. Its 96 queries at ten times the data took 234 s rather than 260.
+- While the first DuckDB reads, it goes only what the machine has to spare,
+  between a sixteenth and a quarter of the memory limit, past what the second has let
+  go of, and the second is told to let go of that much ahead of it. Free to take
+  three quarters of the limit at once, whatever the
+  second held, the first took memory faster than the second's spill files could
+  give it back: beside a burst of heavy statements the two held 134% of the limit,
+  and the kernel killed the process.
+- A heavy statement stays in the first DuckDB while most of what runs there is of
+  some size itself, known to take 5 seconds of all the cores alone or having run
+  for a while, since there is nothing short for it to give way to. Under a
+  dashboard's burst at ten times its data, statements sent to the second had a tenth
+  of what the others left of the cores and ran past 15 minutes, and those moved
+  there threw away what they had done.
+- A statement that reserves memory also waits while what DuckDB holds for the
+  statements running leaves no room for it, whatever they reserved. A dashboard's
+  324 queries at ten times the data took 1,945 s rather than 2,086, with a median
+  of 392 s rather than 429.
+- A comparison with what a `CASE` of constants can never be, as of a view's `CASE`
+  with a value it has none of, is false before DuckDB plans the statement, which
+  then reads none of the tables behind it: a dashboard's statements that ask for
+  such a value took a minute of the cores each at ten times its data.
+- A run that read nothing, as DuckDB plans a statement to no rows for some values
+  of its literals, says nothing of what other statements of its shape reserve and
+  take, or which `FLATTEN` form suits them.
+- Statements wait in the order they would end if each ran alone from when it
+  came, as their shape's runs say, rather than in arrival order; a shape that took
+  under a second of CPU does not wait at all; and a statement of a shape not seen
+  yet waits while the memory is nearly full (see [the
+  line](docs/workload-management.md#the-line)). The slowest tenth of a dashboard's
+  96 queries at ten times the data took 94 s rather than 102.
 - A `FLATTEN` of a column takes the form DuckDB's estimates point to, then
   whichever form its shape's latest runs took the less CPU time in at best (see
   [Snowflake SQL](docs/snowflake-sql.md)): two dashboard queries over tens
@@ -2097,6 +2149,15 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   compaction caught up at 8 GB a table an hour. Igloo now sets the property
   when it creates a table, unless the statement did. See
   [operations](docs/operations.md#table-maintenance).
+- A table Igloo's SQL creates starts with row groups of 524,288 rows, fewer
+  for wide rows, so the statement that loads it no longer writes DuckDB's
+  122,880 rows a group, which stayed until something rewrote the files: over
+  copies of TPC-H at scale factor 100, a cold pass took 115 s instead of
+  197 s, and six reports 52 s instead of 60 s, with warm scans and the
+  inserts within 2%. Such an insert holds more memory, 29.5 GiB rather than
+  25.9 GiB for 600 million rows, and more again for long strings, which the
+  types do not show. Maintenance still sets the size from the table's bytes
+  a row once it has rows. See [operations](docs/operations.md#row-groups).
 - Row groups of about 16 MiB. Compaction and clustering size the row groups
   they write from the files' bytes a row, instead of writing DuckDB's
   122,880 rows, a few hundred kilobytes of narrow rows, each read cold with

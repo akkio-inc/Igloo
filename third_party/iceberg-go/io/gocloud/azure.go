@@ -24,7 +24,9 @@ import (
 	"net/url"
 	"regexp"
 	"strings"
+	"sync/atomic"
 
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
 	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/container"
@@ -165,9 +167,15 @@ func createAzureBucket(ctx context.Context, parsed *url.URL, props map[string]st
 			return nil, err
 		}
 
-		cred, err := azidentity.NewDefaultAzureCredential(nil)
-		if err != nil {
-			return nil, fmt.Errorf("failed azidentity.NewDefaultAzureCredential: %w", err)
+		var cred azcore.TokenCredential
+		if shared := defaultAzureCredential.Load(); shared != nil {
+			cred = *shared
+		} else {
+			var err error
+			cred, err = azidentity.NewDefaultAzureCredential(nil)
+			if err != nil {
+				return nil, fmt.Errorf("failed azidentity.NewDefaultAzureCredential: %w", err)
+			}
 		}
 
 		client, err = container.NewClient(containerURL, cred, nil)
@@ -177,6 +185,17 @@ func createAzureBucket(ctx context.Context, parsed *url.URL, props map[string]st
 	}
 
 	return azureblob.OpenBucket(ctx, client, nil)
+}
+
+// defaultAzureCredential, when set, is the credential of an Azure file system whose
+// properties give none (see SetDefaultAzureCredential).
+var defaultAzureCredential atomic.Pointer[azcore.TokenCredential]
+
+// SetDefaultAzureCredential has every Azure file system whose properties give no
+// credentials use c, rather than a default chain of its own, whose cache starts empty:
+// one file system a table, each asking the instance metadata service. (Igloo patch.)
+func SetDefaultAzureCredential(c azcore.TokenCredential) {
+	defaultAzureCredential.Store(&c)
 }
 
 // adlsKeyExtractor creates a key extractor for Azure schemes using the adlsURIPattern pattern

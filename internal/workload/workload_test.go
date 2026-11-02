@@ -499,3 +499,447 @@ func TestPeaks(t *testing.T) {
 	stop()
 	<-done
 }
+
+// TestFlattenForms checks the form each statement shape's FLATTENs take:
+// the estimate's for the first statement, asked for once; the other for
+// the next; either while neither has ended; and from then on the one whose
+// latest runs took the less CPU time at best.
+func TestFlattenForms(t *testing.T) {
+	f := NewController(0)
+	asked := 0
+	estimate := func() bool { asked++; return true }
+	for i, want := range []bool{true, false, true} {
+		if got := f.ChooseForm("a", estimate); got != want {
+			t.Errorf("statement %d: lists %v, want %v", i, got, want)
+		}
+	}
+	if asked != 1 {
+		t.Errorf("asked DuckDB %d times", asked)
+	}
+	f.ObserveForm("a", false, 2*time.Second)
+	if f.ChooseForm("a", estimate) {
+		t.Error("with only the lateral form's run ended, not the lateral form")
+	}
+	f.ObserveForm("a", true, 5*time.Second)
+	if f.ChooseForm("a", estimate) {
+		t.Error("the slower form")
+	}
+	f.ObserveForm("a", true, time.Second)
+	if !f.ChooseForm("a", estimate) {
+		t.Error("not the form that became faster")
+	}
+	// A run beside others takes longer: it changes nothing until the faster
+	// run is no longer among the latest.
+	f.ObserveForm("a", true, 5*time.Second)
+	if !f.ChooseForm("a", estimate) {
+		t.Error("a slower run of the faster form moved the shape off it")
+	}
+	for range formRuns {
+		f.ObserveForm("a", true, 5*time.Second)
+	}
+	if f.ChooseForm("a", estimate) {
+		t.Error("the form that became slower")
+	}
+	f.ObserveForm("unseen", true, time.Second)
+	if f.ChooseForm("b", func() bool { return false }) || !f.ChooseForm("b", estimate) {
+		t.Error("another shape: not the estimate's, then the other form")
+	}
+}
+
+// TestFormsFromTheHistory checks what a restart keeps of a shape's forms: both
+// seen, the faster; one seen, the other next, and then the faster.
+func TestFormsFromTheHistory(t *testing.T) {
+	never := func() bool { t.Error("asked DuckDB of a shape in the history"); return false }
+	f := NewController(0)
+	f.ObserveForm("both", false, 5*time.Second)
+	f.ObserveForm("both", true, 2*time.Second)
+	if !f.ChooseForm("both", never) {
+		t.Error("with both seen, not the faster")
+	}
+	f.ObserveForm("one", true, 2*time.Second)
+	if f.ChooseForm("one", never) {
+		t.Error("with one seen, not the other next")
+	}
+	f.ObserveForm("one", false, 5*time.Second)
+	if !f.ChooseForm("one", never) {
+		t.Error("with both seen by then, not the faster")
+	}
+	var none *Controller
+	none.ObserveForm("x", true, time.Second)
+}
+
+// TestControllerLineByExpected checks that statements wait in the order they
+// would end if each ran alone from when it came: a short one goes before a
+// long one that came just before it, a long one before a short one that comes
+// after it would have ended, and those with no history in arrival order.
+func TestControllerLineByExpected(t *testing.T) {
+	c := NewController(0)
+	c.LimitReplica(1)
+	ctx := context.Background()
+	first, _, err := c.Admit(ctx, Limits{Counted: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var mu sync.Mutex
+	var order []string
+	var wg sync.WaitGroup
+	start := func(name string, expect time.Duration) {
+		before := func() int {
+			c.mu.Lock()
+			defer c.mu.Unlock()
+			return len(c.queue)
+		}
+		n := before()
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			release, _, err := c.Admit(ctx, Limits{Counted: true, Expect: expect})
+			if err != nil {
+				t.Error(err)
+				return
+			}
+			mu.Lock()
+			order = append(order, name)
+			mu.Unlock()
+			release()
+		}()
+		for deadline := time.Now().Add(5 * time.Second); before() == n && time.Now().Before(deadline); time.Sleep(time.Millisecond) {
+		}
+	}
+	start("long", time.Hour)
+	start("short", time.Second)
+	start("unknown", 0)
+	start("unknown too", 0)
+	start("medium", time.Minute)
+	first()
+	wg.Wait()
+	if got := strings.Join(order, ","); got != "unknown,unknown too,short,medium,long" {
+		t.Errorf("order %s", got)
+	}
+
+	// A statement that comes long after a long one's start does not pass it:
+	// the long one is due first.
+	c = NewController(0)
+	c.LimitReplica(1)
+	first, _, _ = c.Admit(ctx, Limits{Counted: true})
+	order = nil
+	start("long", 10*time.Millisecond)
+	time.Sleep(30 * time.Millisecond)
+	start("short", time.Millisecond)
+	first()
+	wg.Wait()
+	if got := strings.Join(order, ","); got != "long,short" {
+		t.Errorf("order %s", got)
+	}
+}
+
+// TestCosts checks what the controller learns of what statements cost: the
+// least of a shape's latest runs, over the cores, and which are light.
+func TestCosts(t *testing.T) {
+	c := NewController(0)
+	if c.Expect("a") != 0 || c.Light("a") {
+		t.Error("costs before WeighCosts")
+	}
+	c.ObserveCost("a", time.Second)
+	if c.Expect("a") != 0 || c.Light("a") {
+		t.Error("costs without WeighCosts")
+	}
+	c.WeighCosts(8, 8*time.Second)
+	if c.Expect("b") != 0 || c.Light("b") {
+		t.Error("a shape not seen has a cost")
+	}
+	c.ObserveCost("b", 160*time.Second)
+	if c.Expect("b") != 20*time.Second || c.Light("b") {
+		t.Errorf("b: expected %s, light %v", c.Expect("b"), c.Light("b"))
+	}
+	// A run beside others takes more than it would alone: the least counts.
+	c.ObserveCost("b", 4*time.Second)
+	c.ObserveCost("b", 160*time.Second)
+	if c.Expect("b") != 500*time.Millisecond || !c.Light("b") {
+		t.Errorf("b: expected %s, light %v", c.Expect("b"), c.Light("b"))
+	}
+	// Until it is no longer among the latest.
+	for range costRuns {
+		c.ObserveCost("b", 160*time.Second)
+	}
+	if c.Expect("b") != 20*time.Second || c.Light("b") {
+		t.Errorf("b later: expected %s, light %v", c.Expect("b"), c.Light("b"))
+	}
+	c.WeighCosts(8, 0)
+	c.ObserveCost("c", 0)
+	if c.Light("c") {
+		t.Error("light with no threshold")
+	}
+}
+
+// TestUnseenWaitsWhileMemoryIsFull checks that a statement nothing is known of
+// waits while DuckDB holds nearly all the memory for those running, and that
+// one known to hold little does not.
+func TestUnseenWaitsWhileMemoryIsFull(t *testing.T) {
+	const gb = int64(1) << 30
+	c := NewController(8 * gb)
+	c.LimitReplica(8)
+	ctx := context.Background()
+	// Nothing runs yet: however much DuckDB held, an unseen one starts.
+	c.sample(7 * gb)
+	first, waited, err := c.Admit(ctx, Limits{Counted: true, Unseen: true})
+	if err != nil || waited != 0 {
+		t.Fatalf("with nothing running: waited %s: %v", waited, err)
+	}
+	// Below the mark, another starts too.
+	c.sample(gb)
+	second, waited, err := c.Admit(ctx, Limits{Counted: true, Unseen: true})
+	if err != nil || waited != 0 {
+		t.Fatalf("below the mark: waited %s: %v", waited, err)
+	}
+	second()
+	c.sample(7 * gb)
+	// A known one starts whatever is held.
+	known, waited, err := c.Admit(ctx, Limits{Counted: true})
+	if err != nil || waited != 0 {
+		t.Fatalf("a known statement waited %s: %v", waited, err)
+	}
+	known()
+	started := make(chan struct{})
+	go func() {
+		r, _, err := c.Admit(ctx, Limits{Counted: true, Unseen: true})
+		if err != nil {
+			t.Error(err)
+		}
+		close(started)
+		r()
+	}()
+	select {
+	case <-started:
+		t.Fatal("an unseen statement started with the memory full")
+	case <-time.After(50 * time.Millisecond):
+	}
+	// The next sample that finds room lets it start.
+	c.sample(2 * gb)
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("an unseen statement did not start once there was room")
+	}
+	first()
+	// Without a replica's limit, it waits all the same.
+	free := NewController(8 * gb)
+	r, _, _ := free.Admit(ctx, Limits{Memory: gb})
+	free.sample(7 * gb)
+	short, cancel := context.WithTimeout(ctx, 20*time.Millisecond)
+	defer cancel()
+	if _, _, err := free.Admit(short, Limits{Counted: true, Unseen: true}); !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("without a limit, with the memory full: %v", err)
+	}
+	r()
+}
+
+// TestTook checks how long a shape's statements take here, by its latest runs:
+// the median, the lower one of two, of its completed runs.
+func TestTook(t *testing.T) {
+	c := NewController(1 << 30)
+	if _, ok := c.Took("a"); ok {
+		t.Error("a time for a shape not seen")
+	}
+	c.ObserveTook("a", 0)
+	c.ObserveTook("", time.Second)
+	if _, ok := c.Took("a"); ok {
+		t.Error("a time from a run that took none")
+	}
+	c.ObserveTook("a", 714*time.Second)
+	if got, ok := c.Took("a"); !ok || got != 714*time.Second {
+		t.Errorf("one run: %s, %v", got, ok)
+	}
+	c.ObserveTook("a", 400*time.Second)
+	if got, _ := c.Took("a"); got != 400*time.Second {
+		t.Errorf("two runs: %s", got)
+	}
+	// What a shape took says nothing of what it held.
+	if _, ok := c.Footprint("a"); ok {
+		t.Error("a footprint from runs' times")
+	}
+	for range footprintRuns {
+		c.ObserveTook("a", time.Second)
+	}
+	if got, _ := c.Took("a"); got != time.Second {
+		t.Errorf("after as many shorter runs as it keeps: %s", got)
+	}
+	var none *Controller
+	none.ObserveTook("a", time.Second)
+	if _, ok := none.Took("a"); ok {
+		t.Error("a time without a controller")
+	}
+}
+
+// TestHeldBehindSecond checks when statements wait for what the second DuckDB's
+// holds: with one running there, none in the first, and some in line.
+func TestHeldBehindSecond(t *testing.T) {
+	const gb = int64(1) << 30
+	c := NewController(16 * gb)
+	ctx := context.Background()
+	if c.HeldBehindSecond() {
+		t.Error("with nothing running")
+	}
+	report, _, err := c.Admit(ctx, Limits{Apart: true, Memory: 16 * gb})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.HeldBehindSecond() {
+		t.Error("with nothing in line")
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		r, _, err := c.Admit(ctx, Limits{Memory: 4 * gb})
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		r()
+	}()
+	for deadline := time.Now().Add(5 * time.Second); !c.HeldBehindSecond() && time.Now().Before(deadline); time.Sleep(time.Millisecond) {
+	}
+	if !c.HeldBehindSecond() {
+		t.Error("with a statement in line behind the report")
+	}
+	report()
+	<-done
+	if c.HeldBehindSecond() {
+		t.Error("after the report")
+	}
+	// One running in the first keeps its caches.
+	first, _, _ := c.Admit(ctx, Limits{Memory: gb})
+	report, _, _ = c.Admit(ctx, Limits{Apart: true, Memory: gb})
+	short, cancel := context.WithTimeout(ctx, 100*time.Millisecond)
+	defer cancel()
+	go func() {
+		if r, _, err := c.Admit(short, Limits{Memory: 16 * gb}); err == nil {
+			r()
+		}
+	}()
+	time.Sleep(20 * time.Millisecond)
+	if c.HeldBehindSecond() {
+		t.Error("with one running in the first")
+	}
+	first()
+	report()
+	var none *Controller
+	if none.HeldBehindSecond() {
+		t.Error("nil controller")
+	}
+}
+
+// TestReservationsWaitForWhatIsHeld checks that a statement that reserves memory
+// waits while what DuckDB holds leaves no room for it, whatever those running
+// reserved, and one that reserves nothing does not.
+func TestReservationsWaitForWhatIsHeld(t *testing.T) {
+	const gb = int64(1) << 30
+	c := NewController(16 * gb)
+	ctx := context.Background()
+	first, _, err := c.Admit(ctx, Limits{Memory: 2 * gb})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// It holds more than it reserved.
+	c.sample(12 * gb)
+	second := make(chan func() (int64, bool), 1)
+	go func() {
+		r, _, err := c.Admit(ctx, Limits{Memory: 6 * gb})
+		if err != nil {
+			t.Error(err)
+		}
+		second <- r
+	}()
+	select {
+	case <-second:
+		t.Fatal("a statement started with no room for what it reserved")
+	case <-time.After(50 * time.Millisecond):
+	}
+	// One that reserves nothing starts all the same.
+	small, waited, err := c.Admit(ctx, Limits{Counted: true, Unseen: false, Slots: Slots{Key: "small", Max: 8}})
+	if err != nil || waited != 0 {
+		t.Fatalf("one that reserves nothing waited %s: %v", waited, err)
+	}
+	small()
+	// The next sample that finds room lets it start.
+	c.sample(10 * gb)
+	var r func() (int64, bool)
+	select {
+	case r = <-second:
+	case <-time.After(5 * time.Second):
+		t.Fatal("a statement did not start once there was room")
+	}
+	r()
+	// One that reserves it all starts with a quarter still held, by what
+	// reserves nothing, and only then.
+	first()
+	long, _, err := c.Admit(ctx, Limits{Slots: Slots{Key: "long", Max: 8}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.sample(8 * gb)
+	all := make(chan func() (int64, bool), 1)
+	go func() {
+		r, _, err := c.Admit(ctx, Limits{Memory: 16 * gb})
+		if err != nil {
+			t.Error(err)
+		}
+		all <- r
+	}()
+	select {
+	case <-all:
+		t.Fatal("a statement that reserves it all started with half held")
+	case <-time.After(50 * time.Millisecond):
+	}
+	c.sample(4 * gb)
+	select {
+	case r = <-all:
+	case <-time.After(5 * time.Second):
+		t.Fatal("a statement that reserves it all did not start with a quarter held")
+	}
+	r()
+	long()
+}
+
+// TestRunsThatReadNothing checks that a run DuckDB planned to no rows for its
+// literals says nothing of a shape with runs that read something, whichever comes
+// first, and that a shape with no others has what such a run says.
+func TestRunsThatReadNothing(t *testing.T) {
+	const gb = int64(1) << 30
+	if !ReadNothing(0, 300*time.Millisecond) || ReadNothing(1, time.Millisecond) || ReadNothing(0, 2*time.Second) {
+		t.Error("what reads nothing")
+	}
+	c := NewController(16 * gb)
+	c.EstimateFromHistory(1)
+	c.WeighCosts(8, LightCPU)
+	seen := func(shape string, held int64, expect time.Duration, light bool) {
+		t.Helper()
+		if got := c.Estimate(shape); got != held {
+			t.Errorf("%s: reserves %d, want %d", shape, got, held)
+		}
+		if got := c.Expect(shape); got != expect {
+			t.Errorf("%s: expected to take %s, want %s", shape, got, expect)
+		}
+		if got := c.Light(shape); got != light {
+			t.Errorf("%s: light %v, want %v", shape, got, light)
+		}
+	}
+	// After a run that read something.
+	c.Observe("after", 4*gb)
+	c.ObserveCost("after", 80*time.Second)
+	c.ObserveEmpty("after")
+	seen("after", 4*gb, 10*time.Second, false)
+	// Before one: until it comes, a shape of next to nothing.
+	c.ObserveEmpty("before")
+	seen("before", 0, 0, true)
+	if _, ok := c.Footprint("before"); !ok {
+		t.Error("a shape with a run that read nothing is not seen")
+	}
+	c.Observe("before", 4*gb)
+	c.ObserveCost("before", 80*time.Second)
+	seen("before", 4*gb, 10*time.Second, false)
+	// Several, and nothing else.
+	c.ObserveEmpty("only")
+	c.ObserveEmpty("only")
+	seen("only", 0, 0, true)
+}

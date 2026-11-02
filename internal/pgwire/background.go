@@ -43,6 +43,14 @@ import (
 // connection's tables or a view not yet copied there, fails as it is
 // prepared, and runs in the first.
 //
+// All this is for short statements beside heavy ones. Where most of what runs in
+// the first DuckDB is of some size itself (see besideIsHeavy), there are none to
+// give way to, and a heavy statement stays in the first: under a dashboard's burst
+// at ten times its data, with every statement a minute or more, those sent to the
+// second had a tenth of what the others left of the cores, and ran past 15 minutes
+// until they timed out, the two DuckDBs each spilling what the other wanted, and
+// those moved there threw away what they had done.
+//
 // A write of the catalog's tables known to be heavy (INSERT, UPDATE, DELETE,
 // MERGE and the fill of CREATE TABLE ... AS) runs there too, under the same
 // conditions and through its own proxy, with the same guard. It commits as a
@@ -187,6 +195,14 @@ func (h *heavyHistory) observe(shape string, cpu time.Duration, inBackground boo
 	}
 }
 
+// known says whether a statement of shape has run.
+func (h *heavyHistory) known(shape string) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	r := h.shapes[shape]
+	return r != nil && r.runs > 0
+}
+
 // heavy says whether statements of shape are known to be heavy.
 func (h *heavyHistory) heavy(shape string) bool {
 	h.mu.Lock()
@@ -238,6 +254,57 @@ func (h *heavyHistory) moved(shape string) {
 // could have used that much, sharing the cores with others.
 func (h *heavyHistory) moveAfter(others int) time.Duration {
 	return h.after * time.Duration(1+min(others, 7))
+}
+
+// aStatement is a statement running in the first DuckDB, as besideIsHeavy sees it.
+type aStatement struct {
+	// expect is how long statements of its shape take alone (see
+	// workload.Controller.Expect), zero for a shape not seen yet, and ran how long
+	// it has run.
+	expect, ran time.Duration
+}
+
+// mostOfSize says whether most of beside are of some size: known to take as much
+// alone as makes a statement heavy at the least, or, of a shape not seen yet, running
+// for half as long as a statement not known to be heavy would before it could have
+// used that much. A statement known to be short counts as short however long it has
+// run: a heavy statement beside dashboards slows them, and were that to make them of
+// some size, it would stay beside them. Their p95 went from 9 s to 119 s.
+func (h *heavyHistory) mostOfSize(beside []aStatement) bool {
+	long := h.moveAfter(len(beside)) / 2
+	sized := 0
+	for _, b := range beside {
+		if b.expect >= h.after || b.expect == 0 && b.ran >= long {
+			sized++
+		}
+	}
+	return sized*2 > len(beside)
+}
+
+// besideIsHeavy says whether most of what runs in the first DuckDB beside sess is
+// of some size itself, so that a heavy statement would give way to nothing (see the
+// top of this file).
+func (s *Server) besideIsHeavy(sess *session) bool {
+	r := s.sessions
+	r.mu.Lock()
+	all := make([]*session, 0, len(r.byPID))
+	for _, other := range r.byPID {
+		if other != sess {
+			all = append(all, other)
+		}
+	}
+	r.mu.Unlock()
+	now := time.Now()
+	beside := make([]aStatement, 0, len(all))
+	for _, other := range all {
+		other.mu.Lock()
+		running, shape, started := other.statement != "" && !other.queued && !other.inBackground, other.runShape, other.started
+		other.mu.Unlock()
+		if running {
+			beside = append(beside, aStatement{expect: s.workload.Expect(shape), ran: now.Sub(started)})
+		}
+	}
+	return s.heavy.mostOfSize(beside)
 }
 
 // backgroundLane is the second DuckDB as this server uses it.
@@ -380,9 +447,20 @@ func (s *Server) backgroundConnOf(ctx context.Context, sess *session, eng *engin
 // DuckDB, as far as a look at it can tell (see above); what it does not
 // tell, preparing it there does.
 func (s *Server) mayRunInBackground(sess *session, st *statement, tw *tagWriter, parts *distParts) bool {
+	return s.readInBackground(sess, st) && parts.local == 0 && tw.Written() == 0
+}
+
+// readInBackground says whether st is a read that could run in the second
+// DuckDB, whatever comes of its turn.
+func (s *Server) readInBackground(sess *session, st *statement) bool {
 	return s.heavy != nil && sess.wl.shape != "" && st.stmtType == duckdb.STATEMENT_TYPE_SELECT && st.kind == returnsRows &&
-		!sess.inTx && len(st.loads) > 0 && !st.ai && len(st.indexPins) == 0 && st.idCounts == nil && parts.local == 0 &&
-		tw.Written() == 0 && policyReason(st) == ""
+		!sess.inTx && len(st.loads) > 0 && !st.ai && len(st.indexPins) == 0 && st.idCounts == nil && policyReason(st) == ""
+}
+
+// runsApart says st is known to be heavy and will run in the second DuckDB (see
+// workload.Limits.Apart).
+func (s *Server) runsApart(sess *session, st *statement) bool {
+	return s.readInBackground(sess, st) && s.heavy.heavy(sess.wl.shape) && !s.besideIsHeavy(sess)
 }
 
 // sameInBackground looks closer, as only a statement that will run there
@@ -420,6 +498,9 @@ func (s *Server) runPlaced(ctx, outer context.Context, sess *session, st *statem
 		return s.runHere(ctx, sess, st, args, tw)
 	}
 	background, mayMove := s.heavy.place(sess.wl.shape)
+	if background && s.besideIsHeavy(sess) {
+		background, mayMove = false, true
+	}
 	if background {
 		if ran, err := s.runInBackground(ctx, sess, st, args, tw, parts); ran {
 			return err
@@ -435,7 +516,7 @@ func (s *Server) runPlaced(ctx, outer context.Context, sess *session, st *statem
 	start := time.Now()
 	guard := guardLocalBy(ctx, func() time.Duration {
 		others := s.othersRunning(sess)
-		if others == 0 || time.Since(start) > heavyMoveWithin {
+		if others == 0 || time.Since(start) > heavyMoveWithin || s.besideIsHeavy(sess) {
 			return time.Hour
 		}
 		return s.heavy.moveAfter(others)
@@ -538,6 +619,13 @@ func (s *Server) prepareInBackground(ctx context.Context, sess *session, query s
 	return fin, bc, opener.UsingBackground(ctx)
 }
 
+// setInBackground says whether the session's statement runs in the second DuckDB.
+func (sess *session) setInBackground(on bool) {
+	sess.mu.Lock()
+	sess.inBackground = on
+	sess.mu.Unlock()
+}
+
 // runInBackground runs st in the second DuckDB. ran false says it did not,
 // and nothing was sent: it runs in the first.
 func (s *Server) runInBackground(ctx context.Context, sess *session, st *statement, args []driver.NamedValue, tw *tagWriter, parts *distParts) (ran bool, err error) {
@@ -555,6 +643,8 @@ func (s *Server) runInBackground(ctx context.Context, sess *session, st *stateme
 		return false, nil
 	}
 	fin.stmtType, fin.query = st.stmtType, st.query
+	sess.setInBackground(true)
+	defer sess.setInBackground(false)
 	// On this thread, which works on the statement's tasks too, at the
 	// default priority: one core's worth of it. The client's writer cannot
 	// be called from another goroutine.

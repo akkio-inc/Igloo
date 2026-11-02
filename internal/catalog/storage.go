@@ -17,6 +17,7 @@ import (
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 
 	"github.com/akkio-inc/igloo/internal/awscreds"
+	"github.com/akkio-inc/igloo/internal/azurecreds"
 	"github.com/akkio-inc/igloo/internal/config"
 )
 
@@ -32,6 +33,8 @@ func ioProperties(s config.Storage) map[string]string {
 		if s.Azure.AccountKey != "" {
 			props[iceio.ADLSSharedKeyAccountName] = s.Azure.Account
 			props[iceio.ADLSSharedKeyAccountKey] = s.Azure.AccountKey
+		} else {
+			useSharedAzureIdentity()
 		}
 	case config.StorageGCS:
 		// DuckDB reaches GCS with an HMAC key through the S3 API;
@@ -78,6 +81,25 @@ func useSharedCredentials(region string) {
 			}
 			return cfg.Credentials, nil
 		}, slog.Default().With("component", "aws-credentials")))
+	})
+}
+
+// sharedAzureIdentity sets the process's one provider of Azure tokens for Azure file
+// systems without keys, once (see package azurecreds).
+var sharedAzureIdentity sync.Once
+
+// useSharedAzureIdentity has iceberg-go's Azure file systems without keys take their
+// tokens from one provider for the process, rather than each from the instance
+// metadata service, which allows a VM few requests a second.
+func useSharedAzureIdentity() {
+	sharedAzureIdentity.Do(func() {
+		log := slog.Default().With("component", "azure-credentials")
+		p, err := azurecreds.Shared(log)
+		if err != nil {
+			log.Warn("no Azure identity for Igloo's own clients; each makes its own", "err", err)
+			return
+		}
+		gocloud.SetDefaultAzureCredential(p)
 	})
 }
 

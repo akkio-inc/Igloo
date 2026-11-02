@@ -118,7 +118,9 @@ Run in October 2026: Igloo d208dd2 (DuckDB 1.5.6) with tables in S3 and
 the read cache, scale-to-zero bursts as above (the first with an empty
 cache, three with the cache the first filled); Snowflake X-Small to
 X-Large, on Gen1 and on Gen2; Databricks SQL Serverless 2X-Small to
-X-Large. All results are in `results/` and `results/report.md`.
+X-Large. c7g.8xlarge and c7g.16xlarge ran again the same way in November
+2026, on Igloo 25282fb7, with the result cache off. All results are in
+`results/` and `results/report.md`.
 
 **Warm runs.** Every Igloo size is faster than Snowflake X-Small (either
 generation) and Databricks 2X-Small, which cost more per hour than any of
@@ -131,23 +133,23 @@ the data (c7g.4xlarge: 5.5 s to 58.5 s), while Snowflake Gen1 X-Small grew
 much of their time is fixed per-query overhead. Igloo against each
 warehouse, faster / cheaper per warm run (warm run in seconds):
 
-| | c7g.4xlarge, 58.5 s | c7g.8xlarge, 27.5 s | c7g.16xlarge, 17.8 s |
+| | c7g.4xlarge, 58.5 s | c7g.8xlarge, 24.4 s | c7g.16xlarge, 15.4 s |
 |---|---|---|---|
-| Snowflake XS Gen1, 185 s | 3.2x / 16x | 6.7x / 18x | 10.4x / 13x |
-| Snowflake XS Gen2, 128 s | 2.2x / 15x | 4.7x / 16x | 7.2x / 13x |
-| Snowflake S Gen1, 113 s | 1.9x / 20x | 4.1x / 21x | 6.4x / 16x |
-| Snowflake S Gen2, 83 s | 1.4x / 20x | 3.0x / 21x | 4.7x / 16x |
-| Snowflake M Gen1, 86 s | 1.5x / 30x | 3.1x / 32x | 4.8x / 25x |
-| Snowflake M Gen2, 62 s | 1.1x / 30x | 2.2x / 31x | 3.5x / 24x |
-| Snowflake L Gen1, 66 s | 1.1x / 47x | 2.4x / 50x | 3.7x / 38x |
-| Snowflake L Gen2, 53 s | 0.9x / 51x | 1.9x / 54x | 3.0x / 42x |
-| Snowflake XL Gen1, 57 s | 1.0x / 81x | 2.1x / 86x | 3.2x / 66x |
-| Snowflake XL Gen2, 44 s | 0.8x / 84x | 1.6x / 90x | 2.5x / 69x |
-| Databricks 2XS, 127 s | 2.2x / 10x | 4.6x / 11x | 7.1x / 9x |
-| Databricks S, 63 s | 1.1x / 16x | 2.3x / 17x | 3.5x / 13x |
-| Databricks M, 48 s | 0.8x / 24x | 1.8x / 25x | 2.7x / 20x |
-| Databricks L, 44 s | 0.8x / 37x | 1.6x / 39x | 2.5x / 30x |
-| Databricks XL, 43 s | 0.7x / 72x | 1.6x / 76x | 2.4x / 59x |
+| Snowflake XS Gen1, 185 s | 3.2x / 16x | 7.6x / 20x | 12.0x / 16x |
+| Snowflake XS Gen2, 128 s | 2.2x / 15x | 5.3x / 18x | 8.3x / 15x |
+| Snowflake S Gen1, 113 s | 1.9x / 20x | 4.6x / 24x | 7.3x / 19x |
+| Snowflake S Gen2, 83 s | 1.4x / 20x | 3.4x / 24x | 5.4x / 19x |
+| Snowflake M Gen1, 86 s | 1.5x / 30x | 3.5x / 36x | 5.6x / 29x |
+| Snowflake M Gen2, 62 s | 1.1x / 30x | 2.5x / 35x | 4.0x / 28x |
+| Snowflake L Gen1, 66 s | 1.1x / 47x | 2.7x / 56x | 4.3x / 44x |
+| Snowflake L Gen2, 53 s | 0.9x / 51x | 2.2x / 61x | 3.4x / 48x |
+| Snowflake XL Gen1, 57 s | 1.0x / 81x | 2.3x / 97x | 3.7x / 76x |
+| Snowflake XL Gen2, 44 s | 0.8x / 84x | 1.8x / 101x | 2.8x / 80x |
+| Databricks 2XS, 127 s | 2.2x / 10x | 5.2x / 13x | 8.2x / 10x |
+| Databricks S, 63 s | 1.1x / 16x | 2.6x / 19x | 4.1x / 15x |
+| Databricks M, 48 s | 0.8x / 24x | 2.0x / 29x | 3.1x / 23x |
+| Databricks L, 44 s | 0.8x / 37x | 1.8x / 44x | 2.9x / 35x |
+| Databricks XL, 43 s | 0.7x / 72x | 1.8x / 86x | 2.8x / 68x |
 
 With the pairing used at scale 10 (c7g.4xlarge against Snowflake X-Small
 and Databricks 2X-Small), Igloo is 3.2x faster and 16x cheaper per warm run
@@ -155,7 +157,7 @@ than Gen1 X-Small, 2.2x and 15x than Gen2 X-Small, and 2.2x and 10x than
 Databricks 2X-Small; at scale 10 it was 6.8x and 35x against Gen1 X-Small,
 4.3x and 30x against Gen2 X-Small, and 5.4x and 26x against Databricks
 2X-Small. No pairing at scale 100 is both 5x faster and 30x cheaper; the
-nearest is c7g.16xlarge against Snowflake Gen1 Medium (4.8x, 25x).
+nearest is c7g.16xlarge against Snowflake Gen1 Medium (5.6x, 29x).
 Snowflake and Databricks gain little beyond Large: X-Large cuts the warm
 run by 14% (Snowflake Gen1), 17% (Gen2) and 2% (Databricks) for twice the
 price.
@@ -170,19 +172,19 @@ Gen2's speed-up. The scale 10 Gen1 X-Small result is the earlier run on
 another warehouse (COMPUTE_WH, also Gen1); every other Snowflake run used
 one warehouse, BENCH_WH, switched between generations.
 
-**The first run after a resume** is where Igloo's lead goes. It waits about
-17 s for the machine to start, then reads table data from the disk cache
-(136 s, 65 s and 57 s on the three sizes) or, with an empty cache, from S3
-(333 s, 160 s and 102 s). The cached run is limited by the disk: the cache
+**The first run after a resume** is where Igloo's lead goes. It waits 17 to
+20 s for the machine to start, then reads table data from the disk cache
+(136 s, 55 s and 49 s on the three sizes) or, with an empty cache, from S3
+(333 s, 97 s and 105 s). The cached run is limited by the disk: the cache
 holds 27 GB at scale 100, and the volume is provisioned for 500 MB/s, so
 reading it takes about a minute on any machine. Snowflake resumes within
 its first query, and Databricks' serverless start (about 10 s, not counted
 here) is short, so their first runs (Snowflake Gen1 208 s at X-Small to
 71 s at X-Large, Gen2 154 s to 59 s, Databricks 164 s to 65 s) beat
 c7g.4xlarge's (153 s with the start) from Snowflake Small and Databricks
-Small up, and match or beat c7g.16xlarge's (75 s) from Snowflake Gen2
-Medium, Gen1 X-Large and Databricks Medium up. Igloo still costs less per
-burst at every pairing (2.6x to 166x), because the others bill an idle
+Small up, and beat c7g.16xlarge's (67 s) from Snowflake Gen2 Large and
+Databricks Large up. Igloo still costs less per burst at every pairing
+(2.7x to 166x), because the others bill an idle
 tail: at 24 bursts a day, c7g.4xlarge with scale to zero comes to $66 a
 month, Snowflake X-Small to $163 (Gen1) or $176 (Gen2) and Databricks
 2X-Small to $263.
@@ -200,9 +202,10 @@ month, Snowflake X-Small to $163 (Gen1) or $176 (Gen2) and Databricks
   and q14 at most pairings (under a second on every Snowflake size, against
   0.9 s and 1.6 s on c7g.4xlarge): Snowflake's own copy of the data lets it
   skip most of lineitem, while the Igloo and Databricks copies are in
-  generator order. Databricks X-Large ties c7g.16xlarge on q09.
-- c7g.4xlarge's 32 GB ran every query, so memory-optimized machines were not
-  needed, but q09 took 4x as long as on c7g.8xlarge where most queries took
+  generator order. Databricks X-Large comes close to c7g.16xlarge on q09 (2.4 s
+  against 2.2 s).
+- On d208dd2, c7g.4xlarge's 32 GB ran every query, so memory-optimized machines
+  were not needed, but q09 took 4x as long as on c7g.8xlarge where most queries took
   1.8x: the sign of memory pressure.
 - q11 returns no rows at scale 100 on every platform: its text keeps scale
   1's `FRACTION`. The work is the same everywhere.
