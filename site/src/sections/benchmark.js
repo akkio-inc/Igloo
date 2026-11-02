@@ -16,13 +16,25 @@ const median = (xs) => {
 	return s.length % 2 ? s[(s.length - 1) / 2] : (s[s.length / 2 - 1] + s[s.length / 2]) / 2;
 };
 const lead = (r) => times(median([r[1] / r[0], r[2] / r[0]]));
+// Where Igloo is slower, by how much, rather than a lead under 1×.
+const leadOrBehind = (r) => {
+	const m = median([r[1] / r[0], r[2] / r[0]]);
+	return m >= 1 ? [times(m), 'faster'] : [`${Math.round((1 / m - 1) * 100)}%`, 'slower'];
+};
 const METRICS = {
 	seconds: {
-		max: 140,
-		ticks: [0, 50, 100],
+		max: 180,
+		ticks: [0, 50, 100, 150],
 		tick: (v) => `${v}s`,
 		value: (v) => `${v} s`,
 		lead: (r) => [lead(r), 'faster'],
+	},
+	first: {
+		max: 180,
+		ticks: [0, 50, 100, 150],
+		tick: (v) => `${v}s`,
+		value: (v) => `${v} s`,
+		lead: leadOrBehind,
 	},
 	dollars: {
 		max: 0.85,
@@ -36,7 +48,7 @@ const METRICS = {
 if (section && table) {
 	const rows = [...table.tBodies[0].rows].map((tr) => {
 		const v = [...tr.cells].slice(1).map((td) => parseFloat(td.textContent));
-		return { size: tr.cells[0].textContent.trim(), seconds: v.slice(0, 3), dollars: v.slice(3, 6) };
+		return { size: tr.cells[0].textContent.trim(), seconds: v.slice(0, 3), dollars: v.slice(3, 6), first: v.slice(6, 9) };
 	});
 	section.querySelectorAll('.vx-bm-chart').forEach((figure) => {
 		const plot = figure.querySelector('.vx-bm-plot');
