@@ -130,6 +130,8 @@ func openBackground(ctx context.Context, cfg config.Config, log *slog.Logger) (*
 // over a billion rows read their files again, 12 GB each, and took 60 s, not
 // 8. The background DuckDB then has what the first does not hold, down to a
 // quarter of the limit, and spills: what it gives up is its own to give up.
+// With statements in line behind the background DuckDB's and none running in
+// the first, the caches give way all the same (see WatchForeground).
 //
 // Two DuckDBs hold more than their limits count, each its own metadata and what
 // its allocator keeps: a report over a billion rows and dashboards beside it took
@@ -175,6 +177,24 @@ func (e *Engine) UsingBackground(ctx context.Context) func() {
 		e.bgUsers.Add(-1)
 		e.balanceNow()
 	}
+}
+
+// WatchForeground has held say whether statements wait in line with none running
+// in the first DuckDB. They wait for the memory of the one in the second, and until
+// it ends nothing will read what the first's caches keep: a dashboard's heavy
+// statements, held to the memory those caches left them, spilled and took half as
+// long again as in the first, while the statements behind them waited.
+func (e *Engine) WatchForeground(held func() bool) {
+	e.fgHeld.Store(&held)
+}
+
+// foregroundReading says whether the first DuckDB's caches keep their memory.
+func (e *Engine) foregroundReading() bool {
+	if time.Since(time.Unix(0, e.fgRead.Load())) >= foregroundIdle {
+		return false
+	}
+	held := e.fgHeld.Load()
+	return held == nil || !(*held)()
 }
 
 func (e *Engine) balanceNow() {
@@ -223,7 +243,7 @@ func (e *Engine) balance(ctx context.Context) {
 		e.limit.CompareAndSwap(0, total)
 	}
 	wantMain, wantBg := total, int64(backgroundIdleLimit)
-	reading := time.Since(time.Unix(0, e.fgRead.Load())) < foregroundIdle
+	reading := e.foregroundReading()
 	// With nothing running in the background DuckDB, what it holds stays for its
 	// next statement until the first reads: a session's reports one after another
 	// read the same files, and one of 24 s took 50 s starting with nothing.

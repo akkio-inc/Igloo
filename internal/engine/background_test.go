@@ -1,6 +1,9 @@
 package engine
 
-import "testing"
+import (
+	"testing"
+	"time"
+)
 
 // TestBalancedLimits checks how the two DuckDBs share the memory limit: a
 // heavy statement alone may use it all, the first's caches giving way to it;
@@ -48,5 +51,28 @@ func TestRoomFor(t *testing.T) {
 	}
 	if processRSS() < 0 {
 		t.Error("a process holds no less than nothing")
+	}
+}
+
+// TestForegroundReading checks when the first DuckDB's caches keep their memory:
+// after a read lately, unless statements are held behind the second's.
+func TestForegroundReading(t *testing.T) {
+	t.Parallel()
+	e := &Engine{}
+	if e.foregroundReading() {
+		t.Error("with no read")
+	}
+	e.fgRead.Store(time.Now().UnixNano())
+	if !e.foregroundReading() {
+		t.Error("after a read")
+	}
+	held := false
+	e.WatchForeground(func() bool { return held })
+	if !e.foregroundReading() {
+		t.Error("after a read, none held")
+	}
+	held = true
+	if e.foregroundReading() {
+		t.Error("after a read, statements held behind the second")
 	}
 }

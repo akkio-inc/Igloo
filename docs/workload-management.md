@@ -246,6 +246,8 @@ The two share the memory limit. A heavy statement alone may use it all, the
 first's caches giving way to it. While the first reads tables it keeps what
 it holds, up to three quarters of the limit, for its statements not to read
 their files again, and the heavy statement has what is left and spills.
+With statements in line behind the heavy one and none running in the first, the
+first's caches give way to it too: nothing will read them until it ends.
 
 A statement is heavy if its shape, its text with the literals masked, used 5
 seconds of all the replica's cores (`cpu_time_ms` in the

@@ -733,3 +733,61 @@ func TestUnseenWaitsWhileMemoryIsFull(t *testing.T) {
 	}
 	r()
 }
+
+// TestHeldBehindSecond checks when statements wait for what the second DuckDB's
+// holds: with one running there, none in the first, and some in line.
+func TestHeldBehindSecond(t *testing.T) {
+	const gb = int64(1) << 30
+	c := NewController(16 * gb)
+	ctx := context.Background()
+	if c.HeldBehindSecond() {
+		t.Error("with nothing running")
+	}
+	report, _, err := c.Admit(ctx, Limits{Apart: true, Memory: 16 * gb})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.HeldBehindSecond() {
+		t.Error("with nothing in line")
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		r, _, err := c.Admit(ctx, Limits{Memory: 4 * gb})
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		r()
+	}()
+	for deadline := time.Now().Add(5 * time.Second); !c.HeldBehindSecond() && time.Now().Before(deadline); time.Sleep(time.Millisecond) {
+	}
+	if !c.HeldBehindSecond() {
+		t.Error("with a statement in line behind the report")
+	}
+	report()
+	<-done
+	if c.HeldBehindSecond() {
+		t.Error("after the report")
+	}
+	// One running in the first keeps its caches.
+	first, _, _ := c.Admit(ctx, Limits{Memory: gb})
+	report, _, _ = c.Admit(ctx, Limits{Apart: true, Memory: gb})
+	short, cancel := context.WithTimeout(ctx, 100*time.Millisecond)
+	defer cancel()
+	go func() {
+		if r, _, err := c.Admit(short, Limits{Memory: 16 * gb}); err == nil {
+			r()
+		}
+	}()
+	time.Sleep(20 * time.Millisecond)
+	if c.HeldBehindSecond() {
+		t.Error("with one running in the first")
+	}
+	first()
+	report()
+	var none *Controller
+	if none.HeldBehindSecond() {
+		t.Error("nil controller")
+	}
+}

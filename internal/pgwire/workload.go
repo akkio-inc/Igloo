@@ -55,6 +55,9 @@ type workloadState struct {
 	// counted says the statement about to run counts against the
 	// replica's limit of statements at once (see countsOnReplica).
 	counted bool
+	// apart says it is known to be heavy and runs in the second DuckDB (see
+	// workload.Limits.Apart).
+	apart bool
 	// shape is the statement's text with its literals masked, by which the
 	// controller estimates what it reserves (see statementShape); "" for
 	// none.
@@ -135,6 +138,7 @@ func countsOnReplica(sess *session, st *statement) bool {
 func (sess *session) admit(ctx context.Context) (func(), error) {
 	l := sess.wl.limits
 	l.Counted = sess.wl.counted
+	l.Apart = sess.wl.apart
 	if controller := sess.wl.controller; l.Counted {
 		l.Expect = controller.Expect(sess.wl.shape)
 		switch {

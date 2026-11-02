@@ -52,7 +52,9 @@ type Controller struct {
 	running  map[string]int
 	// replicaRunning counts the counted statements running.
 	replicaRunning int
-	queue          []*waiter
+	// apartRunning counts the statements running in the second DuckDB.
+	apartRunning int
+	queue        []*waiter
 	// active are the statements running under the controller's limits,
 	// whose peaks SampleMemory keeps.
 	active map[*waiter]struct{}
@@ -73,6 +75,8 @@ type waiter struct {
 	// unseen says nothing is known of what it holds, so that it waits while
 	// the memory is nearly full (see full).
 	unseen bool
+	// apart says it runs in the second DuckDB (see Limits.Apart).
+	apart bool
 	// due is its place in line: when it came, plus how long it takes alone.
 	due   time.Time
 	ready chan struct{}
@@ -131,7 +135,7 @@ func (c *Controller) Admit(ctx context.Context, l Limits) (release func() (peak 
 	if c == nil || !l.Limited() && !(l.Counted && c.replicaMax > 0) && !l.Unseen {
 		return unlimited, 0, nil
 	}
-	w := &waiter{slots: l.Slots, memory: c.reservation(l.Memory), counted: l.Counted && c.replicaMax > 0, unseen: l.Unseen, ready: make(chan struct{})}
+	w := &waiter{slots: l.Slots, memory: c.reservation(l.Memory), counted: l.Counted && c.replicaMax > 0, unseen: l.Unseen, apart: l.Apart, ready: make(chan struct{})}
 	if w.slots.Max == 0 && w.memory == 0 && !w.counted && !w.unseen {
 		return unlimited, 0, nil
 	}
@@ -203,7 +207,12 @@ func (c *Controller) admit() {
 				c.replicaRunning++
 			}
 			c.reserved += w.memory
-			c.active[w] = struct{}{}
+			if w.apart {
+				c.apartRunning++
+			} else {
+				// What SampleMemory reads is the first DuckDB's.
+				c.active[w] = struct{}{}
+			}
 			w.admitted = true
 			close(w.ready)
 			continue
@@ -241,6 +250,18 @@ func (c *Controller) full() bool {
 	return c.budget > 0 && len(c.active) > 0 && float64(c.held) >= fullShare*float64(c.budget)
 }
 
+// HeldBehindSecond reports whether statements wait in line while all that run
+// run in the second DuckDB: what they wait for is that one's memory, so the
+// first's caches keep nothing for anyone.
+func (c *Controller) HeldBehindSecond() bool {
+	if c == nil {
+		return false
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.apartRunning > 0 && len(c.active) == 0 && len(c.queue) > 0
+}
+
 func (c *Controller) remove(w *waiter) {
 	for i, other := range c.queue {
 		if other == w {
@@ -262,6 +283,9 @@ func (c *Controller) release(w *waiter) {
 		c.replicaRunning--
 	}
 	c.reserved -= w.memory
+	if w.apart {
+		c.apartRunning--
+	}
 	delete(c.active, w)
 	c.admit()
 }

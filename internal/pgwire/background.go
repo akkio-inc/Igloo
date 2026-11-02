@@ -380,9 +380,20 @@ func (s *Server) backgroundConnOf(ctx context.Context, sess *session, eng *engin
 // DuckDB, as far as a look at it can tell (see above); what it does not
 // tell, preparing it there does.
 func (s *Server) mayRunInBackground(sess *session, st *statement, tw *tagWriter, parts *distParts) bool {
+	return s.readInBackground(sess, st) && parts.local == 0 && tw.Written() == 0
+}
+
+// readInBackground says whether st is a read that could run in the second
+// DuckDB, whatever comes of its turn.
+func (s *Server) readInBackground(sess *session, st *statement) bool {
 	return s.heavy != nil && sess.wl.shape != "" && st.stmtType == duckdb.STATEMENT_TYPE_SELECT && st.kind == returnsRows &&
-		!sess.inTx && len(st.loads) > 0 && !st.ai && len(st.indexPins) == 0 && st.idCounts == nil && parts.local == 0 &&
-		tw.Written() == 0 && policyReason(st) == ""
+		!sess.inTx && len(st.loads) > 0 && !st.ai && len(st.indexPins) == 0 && st.idCounts == nil && policyReason(st) == ""
+}
+
+// runsApart says st is known to be heavy and will run in the second DuckDB (see
+// workload.Limits.Apart).
+func (s *Server) runsApart(sess *session, st *statement) bool {
+	return s.readInBackground(sess, st) && s.heavy.heavy(sess.wl.shape)
 }
 
 // sameInBackground looks closer, as only a statement that will run there

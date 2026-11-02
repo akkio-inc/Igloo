@@ -777,6 +777,9 @@ func New(engine Engine, opts Options, log *slog.Logger) (*Server, error) {
 	s.queryMemory = opts.QueryMemory
 	if opts.HeavyInBackground {
 		s.heavy = newHeavyHistory()
+		if e, ok := s.engine.(interface{ WatchForeground(func() bool) }); ok {
+			e.WatchForeground(s.workload.HeldBehindSecond)
+		}
 	}
 	s.scanner, s.prefetcher = opts.Scanner, opts.Prefetcher
 	s.bitmaps, s.bitmapMinRows, s.bitmapIndexesOn = opts.Bitmaps, opts.BitmapMinRows, opts.BitmapIndexes
@@ -2139,6 +2142,7 @@ func (s *Server) preparedQuery(ctx context.Context, sess *session, user auth.Use
 			sess.wl.shape = s.workloadShape(ctx, sess, st.prepared)
 		}
 		shape := sess.wl.shape
+		sess.wl.apart = s.runsApart(sess, st)
 		err = sess.runCancelable(ctx, q.Query, func(ctx context.Context) error {
 			runOnce := func() error {
 				p, done, err := s.runDistributed(ctx, sess, sess.currentUser(), st, args, tw, sessionMode(sess, sess.currentUser()))
@@ -2216,7 +2220,7 @@ func (s *Server) preparedQuery(ctx context.Context, sess *session, user auth.Use
 			spend = &sp
 			aiNotice(w, sp)
 		}
-		sess.wl.counted, sess.wl.shape = false, ""
+		sess.wl.counted, sess.wl.shape, sess.wl.apart = false, "", false
 		if st.filled != nil {
 			// A fill's query ran on workers, or here, as a read of it would
 			// (see fillOn): the history says where, and auto mode learns how

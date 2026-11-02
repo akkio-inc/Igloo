@@ -120,6 +120,9 @@ type Engine struct {
 	// current what it is now set to; fgRead when a statement that reads
 	// tables last ran in it, in Unix nanoseconds.
 	limit, current, fgRead atomic.Int64
+	// fgHeld, if set, says statements wait in line with none running in the
+	// first (see WatchForeground).
+	fgHeld atomic.Pointer[func() bool]
 	// bgOver is what the process holds past what the two DuckDBs hold (see
 	// balance).
 	bgOver atomic.Int64
