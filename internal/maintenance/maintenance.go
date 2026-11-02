@@ -192,6 +192,9 @@ type Maintainer struct {
 	// clusterFailed holds the tables whose clustering needed more memory
 	// than Options.Memory (see compactOrCluster).
 	clusterFailed map[string]clusterFailure
+	// splitChecked holds the snapshot of each table last looked at for row
+	// groups too few for its size (see splitRowGroups).
+	splitChecked map[string]int64
 	// maxRewrite, if set, is how many bytes clustering rewrites a pass in
 	// place of maxCompactBytes, for tests.
 	maxRewrite int64
@@ -213,6 +216,7 @@ func New(cat Catalog, warehouse string, opts Options, log *slog.Logger) *Maintai
 		rewrites:       map[string]time.Time{},
 		tooBig:         map[string]int64{},
 		clusterFailed:  map[string]clusterFailure{},
+		splitChecked:   map[string]int64{},
 	}
 }
 
@@ -445,8 +449,19 @@ func (m *Maintainer) rewrite(ctx context.Context, ident table.Identifier, tbl *t
 		return nil
 	}
 	var errs []error
-	switch _, err := m.compactOrCluster(ctx, tbl, log); {
+	switch committed, err := m.compactOrCluster(ctx, tbl, log); {
 	case err == nil:
+		switch _, err := m.splitRowGroups(ctx, committed, log); {
+		case err == nil:
+		case errors.Is(err, table.ErrCommitFailed):
+			log.Debug("splitting the table's row groups lost a race with a writer; retrying next pass")
+		case errors.Is(err, errOverBudget):
+			// Trying again before the table changes would fail the same way.
+			m.splitChecked[name(ident)] = committed.CurrentSnapshot().SnapshotID
+			errs = append(errs, fmt.Errorf("split row groups: %w; not tried again until the table changes", err))
+		default:
+			errs = append(errs, fmt.Errorf("split row groups: %w", err))
+		}
 	case errors.Is(err, table.ErrCommitFailed):
 		log.Debug("compaction lost a race with a writer; retrying next pass")
 	case errors.Is(err, errOverBudget):

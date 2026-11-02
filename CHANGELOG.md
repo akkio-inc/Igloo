@@ -13,6 +13,11 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
 
 ### SQL and tables
 
+- A small table's row groups no longer limit the threads that scan it. A table
+  under 256 MiB loaded in row groups of half a million rows has few, and DuckDB reads
+  each on one thread. A maintenance pass now rewrites one that has too few, into
+  row groups of about a sixteenth of it, of at least 122,880 rows.
+
 - A canceled statement holds nobody up. Statements behind one waited until DuckDB
   had stopped it, for its slots and its memory, and a statement of a shape not seen
   yet waited for memory for as long as what held it ran: behind a report estimated

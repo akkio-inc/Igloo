@@ -1243,6 +1243,15 @@ long ones cost more: copying 4 million rows of 2 KB took 6 s rather than
 4.4 s, and 15.8 GiB rather than 12.1 GiB. If a table's rows are like that,
 set its `write.parquet.row-group-size` before you load it.
 
+DuckDB reads a row group on one thread, so a scan takes at least as long as
+reading its largest row group, however many threads there are, and a small
+table gets few from the statements that load it: a million rows in 2 to 4. So a
+table under 256 MiB aims at 16 row groups, of at least 122,880 rows, and a
+maintenance pass rewrites one that Igloo sizes, that is not partitioned or
+clustered, whose row groups hold half as many rows again as that. A query
+that read all the columns of a table of a million rows twice took 0.47 s where it
+had 9 row groups, 0.51 s with 4 and 0.58 s with 2.
+
 Maintenance then sets a table's `write.parquet.row-group-size` from its
 bytes a row as compaction would, once it has rows, and again when that size
 moves by more than 15%. DuckDB holds a row group, uncompressed, on each of

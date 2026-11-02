@@ -49,6 +49,14 @@ const (
 	// nothing, and a filter on a sorted column read up to twice as much at
 	// 90 MiB as at 15.
 	TargetRowGroupBytes = 16 << 20
+	// TableRowGroups is the fewest row groups a rewrite aims a table at, of
+	// DefaultRowGroupRows rows or more each. DuckDB reads a row group on one
+	// thread, so a scan takes at least as long as its largest row group,
+	// however many threads there are: a query that read all the columns of a
+	// table of a million rows twice took 0.47 s where it had 9 row groups, 0.51
+	// s with 4 and 0.58 s with 2. A table this small is read with few requests
+	// whatever it holds.
+	TableRowGroups = 16
 	// MaxRowGroupRows bounds a row group's rows, however narrow.
 	MaxRowGroupRows = 16 << 20
 	// MinRowGroupRows is the smallest row group a rewrite writes. Files
@@ -177,15 +185,31 @@ func RowGroupRows(props iceberg.Properties, tasks []table.FileScanTask) int64 {
 	return TargetRows(size, rows)
 }
 
-// TargetRows is how many rows make a row group of TargetRowGroupBytes at
-// size bytes for rows rows, between DefaultRowGroupRows and
-// MaxRowGroupRows.
+// TargetRows is how many rows make a row group of TargetRowGroupBytes, or
+// of a TableRowGroups-th of a smaller table, at size bytes for rows rows,
+// between DefaultRowGroupRows and MaxRowGroupRows.
 func TargetRows(size, rows int64) int64 {
 	if size <= 0 || rows <= 0 {
 		return DefaultRowGroupRows
 	}
-	n := int64(float64(TargetRowGroupBytes) * float64(rows) / float64(size))
+	target := min(TargetRowGroupBytes, size/TableRowGroups)
+	n := int64(float64(target) * float64(rows) / float64(size))
 	return min(max(n, DefaultRowGroupRows), MaxRowGroupRows)
+}
+
+// RowGroups counts the row groups of the file at path.
+func RowGroups(fs iceio.IO, path string) (int, error) {
+	f, err := fs.Open(path)
+	if err != nil {
+		return 0, err
+	}
+	rdr, err := file.NewParquetReader(f)
+	if err != nil {
+		_ = f.Close()
+		return 0, fmt.Errorf("read %s: %w", path, err)
+	}
+	defer rdr.Close() //nolint:errcheck
+	return rdr.NumRowGroups(), nil
 }
 
 // measure decodes the first rows of the first file of tasks that has any, and
