@@ -1874,9 +1874,19 @@ func (a *aggregation) rewrite(e node, part string) (node, error) {
 			case "SUBQUERY":
 				// A scalar subquery that stands on its own (see analyze),
 				// which the coordinator computes, its tables read at the
-				// workers' snapshots (see pinReads).
+				// workers' snapshots (see pinReads). It defines the common
+				// table expressions it reads, which the statement the
+				// coordinator runs does not: TPC-DS q24's HAVING reads
+				// ssales, which workers compute for its FROM.
 				if !a.c.relation {
-					return n, true
+					q, serr := standalone(subqueryNode(n), a.c.ctes)
+					if serr != nil {
+						err = serr
+						return nil, false
+					}
+					s := clone(n).(node)
+					child(s, "subquery")["node"] = q
+					return s, true
 				}
 			}
 			err = unsupported("%s outside WHERE", strings.ToLower(str(n["class"])))

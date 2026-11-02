@@ -132,6 +132,9 @@ func TestAgreement(t *testing.T) {
 			sf, _ = strconv.ParseFloat(v, 64)
 		}
 		h := newTPCDSHarness(t, sf, 4, 3)
+		// A coordinator of a fleet's size computes larger scalar subqueries of
+		// HAVING itself, as q44's: one of 2 cores leaves all of q44 to itself.
+		h.co.opts.Cores = 16
 		rows, _, err := h.query(context.Background(), "SELECT query_nr, query FROM tpcds_queries() ORDER BY query_nr")
 		if err != nil {
 			t.Fatal(err)
