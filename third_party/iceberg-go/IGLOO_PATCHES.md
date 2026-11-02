@@ -173,6 +173,10 @@ compact large tables within `IGLOO_MAINTENANCE_MEMORY`:
   `Remove` and `DeleteFiles` delete such a key by the store's own client, as
   gocloud escapes what it asks for.
 
+- `io/gocloud/azure.go`, `SetDefaultAzureCredential` (new): Azure file systems whose
+  properties give no credentials take them from one provider for the process, as
+  `SetDefaultCredentials` does for S3.
+
 Drop this copy and the `replace` directive once an iceberg-go release reads
 DuckDB-written tables, lets callers choose these Parquet writer defaults,
 no longer needs an MPL-licensed dependency and can rewrite manifests.

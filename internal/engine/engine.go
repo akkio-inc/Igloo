@@ -20,6 +20,7 @@ import (
 	iceio "github.com/apache/iceberg-go/io"
 	"github.com/duckdb/duckdb-go/v2"
 
+	"github.com/akkio-inc/igloo/internal/azurecreds"
 	"github.com/akkio-inc/igloo/internal/catalog"
 	"github.com/akkio-inc/igloo/internal/catalogproxy"
 	"github.com/akkio-inc/igloo/internal/config"
@@ -58,9 +59,6 @@ type Engine struct {
 	// local is DuckDB's own database, where Igloo keeps its copies of the
 	// catalog's views: DuckDB cannot keep views in an Iceberg catalog.
 	local string
-	// stopAzureTokens stops renewing DuckDB's Azure token, where it has one (see
-	// startAzureTokens).
-	stopAzureTokens func()
 	// connectStmts run on every new connection so unqualified names
 	// resolve to the catalog's default schema, and to the views kept for
 	// it in the local database.
@@ -671,9 +669,6 @@ func (e *Engine) Close() error {
 		e.bg = nil
 	}
 	e.bgMu.Unlock()
-	if e.stopAzureTokens != nil {
-		e.stopAzureTokens()
-	}
 	if e.prefetcher != nil {
 		e.prefetcher.Close()
 	}
@@ -762,13 +757,13 @@ func (e *Engine) setup(ctx context.Context, cfg config.Config, log *slog.Logger,
 		return e.lockDown(exec, cfg, o.sandboxDirs())
 	}
 
+	useAzureIdentity(cfg.Storage, log)
 	for _, stmt := range storageStatements(cfg.Storage) {
 		if err := exec(stmt); err != nil {
 			// Never echo the statement: it can contain a secret key.
 			return fmt.Errorf("configure object storage: %w", err)
 		}
 	}
-	e.startAzureTokens(ctx, cfg, log)
 	if err := e.setupCache(exec, cfg, log); err != nil {
 		return err
 	}
@@ -1055,7 +1050,7 @@ func storageStatements(s config.Storage) []string {
 			stmts = append(stmts, secret(scope,
 				"TYPE azure",
 				"PROVIDER credential_chain",
-				"CHAIN 'workload_identity;managed_identity;env'",
+				"CHAIN "+literal(azureChain()),
 				"ACCOUNT_NAME "+literal(s.Azure.Account),
 			))
 		}
@@ -1083,6 +1078,27 @@ func storageStatements(s config.Storage) []string {
 	}
 
 	return stmts
+}
+
+// useAzureIdentity has DuckDB ask this process for an Azure identity's tokens, where it
+// uses an identity (see package azurecreds).
+func useAzureIdentity(s config.Storage, log *slog.Logger) {
+	if s.Type != config.StorageAzure || s.Azure.AccountKey != "" {
+		return
+	}
+	if _, err := azurecreds.Shared(log); err != nil {
+		log.Warn("no Azure identity for DuckDB's tokens; it asks for them itself", "err", err)
+	}
+}
+
+// azureChain is the credentials of DuckDB's secret for an Azure warehouse with no account
+// key: its managed identity credential asks this process if it serves them, and
+// otherwise it has what the identity's own services give.
+func azureChain() string {
+	if azurecreds.Serving() {
+		return "managed_identity"
+	}
+	return "workload_identity;managed_identity;env"
 }
 
 // extensionStatements load the extensions every deployment uses.

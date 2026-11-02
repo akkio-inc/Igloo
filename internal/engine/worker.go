@@ -72,13 +72,13 @@ func (e *Engine) setupWorker(ctx context.Context, cfg config.Config, log *slog.L
 	if err := e.setupForecasting(ctx, cfg); err != nil {
 		return fmt.Errorf("register forecasting functions: %w", err)
 	}
+	useAzureIdentity(cfg.Storage, log)
 	for _, stmt := range storageStatements(cfg.Storage) {
 		if err := exec(stmt); err != nil {
 			// Never echo the statement: it can contain a secret key.
 			return fmt.Errorf("configure object storage: %w", err)
 		}
 	}
-	e.startAzureTokens(ctx, cfg, log)
 	if err := e.setupCache(exec, cfg, log); err != nil {
 		return err
 	}
