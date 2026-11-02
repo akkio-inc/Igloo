@@ -989,3 +989,33 @@ func TestClearedHistory(t *testing.T) {
 		t.Errorf("after a run of 51.4 GB: %s", e.local)
 	}
 }
+
+// TestShortStaysOnTheReplica checks that a statement of seconds runs on the replica,
+// however many run there and whatever workers took or one machine's estimate says.
+func TestShortStaysOnTheReplica(t *testing.T) {
+	now := time.Now()
+	const threshold = time.Minute
+	busy := estimate{oneMachine: 30, onWorkers: 5, workers: 16, others: 8}
+	for _, c := range []struct {
+		name    string
+		e       estimate
+		r       runs
+		found   bool
+		workers bool
+	}{
+		{"ran 3 s on workers, estimated at 30 s, beside 8", busy, runs{dist: 3, distWorkers: 16}, true, false},
+		{"ran 1.5 s here and 3 s on workers, beside 8", busy, runs{local: 1.5, dist: 3, distWorkers: 16}, true, false},
+		{"ran 10 s here and 3 s on workers, alone", estimate{oneMachine: 30, onWorkers: 5, workers: 16}, runs{local: 10, dist: 3, distWorkers: 16}, true, false},
+		{"never ran, estimated at 30 s, beside 8", busy, runs{}, false, true},
+		{"ran 30 s here and 3 s on workers, beside 8", busy, runs{local: 30, dist: 3, distWorkers: 16}, true, true},
+		{"ran 66 s on workers", estimate{oneMachine: 400, onWorkers: 60, workers: 16, others: 8}, runs{dist: 66, distWorkers: 16}, true, true},
+		{"ran 3 s on workers, and one machine should spill", estimate{oneMachine: 30, onWorkers: 5, workers: 16, others: 8, spills: true}, runs{dist: 3, distWorkers: 16}, true, true},
+		{"ran 3 s on workers, exchanging more than one machine holds", busy, runs{dist: 3, distWorkers: 16, heavy: true}, true, true},
+		{"stopped by the guard, though 3 s on workers", busy, runs{local: 12, dist: 3, distWorkers: 16, guarded: true}, true, true},
+	} {
+		workers, _, reason := choose(c.e, c.r, c.found, threshold, now)
+		if workers != c.workers {
+			t.Errorf("%s: on workers %v (%s), want %v", c.name, workers, reason, c.workers)
+		}
+	}
+}

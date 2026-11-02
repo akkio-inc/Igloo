@@ -63,6 +63,12 @@ const (
 	heldFactor = 6
 	// Workers must be estimated this much faster than one machine.
 	speedup = 1.5
+	// shortOnWorkers is how many times less than IGLOO_WORKER_THRESHOLD makes a
+	// statement's time on workers short: it runs on the replica, where the guard
+	// moves it if it was short only for all the workers. Weighed at four times
+	// its estimate beside others, one machine should have taken long enough for a
+	// dashboard's statement of 1.5 s, which then stayed on workers, at 2.8 s, for good.
+	shortOnWorkers = 6
 	// shareCap is the most other statements on the replica auto mode counts
 	// as sharing its cores with a statement (see choose): beside three or
 	// more, a statement takes about four times as long there, and slows
@@ -996,7 +1002,8 @@ func levels(stages []*Stage) int {
 // times, which is what auto mode weighs one machine's time at, so that a
 // heavy statement runs on workers rather than take the cores of the
 // replica's other statements, as a dashboard's, and one ran only on
-// workers is not tried on the replica meanwhile. At ten times the data,
+// workers is not tried on the replica meanwhile, unless it took them next
+// to nothing (see shortOnWorkers). At ten times the data,
 // beside 16 users' dashboards, a report that had run in 25 s on one
 // machine, and 66 s on 16 workers alone, ran 577 s there, the dashboards'
 // median rising from 4 ms to 23 s.
@@ -1061,6 +1068,11 @@ func chooseShared(e estimate, r runs, found bool, threshold time.Duration, now t
 		return true, false, "it ran out of memory on one machine"
 	case found && r.guarded && e.workers > 0:
 		return true, false, fmt.Sprintf("it ran on one machine for %.0f s, far past its estimate", r.local)
+	case found && r.local > 0 && r.local*share < limit && !e.risky:
+		// However much faster workers were: a statement of seconds is the replica's.
+		return false, false, fmt.Sprintf("it ran in %.0f s on one machine, under %.0f s", r.local, limit/share)
+	case found && r.local == 0 && r.dist > 0 && r.dist < limit/shortOnWorkers && !e.memory && !e.spills && !r.heavy && !e.risky:
+		return false, false, fmt.Sprintf("it ran in %.1f s on workers, too little for them to be worth it, whatever one machine's estimate of %.0f s", r.dist, e.oneMachine)
 	case found && r.dist > 0 && r.distWorkers > 0 && e.workers >= 2*r.distWorkers && mayExplore:
 		// Measured on far fewer workers than it would run on now, as
 		// after an earlier session's runs on a smaller fleet: a report
@@ -1077,8 +1089,6 @@ func chooseShared(e estimate, r runs, found bool, threshold time.Duration, now t
 		return false, false, fmt.Sprintf("it ran in %.0f s on one machine and %.0f s on workers", r.local, r.dist)
 	case found && r.local > 0:
 		switch {
-		case r.local*share < limit:
-			return false, false, fmt.Sprintf("it ran in %.0f s on one machine, under %.0f s", r.local, limit/share)
 		case e.workers > 0 && mayExplore && r.local < exploreUnder.Seconds() && tryWorkers(r.local):
 			return true, true, fmt.Sprintf("it ran in %.0f s on one machine; trying workers once, estimated at %.0f s", r.local, e.onWorkers)
 		case share == 1 && r.local < e.oneMachine/2:
