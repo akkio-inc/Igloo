@@ -3,10 +3,13 @@ package distributed
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net"
 	"net/http"
+	"slices"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -300,5 +303,105 @@ func TestUnresponsiveWorkerWithExchanges(t *testing.T) {
 	}
 	if took := time.Duration(foundAt.Load() - frozenAt.Load()); took > 20*time.Second {
 		t.Errorf("the worker was taken for lost %s after it stopped answering", took)
+	}
+}
+
+// TestPieces checks how a task is divided: every unit in exactly one piece, the pieces
+// as even as can be, and each with a directory of its own.
+func TestPieces(t *testing.T) {
+	units := []int{0, 1, 2, 3, 4, 5, 6}
+	for k := 1; k <= 8; k++ {
+		var all []int
+		names := map[int]bool{}
+		for j := range k {
+			p := piece{i: 7, j: j, k: k}
+			got := pieceOf(units, p)
+			if n := len(got); n < len(units)/k || n > (len(units)+k-1)/k {
+				t.Errorf("piece %d of %d: %v", j, k, got)
+			}
+			all = append(all, got...)
+			if names[p.index()] {
+				t.Errorf("piece %d of %d shares a directory", j, k)
+			}
+			names[p.index()] = true
+		}
+		slices.Sort(all)
+		if !slices.Equal(all, units) {
+			t.Errorf("%d pieces hold %v", k, all)
+		}
+		if k > 1 && names[wholeTask(7).index()] {
+			t.Errorf("a piece of %d shares the undivided task's directory", k)
+		}
+	}
+	if got := pieceOf(units, wholeTask(3)); !slices.Equal(got, units) {
+		t.Errorf("an undivided task: %v", got)
+	}
+}
+
+// TestLostMidTaskRunsAsSmallerTasks has a worker stop answering in the middle of a
+// task, its sockets open: the task runs as smaller tasks on the others, one each, and
+// the rows are exactly what one machine returns, also once the lost worker, let go,
+// runs the task late and writes what it was given to, with exchanges in object storage
+// and on workers' disks.
+func TestLostMidTaskRunsAsSmallerTasks(t *testing.T) {
+	fastBeats(t, 50*time.Millisecond, 200*time.Millisecond, 5*time.Second)
+	for _, local := range []bool{false, true} {
+		name := "object storage"
+		if local {
+			name = "workers' disks"
+		}
+		t.Run(name, func(t *testing.T) {
+			// Shares of three files a worker, which a task lost can be divided by.
+			h := newHarness(t, 0.01, 12, 4)
+			h.co.maxBroadcast = 1
+			h.co.opts.LocalExchanges = local
+			f := frozenWorker(t, h, 1)
+			want, _, err := h.query(context.Background(), exchangeQuery)
+			if err != nil {
+				t.Fatal(err)
+			}
+			late := make(chan struct{})
+			var once sync.Once
+			var froze, ranLate atomic.Int32
+			h.workers[1].beforeTask = func(rw http.ResponseWriter, r *http.Request) bool {
+				if froze.Add(1) > 1 {
+					return false
+				}
+				f.frozen.Store(true)
+				select {
+				case <-late:
+					// Let go: it runs the task, and nobody hears of it.
+					ranLate.Add(1)
+					return true
+				case <-f.thaw:
+					return false
+				}
+			}
+			var split atomic.Int32
+			var pieces atomic.Int64
+			hook := func(r slog.Record) {
+				if strings.Contains(r.Message, "running the task as smaller ones on the others") {
+					split.Add(1)
+					var n int64
+					fmt.Sscan(attr(r, "tasks"), &n)
+					pieces.Add(n)
+					once.Do(func() { close(late) })
+				}
+			}
+			h.hook.Store(&hook)
+			got, _, _, _, err := h.run(context.Background(), exchangeQuery, ModeOn)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if msg := compareRows(want, got, true); msg != "" {
+				t.Error(msg)
+			}
+			if split.Load() == 0 || pieces.Load() < 2 {
+				t.Errorf("the lost worker's task ran as %d smaller ones, %d times", pieces.Load(), split.Load())
+			}
+			if ranLate.Load() == 0 {
+				t.Errorf("the lost worker did not run its task late (given %d tasks)", froze.Load())
+			}
+		})
 	}
 }

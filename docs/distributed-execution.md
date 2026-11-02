@@ -1128,7 +1128,11 @@ other manifests only with that port open between them, or say `object`.
   that cannot fetch a file fails; if the worker no longer answers, or
   answers as a new run of itself, what it wrote that readers still need runs
   again on the other workers, those tasks' inputs it held first, and the task
-  on what is there now: nothing else runs again. A statement with `LIMIT`,
+  on what is there now: nothing else runs again. Each of those tasks, and a
+  task whose worker is lost while it runs it, runs as smaller tasks spread
+  over the workers left, one each, divided by its files, buckets or
+  partitions, so that a loss costs about a worker's share of a stage over
+  the workers left rather than all of it on one. A statement with `LIMIT`,
   samples or a volatile function among those tasks could not mix two runs of
   them, and its parts all run again, once, as they do if a task writes other
   rows than it did. One that still answers as the same run was busy, and the

@@ -24,6 +24,15 @@ import (
 // something else each time cannot mix two runs of a task, and runs whole again as
 // before, as it does if a task writes other rows than it did, or anything else goes
 // wrong here.
+//
+// A task is a worker's whole share of its stage, and run again as one, on one of the
+// others, it took as long as the stage had: running only what was lost added 39 s to
+// that report, all of its parts again 35 s. So a task lost, as it ran or with what it
+// wrote, runs as smaller ones spread over the workers left, one each, each the j-th of
+// every k of its buckets, partitions or files of the split table (see piece), which the
+// plan divides its tasks by in any case. Those write to directories of their own, so
+// that what the lost worker wrote, should it turn up late, is never read; and the
+// exchange lists only what they wrote, in place of what the task had.
 
 // repairRounds bounds how many times a task runs again for workers lost.
 const repairRounds = 3
@@ -34,16 +43,42 @@ var repairFault func() error
 // ranTask is a task that wrote to an exchange, on a worker's disk if it could.
 type ranTask struct {
 	// run is the run it was part of, which another's may read (see runProbing).
-	run     *execution
-	stage   *Stage
-	index   int
+	run   *execution
+	stage *Stage
+	// piece is which task, or which part of one, and units how many parts its task
+	// may be divided into.
+	piece   piece
+	units   int
 	first   int
-	request func(i, round int) (*taskRequest, int64)
+	request func(p piece, round int) (*taskRequest, int64)
 	task    *taskRequest
 	head    *taskResult
 	worker  string
 	// rounds counts how many times it ran again.
 	rounds int
+}
+
+// taskLostError is a task whose worker was lost while it ran it, which its stage runs
+// as smaller tasks on the others (see dispatch and taskRequest.splittable).
+type taskLostError struct {
+	worker string
+	err    error
+}
+
+func (e *taskLostError) Error() string {
+	return fmt.Sprintf("worker %s was lost while it ran the task: %v", e.worker, e.err)
+}
+func (e *taskLostError) Unwrap() error { return e.err }
+
+// usable counts the workers the run goes on with that are not set aside.
+func (e *execution) usable() int {
+	n := 0
+	for _, w := range e.workers() {
+		if !e.co.pool.isDown(w.addr) {
+			n++
+		}
+	}
+	return n
 }
 
 // onDisk reports whether t wrote a file to its worker's disk.
@@ -206,10 +241,11 @@ func (e *execution) writeAgain(ctx context.Context, addr string) (int, error) {
 		g, gctx := errgroup.WithContext(ctx)
 		for _, t := range tasks {
 			g.Go(func() error {
-				if err := e.taskAgain(gctx, t); err != nil {
+				n, err := e.taskAgain(gctx, t)
+				if err != nil {
 					return err
 				}
-				count.Add(1)
+				count.Add(int64(n))
 				return nil
 			})
 		}
@@ -220,35 +256,66 @@ func (e *execution) writeAgain(ctx context.Context, addr string) (int, error) {
 	return int(count.Load()), nil
 }
 
-// taskAgain runs t again on the workers left, and has its exchange hold what it wrote
-// this time in place of what it wrote before.
-func (e *execution) taskAgain(ctx context.Context, t *ranTask) error {
-	t.rounds++
-	task, _ := t.request(t.index, t.rounds)
-	w, head, err := e.co.dispatch(ctx, task, e.workers(), t.first, "", nil)
-	if err != nil {
-		return err
+// taskAgain runs t again on the workers left, as smaller tasks if it is a whole one
+// that can be divided, and has its exchange hold what they wrote in place of what it
+// wrote before. It returns how many tasks it ran.
+func (e *execution) taskAgain(ctx context.Context, t *ranTask) (int, error) {
+	round := t.rounds + 1
+	pieces := []piece{t.piece}
+	if k := min(t.units, e.usable()); !t.piece.split() && k > 1 {
+		pieces = make([]piece, k)
+		for j := range pieces {
+			pieces[j] = piece{i: t.piece.i, j: j, k: k}
+		}
 	}
-	if head.Rows != t.head.Rows {
-		return fmt.Errorf("task %d wrote %d rows, and %d when it ran again", task.Task, t.head.Rows, head.Rows)
+	again := make([]*ranTask, len(pieces))
+	g, gctx := errgroup.WithContext(ctx)
+	for n, p := range pieces {
+		g.Go(func() error {
+			task, _ := t.request(p, round)
+			first := t.first + 1 + n
+			w, head, err := e.co.dispatch(gctx, task, e.workers(), first, "", nil)
+			if err != nil {
+				return err
+			}
+			again[n] = &ranTask{run: t.run, stage: t.stage, piece: p, units: t.units, first: first, request: t.request,
+				task: task, head: head, worker: w.addr, rounds: round}
+			return nil
+		})
+	}
+	if err := g.Wait(); err != nil {
+		return 0, err
+	}
+	if len(again) == 1 && again[0].head.Rows != t.head.Rows {
+		// Divided, a task that groups its rows may well write more of them.
+		return 0, fmt.Errorf("task %d wrote %d rows, and %d when it ran again", t.task.Task, t.head.Rows, again[0].head.Rows)
 	}
 	x := t.run.exchanges[t.stage.Out.ID]
 	// At once: a task made in between would read short of what t wrote, and check
 	// the rows of its files against those.
 	x.mu.Lock()
 	t.run.forget(x, t)
-	err = t.run.receivedLocked(x, task, head, w)
+	var err error
+	for _, a := range again {
+		if err = t.run.receivedLocked(x, a.task, a.head, &worker{addr: a.worker}); err != nil {
+			break
+		}
+	}
 	if err == nil {
-		t.task, t.head, t.worker = task, head, w.addr
+		if i := slices.Index(x.ran, t); i >= 0 {
+			x.ran = slices.Replace(x.ran, i, i+1, again...)
+		}
 	}
 	x.mu.Unlock()
 	if err != nil {
-		return err
+		return 0, err
 	}
 	t.run.writtenAgain.Add(1)
 	e.writtenAgain.Add(1)
-	e.co.opts.Metrics.task("ran_again_for_lost_worker")
-	return nil
+	for range again {
+		e.co.opts.Metrics.task("ran_again_for_lost_worker")
+	}
+	return len(again), nil
 }
 
 // forget takes what t wrote out of x, whose lock the caller holds.

@@ -1585,6 +1585,12 @@ func (co *Coordinator) dispatch(ctx context.Context, task *taskRequest, ws []*wo
 			co.opts.Metrics.task("failed")
 			return nil, nil, err
 		}
+		if task.splittable && len(ws) > 2 {
+			// Its caller runs it as smaller tasks on the others (see repair.go).
+			co.opts.Metrics.task("lost")
+			co.pool.markDown(w.addr)
+			return nil, nil, &taskLostError{worker: w.addr, err: err}
+		}
 		tried++
 		co.log.Warn("task failed on a worker; trying another", "query", task.Query, "task", task.Task, "worker", w.addr, "err", err)
 		co.opts.Metrics.task("retried")
