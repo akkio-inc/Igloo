@@ -331,6 +331,13 @@ func loadWorkers(lookup func(string) (string, bool), errs *[]error) Workers {
 	return w
 }
 
+// DefaultWorkerCacheReadThreads is IGLOO_CACHE_READ_THREADS on a worker, which reads
+// cold with nothing read ahead: its threads then wait on requests for one block at a
+// time, as DuckDB's tasks. A copy of 130 GB on 16 workers took 88 s with a thread for
+// each block of a read and 110 to 113 s as tasks. A worker runs few tasks, so that
+// these are bounded: on 11 threads and 2 tasks at once, about 104.
+const DefaultWorkerCacheReadThreads = 8
+
 // LoadWorker reads a worker's configuration (igloo worker): where table
 // data lives and how to reach it, DuckDB's settings, the read cache, logs,
 // and the worker's own settings. Workers have no catalog and no users.
@@ -354,6 +361,9 @@ func LoadWorker(lookup func(string) (string, bool)) (Config, error) {
 	// half of what it fetched went unread.
 	if _, set := lookup("IGLOO_PREFETCH"); !set {
 		cfg.Prefetch.Enabled = false
+	}
+	if v, _ := lookup("IGLOO_CACHE_READ_THREADS"); v == "" {
+		cfg.Cache.ReadThreads = DefaultWorkerCacheReadThreads
 	}
 	var errs []error
 	if cfg.Storage.Location == "" {

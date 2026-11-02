@@ -51,7 +51,7 @@ func TestCacheLimits(t *testing.T) {
 }
 
 func TestCacheStatements(t *testing.T) {
-	stmts := cacheStatements("/var/lib/igloo/cache/blocks", "s3://my.bucket/ware'house/", 42, true)
+	stmts := cacheStatements("/var/lib/igloo/cache/blocks", "s3://my.bucket/ware'house/", 42, true, 0)
 	got := joined(stmts)
 	for _, want := range []string{
 		"SET GLOBAL cache_httpfs_cache_directory = '/var/lib/igloo/cache/blocks'",
@@ -78,7 +78,11 @@ func TestCacheStatements(t *testing.T) {
 	}
 	// On a full disk the extension is configured but left passing reads
 	// through.
-	stmts = cacheStatements("/c", "s3://b/w/", 42, false)
+	if got := joined(cacheStatements("/c", "s3://b/w/", 42, true, 8)); !strings.Contains(got, "cache_httpfs_parallel_read_mode = 'internal_thread_pool'") ||
+		!strings.Contains(got, "cache_httpfs_max_fanout_subrequest = 8") || strings.Contains(got, "duckdb_task_scheduler") {
+		t.Errorf("a worker's reads: %s", got)
+	}
+	stmts = cacheStatements("/c", "s3://b/w/", 42, false, 0)
 	if last := stmts[len(stmts)-1]; last != "SET GLOBAL cache_httpfs_type = 'noop'" {
 		t.Errorf("a paused cache should end in noop, not %q", last)
 	}
@@ -143,7 +147,7 @@ func TestSetupCache(t *testing.T) {
 	if e.cache == nil || e.cache.dir != filepath.Join(dir, "blocks") {
 		t.Fatalf("cache not set up in %s: %+v", dir, e.cache)
 	}
-	if r.ran[0] != "LOAD cache_httpfs" || !slices.Equal(r.ran[1:], cacheStatements(e.cache.dir, "s3://bucket/warehouse/", e.cache.reserve, e.cache.on)) {
+	if r.ran[0] != "LOAD cache_httpfs" || !slices.Equal(r.ran[1:], cacheStatements(e.cache.dir, "s3://bucket/warehouse/", e.cache.reserve, e.cache.on, 0)) {
 		t.Errorf("ran %q", r.ran)
 	}
 	if entries, _ := os.ReadDir(e.cache.dir); len(entries) != 0 {

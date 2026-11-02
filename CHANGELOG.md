@@ -18,6 +18,8 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   beside each other a replica of 16 cores reached 20,394 threads and a load of 240,
   and no statement finished for 20 minutes. Blocks are now read as DuckDB's tasks,
   on its threads, and `igloo_process_threads` tells how many the process has.
+  Workers, which read nothing ahead, start up to `IGLOO_CACHE_READ_THREADS` a read,
+  8 by default, as reading cold on their own threads took a quarter as long again.
 
 - A small table's row groups no longer limit the threads that scan it. A table
   under 256 MiB loaded in row groups of half a million rows has few, and DuckDB reads

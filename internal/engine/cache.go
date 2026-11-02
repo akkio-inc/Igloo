@@ -123,7 +123,7 @@ func (e *Engine) setupCache(exec func(string) error, cfg config.Config, log *slo
 		log.Warn("read cache off: cannot load the cache_httpfs extension", "err", err)
 		return nil
 	}
-	for _, stmt := range cacheStatements(dir, cfg.Storage.Root(), reserve, c.on) {
+	for _, stmt := range cacheStatements(dir, cfg.Storage.Root(), reserve, c.on, cfg.Cache.ReadThreads) {
 		if err := exec(stmt); err != nil {
 			// The extension is loaded with its own defaults, which
 			// cache directory listings: turn it into a plain httpfs.
@@ -151,7 +151,7 @@ func (e *Engine) setupCache(exec func(string) error, cfg config.Config, log *slo
 // cacheStatements configure the loaded extension, caching if on. The
 // settings that keep cached state from going stale come first, so
 // cacheOffStatements can rely on them.
-func cacheStatements(dir, warehouseRoot string, reserve uint64, on bool) []string {
+func cacheStatements(dir, warehouseRoot string, reserve uint64, on bool, readThreads int) []string {
 	cacheType := "noop"
 	if on {
 		cacheType = "on_disk"
@@ -166,15 +166,8 @@ func cacheStatements(dir, warehouseRoot string, reserve uint64, on bool) []strin
 		// off, does that job better and is what Igloo used before.
 		"SET GLOBAL cache_httpfs_disk_cache_reader_enable_memory_cache = false",
 		"SET GLOBAL enable_external_file_cache = true",
-		// By default a read starts a thread for each of its blocks, up to 1,024, warm
-		// or cold, and a read of a column of a row group of half a million rows
-		// has dozens: 20,394 threads on a replica of 16 cores with dashboards, ELT and
-		// reports beside each other, a load of 240, and no statement finished for
-		// 20 minutes. Blocks are read as DuckDB's tasks instead, on its threads, so
-		// that its thread count bounds them.
-		"SET GLOBAL cache_httpfs_parallel_read_mode = 'duckdb_task_scheduler'",
-		// Where the extension falls back on threads of its own.
-		fmt.Sprintf("SET GLOBAL cache_httpfs_max_fanout_subrequest = %d", readFanoutFallback),
+		readThreadsStatements(readThreads)[0],
+		readThreadsStatements(readThreads)[1],
 		// Cache only the warehouse: other allowed locations hold files
 		// that are read once, such as data to load, and so do the rows
 		// distributed-execution workers exchange.
@@ -186,8 +179,29 @@ func cacheStatements(dir, warehouseRoot string, reserve uint64, on bool) []strin
 	)
 }
 
-// readFanoutFallback is the threads a read may start where the extension has no
-// DuckDB to give its blocks to.
+// readThreadsStatements have a read of the cache start at most n threads for its blocks,
+// or none if n is 0. By default a read starts a thread for each of its blocks, up to
+// 1,024, warm or cold, and a read of a column of a row group of half a million rows has
+// dozens: 20,394 threads on a replica of 16 cores with dashboards, ELT and reports
+// beside each other, a load of 240, and no statement finished for 20 minutes, while a
+// replica's reads are as many as its sessions, and even at 8 threads each it reached
+// 791. So a replica reads blocks as DuckDB's tasks, on its threads, which
+// bounds them, and reads ahead for what that costs cold. A worker reads nothing ahead,
+// and runs few tasks, so it may start a few (see config.DefaultWorkerCacheReadThreads):
+// a cold scan of 1 GB on 11 threads, of a store that answers after 30 ms, took 11 s as
+// tasks, 3.8 s with 8 threads a read, 3.2 s with 16, and 3.5 to 4.4 s with one a block.
+func readThreadsStatements(n int) [2]string {
+	if n > 0 {
+		return [2]string{"SET GLOBAL cache_httpfs_parallel_read_mode = 'internal_thread_pool'",
+			fmt.Sprintf("SET GLOBAL cache_httpfs_max_fanout_subrequest = %d", n)}
+	}
+	return [2]string{"SET GLOBAL cache_httpfs_parallel_read_mode = 'duckdb_task_scheduler'",
+		// Where the extension has no DuckDB to give its blocks to.
+		fmt.Sprintf("SET GLOBAL cache_httpfs_max_fanout_subrequest = %d", readFanoutFallback)}
+}
+
+// readFanoutFallback is the threads a read starts where the extension has no DuckDB to
+// give its blocks to.
 const readFanoutFallback = 8
 
 // cacheOffStatements make the loaded extension behave like plain httpfs.

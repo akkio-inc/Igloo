@@ -191,6 +191,9 @@ type Cache struct {
 	// MaxSize caps the cache in bytes. Zero sizes it from the free space on
 	// Dir's disk.
 	MaxSize int64
+	// ReadThreads is IGLOO_CACHE_READ_THREADS: the threads a read of the cache may
+	// start for its blocks. Zero reads them as DuckDB's tasks, starting none.
+	ReadThreads int
 	// Ephemeral is IGLOO_CACHE_EPHEMERAL: Dir's volume goes with the pod
 	// or machine, as a Kubernetes emptyDir or ephemeral volume does, so
 	// erasure requests do not count a replica that is gone as keeping it.
@@ -546,6 +549,13 @@ func Load(lookup func(string) (string, bool)) (Config, error) {
 	}
 	if d := cfg.Cache.Dir; d != "" && !strings.HasPrefix(d, "/") {
 		addErr("IGLOO_CACHE_DIR must be an absolute path, got %q", d)
+	}
+	if v := get("IGLOO_CACHE_READ_THREADS", ""); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 0 || n > 1024 {
+			addErr("IGLOO_CACHE_READ_THREADS must be a number from 0 to 1024, got %q", v)
+		}
+		cfg.Cache.ReadThreads = n
 	}
 	if cfg.Cache.Ephemeral, err = strconv.ParseBool(get("IGLOO_CACHE_EPHEMERAL", "false")); err != nil {
 		addErr("IGLOO_CACHE_EPHEMERAL must be true or false: %w", err)

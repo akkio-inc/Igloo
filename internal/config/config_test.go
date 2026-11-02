@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -477,6 +478,37 @@ func TestErasureKey(t *testing.T) {
 		vars["IGLOO_ADMIN_PASSWORD"] = "password"
 		if _, err := Load(env(vars)); err == nil {
 			t.Errorf("%v: accepted", vars)
+		}
+	}
+}
+
+// IGLOO_CACHE_READ_THREADS is none on a replica and a few on a worker, unless set.
+func TestCacheReadThreads(t *testing.T) {
+	cfg, err := Load(env(map[string]string{"IGLOO_ADMIN_PASSWORD": "password"}))
+	if err != nil || cfg.Cache.ReadThreads != 0 {
+		t.Fatalf("a replica: %d %v", cfg.Cache.ReadThreads, err)
+	}
+	cfg, err = Load(env(map[string]string{"IGLOO_ADMIN_PASSWORD": "password", "IGLOO_CACHE_READ_THREADS": "16"}))
+	if err != nil || cfg.Cache.ReadThreads != 16 {
+		t.Fatalf("a replica told to: %d %v", cfg.Cache.ReadThreads, err)
+	}
+	for _, bad := range []string{"-1", "1025", "many"} {
+		if _, err := Load(env(map[string]string{"IGLOO_ADMIN_PASSWORD": "password", "IGLOO_CACHE_READ_THREADS": bad})); err == nil {
+			t.Errorf("IGLOO_CACHE_READ_THREADS=%s should be refused", bad)
+		}
+	}
+	worker := map[string]string{"IGLOO_WAREHOUSE_LOCATION": "s3://b/w", "IGLOO_WORKER_SECRET": "a-secret-of-enough-characters-for-it", "IGLOO_DUCKDB_TEMP_DIR": "/tmp/x"}
+	if cfg, err = LoadWorker(env(worker)); err != nil || cfg.Cache.ReadThreads != DefaultWorkerCacheReadThreads {
+		t.Fatalf("a worker by default: %d %v", cfg.Cache.ReadThreads, err)
+	}
+	worker["IGLOO_CACHE_READ_THREADS"] = ""
+	if cfg, err = LoadWorker(env(worker)); err != nil || cfg.Cache.ReadThreads != DefaultWorkerCacheReadThreads {
+		t.Fatalf("a worker with it empty: %d %v", cfg.Cache.ReadThreads, err)
+	}
+	for _, n := range []int{0, 32} {
+		worker["IGLOO_CACHE_READ_THREADS"] = strconv.Itoa(n)
+		if cfg, err = LoadWorker(env(worker)); err != nil || cfg.Cache.ReadThreads != n {
+			t.Fatalf("a worker told %d: %d %v", n, cfg.Cache.ReadThreads, err)
 		}
 	}
 }
