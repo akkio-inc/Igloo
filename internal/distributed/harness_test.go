@@ -274,6 +274,7 @@ func newHarnessRB(t *testing.T, sf float64, files, n int, rb string) *harness {
 
 // newHarnessWith is newHarnessRB whose session and workers also load
 // extensions, DuckDB's, from IGLOO_TEST_EXTENSION_DIR, as Igloo loads them.
+// With sf 0 it has no TPC-H tables.
 func newHarnessWith(t *testing.T, sf float64, files, n int, rb string, extensions ...string) *harness {
 	t.Helper()
 	h := &harness{t: t, dir: t.TempDir(), tables: map[string]*Table{}, files: map[string][]File{}, rb: rb, extensions: extensions}
@@ -298,11 +299,13 @@ func newHarnessWith(t *testing.T, sf float64, files, n int, rb string, extension
 	for _, stmt := range h.extensionLoads() {
 		h.exec(stmt)
 	}
-	h.exec("INSTALL tpch")
-	h.exec("LOAD tpch")
-	h.exec(fmt.Sprintf("CALL dbgen(sf = %g)", sf))
-	for _, name := range []string{"lineitem", "orders", "customer", "part", "partsupp", "supplier", "nation", "region"} {
-		h.addTable(name, name, files)
+	if sf > 0 {
+		h.exec("INSTALL tpch")
+		h.exec("LOAD tpch")
+		h.exec(fmt.Sprintf("CALL dbgen(sf = %g)", sf))
+		for _, name := range []string{"lineitem", "orders", "customer", "part", "partsupp", "supplier", "nation", "region"} {
+			h.addTable(name, name, files)
+		}
 	}
 	h.startWorkers(n)
 	return h

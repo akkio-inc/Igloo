@@ -36,12 +36,13 @@ import (
 const attachRetryInterval = 2 * time.Second
 
 // Extensions are the DuckDB extensions Igloo uses: object storage (httpfs,
-// aws, azure), Iceberg (which reads manifests with avro), TPC-H data for
-// demos and benchmarks, the read cache (cache_httpfs, see cache.go),
+// aws, azure), Iceberg (which reads manifests with avro), TPC-H and TPC-DS
+// data for demos, benchmarks and the tests that compare distributed results
+// with one machine's, the read cache (cache_httpfs, see cache.go),
 // geospatial functions and sketches (see media.go), and connections to
 // PostgreSQL and MySQL databases (see package federation), which are loaded
 // only when a connection needs them. The image installs them at build time.
-var Extensions = append([]string{"httpfs", "aws", "azure", "iceberg", "avro", "tpch", "cache_httpfs", "postgres", "mysql"}, mediaExtensions...)
+var Extensions = append([]string{"httpfs", "aws", "azure", "iceberg", "avro", "tpch", "tpcds", "cache_httpfs", "postgres", "mysql"}, mediaExtensions...)
 
 // communityExtensions come from DuckDB's community repository rather than
 // the core one. DuckDB checks their signatures on load just the same.
