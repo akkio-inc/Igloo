@@ -2,6 +2,7 @@ package distributed
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"hash/fnv"
 	"maps"
@@ -285,6 +286,15 @@ type execution struct {
 	// stage, by ID.
 	used   map[string]bool
 	usedBy map[int]map[string]bool
+	// started are its stages, and finished those that ended, by ID; lost the
+	// workers it went on without, as they took their exchanges with them; see
+	// repair.go, which repairing keeps to one at a time.
+	started   []*Stage
+	finished  map[int]bool
+	lost      map[string]bool
+	repairing sync.Mutex
+	// writtenAgain counts the tasks written again, which change what exchanges hold.
+	writtenAgain atomic.Int64
 }
 
 // exchangeRun is an exchange while its producers run.
@@ -306,6 +316,8 @@ type exchangeRun struct {
 	bytes     int64
 	partBytes []int64
 	tasks     int
+	// ran are the tasks whose files are on workers' disks (see repair.go).
+	ran []*ranTask
 }
 
 // jobResult is where a coordinator-bound stage's partial results are.
@@ -326,6 +338,9 @@ func (e *execution) run(ctx context.Context, stages []*Stage) error {
 // start starts running stages as run does, and returns what waits for them
 // to finish. The exchanges they write are in e.exchanges when it returns.
 func (e *execution) start(ctx context.Context, stages []*Stage) (wait func() error) {
+	e.mu.Lock()
+	e.started = append(e.started, stages...)
+	e.mu.Unlock()
 	for _, s := range stages {
 		if s.Out == nil {
 			continue
@@ -366,6 +381,12 @@ func (e *execution) start(ctx context.Context, stages []*Stage) (wait func() err
 			if err := e.stage(gctx, s); err != nil {
 				return err
 			}
+			e.mu.Lock()
+			if e.finished == nil {
+				e.finished = map[int]bool{}
+			}
+			e.finished[s.ID] = true
+			e.mu.Unlock()
 			e.co.log.Debug("ran a stage", "query", e.qid, "stage", s.String(), "seconds", time.Since(start).Seconds())
 			if s.Out != nil {
 				x := e.exchanges[s.Out.ID]
@@ -380,6 +401,53 @@ func (e *execution) start(ctx context.Context, stages []*Stage) (wait func() err
 		})
 	}
 	return g.Wait
+}
+
+// piece is task i of a stage, or the j-th of k smaller tasks it is divided into when a
+// worker running it, or holding what it wrote, is lost (see repair.go): the j-th of
+// every k of its buckets, partitions or files of the split table.
+type piece struct{ i, j, k int }
+
+// wholeTask is task i, undivided.
+func wholeTask(i int) piece { return piece{i: i, k: 1} }
+
+// split reports whether p is a smaller task of one divided.
+func (p piece) split() bool { return p.k > 1 }
+
+// pieceIndex spaces the directories of pieces from their tasks' (see index).
+const pieceIndex = 100000
+
+// index names p's directories and files: its task's number, or one of its own above
+// all tasks', so that what an attempt of the undivided task leaves is never read.
+func (p piece) index() int {
+	if p.split() {
+		return p.i + pieceIndex*(p.j+1)
+	}
+	return p.i
+}
+
+// pieceOf returns p's share of list: all of it for a task undivided.
+func pieceOf[T any](list []T, p piece) []T {
+	if !p.split() {
+		return list
+	}
+	var out []T
+	for n := p.j; n < len(list); n += p.k {
+		out = append(out, list[n])
+	}
+	return out
+}
+
+// ranPiece is a piece that ran, and where.
+type ranPiece struct {
+	p      piece
+	first  int
+	rounds int
+	task   *taskRequest
+	head   *taskResult
+	w      *worker
+	bytes  int64
+	out    string
 }
 
 // onePartition is a task that ran out of memory over one partition of the
@@ -486,12 +554,13 @@ func (e *execution) stage(ctx context.Context, s *Stage) error {
 	}
 	if in := s.split(); in != nil {
 		split := e.files[in.Table.key()]
-		n := len(e.ws)
+		ws := e.workers()
+		n := len(ws)
 		if want := int((in.Table.Bytes + bytesPerWorker - 1) / bytesPerWorker); want < n && !e.force {
 			n = max(want, min(2, n))
 		}
 		n = max(1, min(n, len(split)))
-		shares, owners = divide(assign(split, e.ws[:n]), 1<<e.smaller)
+		shares, owners = divide(assign(split, ws[:n]), 1<<e.smaller)
 		tasks = len(shares)
 	}
 	var groups [][]int
@@ -514,30 +583,46 @@ func (e *execution) stage(ctx context.Context, s *Stage) error {
 	}
 	e.co.log.Debug("running a stage", "query", e.qid, "stage", s.String(), "tasks", tasks, "partitions", e.parts)
 
-	// What every task reads in full, and its bytes.
+	// What every task reads in full, and its bytes: as it is when a task is
+	// made, as a worker's files may have been written again by then.
 	used := e.prefetchUsed(ctx, s)
-	whole := map[string]viewDef{}
+	var wholeMu sync.Mutex
+	var whole map[string]viewDef
 	var wholeBytes int64
-	for _, in := range s.Inputs {
-		switch {
-		case in.Table != nil && in.Bucketed:
-		case in.Table != nil && !in.Split:
-			def := viewDef{Name: in.View, Columns: in.Table.Columns, Rows: rowCount(e.files[in.Table.key()])}
-			def.Files, def.Deletes = paths(e.files[in.Table.key()]), deletesOf(e.files[in.Table.key()])
-			def.Prefetch = prefetchOf(used, in.View, e.files[in.Table.key()])
-			whole[in.View] = def
-			for _, f := range e.files[in.Table.key()] {
-				wholeBytes += f.Size
-			}
-		case in.Exchange != nil && !in.Partitioned:
-			x := e.exchanges[in.Exchange.ID]
-			def := viewDef{Name: in.View, Columns: x.columns, ByName: true, Rows: x.rows, Exact: true}
-			for _, fs := range x.files {
-				def.Files = append(def.Files, fs...)
-			}
-			whole[in.View] = def
-			wholeBytes += x.bytes
+	wholeAt := int64(-1)
+	wholeViews := func() (map[string]viewDef, int64) {
+		wholeMu.Lock()
+		defer wholeMu.Unlock()
+		at := e.writtenAgain.Load()
+		if at == wholeAt {
+			return whole, wholeBytes
 		}
+		wholeAt = at
+		whole, wholeBytes = map[string]viewDef{}, 0
+		for _, in := range s.Inputs {
+			switch {
+			case in.Table != nil && in.Bucketed:
+			case in.Table != nil && !in.Split:
+				def := viewDef{Name: in.View, Columns: in.Table.Columns, Rows: rowCount(e.files[in.Table.key()])}
+				def.Files, def.Deletes = paths(e.files[in.Table.key()]), deletesOf(e.files[in.Table.key()])
+				def.Prefetch = prefetchOf(used, in.View, e.files[in.Table.key()])
+				whole[in.View] = def
+				for _, f := range e.files[in.Table.key()] {
+					wholeBytes += f.Size
+				}
+			case in.Exchange != nil && !in.Partitioned:
+				x := e.exchanges[in.Exchange.ID]
+				x.mu.Lock()
+				def := viewDef{Name: in.View, Columns: x.columns, ByName: true, Rows: x.rows, Exact: true}
+				for _, fs := range x.files {
+					def.Files = append(def.Files, fs...)
+				}
+				wholeBytes += x.bytes
+				x.mu.Unlock()
+				whole[in.View] = def
+			}
+		}
+		return whole, wholeBytes
 	}
 
 	// A stage that writes the statement's rows sends none.
@@ -554,7 +639,24 @@ func (e *execution) stage(ctx context.Context, s *Stage) error {
 	defer stop()
 	var sent atomic.Int64
 	var stopped atomic.Bool
-	for i := range tasks {
+	// units are what task i reads that it may be divided by, into smaller tasks
+	// (see piece): its buckets, its partitions, or its files of the split table.
+	units := func(i int) int {
+		switch {
+		case buckets != nil:
+			return len(buckets[i])
+		case groups != nil:
+			return len(groups[i])
+		case shares != nil:
+			return len(shares[i])
+		}
+		return 0
+	}
+	// request makes piece p of the stage, of what its inputs hold now, for the
+	// round-th time.
+	request := func(p piece, round int) (*taskRequest, int64) {
+		i := p.i
+		whole, wholeBytes := wholeViews()
 		task := &taskRequest{Query: e.qid, Task: s.ID*10000 + i, Version: e.co.opts.Version, Settings: e.settings, Erased: e.erased}
 		if e.slots > 1 {
 			task.Slots = e.slots
@@ -566,6 +668,9 @@ func (e *execution) stage(ctx context.Context, s *Stage) error {
 			switch {
 			case in.Table != nil && in.Split:
 				share := shares[i]
+				if buckets == nil && groups == nil {
+					share = pieceOf(share, p)
+				}
 				for _, f := range share {
 					bytes += f.Size
 				}
@@ -573,7 +678,7 @@ func (e *execution) stage(ctx context.Context, s *Stage) error {
 					Deletes: deletesOf(share), Prefetch: prefetchOf(used, in.View, share)})
 			case in.Table != nil && in.Bucketed:
 				var share []File
-				for _, b := range buckets[i] {
+				for _, b := range pieceOf(buckets[i], p) {
 					share = append(share, bucketFiles[in.View][b]...)
 				}
 				for _, f := range share {
@@ -583,52 +688,112 @@ func (e *execution) stage(ctx context.Context, s *Stage) error {
 					Deletes: deletesOf(share), Prefetch: prefetchOf(used, in.View, share)})
 			case in.Exchange != nil && in.Partitioned:
 				x := e.exchanges[in.Exchange.ID]
+				x.mu.Lock()
 				def := viewDef{Name: in.View, Columns: x.columns, ByName: true, Exact: true}
-				for _, p := range groups[i] {
-					def.Files = append(def.Files, x.files[p]...)
-					def.Rows += x.partRows[p]
-					reads += x.partBytes[p]
+				// Bucketed, its groups are its buckets, and a piece takes the same
+				// of both.
+				for _, part := range pieceOf(groups[i], p) {
+					def.Files = append(def.Files, x.files[part]...)
+					def.Rows += x.partRows[part]
+					reads += x.partBytes[part]
 				}
+				x.mu.Unlock()
 				task.Views = append(task.Views, def)
 			default:
 				task.Views = append(task.Views, whole[in.View])
 			}
 		}
-		out := ""
+		task.round = round
+		idx := strconv.Itoa(p.index())
 		if writes {
 			task.SQL = writeSQL(s, e.target)
-			task.Write = writeRequestFor(e.target, e.target.Dir+"/"+e.qid+"/s"+strconv.Itoa(s.ID)+"-"+strconv.Itoa(i))
+			task.Write = writeRequestFor(e.target, e.target.Dir+"/"+e.qid+"/s"+strconv.Itoa(s.ID)+"-"+idx)
 			// A task out of memory may have been sorting them.
 			task.Write.AsTheyCome = e.smaller > 0
 		} else if s.Out == nil {
 			task.SQL, task.Columns = s.SQL, s.Columns
-			out = filepath.Join(e.dir, fmt.Sprintf("%d-%d.parquet", s.ID, i))
 		} else {
 			task.SQL = exchangeSQL(s, e.parts)
-			task.Shuffle = e.rootOf(s.ID, i) + "/s" + strconv.Itoa(s.ID) + "/" + strconv.Itoa(i)
+			task.Shuffle = e.rootOf(s.ID, i) + "/s" + strconv.Itoa(s.ID) + "/" + idx
 			task.Partitions = e.parts
 			if e.local {
 				// What it writes is taken to be at most what it reads.
-				task.Local = e.qid + "/s" + strconv.Itoa(s.ID) + "/" + strconv.Itoa(i)
+				task.Local = e.qid + "/s" + strconv.Itoa(s.ID) + "/" + idx
 				task.Expect = reads + bytes
 			}
 		}
 		task.Variables = variablesOf(e.variables, task.SQL)
 		if e.local {
-			for _, w := range e.ws {
+			for _, w := range e.workers() {
 				task.Peers = append(task.Peers, w.addr)
 			}
 		}
-		g.Go(func() error {
-			var sp *spool
-			if s.Out == nil && !writes {
-				sp = e.sp
+		return task, bytes
+	}
+	// outOf is where piece p's rows go, for a stage whose rows go to the coordinator.
+	outOf := func(p piece) string {
+		if s.Out != nil || writes {
+			return ""
+		}
+		return filepath.Join(e.dir, fmt.Sprintf("%d-%d.parquet", s.ID, p.index()))
+	}
+	var sp *spool
+	if s.Out == nil && !writes {
+		sp = e.sp
+	}
+	// run runs piece p, first on worker first; a whole task whose worker is lost
+	// while it runs it runs as smaller tasks on the others instead.
+	var run func(p piece, first, round int) ([]ranPiece, error)
+	run = func(p piece, first, round int) ([]ranPiece, error) {
+		task, bytes := request(p, round)
+		task.splittable = !p.split() && units(p.i) > 1
+		w, head, err := e.co.dispatch(tctx, task, e.workers(), first, outOf(p), sp)
+		// A worker lost with files the task reads: once what they held is
+		// written again, the task runs on what is there now (see repair).
+		rounds := round
+		for err != nil && rounds < round+repairRounds && e.repair(tctx, err) {
+			rounds++
+			task, bytes = request(p, rounds)
+			task.splittable = !p.split() && units(p.i) > 1
+			w, head, err = e.co.dispatch(tctx, task, e.workers(), first, outOf(p), sp)
+		}
+		var lost *taskLostError
+		if errors.As(err, &lost) && tctx.Err() == nil {
+			k := min(units(p.i), e.usable())
+			if k < 2 {
+				// Not worth dividing after all: as one task, on the others.
+				task.splittable = false
+				w, head, err = e.co.dispatch(tctx, task, e.workers(), first+1, outOf(p), sp)
+			} else {
+				e.co.log.Warn("a worker was lost while it ran a task; running the task as smaller ones on the others", "query", e.qid,
+					"stage", s.ID, "task", p.i, "worker", lost.worker, "tasks", k)
+				pieces := make([][]ranPiece, k)
+				pg, _ := errgroup.WithContext(tctx)
+				for j := range k {
+					pg.Go(func() error {
+						var err error
+						pieces[j], err = run(piece{i: p.i, j: j, k: k}, first+1+j, rounds+1)
+						return err
+					})
+				}
+				if err := pg.Wait(); err != nil {
+					return nil, err
+				}
+				return slices.Concat(pieces...), nil
 			}
-			first := i % len(e.ws)
+		}
+		if err != nil {
+			return nil, err
+		}
+		return []ranPiece{{p: p, first: first, rounds: rounds, task: task, head: head, w: w, bytes: bytes, out: outOf(p)}}, nil
+	}
+	for i := range tasks {
+		g.Go(func() error {
+			first := i
 			if owners != nil {
 				first = owners[i]
 			}
-			w, head, err := e.co.dispatch(tctx, task, e.ws, first, out, sp)
+			ran, err := run(wholeTask(i), first, 0)
 			if err != nil && stopped.Load() && gctx.Err() == nil {
 				// Not needed: the tasks that ended sent enough rows.
 				return nil
@@ -639,36 +804,54 @@ func (e *execution) stage(ctx context.Context, s *Stage) error {
 				}
 				return err
 			}
-			e.co.opts.Metrics.scan(bytes)
-			e.mu.Lock()
-			e.used[w.addr] = true
-			if e.usedBy == nil {
-				e.usedBy = map[int]map[string]bool{}
-			}
-			if e.usedBy[s.ID] == nil {
-				e.usedBy[s.ID] = map[string]bool{}
-			}
-			e.usedBy[s.ID][w.addr] = true
-			e.mu.Unlock()
-			if s.Out != nil {
-				return e.received(s, task, head, w)
-			}
-			if writes {
-				return e.writtenBy(task, head, w)
-			}
-			mu.Lock()
-			defer mu.Unlock()
-			res.files[i] = out
-			res.workers[w.addr] = true
-			if res.columns == nil {
-				res.columns = head.Columns
-			} else if !slices.Equal(res.columns, head.Columns) {
-				return fmt.Errorf("workers returned different columns for stage %d", s.ID)
-			}
-			if s.enough > 0 && sent.Add(head.Rows) >= s.enough && !stopped.Swap(true) {
-				e.co.log.Debug("a stage's tasks sent the rows it needs; stopping the others", "query", e.qid, "stage", s.ID,
-					"rows", sent.Load(), "enough", s.enough)
-				stop()
+			for _, r := range ran {
+				e.co.opts.Metrics.scan(r.bytes)
+				e.mu.Lock()
+				e.used[r.w.addr] = true
+				if e.usedBy == nil {
+					e.usedBy = map[int]map[string]bool{}
+				}
+				if e.usedBy[s.ID] == nil {
+					e.usedBy[s.ID] = map[string]bool{}
+				}
+				e.usedBy[s.ID][r.w.addr] = true
+				e.mu.Unlock()
+				switch {
+				case s.Out != nil:
+					if err := e.received(s, r.task, r.head, r.w); err != nil {
+						return err
+					}
+					e.ranOn(&ranTask{run: e, stage: s, piece: r.p, units: units(i), first: r.first, request: request, task: r.task, head: r.head,
+						worker: r.w.addr, rounds: r.rounds})
+				case writes:
+					if err := e.writtenBy(r.task, r.head, r.w); err != nil {
+						return err
+					}
+				default:
+					if err := func() error {
+						mu.Lock()
+						defer mu.Unlock()
+						if r.p.split() {
+							res.files = append(res.files, r.out)
+						} else {
+							res.files[i] = r.out
+						}
+						res.workers[r.w.addr] = true
+						if res.columns == nil {
+							res.columns = r.head.Columns
+						} else if !slices.Equal(res.columns, r.head.Columns) {
+							return fmt.Errorf("workers returned different columns for stage %d", s.ID)
+						}
+						if s.enough > 0 && sent.Add(r.head.Rows) >= s.enough && !stopped.Swap(true) {
+							e.co.log.Debug("a stage's tasks sent the rows it needs; stopping the others", "query", e.qid, "stage", s.ID,
+								"rows", sent.Load(), "enough", s.enough)
+							stop()
+						}
+						return nil
+					}(); err != nil {
+						return err
+					}
+				}
 			}
 			return nil
 		})
@@ -725,12 +908,17 @@ func (e *execution) received(s *Stage, task *taskRequest, head *taskResult, w *w
 	x := e.exchanges[s.Out.ID]
 	x.mu.Lock()
 	defer x.mu.Unlock()
+	return e.receivedLocked(x, task, head, w)
+}
+
+// receivedLocked is received, into x, whose lock the caller holds.
+func (e *execution) receivedLocked(x *exchangeRun, task *taskRequest, head *taskResult, w *worker) error {
 	x.rows += head.Rows
 	x.tasks++
 	if x.columns == nil {
 		x.columns = head.Columns
 	} else if !slices.Equal(x.columns, head.Columns) {
-		return fmt.Errorf("stages wrote different columns to exchange %d", s.Out.ID)
+		return fmt.Errorf("stages wrote different columns to the exchange of task %d", task.Task)
 	}
 	var listed int64
 	for _, f := range head.Files {
@@ -752,7 +940,7 @@ func (e *execution) received(s *Stage, task *taskRequest, head *taskResult, w *w
 		listed += f.Rows
 	}
 	if listed != head.Rows {
-		return fmt.Errorf("a worker listed files of %d rows for the %d it wrote to exchange %d", listed, head.Rows, s.Out.ID)
+		return fmt.Errorf("a worker listed files of %d rows for the %d task %d wrote", listed, head.Rows, task.Task)
 	}
 	return nil
 }

@@ -139,8 +139,10 @@ type Worker struct {
 	// local are the exchange files it wrote to its disk, peers what fetches
 	// those of other workers, into fetchRoot (see localx.go); stopSweep
 	// ends their sweeps.
-	local     *localExchanges
-	peers     *http.Client
+	local *localExchanges
+	peers *http.Client
+	// beats watches the workers it fetches exchange files from (see heartbeats).
+	beats     *heartbeats
 	fetchRoot string
 	stopSweep chan struct{}
 	stopOnce  sync.Once
@@ -215,6 +217,7 @@ func NewWorker(opts WorkerOptions, log *slog.Logger) (*Worker, error) {
 			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 		},
 		boot: newID()}
+	w.beats = newHeartbeats(func(ctx context.Context, addr string) error { return statusAnswered(ctx, w.peers, addr) }, nil)
 	w.slots = newFairSlots(int64(w.slotCount))
 	// What its read cache on disk says it was purged through, unless that has
 	// not come yet, which it says only if it was told so: it purges again.

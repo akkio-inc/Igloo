@@ -566,10 +566,37 @@ func (w *Worker) fetchExchanges(ctx context.Context, req *taskRequest) (func(), 
 }
 
 // fetchFile fetches exchange file f from the worker that wrote it to dst.
-// The worker is lost if it cannot be reached, does not have the file, or
-// breaks off sending it; a worker too busy to send it now (HTTP 503) is
-// asked again, for up to fetchPatience.
+// The worker is lost if it cannot be reached, does not have the file, breaks
+// off sending it, or stops answering at all (see heartbeats); a worker too
+// busy to send it now (HTTP 503) is asked again, for up to fetchPatience.
 func (w *Worker) fetchFile(ctx context.Context, f localFile, dst string) error {
+	lost, why, release := w.beats.watch(f.worker)
+	defer release()
+	fctx, stop := context.WithCancel(ctx)
+	defer stop()
+	go func() {
+		select {
+		case <-lost:
+			stop()
+		case <-fctx.Done():
+		}
+	}()
+	err := w.fetchAsked(fctx, f, dst)
+	select {
+	case <-lost:
+		if ctx.Err() == nil {
+			return &lostError{worker: f.worker, err: fmt.Errorf("it stopped answering: %w", why())}
+		}
+	default:
+	}
+	if err != nil && ctx.Err() != nil {
+		return ctx.Err()
+	}
+	return err
+}
+
+// fetchAsked is fetchFile but for its worker's heartbeat, which ends ctx.
+func (w *Worker) fetchAsked(ctx context.Context, f localFile, dst string) error {
 	url := "https://" + f.worker + exchangesPath + f.qid + "/" + f.name
 	wait, waited := 100*time.Millisecond, time.Duration(0)
 	for {
@@ -729,26 +756,28 @@ func (co *Coordinator) exchangeRequest(ctx context.Context, w *worker, method, p
 }
 
 // confirmLost reports whether worker addr, of ws, a reader could not fetch
-// exchange files from, is lost with them: it does not answer, or answers as
-// another run of it, which holds none. One that answers as the same run
-// was busy or briefly unreachable, and the statement fails as it is rather
-// than run again without a worker that has its files.
+// exchange files from, is lost with them: its heartbeat here says so, it does
+// not answer, or it answers as another run of it, which holds none. One that
+// answers as the same run was busy or briefly unreachable, and the statement
+// fails as it is rather than run again without a worker that has its files.
 func (co *Coordinator) confirmLost(ctx context.Context, ws []*worker, addr string) bool {
 	i := slices.IndexFunc(ws, func(w *worker) bool { return w.addr == addr })
 	if i < 0 {
 		return false
 	}
-	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
-	defer cancel()
-	for try := 0; try < 3; try++ {
-		st, err := co.pool.status(ctx, addr)
+	if co.pool.beats.lostWithin(addr, time.Minute) {
+		return true
+	}
+	// The reader waited out its misses already: a couple of checks are enough.
+	for try := 0; try < 2; try++ {
+		cctx, cancel := context.WithTimeout(ctx, taskCheckTimeout)
+		st, err := co.pool.status(cctx, addr)
+		cancel()
 		if err == nil {
 			return st.Boot != ws[i].status.Boot
 		}
-		select {
-		case <-ctx.Done():
+		if ctx.Err() != nil {
 			return true
-		case <-time.After(time.Second):
 		}
 	}
 	return true

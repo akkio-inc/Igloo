@@ -41,8 +41,9 @@ and makes migration cheap: Igloo reads existing tables where they are.
 A vectorized engine on one well-sized machine beats a cluster for most
 analytical work. Prefer local caches of hot data, fewer network round trips
 and less coordination. Distribution is the escape hatch for queries that do
-not fit, not the default. Benchmarks run in CI so that slowdowns are caught
-like bugs.
+not fit, not the default. Benchmarks measure it on real cloud machines, and
+their results are published with their method ([benchmark](../bench/README.md)).
+They run by hand, not in CI, so a slowdown shows at the next run.
 
 ## 5. Feature parity by what blocks a migration, not by checklist
 
@@ -70,5 +71,5 @@ already use.
 
 - Design documents and larger pull requests say which principles they serve
   and which they cost.
-- Every release reports the measures behind them: price-performance on the
+- Releases should report the measures behind them: price-performance on the
   benchmark suite, time to first query, and migration coverage.

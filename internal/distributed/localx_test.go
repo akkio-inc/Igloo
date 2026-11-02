@@ -381,49 +381,79 @@ func TestLocalExchangeRoom(t *testing.T) {
 
 // TestLostExchange checks a statement one of whose workers is lost after
 // its writing stages ran, before the stages that read what they wrote:
-// what it wrote to its disk is gone, and the statement's parts run again
-// on the other workers, and return what one machine does. Two lost fail
-// the statement, which returns nothing.
+// what it wrote to its disk is gone, what readers need of it is written
+// again on the other workers, and the statement returns what one machine
+// does. So it does with a second lost once that is done, on the worker left.
+// With what it wrote not to be written again, its parts all run again, once,
+// and another lost then fails the statement, which returns nothing.
 func TestLostExchange(t *testing.T) {
-	for _, lose := range []int{1, 2} {
-		h := localHarness(t, 3)
-		var ran atomic.Int32
-		var killed atomic.Int32
-		hook := func(r slog.Record) {
-			// After the second of the stages that write the exchanges the
-			// join reads, of each run.
-			if r.Message != "ran a stage" || !strings.Contains(attr(r, "stage"), " to exchange ") {
-				return
+	for _, c := range []struct {
+		name string
+		lose int
+		// whole has every part run again.
+		whole bool
+	}{
+		{"one", 1, false},
+		{"two", 2, false},
+		{"one, whole", 1, true},
+		{"two, whole", 2, true},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			if c.whole {
+				repairFault = func() error { return errors.New("not this time") }
+				defer func() { repairFault = nil }()
 			}
-			if n := int(ran.Add(1)); n == 2 || lose == 2 && n == 4 {
-				i := 3 - n/2
+			h := localHarness(t, 3)
+			var ran, killed, repaired, wholes atomic.Int32
+			kill := func(i int) {
 				_ = h.workers[i].Shutdown(context.Background())
 				_ = h.lns[i].Close()
 				killed.Add(1)
 			}
-		}
-		h.hook.Store(&hook)
-		want, _, err := h.query(context.Background(), exchangeQuery)
-		if err != nil {
-			t.Fatal(err)
-		}
-		got, _, _, _, err := h.run(context.Background(), exchangeQuery, ModeOn)
-		switch lose {
-		case 1:
+			hook := func(r slog.Record) {
+				switch {
+				case strings.Contains(r.Message, "ran again only its tasks that readers still need"):
+					if repaired.Add(1) == 1 && c.lose == 2 {
+						kill(1)
+					}
+				case strings.Contains(r.Message, "running the statement's parts again without it"):
+					wholes.Add(1)
+				case r.Message == "ran a stage" && strings.Contains(attr(r, "stage"), " to exchange "):
+					// After the second of the stages that write the exchanges
+					// the join reads, of each run.
+					switch n := ran.Add(1); {
+					case n == 2:
+						kill(2)
+					case n == 4 && c.lose == 2 && c.whole:
+						kill(1)
+					}
+				}
+			}
+			h.hook.Store(&hook)
+			want, _, err := h.query(context.Background(), exchangeQuery)
 			if err != nil {
-				t.Fatalf("one worker lost: %v", err)
+				t.Fatal(err)
 			}
-			if msg := compareRows(want, got, true); msg != "" {
-				t.Errorf("one worker lost: %s", msg)
+			got, _, _, _, err := h.run(context.Background(), exchangeQuery, ModeOn)
+			if c.whole && c.lose == 2 {
+				if !errors.Is(err, ErrExchangeLost) || got != nil {
+					t.Errorf("%d rows, %v", len(got), err)
+				}
+			} else {
+				if err != nil {
+					t.Fatal(err)
+				}
+				if msg := compareRows(want, got, true); msg != "" {
+					t.Error(msg)
+				}
 			}
-		case 2:
-			if !errors.Is(err, ErrExchangeLost) || got != nil {
-				t.Errorf("two workers lost: %d rows, %v", len(got), err)
+			if int(killed.Load()) != c.lose {
+				t.Errorf("%d workers lost, want %d", killed.Load(), c.lose)
 			}
-		}
-		if int(killed.Load()) != lose {
-			t.Errorf("%d workers lost, want %d", killed.Load(), lose)
-		}
+			if c.whole && (repaired.Load() != 0 || wholes.Load() != 1) || !c.whole && (repaired.Load() == 0 || wholes.Load() != 0) {
+				t.Errorf("ran again only what was lost %d times, every part %d times", repaired.Load(), wholes.Load())
+			}
+		})
 	}
 }
 

@@ -1259,8 +1259,19 @@ func (a *aggregation) fragment() (node, error) {
 		}
 		f["group_expressions"] = groups
 		f["group_sets"] = []any{set}
-		// Whole groups: the rows a statement ranks and keeps the first of
-		// (see markTopK), and under ORDER BY ... LIMIT each task's first.
+		// Whole groups: those HAVING keeps, and of them the rows a statement
+		// ranks and keeps the first of (see markTopK), and under ORDER BY ...
+		// LIMIT each task's first.
+		cut := true
+		if h := child(a.c.sel, "having"); h != nil {
+			e, err := a.substituteAliases(clone(h).(node))
+			if cut = err == nil && workerExpression(e); cut {
+				f["having"] = e
+			}
+		}
+		if !cut {
+			return f, nil
+		}
 		if keep := child(a.c.sel, topKMark); keep != nil {
 			if q, err := a.substituteAliases(clone(keep).(node)); err == nil {
 				f["qualify"] = q
@@ -1420,16 +1431,19 @@ func (a *aggregation) groupStage() (*secondStage, error) {
 	// HAVING and the first rows are worth applying early, when they can be
 	// said in terms of the partial results alone; the coordinator applies
 	// them again. So are the rows a statement ranks and keeps the first of
-	// (see markTopK), which it ranks again.
+	// (see markTopK), which it ranks again. Those cuts come after HAVING,
+	// as in SQL: a stage that cannot apply HAVING keeps every group.
+	cut := true
 	if h := child(a.c.sel, "having"); h != nil {
-		if e, err := a.rewrite(clone(h).(node), "having"); err == nil && overPartials(e) {
+		e, err := a.rewrite(clone(h).(node), "having")
+		if cut = err == nil && overPartials(e); cut {
 			f["having"] = e
 		}
 	}
-	if q := qualifyTopK(a.c.sel, func(e node) (node, error) { return a.rewrite(e, "select") }); q != nil {
+	if q := qualifyTopK(a.c.sel, func(e node) (node, error) { return a.rewrite(e, "select") }); q != nil && cut {
 		f["qualify"] = q
 	}
-	if mods, ok := a.firstRows(); ok {
+	if mods, ok := a.firstRows(); ok && cut {
 		f["modifiers"] = mods
 	}
 	a.final = true
@@ -1517,6 +1531,13 @@ func (a *aggregation) groupColumns() []string {
 		out = append(out, "__g"+strconv.Itoa(i))
 	}
 	return out
+}
+
+// workerExpression reports whether e, an expression of a stage's own FROM clause,
+// can be computed by the stage alone: it reads no subquery, window, parameter or
+// lambda.
+func workerExpression(e node) bool {
+	return !hasClass(e, "SUBQUERY") && !hasClass(e, "WINDOW") && !hasClass(e, "PARAMETER") && !hasClass(e, "LAMBDA")
 }
 
 // overPartials reports whether e reads nothing but partial results'
