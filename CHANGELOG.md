@@ -13,6 +13,12 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
 
 ### SQL and tables
 
+- `CALL dbgen` from sessions at once no longer crashes the server. DuckDB's data
+  generators keep their state in the process, and two at once ended it with a
+  segmentation fault. One statement of a process may call them at a time, the
+  others fail with SQLSTATE `55P03`, and a macro, view or prepared statement may
+  not keep them for later. Only admins could call them, and still only they can.
+
 - Models trained and scored in SQL, as Snowflake's ML classes:
   `SNOWFLAKE.ML.FORECAST` and `ANOMALY_DETECTION` (Snowflake's `fast`
   method, many series, exogenous columns, intervals from
