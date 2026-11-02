@@ -541,6 +541,32 @@ func (co *Coordinator) fillPartitions(ctx context.Context, env Env, query string
 	return partitionsOf(half, all, sampled, x.rows)
 }
 
+const (
+	// sortWideRow is the width of a row past which sorting a task's share of a
+	// fill's rows by partition may not fit its memory, and sortHeld the share of
+	// what it sorts DuckDB's sort was seen holding at once. Half a million rows of
+	// a twelfth of TPC-H's lineitem, sorted on 2 threads at 953 MB: of 270 B, 254
+	// MiB; of 1.1 KB, 661 MiB; of 2.7 KB, 1,207 MiB, past the limit; of 5.4 KB and
+	// of 10.8 KB, out of memory at once. Written as they came, those of 10.8 KB
+	// took 420 MiB at 476 MB.
+	sortWideRow = 1 << 10
+	sortHeld    = 0.7
+)
+
+// sortFits reports whether a task of f sorts its share of a fill's rows by
+// partition within half its memory, as its tasks do where the partitions are more
+// than the files they keep open (see Worker.writeFiles): rows narrower than
+// sortWideRow always, as DuckDB's sort spills them; wider ones if sortHeld of a
+// task's share of them fits.
+func (x features) sortFits(f fleet) bool {
+	width := x.rowBytes()
+	if width < sortWideRow || x.planRows <= 0 || f.memory <= 0 {
+		return true
+	}
+	share := float64(f.memory) / float64(taskSlots(f.cores, f.memory))
+	return sortHeld*x.planRows/writeTasks(x.bytes, f)*width <= share/2
+}
+
 // fillWidthRows are the first rows of a fill's query whose width stands for its
 // rows': a vector of DuckDB's, which most reads give at once.
 const fillWidthRows = 2048

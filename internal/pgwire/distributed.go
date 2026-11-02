@@ -344,9 +344,10 @@ func (s *Server) startDistributed(ctx context.Context, sess *session, user auth.
 			s.dist.Metrics().Fallback("worker_memory")
 			s.log.Warn("workers ran out of memory on a fill, which this replica has the room for; running it here", "user", user.Name, "err", err)
 			return nil, parts, false, nil
-		case distributed.OutOfMemory(err) && st.writer != nil && plan.WorkersWrite():
+		case distributed.OutOfMemory(err) && st.writer != nil && plan.WorkersWrite() && plan.WriteFitsHere():
 			// Too much for this replica's memory: its tasks may fare better
-			// with this replica writing the table from their results.
+			// with this replica writing the table from their results, where
+			// this replica has the room for that.
 			s.dist.Metrics().Fallback("worker_memory")
 			s.log.Warn("workers ran out of memory writing a table's files; this replica writes them", "user", user.Name, "err", err)
 			st.writer = nil

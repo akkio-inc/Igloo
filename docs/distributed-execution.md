@@ -426,23 +426,32 @@ statement's rows are in the table when that commit is, or not at all.
   [maintenance](operations.md#table-maintenance) and erasure requests. The partition
   directories are named by a hash, so no value of the table is in a path.
 - **Memory.** A task bounds what its writer holds by its share of the worker's
-  memory: row groups of at most 128 MiB, an eighth of its share over its threads
-  or the partitions' files it keeps open, which rows of many kilobytes need on a
-  small worker. Auto mode takes rows wider than a task could hold (at least two
-  vectors of 2,048 rows a thread, by what its scans read a row) to this replica
-  where it has the room. A fill that still runs out of memory on workers, after
-  the retries with smaller tasks, runs on the replica if it has the room for the
-  query, or else with the replica writing the table from the workers' results.
+  memory as it stands, which the memory watch lowers while the machine runs short:
+  row groups of at most 128 MiB, an eighth of its share over its threads or the
+  partitions' files it keeps open, which rows of many kilobytes need on a small
+  worker. Auto mode takes rows wider than a task could hold (at least two vectors
+  of 2,048 rows a thread, by what its scans read a row or its first rows took) to
+  this replica where it has the room. A fill that still runs out of memory on
+  workers, after the retries with smaller tasks, runs on the replica if it has the
+  room for the query and its rows' row groups, or else with the replica writing
+  the table from the workers' results if it has the room for those, and fails
+  otherwise, leaving the table as it was.
 - **Partitions.** Identity of booleans, integers, dates, timestamps and
   strings, truncate of integers and strings, and year, month, day and hour are
   written by workers, one file per partition per task until compaction merges
   them. So a table of many partitions gets many small files at first. A look at
   a fill's first rows, for up to 3 s, says how many partitions to expect: a task
-  keeps that many files open, if they fit in half of a worker's memory at about 8
-  MiB each, and otherwise sorts its rows by partition first, which takes longer but
-  makes a file of each. Auto mode has this replica write a table whose files would
-  be under 8 MiB on average, or need that sort; `distributed_execution = 'on'` still
-  sends it to workers.
+  keeps that many files open, if their upload buffers of 5.25 MB and their row
+  groups, at 2.7 times theirs, fit in half of its memory, and otherwise sorts its
+  rows by partition first, which takes longer but makes a file of each. A task of
+  953 MiB keeps 29 open, one of 497 MiB 15. Rows of a kilobyte or more it sorts only
+  if about 70% of its share of them fits in half of its memory, as DuckDB's sort
+  held them: half a million rows of 10.8 KB ran a task of 953 MiB out of memory at
+  once, and every task of a write of 6 million into 600 partitions, where written
+  as they came they took 427 MiB at 497 MiB. It writes those as they come, which
+  makes more files where their partitions are mixed. Auto mode has this replica
+  write a table whose files would be under 8 MiB on average, or need that sort,
+  where it has the room; `distributed_execution = 'on'` still sends it to workers.
 - **On the coordinator's way instead**, as the log says at debug level: tables
   partitioned by bucket, or identity of decimals, whose partition values
   cannot be read from a file's bounds or written to its manifest; tables with

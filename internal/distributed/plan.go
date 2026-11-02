@@ -186,6 +186,9 @@ type Plan struct {
 	// than farBeyondRatio times the coordinator's room for it.
 	shortOfMemory bool
 	farBeyond     bool
+	// writeBeyond says the coordinator's row groups of the rows it fills a
+	// table with would be more than its room (see features.writeHeld).
+	writeBeyond bool
 	// uncertain are relations of uncertain size its stages read by
 	// partition, with large tables partitioned to meet them; relKeys are
 	// the keys of the relations its exchanges hold, by exchange ID.
@@ -206,6 +209,9 @@ type Plan struct {
 	// writeParts is how many partitions the table's rows are estimated to have,
 	// for how its tasks write them; zero for not known.
 	writeParts int64
+	// writeUnsorted says its tasks write the rows as they come, as sorting them
+	// would not fit (see features.sortFits).
+	writeUnsorted bool
 	// versions are the snapshots the statement reads tables at, AT
 	// (VERSION => n), by key: Execute runs it on workers only if each is
 	// the snapshot it loads (see pinVersion).
@@ -229,6 +235,14 @@ func (p *Plan) StreamMerged() { p.streamMerged = true }
 // coordinator's memory, so that running it there instead of on workers
 // would fail, slowly.
 func (p *Plan) ShortOfMemory() bool { return p.shortOfMemory }
+
+// WriteFitsHere reports whether the coordinator could write the rows the
+// statement fills a table with from its workers' results, should they fail to
+// write them: not where its Parquet writer's row groups of them, which it cannot
+// spill, would be more than its room. After workers' tasks ran out of memory
+// writing 600 partitions of rows of 10.8 KB, it tried, holding 5.2 GiB, and ran
+// out of memory too.
+func (p *Plan) WriteFitsHere() bool { return !p.writeBeyond }
 
 // FitsHere reports whether the coordinator could run the statement itself,
 // should the workers chosen fail: not when its working set by DuckDB's

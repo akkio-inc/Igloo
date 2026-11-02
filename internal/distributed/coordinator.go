@@ -631,6 +631,7 @@ func (co *Coordinator) planOn(ctx context.Context, query string, env Env, mode M
 	if x.workersWrite && !dry {
 		parts := co.fillPartitions(ctx, env, query, x)
 		plan.writeParts, x.writeParts = int64(parts), parts
+		plan.writeUnsorted = parts > 0 && !x.sortFits(f)
 		if mode == ModeAuto && !co.partitionFilesFit(parts, x, f) {
 			x.workersWrite = false
 		}
@@ -670,6 +671,7 @@ func (co *Coordinator) planOn(ctx context.Context, query string, env Env, mode M
 	}
 	plan.workers, plan.large = e.workers, e.large
 	plan.shortOfMemory, plan.farBeyond = e.memory || found && r.outOfMemory, e.farBeyond
+	plan.writeBeyond = m.memory > 0 && x.writeHeld(max(m.threads, m.cores)) > memoryShare*float64(m.memory)
 	d := &decision{onWorkers: true, reason: "distributed_execution is " + string(mode), e: e, ws: ws, forced: mode != ModeAuto, writes: plan.writes}
 	if mode != ModeAuto {
 		return plan, d, nil

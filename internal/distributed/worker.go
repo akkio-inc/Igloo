@@ -69,6 +69,9 @@ type WorkerOptions struct {
 	// means those Go may use (runtime.GOMAXPROCS).
 	Cores       int
 	MemoryBytes int64
+	// MemoryNow, if set, is DuckDB's memory limit as it stands, which the
+	// memory watch lowers while the machine runs short (see memoryNow).
+	MemoryNow func(context.Context) int64
 	// Threads are DuckDB's threads, reported to coordinators, which
 	// estimate how fast workers read object storage cold by their threads
 	// a core; zero for unknown.

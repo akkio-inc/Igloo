@@ -116,8 +116,10 @@ type WriteTarget struct {
 	Columns    []WriteColumn
 	Partitions []string
 	// parts is how many partitions the statement's rows are estimated to have, zero
-	// for not known (see Plan.writeParts).
+	// for not known (see Plan.writeParts); unsorted says tasks write them as they
+	// come (see Plan.writeUnsorted).
 	parts       int64
+	unsorted    bool
 	FileBytes   int64
 	RowGroup    int64
 	Compression string
@@ -262,9 +264,8 @@ func writeRowGroup(memory int64, shares, writers int) int64 {
 	return min(max(memory/int64(max(shares, 1))/8/int64(max(writers, 1)), leastWriteRowGroup), mostWriteRowGroup)
 }
 
-// writeFilesOpen is how many partitions' files a task keeps open, each with
-// an upload's buffer where it writes to object storage (see uploadBuffer):
-// those within a quarter of its share of the worker's memory.
+// writeFilesOpen is how many partitions' files a task keeps open, in shares of
+// a worker's memory: as many as fit (see writeFilesFit), up to mostWriteFiles.
 func writeFilesOpen(memory int64, shares int, uploads bool) int {
 	if memory <= 0 {
 		return 100
@@ -272,18 +273,22 @@ func writeFilesOpen(memory int64, shares int, uploads bool) int {
 	if !uploads {
 		return mostWriteFiles
 	}
-	n := memory / int64(max(shares, 1)) / 4 / uploadBuffer
-	return int(min(max(n, leastWriteFiles), mostWriteFiles))
+	return min(writeFilesFit(memory/int64(max(shares, 1)), uploads), mostWriteFiles)
 }
 
-// partitionFileHeld is about what a partition's file open on object storage holds at
-// the least: an upload's buffer and a row group of leastWriteRowGroup, with what the
-// writer holds beside it.
-const partitionFileHeld = 8 << 20
+// writeFilesHeld is the share of a task's memory its open files take where it
+// writes to object storage: their upload buffers (see uploadBuffer), and their
+// row groups, an eighth of its memory in all (see writeRowGroup) at 2.7 times
+// that, half of it, beside what it gathers for them (see writeFlush) and its rows
+// on their way. A twelfth of TPC-H's lineitem at scale factor 1, each comment
+// repeated 400 times, into 600 partitions on 2 threads at 497 MB: 15 files open
+// held 427 MiB, 29 495 MiB, at the limit, and 59 ran out of memory; at 953 MB, 59
+// held 739 MiB.
+const writeFilesHeld = 0.5 - 2.7/8
 
-// writeFilesFit is the most partitions' files a task can keep open if that is what
-// it needs: their least within half of a worker's memory, where one statement
-// writing is about all it does.
+// writeFilesFit is the most partitions' files a task of memory can keep open if
+// that is what it needs: their upload buffers within writeFilesHeld of it, where
+// it writes to object storage; with no least but leastWriteFiles.
 func writeFilesFit(memory int64, uploads bool) int {
 	if memory <= 0 {
 		return 100
@@ -291,7 +296,7 @@ func writeFilesFit(memory int64, uploads bool) int {
 	if !uploads {
 		return mostWriteFiles
 	}
-	return int(max(memory/2/partitionFileHeld, leastWriteFiles))
+	return int(max(int64(writeFilesHeld*float64(memory))/uploadBuffer, leastWriteFiles))
 }
 
 // writeFlush is how many rows each of a task's threads gathers before it hands
@@ -343,14 +348,16 @@ func (w *Worker) writeFiles(ctx context.Context, conn *duckdb.Conn, req *taskReq
 	}
 	opts := []string{"FORMAT parquet", "FIELD_IDS " + copyFieldIDs(wr.Columns), "RETURN_STATS true", "FILENAME_PATTERN 'part_{i}'"}
 	// The task's share of the worker's memory is that of one of shares tasks
-	// at once.
+	// at once, of its memory as it stands: what the memory watch lowered it to
+	// while the machine runs short, as when other processes on it take it.
 	shares := max(w.slotCount/w.taskSlots(req.Slots), 1)
+	memory := w.memoryNow(ctx)
 	threads := threadsOf(ctx, conn)
 	writers, sorted := threads, false
 	if len(wr.Partitions) > 0 {
 		// DuckDB cannot bound a partition's files by their size.
 		opts = append(opts, "PARTITION_BY ("+strings.Join(wr.Partitions, ", ")+")")
-		writers = writeFilesOpen(w.opts.MemoryBytes, shares, uploadsInParts(to))
+		writers = writeFilesOpen(memory, shares, uploadsInParts(to))
 		// Past the files it keeps open, DuckDB closes one and later opens another
 		// for more of its rows. As rows of 128 partitions came, a task keeping 8
 		// open wrote 18 files of each, 40 KB a file, in a statement that took 32
@@ -359,20 +366,20 @@ func (w *Worker) writeFiles(ctx context.Context, conn *duckdb.Conn, req *taskReq
 		// which finishes each partition once: but that is no small thing, 4 times
 		// as long on a small worker where it was not needed.
 		if wr.Parts > int64(writers) {
-			writers = int(min(wr.Parts, int64(max(writeFilesFit(w.opts.MemoryBytes, uploadsInParts(to)), writers))))
+			writers = int(min(wr.Parts, int64(max(writeFilesFit(memory/int64(shares), uploadsInParts(to)), writers))))
 			sorted = wr.Parts > int64(writers) && !wr.AsTheyCome
 		}
 		if _, err := conn.ExecContext(ctx, fmt.Sprintf("SET SESSION partitioned_write_max_open_files = %d", writers), nil); err != nil {
 			return nil, err
 		}
 		if _, err := conn.ExecContext(ctx, fmt.Sprintf("SET SESSION partitioned_write_flush_threshold = %d",
-			writeFlush(w.opts.MemoryBytes, shares, threads)), nil); err != nil {
+			writeFlush(memory, shares, threads)), nil); err != nil {
 			return nil, err
 		}
 	} else if wr.FileBytes > 0 {
 		opts = append(opts, "FILE_SIZE_BYTES "+strconv.FormatInt(wr.FileBytes, 10))
 	}
-	opts = append(opts, "ROW_GROUP_SIZE_BYTES "+strconv.FormatInt(writeRowGroup(w.opts.MemoryBytes, shares, writers), 10))
+	opts = append(opts, "ROW_GROUP_SIZE_BYTES "+strconv.FormatInt(writeRowGroup(memory, shares, writers), 10))
 	if wr.RowGroup > 0 {
 		opts = append(opts, "ROW_GROUP_SIZE "+strconv.FormatInt(wr.RowGroup, 10))
 	}
@@ -412,6 +419,20 @@ func (w *Worker) writeFiles(ctx context.Context, conn *duckdb.Conn, req *taskReq
 		out.Rows += rows
 	}
 	return out, nil
+}
+
+// memoryNow is the worker's memory limit as it stands: what its memory watch
+// lowered it to (see memlimit.Adapt), or what it was given. Tasks sized by what
+// a worker was given, 953 MiB, ran out of memory at the 497 MiB its watch had
+// lowered it to while the coordinator beside it on one machine took the rest.
+func (w *Worker) memoryNow(ctx context.Context) int64 {
+	m := w.opts.MemoryBytes
+	if w.opts.MemoryNow != nil {
+		if n := w.opts.MemoryNow(ctx); n > 0 && (m <= 0 || n < m) {
+			m = n
+		}
+	}
+	return m
 }
 
 // writeSecret gives DuckDB wr's credentials for wr's directory, and returns
@@ -499,7 +520,7 @@ func (p *Plan) WorkersWrite() bool { return p.writes }
 // Write has the plan's tasks write its rows as target says. The target's
 // credentials, if any, are made by the coordinator when the statement runs.
 func (p *Plan) Write(target *WriteTarget) {
-	target.parts = p.writeParts
+	target.parts, target.unsorted = p.writeParts, p.writeUnsorted
 	p.target = target
 }
 
@@ -554,8 +575,8 @@ func (co *Coordinator) noteWriteDenied(err error) {
 // writeRequestFor is what a task of target is to write under dir; dispatch
 // names its attempts' directories, and makes their credentials.
 func writeRequestFor(target *WriteTarget, dir string) *writeRequest {
-	return &writeRequest{Dir: dir, Columns: target.Columns, Partitions: target.Partitions, Parts: target.parts, FileBytes: target.FileBytes,
-		RowGroup: target.RowGroup, Compression: target.Compression}
+	return &writeRequest{Dir: dir, Columns: target.Columns, Partitions: target.Partitions, Parts: target.parts, AsTheyCome: target.unsorted,
+		FileBytes: target.FileBytes, RowGroup: target.RowGroup, Compression: target.Compression}
 }
 
 // writeCredentials are the credentials the attempt that writes dir carries:

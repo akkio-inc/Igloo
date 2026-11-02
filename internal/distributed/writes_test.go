@@ -178,9 +178,10 @@ func TestPartitionFiles(t *testing.T) {
 		memory int64
 		want   int
 	}{
-		{953 * mib, 59},
-		{2355 * mib, 147},
-		{64 * gib, 4096},
+		{953 * mib, 29},
+		{497 * mib, 15},
+		{2355 * mib, 72},
+		{64 * gib, 2028},
 		{100 * mib, leastWriteFiles},
 		{0, 100},
 	} {
@@ -229,7 +230,7 @@ func TestWriteBounds(t *testing.T) {
 			t.Errorf("writeRowGroup(%d MiB, %d, %d) = %d MiB, want about %d", c.memory/mib, c.shares, c.writers, got/mib, c.want/mib)
 		}
 	}
-	if got := writeFilesOpen(953*mib, 1, true); got < 40 || got > 50 {
+	if got := writeFilesOpen(953*mib, 1, true); got != 29 {
 		t.Errorf("files open on a small worker, uploading: %d", got)
 	}
 	if got := writeFilesOpen(64*gib, 4, true); got != mostWriteFiles {
@@ -334,6 +335,35 @@ func TestWideFillFirstRun(t *testing.T) {
 	ran := machine{cores: 8, threads: 8, memory: 7 * gib, ranHere: true, allocated: 2 * gib}
 	if e := wide.estimate(ran, workers); e.farBeyond || e.spills {
 		t.Errorf("after a run here: far beyond %v, spills %v", e.farBeyond, e.spills)
+	}
+}
+
+// TestSortFits checks when a task sorts a fill's rows by partition before it
+// writes them: narrow rows, which DuckDB's sort spills, always; rows of 10.8 KB,
+// six million of them in 600 partitions, which the sort of a worker of 953 MiB
+// ran out of memory on at once, not, though a smaller share of 1.1 KB rows would.
+func TestSortFits(t *testing.T) {
+	small := fleet{cores: 8, threads: 2, running: 3, most: 3, memory: 1 << 30}
+	rows := func(width, n float64) features {
+		return features{bytes: 2e8, rows: n, fill: true, planned: true, planRows: n, fillWidth: width}
+	}
+	for _, c := range []struct {
+		name string
+		x    features
+		f    fleet
+		want bool
+	}{
+		{"narrow rows", rows(150, 6e6), small, true},
+		{"rows of 10.8 KB", rows(10.8e3, 6e6), small, false},
+		{"a few rows of 10.8 KB", rows(10.8e3, 1e4), small, true},
+		{"rows of 1.1 KB, fewer than a task holds", rows(1.1e3, 5e5), small, true},
+		{"rows of 2.7 KB, more than a task holds", rows(2.7e3, 6e6), small, false},
+		{"rows not known", features{bytes: 2e8, fill: true}, small, true},
+		{"memory not known", rows(10.8e3, 6e6), fleet{cores: 8, threads: 2, running: 3, most: 3}, true},
+	} {
+		if got := c.x.sortFits(c.f); got != c.want {
+			t.Errorf("%s: %v", c.name, got)
+		}
 	}
 }
 

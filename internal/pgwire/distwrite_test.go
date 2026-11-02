@@ -1793,9 +1793,10 @@ func TestWorkersShortOfMemoryWriting(t *testing.T) {
 	})
 	t.Run("no room here", func(t *testing.T) {
 		t.Parallel()
-		// By the estimates: this replica's 1 MB would not hold what the
-		// exchange's stage reads.
-		env := startWriteServerWith(t, func(o *distributed.Options) { o.MemoryBytes = 1 << 20 })
+		// By the estimates: this replica's 512 MiB would not hold what the
+		// exchange's stage reads, three times its tables' 300 MiB, and would
+		// its row groups of the rows, of about 3 KB by those.
+		env := startWriteServerWith(t, func(o *distributed.Options) { o.MemoryBytes = 512 << 20 })
 		env.force(t)
 		short(env)
 		query := "SELECT a.id, b.x FROM src AS a JOIN src AS b ON a.id = b.id"
@@ -1808,6 +1809,23 @@ func TestWorkersShortOfMemoryWriting(t *testing.T) {
 		}
 		if data, _ := liveFiles(t, env.admin, "w_short"); slices.ContainsFunc(data, inDir) {
 			t.Errorf("files of tasks: %q", data)
+		}
+		env.checkNoNotes(t)
+	})
+	t.Run("no room here for its rows either", func(t *testing.T) {
+		t.Parallel()
+		// This replica's 1 MiB holds neither the query nor its row groups of the
+		// rows: it fails as the workers did, and leaves no table, rather than run
+		// out of memory here too, as one writing 600 partitions of 10.8 KB rows did.
+		env := startWriteServerWith(t, func(o *distributed.Options) { o.MemoryBytes = 1 << 20 })
+		env.force(t)
+		short(env)
+		_, err := env.admin.Exec(context.Background(), "CREATE TABLE w_short AS SELECT a.id, b.x FROM src AS a JOIN src AS b ON a.id = b.id")
+		if pgCode(err) != "53200" {
+			t.Fatalf("got %v, want the workers' running out of memory", err)
+		}
+		if n := texts(t, env.admin, "SELECT count(*) FROM information_schema.tables WHERE table_name = 'w_short'"); len(n) != 1 || n[0] != "0" {
+			t.Errorf("tables named w_short: %v", n)
 		}
 		env.checkNoNotes(t)
 	})
