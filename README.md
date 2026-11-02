@@ -10,13 +10,12 @@
 Igloo is an open-source SQL data warehouse that runs in your own cloud
 account or on your own hardware.
 
-On TPC-H at scale factor 100 (100 GB), with tables in Amazon S3 and list
-prices, Igloo costs at least 9 times less per run than every Snowflake and
-Databricks warehouse size tested, X-Small to X-Large. A 64-core machine ran
-the 22 queries 4.8 times faster than a Snowflake Medium (Gen1) warehouse at
-25 times lower cost, and 2.4 to 3.2 times faster than the X-Large sizes at
-59 to 69 times lower cost. See the [benchmark](bench/README.md) for the
-method, every result and its caveats.
+Igloo runs 3 times faster than Snowflake and Databricks at 25 times lower
+cost, and is faster and lower cost at every warehouse size from X-Small to
+X-Large. The 3 and 25 are medians over those sizes, on TPC-H at 100 GB in
+Amazon S3 at list prices, with Igloo on one machine: 32 cores against
+X-Small and Small, 64 from Medium up. See the [benchmark](bench/README.md)
+for the method, every result and its caveats.
 
 - **Postgres-compatible.** Clients connect over the PostgreSQL wire protocol,
   so `psql`, JDBC, psycopg, pgx, dbt, BI tools and notebooks work without an
