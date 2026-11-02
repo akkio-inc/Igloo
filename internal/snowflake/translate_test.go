@@ -77,6 +77,12 @@ func TestTranslate(t *testing.T) {
 			`SELECT regexp_extract_all(s, '[0-9]+', 0)[CAST(2 AS BIGINT)] AS "R", regexp_full_match(s, '(?i)a.*') AS "L" FROM t`},
 		{`SELECT * FROM t WHERE s RLIKE 'b+' AND s NOT RLIKE 'c'`, `SELECT * FROM t WHERE s SIMILAR TO 'b+' AND s NOT SIMILAR TO 'c'`},
 		{`SELECT * FROM t WHERE s ILIKE ANY ('a%', 'b%')`, `SELECT * FROM t WHERE (s ILIKE 'a%' OR s ILIKE 'b%')`},
+		{`SELECT * FROM t WHERE s LIKE ANY ('%a%', '%b%')`, `SELECT * FROM t WHERE (s LIKE '%a%' OR s LIKE '%b%')`},
+		{`SELECT * FROM t WHERE LOWER(s) LIKE ANY ('%a%', '%b.c%')`, `SELECT * FROM t WHERE regexp_matches(CAST(LOWER(s) AS VARCHAR), 'a|b\.c')`},
+		{`SELECT * FROM t WHERE LOWER(s) LIKE ANY ('%a%', 'b%')`, `SELECT * FROM t WHERE (LOWER(s) LIKE '%a%' OR LOWER(s) LIKE 'b%')`},
+		{`SELECT * FROM t WHERE LOWER(s) LIKE ANY ('%a_c%', '%b%')`, `SELECT * FROM t WHERE (LOWER(s) LIKE '%a_c%' OR LOWER(s) LIKE '%b%')`},
+		{`SELECT * FROM t WHERE LOWER(s) LIKE ALL ('%a%', '%b%')`, `SELECT * FROM t WHERE (LOWER(s) LIKE '%a%' AND LOWER(s) LIKE '%b%')`},
+		{`SELECT * FROM t WHERE LOWER(s) ILIKE ANY ('%a%', '%b%')`, `SELECT * FROM t WHERE (LOWER(s) ILIKE '%a%' OR LOWER(s) ILIKE '%b%')`},
 		{`SELECT CONCAT(a, b) AS c FROM t`, `SELECT (CAST(a AS VARCHAR) || CAST(b AS VARCHAR)) AS "C" FROM t`},
 		// Literals, comments and variables.
 		{`SELECT 'it\'s' AS a, 'a\\b' AS b, $$raw\n$$ AS c // a comment`, `SELECT 'it''s' AS "A", 'a\b' AS "B", 'raw\n' AS "C" -- a comment`},

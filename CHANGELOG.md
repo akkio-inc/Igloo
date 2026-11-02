@@ -1961,6 +1961,9 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   with a value it has none of, is false before DuckDB plans the statement, which
   then reads none of the tables behind it: a dashboard's statements that ask for
   such a value took a minute of the cores each at ten times its data.
+- Snowflake's `x LIKE ANY ('%a%', '%b%', ...)` is one regular expression where that
+  is faster, rather than a comparison for each pattern that works out `x` again:
+  over `TRIM(LOWER(x))`, 25 patterns took 0.7 s of 10 million strings, not 6.4.
 - A run that read nothing, as DuckDB plans a statement to no rows for some values
   of its literals, says nothing of what other statements of its shape reserve and
   take, or which `FLATTEN` form suits them.
