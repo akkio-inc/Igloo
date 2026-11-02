@@ -2,6 +2,8 @@ package catalogproxy
 
 import (
 	"encoding/json"
+	"strconv"
+	"strings"
 	"testing"
 )
 
@@ -58,6 +60,76 @@ func TestWithDefaults(t *testing.T) {
 			// change must be the same change.
 			if again := withDefaults(c.rest, []byte(c.body)); string(again) != string(out) {
 				t.Fatalf("not the same twice:\n%s\n%s", out, again)
+			}
+			if string(withDefaults(c.rest, out)) != string(out) {
+				t.Fatalf("defaults added twice to %s", out)
+			}
+		})
+	}
+}
+
+// TestFirstRowGroups checks the row groups a new table starts with, as the
+// requests that create one spell its schema and partition spec.
+func TestFirstRowGroups(t *testing.T) {
+	const (
+		create = "v1/wh/namespaces/public/tables"
+		commit = "v1/wh/namespaces/public/tables/t"
+	)
+	field := func(id int, typ string) string {
+		return `{"id":` + strconv.Itoa(id) + `,"name":"c` + strconv.Itoa(id) + `","required":false,"type":"` + typ + `"}`
+	}
+	schema := func(types ...string) string {
+		var fields []string
+		for i, typ := range types {
+			fields = append(fields, field(i+1, typ))
+		}
+		return `{"type":"struct","schema-id":0,"fields":[` + strings.Join(fields, ",") + `]}`
+	}
+	strs := func(n int) []string {
+		out := make([]string, n)
+		for i := range out {
+			out[i] = "string"
+		}
+		return out
+	}
+	narrow := schema("long", "string", "date")
+	for _, c := range []struct {
+		name, rest, body string
+		props            map[string]string
+	}{
+		{"narrow rows, flat", create, `{"name":"t","schema":` + narrow + `}`,
+			map[string]string{targetFileSizeProperty: targetFileSize, rowGroupSizeProperty: "524288", rowGroupsProperty: "auto:524288"}},
+		{"an empty spec", create, `{"name":"t","schema":` + narrow + `,"partition-spec":{"spec-id":0,"fields":[]}}`,
+			map[string]string{targetFileSizeProperty: targetFileSize, rowGroupSizeProperty: "524288", rowGroupsProperty: "auto:524288"}},
+		// 20 strings take 640 bytes: 128 MiB of them.
+		{"wide rows, fewer", create, `{"name":"t","schema":` + schema(strs(20)...) + `}`,
+			map[string]string{targetFileSizeProperty: targetFileSize, rowGroupSizeProperty: "209715", rowGroupsProperty: "auto:209715"}},
+		// 40 strings would get fewer rows than DuckDB's own.
+		{"very wide rows, DuckDB's", create, `{"name":"t","schema":` + schema(strs(40)...) + `}`,
+			map[string]string{targetFileSizeProperty: targetFileSize, rowGroupsProperty: rowGroupsAuto}},
+		{"partitioned, DuckDB's", create,
+			`{"name":"t","schema":` + narrow + `,"partition-spec":{"spec-id":0,"fields":[{"source-id":1,"field-id":1000,"name":"k","transform":"identity"}]}}`,
+			map[string]string{targetFileSizeProperty: targetFileSize, rowGroupsProperty: rowGroupsAuto}},
+		{"the statement's size stays, and is not Igloo's", create,
+			`{"name":"t","schema":` + narrow + `,"properties":{"write.parquet.row-group-size":"1000"}}`,
+			map[string]string{targetFileSizeProperty: targetFileSize, rowGroupSizeProperty: "1000", rowGroupsProperty: rowGroupsAuto}},
+		{"a schema that cannot be read", create, `{"name":"t","schema":{"fields":7}}`,
+			map[string]string{targetFileSizeProperty: targetFileSize, rowGroupsProperty: rowGroupsAuto}},
+		{"the commit of a staged create", commit,
+			`{"requirements":[{"type":"assert-create"}],"updates":[{"action":"assign-uuid","uuid":"u"},` +
+				`{"action":"add-schema","schema":` + narrow + `},{"action":"add-spec","spec":{"spec-id":0,"fields":[]}},` +
+				`{"action":"set-properties","updates":{}}]}`,
+			map[string]string{targetFileSizeProperty: targetFileSize, rowGroupSizeProperty: "524288", rowGroupsProperty: "auto:524288"}},
+		{"the commit of a partitioned create", commit,
+			`{"requirements":[{"type":"assert-create"}],"updates":[{"action":"add-schema","schema":` + narrow + `},` +
+				`{"action":"add-spec","spec":{"spec-id":0,"fields":[{"source-id":1,"field-id":1000,"name":"k","transform":"identity"}]}},` +
+				`{"action":"set-properties","updates":{}}]}`,
+			map[string]string{targetFileSizeProperty: targetFileSize, rowGroupsProperty: rowGroupsAuto}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			out := withDefaults(c.rest, []byte(c.body))
+			if got := propertiesOf(t, c.rest, out); !equalProps(got, []map[string]string{c.props}) {
+				t.Fatalf("properties %v, want %v, in %s", got, c.props, out)
 			}
 			if string(withDefaults(c.rest, out)) != string(out) {
 				t.Fatalf("defaults added twice to %s", out)

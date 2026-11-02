@@ -2125,6 +2125,15 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   compaction caught up at 8 GB a table an hour. Igloo now sets the property
   when it creates a table, unless the statement did. See
   [operations](docs/operations.md#table-maintenance).
+- A table Igloo's SQL creates starts with row groups of 524,288 rows, fewer
+  for wide rows, so the statement that loads it no longer writes DuckDB's
+  122,880 rows a group, which stayed until something rewrote the files: over
+  copies of TPC-H at scale factor 100, a cold pass took 115 s instead of
+  197 s, and six reports 52 s instead of 60 s, with warm scans and the
+  inserts within 2%. Such an insert holds more memory, 29.5 GiB rather than
+  25.9 GiB for 600 million rows, and more again for long strings, which the
+  types do not show. Maintenance still sets the size from the table's bytes
+  a row once it has rows. See [operations](docs/operations.md#row-groups).
 - Row groups of about 16 MiB. Compaction and clustering size the row groups
   they write from the files' bytes a row, instead of writing DuckDB's
   122,880 rows, a few hundred kilobytes of narrow rows, each read cold with

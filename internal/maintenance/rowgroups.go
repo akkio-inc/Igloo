@@ -22,9 +22,10 @@ import (
 // catalog proxy sets), from the table's bytes a row, as for a rewrite.
 // DuckDB holds a row group, uncompressed, on every thread while it writes:
 // the rows are at most Options.Memory over Options.Threads rows as wide as
-// the schema's types make them (rowWidth). Maintenance records the size it
-// set in rowGroupsProperty, after "auto:", and leaves alone a size it did
-// not set, a user's.
+// the schema's types make them (filerewrite.RowWidth). Maintenance records
+// the size it set in rowGroupsProperty, after "auto:", and leaves alone a
+// size it did not set, a user's. The proxy records its first size there too
+// (see catalogproxy's firstRowGroups), which maintenance then corrects.
 const (
 	rowGroupsProperty = "igloo.row-groups"
 	duckDBRowGroups   = "write.parquet.row-group-size"
@@ -47,7 +48,7 @@ func (m *Maintainer) sizeRowGroups(ctx context.Context, tbl *table.Table, log *s
 	if err != nil || size <= 0 || records <= 0 {
 		return err
 	}
-	width := rowWidth(tbl.Schema().Fields())
+	width := filerewrite.RowWidth(tbl.Schema().Fields())
 	writers := max(int64(m.opts.Threads), openPartitions(tbl.Metadata().PartitionSpec()), 1)
 	limit := max(m.memory()/writers/max(width, 1), filerewrite.DefaultRowGroupRows)
 	rows := min(filerewrite.TargetRows(size, records), limit)
@@ -128,37 +129,4 @@ func abs(n int64) int64 {
 		return -n
 	}
 	return n
-}
-
-// rowWidth guesses the bytes a row of fields takes uncompressed, as DuckDB
-// holds it while it writes a row group.
-func rowWidth(fields []iceberg.NestedField) int64 {
-	var n int64
-	for _, f := range fields {
-		n += typeWidth(f.Type)
-	}
-	return n
-}
-
-func typeWidth(t iceberg.Type) int64 {
-	switch t := t.(type) {
-	case *iceberg.StructType:
-		return rowWidth(t.FieldList)
-	case *iceberg.ListType, *iceberg.MapType:
-		return 64
-	case iceberg.BooleanType:
-		return 1
-	case iceberg.Int32Type, iceberg.Float32Type, iceberg.DateType:
-		return 4
-	case iceberg.Int64Type, iceberg.Float64Type, iceberg.TimeType, iceberg.TimestampType, iceberg.TimestampTzType:
-		return 8
-	case iceberg.DecimalType, iceberg.UUIDType:
-		return 16
-	case iceberg.FixedType:
-		return int64(t.Len())
-	}
-	// Strings and binary: a short string inline, a long one out of line.
-	// Four short strings a row took 127 bytes more a row in groups of 4
-	// million rows than in DuckDB's (14.6 GB on 16 threads, not 6.7).
-	return 32
 }
