@@ -571,6 +571,11 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
 
 ### Distributed execution
 
+- A worker that stops answering is found in about 7 seconds, not a minute. Powered off,
+  closing no socket, one of 16 workers took 69 s to find. Whoever waits on a worker,
+  the coordinator on its tasks and readers on its exchange files, now asks it for its
+  status every second and takes it for lost after three answers missed, of 2 s each.
+
 - `ROLLUP`, `CUBE` and `GROUPING SETS` in a subquery or common table expression
   run on workers, as they do in a statement, where they left it to the
   coordinator.

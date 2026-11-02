@@ -1616,17 +1616,6 @@ type transportError struct{ err error }
 func (e *transportError) Error() string { return e.err.Error() }
 func (e *transportError) Unwrap() error { return e.err }
 
-// taskCheckEvery is how often the coordinator asks a worker running one of
-// its tasks for its status, taskCheckTimeout how long it waits for each
-// answer, and taskCheckMisses how many answers in a row the worker may miss
-// before the coordinator takes it for hung (see watchTask); variables for
-// tests.
-var (
-	taskCheckEvery   = 10 * time.Second
-	taskCheckTimeout = 5 * time.Second
-	taskCheckMisses  = 3
-)
-
 // hungError is a worker that stopped answering while it ran a task.
 type hungError struct {
 	worker string
@@ -1639,58 +1628,27 @@ func (e *hungError) Error() string {
 
 // fetch sends a task to a worker and writes its result to path, within sp.
 // A worker that stops answering while it runs the task fails it as one
-// that cannot be reached does (see watchTask), and dispatch runs the task
+// that cannot be reached does (see heartbeats), and dispatch runs the task
 // on another worker.
 func (co *Coordinator) fetch(ctx context.Context, w *worker, body []byte, path string, sp *spool) (*taskResult, error) {
 	tctx, stop := context.WithCancelCause(ctx)
 	defer stop(nil)
-	done := make(chan struct{})
-	defer close(done)
-	go co.watchTask(tctx, w.addr, stop, done)
+	lost, why, release := co.pool.beats.watch(w.addr)
+	defer release()
+	go func() {
+		select {
+		case <-lost:
+			co.log.Warn("a worker stopped answering while it ran a task; running the task elsewhere", "worker", w.addr, "err", why())
+			stop(&hungError{worker: w.addr, err: why()})
+		case <-tctx.Done():
+		}
+	}()
 	res, err := co.fetchTask(tctx, w, body, path, sp)
 	var hung *hungError
 	if err != nil && ctx.Err() == nil && errors.As(context.Cause(tctx), &hung) {
 		return nil, &transportError{hung}
 	}
 	return res, err
-}
-
-// watchTask asks the worker at addr for its status every taskCheckEvery
-// until done, and stops the task's request with a hungError when the worker
-// misses taskCheckMisses answers in a row. Its kernel still answers TCP
-// keepalives, so the request alone would wait for good: on two workers
-// whose C++ runtime aborted after they ran out of memory, every Go thread
-// waited and none answered, while the process lived on (see package
-// engine/terminate), and the statements whose tasks they held waited too.
-// A worker busy with tasks answers its status at once.
-func (co *Coordinator) watchTask(ctx context.Context, addr string, stop context.CancelCauseFunc, done <-chan struct{}) {
-	t := time.NewTicker(taskCheckEvery)
-	defer t.Stop()
-	misses := 0
-	for {
-		select {
-		case <-done:
-			return
-		case <-ctx.Done():
-			return
-		case <-t.C:
-		}
-		cctx, cancel := context.WithTimeout(ctx, taskCheckTimeout)
-		_, err := co.pool.status(cctx, addr)
-		cancel()
-		switch {
-		case ctx.Err() != nil:
-			return
-		case err == nil:
-			misses = 0
-			continue
-		}
-		if misses++; misses >= taskCheckMisses {
-			co.log.Warn("a worker stopped answering while it ran a task; running the task elsewhere", "worker", addr, "err", err)
-			stop(&hungError{worker: addr, err: err})
-			return
-		}
-	}
 }
 
 // mostTaskHead bounds the line that heads a task's answer: what it did and the

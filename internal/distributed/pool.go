@@ -74,6 +74,9 @@ type pool struct {
 	log     *slog.Logger
 	metrics *Metrics
 
+	// beats watches the workers running tasks (see heartbeats).
+	beats *heartbeats
+
 	mu        sync.Mutex
 	workers   []*worker
 	refreshed time.Time
@@ -134,7 +137,7 @@ func newPool(opts PoolOptions, t *transport, version string, metrics *Metrics, l
 	if opts.IdleAfter == 0 {
 		opts.IdleAfter = 10 * time.Minute
 	}
-	return &pool{
+	p := &pool{
 		opts:    opts,
 		version: version,
 		log:     log,
@@ -144,19 +147,25 @@ func newPool(opts PoolOptions, t *transport, version string, metrics *Metrics, l
 			MaxIdleConnsPerHost: 16,
 			IdleConnTimeout:     time.Minute,
 			// A task's response starts only when its result is ready, which
-			// may take a while. TCP keepalives, which the worker's kernel
-			// answers however busy the worker is, tell a worker that is
-			// working from one whose machine is gone, within half a minute.
+			// may take a while. Its worker's heartbeat tells a worker that is
+			// working from one that is not (see heartbeats); TCP keepalives
+			// close what is left of a connection to a machine that is gone.
 			DialContext: (&net.Dialer{Timeout: 5 * time.Second, KeepAliveConfig: net.KeepAliveConfig{
 				Enable: true, Idle: 10 * time.Second, Interval: 5 * time.Second, Count: 3,
 			}}).DialContext,
 			// Its kernel accepts the connection of a worker that answers
-			// nothing (see watchTask); the handshake would wait for good.
+			// nothing (see heartbeats); the handshake would wait for good.
 			TLSHandshakeTimeout: 10 * time.Second,
 		}},
 		down:      map[string]time.Time{},
 		startTook: 30 * time.Second,
 	}
+	p.beats = newHeartbeats(func(ctx context.Context, addr string) error { return statusAnswered(ctx, p.client, addr) },
+		func(addr string, err error) {
+			log.Warn("a worker stopped answering; it is taken for lost", "worker", addr, "err", err)
+			p.markDown(addr)
+		})
+	return p
 }
 
 // known returns the workers that answered the last check, checking now

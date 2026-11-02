@@ -1130,7 +1130,8 @@ other manifests only with that port open between them, or say `object`.
   the other workers. Otherwise, or if another is lost, the statement fails
   (and runs on the server if it fits there). A worker too busy to send a
   file says so within five seconds and is asked again for up to five
-  minutes; one that stops sending for a minute counts as lost. A statement
+  minutes; one that stops sending for a minute, or answering its status for
+  about 7 seconds, counts as lost. A statement
   never returns
   rows short of a lost file: a task checks that the files it reads hold the
   rows written.
