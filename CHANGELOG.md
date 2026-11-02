@@ -1993,6 +1993,12 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
 - Snowflake's `x LIKE ANY ('%a%', '%b%', ...)` is one regular expression where that
   is faster, rather than a comparison for each pattern that works out `x` again:
   over `TRIM(LOWER(x))`, 25 patterns took 0.7 s of 10 million strings, not 6.4.
+- A statement goes by the runs of the same text with the same literals, if there are
+  any, for what it reserves and its place in line, and otherwise by those alike but
+  for its literals: statements over a large audience allocated up to 12 times what
+  the same statements over a small one did, and spilled, once they had run over one.
+  A dashboard's 324 queries at ten times the data, on 8 cores, took 1,708 s rather
+  than 2,207 after one of 96 over small audiences.
 - A run that read nothing, as DuckDB plans a statement to no rows for some values
   of its literals, says nothing of what other statements of its shape reserve and
   take, or which `FLATTEN` form suits them.

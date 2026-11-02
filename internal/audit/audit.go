@@ -101,6 +101,9 @@ type Query struct {
 	// only under the memory it runs with now.
 	Shape  string
 	Memory int64
+	// Exact identifies the statements of the same text with the same literals, as
+	// Shape does those alike but for them (see workload.Controller.Alike).
+	Exact string
 	// Peak is the most memory the statement was seen holding while it ran,
 	// as its replica samples what DuckDB holds, less what the statements
 	// beside it reserved (see workload.Controller.SampleMemory); zero when

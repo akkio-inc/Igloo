@@ -1475,7 +1475,7 @@ func (sess *session) runCancelable(ctx context.Context, query string, fn func(co
 	ctx, cancel := context.WithCancel(ctx)
 	sess.mu.Lock()
 	sess.running, sess.statement, sess.started, sess.shed, sess.queued = cancel, redactQuery(query), time.Now(), false, true
-	sess.runShape = sess.wl.shape
+	sess.runShape = sess.wl.controller.Alike(sess.wl.exact, sess.wl.shape)
 	sess.mu.Unlock()
 
 	defer func() {
@@ -2171,11 +2171,12 @@ func (s *Server) preparedQuery(ctx context.Context, sess *session, user auth.Use
 		// A query or a change of data waits its turn behind the replica's
 		// limit of statements at once, if there is one.
 		sess.wl.counted = countsOnReplica(sess, st)
-		sess.wl.shape = ""
+		sess.wl.shape, sess.wl.exact = "", ""
 		if sess.wl.counted || st.staged != nil {
 			sess.wl.shape = s.workloadShape(ctx, sess, st.prepared)
+			sess.wl.exact = s.workloadExact(sess, st.prepared)
 		}
-		shape := sess.wl.shape
+		shape, exact := sess.wl.shape, sess.wl.exact
 		sess.wl.apart = s.runsApart(sess, st)
 		err = sess.runCancelable(ctx, q.Query, func(ctx context.Context) error {
 			runOnce := func() error {
@@ -2254,7 +2255,7 @@ func (s *Server) preparedQuery(ctx context.Context, sess *session, user auth.Use
 			spend = &sp
 			aiNotice(w, sp)
 		}
-		sess.wl.counted, sess.wl.shape, sess.wl.apart = false, "", false
+		sess.wl.counted, sess.wl.shape, sess.wl.exact, sess.wl.apart = false, "", "", false
 		if st.filled != nil {
 			// A fill's query ran on workers, or here, as a read of it would
 			// (see fillOn): the history says where, and auto mode learns how
@@ -2282,12 +2283,15 @@ func (s *Server) preparedQuery(ctx context.Context, sess *session, user auth.Use
 		case parts.workers > 0:
 			// One that ran on workers held most of its memory there.
 		case measured:
-			// What it held here, for the next statement like it.
-			s.workload.Observe(shape, workload.FootprintOf(used.MemoryAllocated, peak, sampled))
-			s.workload.ObserveCost(shape, used.CPUTime)
+			// What it held here, for the next statement like it, and the next the same.
+			for _, key := range []string{shape, exact} {
+				s.workload.Observe(key, workload.FootprintOf(used.MemoryAllocated, peak, sampled))
+				s.workload.ObserveCost(key, used.CPUTime)
+			}
 			s.workload.ObserveTook(shape, time.Since(start)-sess.wl.queued)
 		case used != nil:
 			s.workload.ObserveEmpty(shape)
+			s.workload.ObserveEmpty(exact)
 		case err != nil && sampled:
 			// It ended before its end, holding at least that much, or, if it
 			// ran a while, all the memory: it may have held any of what the
@@ -2296,6 +2300,7 @@ func (s *Server) preparedQuery(ctx context.Context, sess *session, user auth.Use
 				peak = max(peak, s.queryMemory)
 			}
 			s.workload.ObserveUnfinished(shape, peak)
+			s.workload.ObserveUnfinished(exact, peak)
 		}
 		if !sampled {
 			peak = 0
@@ -2336,7 +2341,7 @@ func (s *Server) preparedQuery(ctx context.Context, sess *session, user auth.Use
 		}
 		s.recordQuery(sess, queryRecord{text: q.Query, start: start, err: err, rows: tw.rows(), acc: st.access,
 			policies: st.policies(), used: used, queued: queued, analyze: st.sourceText(), stmtType: st.stmtType, parts: parts, ai: spend,
-			shape: shape, peak: peak, form: formOf(tr)})
+			shape: shape, exact: exact, peak: peak, form: formOf(tr)})
 		if err != nil {
 			s.log.Debug("statement failed", "user", user.Name, "err", err)
 		}

@@ -55,7 +55,7 @@ const LongUnfinished = 10 * time.Second
 const minReservationShare = 16
 
 // maxFootprints bounds the shapes kept; they are forgotten all at once.
-const maxFootprints = 4096
+const maxFootprints = 1 << 16
 
 // footprints are what statements of each shape held at once, as of their
 // latest runs.
@@ -123,6 +123,24 @@ func (c *Controller) ObserveEmpty(shape string) {
 	if len(k.runs[shape]) == 0 {
 		k.runs[shape] = []time.Duration{0}
 	}
+}
+
+// Alike returns which of a statement's two keys to go by, what it reserves and how
+// long it takes: exact, for the same text with the same literals, if statements of it
+// have run, and otherwise shape, for those alike but for their literals. A dashboard's
+// statements over a large audience allocated 3.7 times, at the median, and up to 12
+// times, what the same statements over a small one did, so once it had run over a small
+// one the statements over a large one reserved next to nothing, started together and
+// spilled: a burst of 324 queries took 2,207 s after one over small audiences, and with
+// their own runs to go by, 1,708 s.
+func (c *Controller) Alike(exact, shape string) string {
+	if c == nil || exact == "" {
+		return shape
+	}
+	if _, _, ok := c.footprint(exact); ok {
+		return exact
+	}
+	return shape
 }
 
 // EstimateFromHistory makes the controller reserve, for a statement that

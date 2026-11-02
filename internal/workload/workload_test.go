@@ -1067,3 +1067,32 @@ func TestUnseenStartAFewAtATime(t *testing.T) {
 	running[1]()
 	running[2]()
 }
+
+// TestAlike checks that a statement goes by the runs of the same text with the same
+// literals if there are any, and otherwise by those alike but for its literals.
+func TestAlike(t *testing.T) {
+	const gb = int64(1) << 30
+	c := NewController(16 * gb)
+	c.EstimateFromHistory(1)
+	if got := c.Alike("large", "shape"); got != "shape" {
+		t.Errorf("with no runs: %q", got)
+	}
+	for _, key := range []string{"shape", "small"} {
+		c.Observe(key, 2*gb)
+	}
+	if got := c.Alike("large", "shape"); got != "shape" {
+		t.Errorf("with runs of others alike: %q", got)
+	}
+	for _, key := range []string{"shape", "large"} {
+		c.Observe(key, 10*gb)
+	}
+	if got := c.Alike("large", "shape"); got != "large" || c.Estimate(got) != 10*gb {
+		t.Errorf("with its own runs: %q, %d", got, c.Estimate(got))
+	}
+	if got := c.Alike("small", "shape"); got != "small" || c.Estimate(got) != 2*gb {
+		t.Errorf("with its own runs: %q, %d", got, c.Estimate(got))
+	}
+	if got := c.Alike("", "shape"); got != "shape" {
+		t.Errorf("with no exact key: %q", got)
+	}
+}

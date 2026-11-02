@@ -353,7 +353,8 @@ replica saw it hold if that is more: every 100 ms the replica reads what
 DuckDB holds for running statements (their hash tables, sorts and the like,
 not its caches) and shares it among them by what they reserved, which is
 exact only for a statement alone. A shape's footprint is the median of its
-latest eight runs. A run that ends early, cancelled or out of memory, raises
+latest eight runs, and the runs of the same text with the same literals, if there
+are any, go before those of its shape, here and in [the line](#the-line). A run that ends early, cancelled or out of memory, raises
 it to what it was seen holding, or, if it ran ten seconds or more, to all
 the memory, so that heavy statements cancelled at their timeout do not start
 together again, unseen, next time. When it starts, a replica reads what the

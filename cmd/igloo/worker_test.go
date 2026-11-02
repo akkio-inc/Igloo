@@ -192,3 +192,32 @@ func TestSeedHistoryRunsThatReadNothing(t *testing.T) {
 		t.Errorf("expected to take %s", got)
 	}
 }
+
+// TestSeedHistoryExact checks that a restarted server has what ran of the same text
+// with the same literals, apart from what ran of others alike.
+func TestSeedHistoryExact(t *testing.T) {
+	store := audit.NewMemoryStore(audit.MemoryQueries, audit.MemoryLogins)
+	now := time.Now()
+	const gb = int64(1) << 30
+	limits := workload.NewController(22 * gb)
+	limits.EstimateFromHistory(1)
+	var qs []audit.Query
+	for i, r := range []struct {
+		exact     string
+		allocated int64
+	}{{"small", 3 * gb}, {"large", 12 * gb}, {"small", 3 * gb}} {
+		qs = append(qs, audit.Query{ID: fmt.Sprint(i), Start: now.Add(time.Duration(i-10) * time.Minute), Outcome: audit.OutcomeOK,
+			Duration: time.Second, Shape: "s", Exact: r.exact, Memory: 22 * gb,
+			Resources: &audit.Resources{BytesRead: 1, CPUTime: time.Minute, MemoryAllocated: r.allocated}})
+	}
+	if err := store.WriteQueries(context.Background(), qs); err != nil {
+		t.Fatal(err)
+	}
+	seedHistory(context.Background(), nil, limits, 22*gb, store, slog.New(slog.DiscardHandler))
+	if got := limits.Estimate("large"); got != 8*gb {
+		t.Errorf("large reserves %d, want %d", got, 8*gb)
+	}
+	if got := limits.Estimate("small"); got != 2*gb {
+		t.Errorf("small reserves %d, want %d", got, 2*gb)
+	}
+}

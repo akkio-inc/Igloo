@@ -338,6 +338,8 @@ func seedHistory(ctx context.Context, seed func([]distributed.Run), fp footprint
 		empty bool
 		// took is how long a run it completed took, past what it waited.
 		took time.Duration
+		// exact is its key with its literals (see workload.Controller.Alike).
+		exact string
 	}
 	var fs []footprint
 	type form struct {
@@ -382,11 +384,11 @@ func seedHistory(ctx context.Context, seed func([]distributed.Run), fp footprint
 			switch {
 			case q.Outcome == audit.OutcomeOK && q.Resources != nil:
 				fs = append(fs, footprint{q.Shape, workload.FootprintOf(q.Resources.MemoryAllocated, q.Peak, q.Peak > 0), false, q.Resources.CPUTime, empty,
-					q.Duration - q.Queued})
+					q.Duration - q.Queued, q.Exact})
 			case early && q.Peak > 0:
-				fs = append(fs, footprint{q.Shape, q.Peak, true, -1, false, 0})
+				fs = append(fs, footprint{q.Shape, q.Peak, true, -1, false, 0, q.Exact})
 			case early && q.Duration-q.Queued >= longUnmeasured:
-				fs = append(fs, footprint{q.Shape, q.Memory, true, -1, false, 0})
+				fs = append(fs, footprint{q.Shape, q.Memory, true, -1, false, 0, q.Exact})
 			}
 		}
 		if len(qs) < pageSize {
@@ -408,15 +410,18 @@ func seedHistory(ctx context.Context, seed func([]distributed.Run), fp footprint
 	for _, f := range fs {
 		if f.empty {
 			fp.ObserveEmpty(f.shape)
+			fp.ObserveEmpty(f.exact)
 			continue
 		}
-		if f.unfinished {
-			fp.ObserveUnfinished(f.shape, f.held)
-		} else {
-			fp.Observe(f.shape, f.held)
-		}
-		if f.cpu >= 0 {
-			fp.ObserveCost(f.shape, f.cpu)
+		for _, key := range []string{f.shape, f.exact} {
+			if f.unfinished {
+				fp.ObserveUnfinished(key, f.held)
+			} else {
+				fp.Observe(key, f.held)
+			}
+			if f.cpu >= 0 {
+				fp.ObserveCost(key, f.cpu)
+			}
 		}
 		fp.ObserveTook(f.shape, f.took)
 	}

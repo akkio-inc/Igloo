@@ -173,6 +173,15 @@ var migrations = []string{
 				ADD COLUMN IF NOT EXISTS flatten_lists boolean;
 		END IF;
 	END $$`,
+	// The statements of the same text with the same literals, for what they
+	// reserve after a restart. Added once, as above.
+	`DO $$
+	BEGIN
+		IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+				WHERE table_schema = 'igloo_audit' AND table_name = 'query_history' AND column_name = 'exact_shape') THEN
+			ALTER TABLE igloo_audit.query_history ADD COLUMN IF NOT EXISTS exact_shape text;
+		END IF;
+	END $$`,
 	// What statements' AI functions did. Added once, as above.
 	`DO $$
 	BEGIN
@@ -246,14 +255,14 @@ func (s *PostgresStore) WriteQueries(ctx context.Context, qs []Query) error {
 			nullable(q.ClientAddress), nullable(q.ApplicationName), nullSlice(q.Policies), nullable(q.QueryTag),
 			nullable(q.Pool), q.Queued.Microseconds(), cpu, read, memory, nullSlice(q.LocationsRead), nullable(q.Job), q.Workers,
 			q.Stages, q.Exchanges, nullable(q.PlanKey), aiCalls, aiHits, aiIn, aiOut, aiCost, aiModels,
-			nullable(q.Shape), nullableInt(q.Memory), nullableInt(q.Peak), nullable(q.Placement), nullable(q.FlattenKey), q.FlattenLists}
+			nullable(q.Shape), nullableInt(q.Memory), nullableInt(q.Peak), nullable(q.Placement), nullable(q.FlattenKey), q.FlattenLists, nullable(q.Exact)}
 	}
 	return s.copy(ctx, "query_history", "query_id", []string{
 		"query_id", "session_id", "user_name", "role", "start_time", "duration_us", "outcome", "sqlstate",
 		"row_count", "statement_type", "query_text", "tables_read", "tables_written", "client_address", "application_name",
 		"policies", "query_tag", "pool", "queued_us", "cpu_time_us", "bytes_read", "memory_allocated", "locations_read", "job", "workers",
 		"stages", "exchanges", "plan_key", "ai_calls", "ai_cache_hits", "ai_input_tokens", "ai_output_tokens", "ai_cost_usd", "ai_models",
-		"shape", "run_memory", "memory_peak", "placement", "flatten_key", "flatten_lists",
+		"shape", "run_memory", "memory_peak", "placement", "flatten_key", "flatten_lists", "exact_shape",
 	}, rows)
 }
 
@@ -301,7 +310,7 @@ func (s *PostgresStore) Queries(ctx context.Context, v Viewer, p Page) ([]Query,
 			locations_read, coalesce(job, ''), workers, stages, exchanges, coalesce(plan_key, ''),
 			ai_calls, coalesce(ai_cache_hits, 0), coalesce(ai_input_tokens, 0), coalesce(ai_output_tokens, 0),
 			coalesce(ai_cost_usd, 0), ai_models, coalesce(shape, ''), coalesce(run_memory, 0), coalesce(memory_peak, 0),
-			coalesce(placement, ''), coalesce(flatten_key, ''), coalesce(flatten_lists, false)
+			coalesce(placement, ''), coalesce(flatten_key, ''), coalesce(flatten_lists, false), coalesce(exact_shape, '')
 		FROM igloo_audit.query_history
 		WHERE ($1::text IS NULL OR user_name = $1)
 		  AND ($2::timestamptz IS NULL OR start_time >= $2)
@@ -325,7 +334,7 @@ func (s *PostgresStore) Queries(ctx context.Context, v Viewer, p Page) ([]Query,
 			&q.StatementType, &q.Text, &q.TablesRead, &q.TablesWritten, &q.ClientAddress, &q.ApplicationName, &q.Policies,
 			&q.QueryTag, &q.Pool, &queuedUS, &cpuUS, &r.BytesRead, &r.MemoryAllocated, &q.LocationsRead, &q.Job, &q.Workers,
 			&q.Stages, &q.Exchanges, &q.PlanKey, &aiCalls, &a.CacheHits, &a.InputTokens, &a.OutputTokens, &a.CostUSD, &a.Models,
-			&q.Shape, &q.Memory, &q.Peak, &q.Placement, &q.FlattenKey, &q.FlattenLists)
+			&q.Shape, &q.Memory, &q.Peak, &q.Placement, &q.FlattenKey, &q.FlattenLists, &q.Exact)
 		q.Duration, q.Queued = micros(us), micros(queuedUS)
 		if cpuUS != nil {
 			r.CPUTime = micros(*cpuUS)
