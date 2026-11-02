@@ -1947,6 +1947,10 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   dashboard's burst at ten times its data, statements sent to the second had a tenth
   of what the others left of the cores and ran past 15 minutes, and those moved
   there threw away what they had done.
+- A statement that reserves memory also waits while what DuckDB holds for the
+  statements running leaves no room for it, whatever they reserved. A dashboard's
+  324 queries at ten times the data took 1,945 s rather than 2,086, with a median
+  of 392 s rather than 429.
 - Statements wait in the order they would end if each ran alone from when it
   came, as their shape's runs say, rather than in arrival order; a shape that took
   under a second of CPU does not wait at all; and a statement of a shape not seen

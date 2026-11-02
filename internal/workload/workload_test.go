@@ -791,3 +791,75 @@ func TestHeldBehindSecond(t *testing.T) {
 		t.Error("nil controller")
 	}
 }
+
+// TestReservationsWaitForWhatIsHeld checks that a statement that reserves memory
+// waits while what DuckDB holds leaves no room for it, whatever those running
+// reserved, and one that reserves nothing does not.
+func TestReservationsWaitForWhatIsHeld(t *testing.T) {
+	const gb = int64(1) << 30
+	c := NewController(16 * gb)
+	ctx := context.Background()
+	first, _, err := c.Admit(ctx, Limits{Memory: 2 * gb})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// It holds more than it reserved.
+	c.sample(12 * gb)
+	second := make(chan func() (int64, bool), 1)
+	go func() {
+		r, _, err := c.Admit(ctx, Limits{Memory: 6 * gb})
+		if err != nil {
+			t.Error(err)
+		}
+		second <- r
+	}()
+	select {
+	case <-second:
+		t.Fatal("a statement started with no room for what it reserved")
+	case <-time.After(50 * time.Millisecond):
+	}
+	// One that reserves nothing starts all the same.
+	small, waited, err := c.Admit(ctx, Limits{Counted: true, Unseen: false, Slots: Slots{Key: "small", Max: 8}})
+	if err != nil || waited != 0 {
+		t.Fatalf("one that reserves nothing waited %s: %v", waited, err)
+	}
+	small()
+	// The next sample that finds room lets it start.
+	c.sample(10 * gb)
+	var r func() (int64, bool)
+	select {
+	case r = <-second:
+	case <-time.After(5 * time.Second):
+		t.Fatal("a statement did not start once there was room")
+	}
+	r()
+	// One that reserves it all starts with a quarter still held, by what
+	// reserves nothing, and only then.
+	first()
+	long, _, err := c.Admit(ctx, Limits{Slots: Slots{Key: "long", Max: 8}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.sample(8 * gb)
+	all := make(chan func() (int64, bool), 1)
+	go func() {
+		r, _, err := c.Admit(ctx, Limits{Memory: 16 * gb})
+		if err != nil {
+			t.Error(err)
+		}
+		all <- r
+	}()
+	select {
+	case <-all:
+		t.Fatal("a statement that reserves it all started with half held")
+	case <-time.After(50 * time.Millisecond):
+	}
+	c.sample(4 * gb)
+	select {
+	case r = <-all:
+	case <-time.After(5 * time.Second):
+		t.Fatal("a statement that reserves it all did not start with a quarter held")
+	}
+	r()
+	long()
+}

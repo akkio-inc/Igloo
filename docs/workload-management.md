@@ -334,8 +334,10 @@ is all of it) of the replica's memory before it starts, as a role's
 shape held more than the replica's memory waits until the others'
 reservations are released; one whose reservation would be under a
 sixteenth of the memory, or whose shape Igloo has not seen since the
-replica started, reserves nothing and starts at once. A role's own
-`memory_limit` comes first.
+replica started, reserves nothing and starts at once. A statement that
+reserves memory also waits while what DuckDB holds for the statements running
+leaves no room for what it reserves, up to three quarters of the memory, since
+reservations are estimates. A role's own `memory_limit` comes first.
 
 DuckDB measures what a statement allocated over its whole run, counting
 memory it freed and allocated again, and the peak of the whole process,
