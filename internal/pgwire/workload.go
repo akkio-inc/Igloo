@@ -68,6 +68,9 @@ type workloadState struct {
 	// elsewhere gives back what the running statement holds of this replica, once it
 	// runs on workers (see workload.Limits.Elsewhere); nil for none.
 	elsewhere func()
+	// admitted gives back what the running statement was admitted with, for
+	// a statement whose thread parked (see Server.statementThread); nil for none.
+	admitted func()
 	// peak is the most memory the latest statement was seen holding while
 	// it ran, and sampled says a sample fell within its run (see
 	// workload.Controller.SampleMemory).
@@ -177,10 +180,10 @@ func (sess *session) admit(ctx context.Context) (release, leave func(), err erro
 	sess.wl.queued = waited
 	sess.wl.peak, sess.wl.sampled = 0, false
 	if err == nil {
-		sess.wl.elsewhere = elsewhere
+		sess.wl.elsewhere, sess.wl.admitted = elsewhere, func() { done() }
 		return func() {
 			sess.wl.peak, sess.wl.sampled = done()
-			sess.wl.elsewhere = nil
+			sess.wl.elsewhere, sess.wl.admitted = nil, nil
 		}, func() { done() }, nil
 	}
 	behind := []string{}

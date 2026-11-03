@@ -6,10 +6,12 @@ import (
 	"cmp"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/subtle"
 	"crypto/tls"
 	"database/sql/driver"
 	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -42,6 +44,7 @@ import (
 	"github.com/akkio-inc/igloo/internal/deletefiles"
 	"github.com/akkio-inc/igloo/internal/distributed"
 	"github.com/akkio-inc/igloo/internal/engine"
+	"github.com/akkio-inc/igloo/internal/engine/terminate"
 	"github.com/akkio-inc/igloo/internal/erasure"
 	"github.com/akkio-inc/igloo/internal/federation"
 	"github.com/akkio-inc/igloo/internal/iddomain"
@@ -852,6 +855,7 @@ func New(engine Engine, opts Options, log *slog.Logger) (*Server, error) {
 		wire.BackendKeyData(s.backendKeyData),
 		wire.CancelRequest(s.cancelRequest),
 		wire.SessionMiddleware(s.openSession),
+		wire.CommandWrapper(s.statementThread),
 		wire.CloseConn(s.closeSession),
 		wire.Statements(newStatementCache),
 		wire.Portals(newPortalCache),
@@ -2405,6 +2409,43 @@ type catalogHold struct{ mode catalogMode }
 // shared, for DuckDB binding a statement (the bind hold openSession sets):
 // binds are safe alongside each other, not alongside the rest. Holds are
 // reentrant per session: the several steps that reach the set while one
+// statementThread runs run, a session's command, on a thread of its own (see
+// terminate.Statement), from which a C++ exception that escapes DuckDB, which
+// nothing can catch, parks the thread rather than end the process: the iceberg
+// extension's scan state threw Out of Memory out of its destructor in the
+// optimizer of a statement bound again at the replica's memory limit, and the
+// process ended with every session's statement.
+func (s *Server) statementThread(ctx context.Context, run func() error) error {
+	sess := sessionFrom(ctx)
+	if sess == nil {
+		return run()
+	}
+	var err error
+	terminate.Statement(func(what string) { s.parked(ctx, sess, what) }, func() { err = run() })
+	return err
+}
+
+// parked ends the session whose statement's thread parked, as what escaped
+// DuckDB there says: it lets go of the session's hold on the catalog lock and of
+// what its statement was admitted with, which the thread, waiting for good,
+// would keep from every other session, and closes the client's connection. The
+// thread keeps its DuckDB connection, and what DuckDB held for its statement.
+func (s *Server) parked(ctx context.Context, sess *session, what string) {
+	sess.mu.Lock()
+	text, user, pid := sess.statement, sess.user.Name, sess.pid
+	sess.mu.Unlock()
+	sum := sha256.Sum256([]byte(text))
+	s.log.Error("a C++ exception escaped DuckDB on a statement's thread, where nothing could catch it; the statement and its session end, "+
+		"and its thread and DuckDB connection wait for good", "pid", pid, "user", user, "statement_sha256", hex.EncodeToString(sum[:8]), "what", what)
+	s.unlockCatalog(sess)
+	if done := sess.wl.admitted; done != nil {
+		done()
+	}
+	if c := wire.AcceptedConn(ctx); c != nil {
+		_ = c.Close()
+	}
+}
+
 // statement is handled (preparing it, binding it, rechecking it, running it,
 // and the commands that resolve or list catalog objects) each take one
 // without deadlocking, and the engine lock is held once, in the strongest
