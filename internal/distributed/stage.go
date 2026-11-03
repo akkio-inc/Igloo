@@ -77,6 +77,11 @@ type Stage struct {
 	// task's rows of the result: its tasks write them, where the statement
 	// has a target (see writes.go).
 	writeSQL string
+	// rows, for a stage that writes an aggregation's partial results, is how
+	// it may write them a row at a time, and rowSQL the fragment that does
+	// (see rowSpec).
+	rows   *rowSpec
+	rowSQL string
 }
 
 // Input is a relation a stage's fragment reads under a view name: a
@@ -142,6 +147,12 @@ func (s *Stage) String() string {
 		fmt.Fprintf(&b, " to exchange %d (%s)", s.Out.ID, s.Out.purpose)
 		if s.Out.Buckets > 0 {
 			fmt.Fprintf(&b, " by bucket[%d]", s.Out.Buckets)
+		}
+		switch {
+		case s.rowSQL != "" && s.rows.first:
+			b.WriteString(", partial results a row at a time")
+		case s.rowSQL != "":
+			b.WriteString(", partial results a row at a time once a task's groups are single rows")
 		}
 	} else {
 		b.WriteString(" to the coordinator")
@@ -425,6 +436,9 @@ func (p piece) split() bool { return p.k > 1 }
 // pieceIndex spaces the directories of pieces from their tasks' (see index).
 const pieceIndex = 100000
 
+// tasksPerStage numbers a stage's tasks: task i of stage s is s*tasksPerStage + i.
+const tasksPerStage = 10000
+
 // index names p's directories and files: its task's number, or one of its own above
 // all tasks', so that what an attempt of the undivided task leaves is never read.
 func (p piece) index() int {
@@ -665,7 +679,7 @@ func (e *execution) stage(ctx context.Context, s *Stage) error {
 	request := func(p piece, round int) (*taskRequest, int64) {
 		i := p.i
 		whole, wholeBytes := wholeViews()
-		task := &taskRequest{Query: e.qid, Task: s.ID*10000 + i, Version: e.co.opts.Version, Settings: e.settings, Erased: e.erased}
+		task := &taskRequest{Query: e.qid, Task: s.ID*tasksPerStage + i, Version: e.co.opts.Version, Settings: e.settings, Erased: e.erased}
 		if e.slots > 1 {
 			task.Slots = e.slots
 		}
@@ -722,6 +736,11 @@ func (e *execution) stage(ctx context.Context, s *Stage) error {
 			task.SQL, task.Columns = s.SQL, s.Columns
 		} else {
 			task.SQL = exchangeSQL(s, e.parts)
+			if s.rowSQL != "" {
+				byRow := *s
+				byRow.SQL = s.rowSQL
+				task.RowSQL, task.RowsFirst = exchangeSQL(&byRow, e.parts), s.rows.first
+			}
 			task.Shuffle = e.rootOf(s.ID, i) + "/s" + strconv.Itoa(s.ID) + "/" + idx
 			task.Partitions = e.parts
 			if e.local {

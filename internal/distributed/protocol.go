@@ -52,6 +52,12 @@ type taskRequest struct {
 	Variables []variable `json:"variables,omitempty"`
 	Views     []viewDef  `json:"views"`
 	SQL       string     `json:"sql"`
+	// RowSQL, for a shuffle task that writes an aggregation's partial
+	// results, writes each row's own instead, and RowsFirst says to run it
+	// rather than SQL; otherwise the worker runs it once a task of the
+	// stage found each of its groups to be one row (see rowSpec).
+	RowSQL    string `json:"row_sql,omitempty"`
+	RowsFirst bool   `json:"rows_first,omitempty"`
 	// Columns, if set, rename the result's columns positionally.
 	Columns []string `json:"columns,omitempty"`
 	// Shuffle, if set, makes the task write its result to this directory
@@ -186,6 +192,10 @@ type taskResult struct {
 	// task wrote.
 	Files []shuffleFile `json:"files,omitempty"`
 	Error *taskErr      `json:"error,omitempty"`
+	// groupRows, for a shuffle task that wrote an aggregation's partial
+	// results, is the most rows any of its groups had, or 0 if not known
+	// (see rowSpec).
+	groupRows int64
 	// attempt is the directory the attempt that answered was given to
 	// write under, as the coordinator knows it (see checkWritten).
 	attempt string

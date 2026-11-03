@@ -321,8 +321,10 @@ type planOptions struct {
 	// every machine sees the same time.
 	now time.Time
 	// aggregation, if set, overrides how aggregations complete their groups
-	// where there is a choice (aggGather or aggByGroup), for tests.
-	aggregation string
+	// where there is a choice (aggGather or aggByGroup), for tests; partials
+	// whether stages write their partial results a row at a time (see
+	// rowpartials.go).
+	aggregation, partials string
 	// sizes are the sizes of relations measured before (see probe.go), by
 	// relation key; taskMemory is what a worker's task may plan on, to
 	// check that a measured relation every task reads fits it.
@@ -491,6 +493,18 @@ func (pl *planner) plan(stmt node) (*Plan, error) {
 		}
 		if s.SQL, err = pl.p.print(s.fragment); err != nil {
 			return nil, unsupported("%v", err)
+		}
+		if s.rows == nil || s.Out == nil {
+			continue
+		}
+		rf, err := pl.rowFragment(s.fragment, s.rows)
+		if err != nil {
+			return nil, err
+		}
+		if rf != nil {
+			if s.rowSQL, err = pl.p.print(rf); err != nil {
+				return nil, unsupported("%v", err)
+			}
 		}
 	}
 	if pl.opts.writes {
@@ -2204,6 +2218,9 @@ type jobBuild struct {
 	// enough is the rows of any that its last stage needs (see
 	// Stage.enough), or 0.
 	enough int64
+	// rows, if set, is how fragment, the partial results for second, may be
+	// written a row at a time (see rowSpec).
+	rows *rowSpec
 }
 
 // viewMark is the key that marks a table reference with the view a
@@ -2350,7 +2367,7 @@ func placeholderRef(name string) node {
 // completed on workers, a second; the last writes to out, or to the
 // coordinator without one.
 func (pl *planner) emit(j *job, b *jobBuild, out *Exchange) (*Stage, error) {
-	last := &Stage{fragment: b.fragment, Columns: b.columns}
+	last := &Stage{fragment: b.fragment, Columns: b.columns, rows: b.rows}
 	for _, k := range j.keyed {
 		var x *Exchange
 		if k.use != nil && k.bucketed {

@@ -183,6 +183,9 @@ func (pl *planner) aggregateJob(c *candidate) (*jobBuild, error) {
 	case aggByGroup:
 		b.second, err = a.groupStage()
 	}
+	if err == nil && b.second != nil && !b.second.whole {
+		b.rows, err = a.rows(b.fragment)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -264,7 +267,13 @@ func (pl *planner) relationAggregate(c *candidate) (*jobBuild, error) {
 	}
 	// Without groups, or of grouping sets, whose groups no partition holds
 	// whole: its one task computes them over every partial result.
-	return &jobBuild{fragment: fragment, second: &secondStage{fragment: combine, keys: a.groupColumns(), whole: len(a.groups) == 0 || !a.singleSet()}}, nil
+	b := &jobBuild{fragment: fragment, second: &secondStage{fragment: combine, keys: a.groupColumns(), whole: len(a.groups) == 0 || !a.singleSet()}}
+	if !b.second.whole {
+		if b.rows, err = a.rows(fragment); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
 }
 
 // singleSet reports whether the aggregation groups by all of its groups, once:

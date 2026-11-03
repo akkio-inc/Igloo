@@ -192,6 +192,9 @@ type Coordinator struct {
 	// groups, for tests (see planOptions); bitmaps, if set, whether
 	// count(DISTINCT) combines roaring bitmaps.
 	aggregation string
+	// partialRows, if set, overrides whether stages write partial results a
+	// row at a time, for tests (see planOptions).
+	partialRows string
 	bitmaps     *bool
 	parser      *parser
 	// aggs are the aggregate functions statements may call: the parser's,
@@ -499,7 +502,7 @@ func (co *Coordinator) planOn(ctx context.Context, query string, env Env, mode M
 	if co.maxBroadcast > 0 {
 		opts.maxBroadcast = co.maxBroadcast
 	}
-	opts.aggregation = co.aggregation
+	opts.aggregation, opts.partials = co.aggregation, co.partialRows
 	opts.bitmaps = co.bitmapsOn(ctx, env)
 	fills, fill := env.(Fills)
 	opts.writes = fill && fills.Fill() && fills.FillWrites() && co.workersMayWrite()

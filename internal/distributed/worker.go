@@ -138,6 +138,12 @@ type Worker struct {
 	runningMu sync.Mutex
 	running   map[*runningTask]bool
 
+	// byRow are the stages whose partial results its tasks write a row at a
+	// time, as a task of theirs found each group to be one row (see
+	// rowSpec), by statement and stage, with when that was found.
+	byRowMu sync.Mutex
+	byRow   map[string]time.Time
+
 	// footerCache holds data files' footers by path; see footers.
 	footersMu   sync.Mutex
 	footerCache map[string]*footer
@@ -773,6 +779,10 @@ func (w *Worker) run(ctx context.Context, req *taskRequest) (string, *taskResult
 		"by_field_id", byID, "seconds", time.Since(start).Seconds())
 
 	query := req.SQL
+	byRow := req.RowSQL != "" && (req.RowsFirst || w.rowsAtOnce(req))
+	if byRow {
+		query = req.RowSQL
+	}
 	if len(req.Columns) > 0 {
 		names := make([]string, len(req.Columns))
 		for i, c := range req.Columns {
@@ -788,12 +798,16 @@ func (w *Worker) run(ctx context.Context, req *taskRequest) (string, *taskResult
 		res, err := w.writeFiles(ctx, conn, req, query, cols)
 		return "", res, err
 	}
-	if req.Shuffle != "" && req.Local != "" {
-		res, err := w.shuffleLocal(ctx, conn, req, query, cols)
-		return "", res, err
-	}
 	if req.Shuffle != "" {
-		res, err := w.shuffle(ctx, conn, req.Shuffle, query, cols, req.Partitions, req.Slots)
+		var res *taskResult
+		if req.Local != "" {
+			res, err = w.shuffleLocal(ctx, conn, req, query, cols)
+		} else {
+			res, err = w.shuffle(ctx, conn, req.Shuffle, query, cols, req.Partitions, req.Slots)
+		}
+		if err == nil && req.RowSQL != "" && !byRow && res.groupRows == 1 {
+			w.noteRowsAtOnce(req)
+		}
 		return "", res, err
 	}
 	// Columns Parquet would change cross as text; see transferType.
@@ -1010,10 +1024,12 @@ func (w *Worker) writePartitions(ctx context.Context, conn *duckdb.Conn, dir, qu
 	}
 	defer res.Close() //nolint:errcheck
 	out := &taskResult{Files: []shuffleFile{}}
+	counted := false
 	for _, c := range cols {
 		if c.Name != "__b" {
 			out.Columns = append(out.Columns, c)
 		}
+		counted = counted || c.Name == groupRowsColumn
 	}
 	// filename, count, file_size_bytes, footer_size_bytes,
 	// column_statistics, partition_keys.
@@ -1039,8 +1055,81 @@ func (w *Worker) writePartitions(ctx context.Context, conn *duckdb.Conn, dir, qu
 		}
 		out.Files = append(out.Files, shuffleFile{Path: f, Partition: n, Rows: rows, Size: size})
 		out.Rows += rows
+		if len(dest) > 4 {
+			if m, ok := statMax(dest[4], groupRowsColumn); ok && counted {
+				out.groupRows = max(out.groupRows, m)
+				continue
+			}
+		}
+		counted = false
+	}
+	if !counted {
+		out.groupRows = 0
 	}
 	return out, nil
+}
+
+// statMax is the largest value of column col in a file the COPY wrote, from
+// its column_statistics, if they say.
+func statMax(stats driver.Value, col string) (int64, bool) {
+	// DuckDB names the column quoted.
+	c, ok := mapValue(stats, quoteIdent(col))
+	if !ok {
+		c, _ = mapValue(stats, col)
+	}
+	v, _ := mapValue(c, "max")
+	s, ok := v.(string)
+	if !ok {
+		return 0, false
+	}
+	n, err := strconv.ParseInt(s, 10, 64)
+	return n, err == nil
+}
+
+// mapValue is the value of key in m, a MAP DuckDB returned.
+func mapValue(m any, key string) (any, bool) {
+	switch m := m.(type) {
+	case duckdb.OrderedMap:
+		return m.Get(key)
+	case duckdb.Map:
+		v, ok := m[key]
+		return v, ok
+	}
+	return nil, false
+}
+
+// rowsAtOnce reports whether req's stage writes its partial results a row at
+// a time on this worker (see rowSpec).
+func (w *Worker) rowsAtOnce(req *taskRequest) bool {
+	w.byRowMu.Lock()
+	defer w.byRowMu.Unlock()
+	_, ok := w.byRow[byRowKey(req)]
+	return ok
+}
+
+// noteRowsAtOnce has the next tasks of req's stage write their partial
+// results a row at a time: req's found each group to be one row. Notes an
+// hour old go.
+func (w *Worker) noteRowsAtOnce(req *taskRequest) {
+	w.byRowMu.Lock()
+	defer w.byRowMu.Unlock()
+	if w.byRow == nil {
+		w.byRow = map[string]time.Time{}
+	}
+	now := time.Now()
+	for k, at := range w.byRow {
+		if now.Sub(at) > time.Hour {
+			delete(w.byRow, k)
+		}
+	}
+	w.byRow[byRowKey(req)] = now
+	w.log.Debug("writing a stage's partial results a row at a time: a task's groups were each one row", "query", req.Query,
+		"stage", req.Task/tasksPerStage)
+}
+
+// byRowKey names req's stage.
+func byRowKey(req *taskRequest) string {
+	return req.Query + "/" + strconv.Itoa(req.Task/tasksPerStage)
 }
 
 // asInt64 returns v, an integer DuckDB returned, as an int64.

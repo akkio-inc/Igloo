@@ -13,9 +13,10 @@ import (
 )
 
 // agreementModes are the ways TestAgreement runs each query on workers: forced on
-// with the planner's own choice of joins, forced on with every join partitioned, and
-// in auto mode.
-var agreementModes = []string{"on", "partitioned", "auto"}
+// with the planner's own choice of joins, forced on with every join partitioned,
+// forced on with partial results written a row at a time wherever they may be (see
+// rowSpec), and in auto mode.
+var agreementModes = []string{"on", "partitioned", "rows", "auto"}
 
 // agreement is what one query came to in each mode: ran distributed, or why not.
 type agreement struct {
@@ -37,13 +38,15 @@ func agree(t *testing.T, h *harness, name, query string) agreement {
 		t.Fatalf("%s on one machine: %v", name, err)
 	}
 	broadcast := h.co.maxBroadcast
-	defer func() { h.co.maxBroadcast = broadcast }()
+	defer func() { h.co.maxBroadcast, h.co.partialRows = broadcast, "" }()
 	for _, mode := range agreementModes {
-		h.co.maxBroadcast = broadcast
+		h.co.maxBroadcast, h.co.partialRows = broadcast, ""
 		m := ModeOn
 		switch mode {
 		case "partitioned":
 			h.co.maxBroadcast = 1
+		case "rows":
+			h.co.partialRows = partialsByRow
 		case "auto":
 			m = ModeAuto
 		}

@@ -387,8 +387,8 @@ func (g *gen) query() string {
 
 // TestRandomAgreement runs randomFound and random queries (IGLOO_TEST_RANDOM_QUERIES,
 // 150 by default) from IGLOO_TEST_RANDOM_SEED on one machine and on workers, with the planner's joins
-// and with every join partitioned, and fails on any result that differs. A query one
-// machine refuses is not counted.
+// and with every join partitioned and partial results a row at a time, and fails on any result that
+// differs. A query one machine refuses is not counted.
 func TestRandomAgreement(t *testing.T) {
 	queries, seed := 150, uint64(1)
 	if v := os.Getenv("IGLOO_TEST_RANDOM_QUERIES"); v != "" {
@@ -433,9 +433,11 @@ func TestRandomAgreement(t *testing.T) {
 		}
 		distributed := false
 		for _, partitioned := range []bool{false, true} {
-			h.co.maxBroadcast = broadcast
+			// Partitioned, partial results are written a row at a time wherever
+			// they may be (see rowSpec).
+			h.co.maxBroadcast, h.co.partialRows = broadcast, ""
 			if partitioned {
-				h.co.maxBroadcast = 1
+				h.co.maxBroadcast, h.co.partialRows = 1, partialsByRow
 			}
 			got, gotCols, plan, ex, err := h.run(ctx, q, ModeOn)
 			if IsUnsupported(err) {
@@ -471,7 +473,7 @@ func TestRandomAgreement(t *testing.T) {
 			ran++
 		}
 	}
-	h.co.maxBroadcast = broadcast
+	h.co.maxBroadcast, h.co.partialRows = broadcast, ""
 	total := len(randomFound) + queries
 	t.Logf("seed %d: %d queries, %d not valid SQL, %d ran on workers, %d runs cut rows early, %d results differed", seed, total, invalid, ran, cut, failed)
 	if valid := total - invalid; valid > 0 && ran*2 < valid {
