@@ -1163,10 +1163,13 @@ the snapshots it read, so users' writes always win: maintenance leaves the
 files of a table alone while a write that reads or writes it runs, or while
 a transaction block (`BEGIN` ... `COMMIT`, as dbt's incremental models run)
 that has read or written it is open, unless the block has sat idle for 15
-minutes. A block that has listed the catalog (`information_schema`,
-`pg_catalog`, `SHOW`), as dbt does before each `MERGE`, holds back every
-table, since a listing takes the tables it lists into the block without
-saying which. It checks again just before it commits a rewrite, with sessions
+minutes. A block of a user who may write holds back every table from its
+`BEGIN`: DuckDB reads a table that changed after the block began as it was
+when the block began, and would commit a write on top of that. So does a
+block that has listed the catalog (`information_schema`, `pg_catalog`,
+`SHOW`), as dbt does before each `MERGE`, since a listing takes the tables
+it lists into the block without saying which. A reader's block holds back
+only what it read. It checks again just before it commits a rewrite, with sessions
 held off the table for that moment, and gives up the rewrite until the next
 pass if one uses it. It sees only its own replica's sessions: a write
 through another replica that loses to compaction is run again if it runs on

@@ -2610,11 +2610,16 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
 - Users' writes win over maintenance: compaction leaves the files of a table
   alone while a write that reads or writes it runs, or a transaction block
   that has read or written it is open (every table, once the block has
-  listed the catalog, as dbt does before each `MERGE`; a block idle for 15
-  minutes no longer counts), and checks again with sessions held off the
-  table just before it commits. A compaction that committed between a MERGE's read and its
-  commit made dbt's microbatch batches, each a `BEGIN` ... `COMMIT`, fail
-  with `CatalogCommitConflicts`, and had writes outside blocks run again.
+  listed the catalog, as dbt does before each `MERGE`, and from its `BEGIN`
+  for a user who may write; a block idle for 15 minutes no longer counts),
+  and checks again with sessions held off the table just before it commits.
+  A compaction that committed between a MERGE's read and its commit made
+  dbt's microbatch batches, each a `BEGIN` ... `COMMIT`, fail with
+  `CatalogCommitConflicts`, and had writes outside blocks run again. So did
+  one that committed after a batch's `BEGIN` and before the batch read the
+  model: DuckDB reads a table changed since its transaction began as it was
+  then, and the batch's `COMMIT`, or the comment dbt's `persist_docs` makes
+  before it, was refused, in 1 of 5 e2e runs.
 - `CREATE TABLE ... PARTITIONED BY (...) AS`, as Snowflake's `CLUSTER BY
   (BUCKET(n, column))` makes it, runs in steps like any `CREATE TABLE ...
   AS`, holding the catalog lock only to create and rename the table: as one

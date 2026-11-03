@@ -5,6 +5,9 @@ import (
 	"strings"
 	"time"
 
+	"github.com/duckdb/duckdb-go/v2"
+
+	"github.com/akkio-inc/igloo/internal/auth"
 	"github.com/akkio-inc/igloo/internal/catalogproxy"
 	"github.com/akkio-inc/igloo/internal/lockorder"
 )
@@ -27,11 +30,19 @@ const holdWait = 2 * time.Second
 // models' (blocks, which Igloo cannot replay), or ran the write again (see
 // runWithCommitRetry). Maintenance leaves these tables' files be (see
 // HoldTable). The session's goroutine writes them; maintenance's reads them.
+//
+// A block that may write uses every table from its BEGIN (see beginBlock):
+// DuckDB reads an Iceberg table whose metadata changed after the
+// transaction began as it was when it began, from the metadata log, and
+// commits a write on top of that. A compaction that committed after a dbt
+// batch's BEGIN and before its MERGE first read the model made the batch's
+// COMMIT fail though the block had read nothing of the model when
+// compaction looked.
 type txTables struct {
 	mu     lockorder.Mutex
 	tables map[string]bool
-	// all says the block listed the catalog (see noteListing), and so may
-	// use any table.
+	// all says the block may use any table: it may write, or it listed the
+	// catalog (see beginBlock, noteListing).
 	all bool
 	// running says a statement of the session runs, and last is when one
 	// last started or ended.
@@ -65,6 +76,10 @@ func (t *txTables) noteListing() {
 	defer t.mu.Unlock()
 	t.all, t.last = true, time.Now()
 }
+
+// beginBlock says a block that may write is beginning: it uses every table
+// until it ends, as DuckDB reads each as of the block's start (see above).
+func (t *txTables) beginBlock() { t.noteListing() }
 
 // start notes the tables of a statement about to run, before DuckDB binds it
 // to run it, which loads them, and finish that it ended: the tables are kept
@@ -126,7 +141,50 @@ func (sess *session) useTables(st *statement) func() {
 	if sess.inTx && st.listsCatalog {
 		sess.txTables.noteListing()
 	}
-	return func() { sess.txTables.finish(sess.inTx) }
+	// A BEGIN ends before the session is in the block it began (see
+	// observe), and the block goes on.
+	begins := !sess.inTx && opensBlock(st)
+	return func() { sess.txTables.finish(sess.inTx || begins) }
+}
+
+// opensBlock reports whether st is a BEGIN or START TRANSACTION.
+func opensBlock(st *statement) bool {
+	return st.stmtType == duckdb.STATEMENT_TYPE_TRANSACTION && transactionChange(st.query) > 0
+}
+
+// beginBlock runs begin, a BEGIN of a block of sess's: for a user who may
+// write, with the block using every table from before DuckDB begins its
+// transaction (see txTables), and the catalog lock held shared meanwhile, so
+// that maintenance's check and commit (HoldTable) fall before both or after
+// both.
+func (s *Server) beginBlock(ctx context.Context, sess *session, begin func() error) error {
+	if !s.mayWrite(ctx, sess) {
+		return begin()
+	}
+	defer s.shareCatalog(sess)()
+	sess.txTables.beginBlock()
+	return begin()
+}
+
+// mayWrite reports whether sess's user may write a catalog table: by role,
+// or through a grant of INSERT, UPDATE or DELETE. A reader's block commits
+// no write that a compaction could make fail.
+func (s *Server) mayWrite(ctx context.Context, sess *session) bool {
+	user := sess.currentUser()
+	if user.Role == auth.RoleAdmin || user.Role == auth.RoleWriter {
+		return true
+	}
+	privs, err := s.privileges(ctx, sess, user)
+	if err != nil {
+		return true
+	}
+	for _, g := range privs.Grants {
+		switch g.Privilege {
+		case auth.PrivilegeInsert, auth.PrivilegeUpdate, auth.PrivilegeDelete:
+			return true
+		}
+	}
+	return false
 }
 
 // InTransaction reports whether a session's transaction that has not ended

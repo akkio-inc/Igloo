@@ -2270,6 +2270,8 @@ func (s *Server) preparedQuery(ctx context.Context, sess *session, user auth.Use
 					}
 				}
 				switch {
+				case st.stmtType == duckdb.STATEMENT_TYPE_TRANSACTION && !sess.inTx && opensBlock(st):
+					return s.beginBlock(ctx, sess, func() error { return sess.runTransaction(ctx, st, tw, run) })
 				case st.stmtType == duckdb.STATEMENT_TYPE_TRANSACTION:
 					return sess.runTransaction(ctx, st, tw, run)
 				case st.changesIceberg:
