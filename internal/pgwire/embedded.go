@@ -218,6 +218,29 @@ func (s *Server) openEmbedded(ctx context.Context, user auth.User, token *auth.T
 	return &EmbeddedSession{srv: s, sess: sess, types: newTypeMap()}, nil
 }
 
+// errParked is what an embedded session's calls return once one of its calls
+// into DuckDB parked its thread (see Server.parked).
+var errParked = pgerror.WithCode(errors.New("the session ended: an exception escaped DuckDB in one of its statements"), codes.Internal)
+
+// guarded runs fn, which may call into DuckDB, and returns its error, or
+// errParked once one of the session's calls into DuckDB parked its thread:
+// that call's goroutine waits there for good, so fn runs on a goroutine of
+// its own, and the console's or Flight SQL's request that ran it fails
+// rather than wait with it. A session that parked runs nothing more.
+func (e *EmbeddedSession) guarded(fn func() error) error {
+	if e.sess.isParked() {
+		return errParked
+	}
+	done := make(chan error, 1)
+	go func() { done <- fn() }()
+	select {
+	case err := <-done:
+		return err
+	case <-e.sess.parkedC:
+		return errParked
+	}
+}
+
 // User is the session's user as of its last role check.
 func (e *EmbeddedSession) User() auth.User { return e.sess.currentUser() }
 
@@ -272,6 +295,10 @@ func (e *EmbeddedSession) RunQuery(ctx context.Context, query string, out Result
 }
 
 func (e *EmbeddedSession) run(ctx context.Context, query string, out ResultWriter, readOnly bool) error {
+	return e.guarded(func() error { return e.runUnguarded(ctx, query, out, readOnly) })
+}
+
+func (e *EmbeddedSession) runUnguarded(ctx context.Context, query string, out ResultWriter, readOnly bool) error {
 	ctx = context.WithValue(ctx, sessionKey{}, e.sess)
 	stmts, err := e.srv.parse(ctx, wire.Query{Query: query, SimpleQuery: true})
 	if err != nil {

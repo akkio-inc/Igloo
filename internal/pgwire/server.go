@@ -922,6 +922,12 @@ type session struct {
 	conn        *duckdb.Conn
 	// left is set once the session has left the server (see leave).
 	left atomic.Bool
+	// callGuard runs each call of the session's connections into DuckDB
+	// that binds, runs or drops a plan (see openSession), and parkedC is
+	// closed once one of them parked its thread (see parked).
+	callGuard func(call func())
+	parkOnce  sync.Once
+	parkedC   chan struct{}
 	// memo keeps what the checks of the statement being prepared would
 	// otherwise ask DuckDB more than once; nil outside prepareChecked.
 	memo *checkMemo
@@ -1250,8 +1256,12 @@ func (s *Server) openSession(ctx context.Context) (context.Context, error) {
 	// scan state threw Out of Memory out of its destructor in the optimizer of
 	// a statement bound again at the replica's memory limit, and the process
 	// ended with every session's statement.
+	// The session's connection to the second DuckDB, for heavy statements,
+	// has the same guard (see backgroundConnOf).
 	ended := func(what string) { s.parked(ctx, sess, what) }
-	conn.SetCallGuard(func(call func()) { terminate.Statement(ended, call) })
+	sess.parkedC = make(chan struct{})
+	sess.callGuard = func(call func()) { terminate.Statement(ended, call) }
+	conn.SetCallGuard(sess.callGuard)
 	for _, stmt := range sessionCatalogSetup(sess.user.Name, sess.user.Role == auth.RoleAdmin, s.version, s.engine.BitmapsLoaded()) {
 		if _, err := conn.ExecContext(ctx, stmt, nil); err != nil {
 			s.sessions.remove(sess)
@@ -1269,6 +1279,11 @@ func (s *Server) closeSession(ctx context.Context) error {
 		return nil
 	}
 	s.leave(sess)
+	if sess.isParked() {
+		// A thread waits for good in one of its connections' calls: closing
+		// what that call is using would free it under the thread.
+		return nil
+	}
 
 	sess.closeCursors(ctx, true)
 	sess.dropModelResults(s.modelRuntime)
@@ -2484,6 +2499,7 @@ func (s *Server) holdCatalog(sess *session) func() {
 // does not wait on its statement, and closes the client's connection. The
 // thread keeps its DuckDB connection, and what DuckDB held for its statement.
 func (s *Server) parked(ctx context.Context, sess *session, what string) {
+	sess.parkOnce.Do(func() { close(sess.parkedC) })
 	sess.mu.Lock()
 	text, user, pid := sess.statement, sess.user.Name, sess.pid
 	sess.mu.Unlock()
@@ -2497,6 +2513,17 @@ func (s *Server) parked(ctx context.Context, sess *session, what string) {
 	}
 	if c := wire.AcceptedConn(ctx); c != nil {
 		_ = c.Close()
+	}
+}
+
+// isParked reports whether one of the session's calls into DuckDB parked its
+// thread (see parked).
+func (sess *session) isParked() bool {
+	select {
+	case <-sess.parkedC:
+		return true
+	default:
+		return false
 	}
 }
 

@@ -424,6 +424,9 @@ func (s *Server) backgroundConnOf(ctx context.Context, sess *session, eng *engin
 			return nil, err
 		}
 		conn.SetBindHold(eng.CatalogShare)
+		// A C++ exception that escapes DuckDB in one of its calls ends the
+		// session, as on the session's own connection (see openSession).
+		conn.SetCallGuard(sess.callGuard)
 		for _, stmt := range sessionCatalogSetup(sess.user.Name, false, s.version, eng.BitmapsLoaded()) {
 			// The macros. Views of Igloo's own relations have no place here,
 			// and one macro that cannot be defined fails only the statements

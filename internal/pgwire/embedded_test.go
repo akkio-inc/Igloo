@@ -335,3 +335,41 @@ func TestEmbeddedSessionsCount(t *testing.T) {
 	}
 	_ = es.Close()
 }
+
+// TestEmbeddedSessionFailsOnceParked checks that once one of an embedded
+// session's calls into DuckDB parked its thread (see Server.parked), the call
+// that was waiting on it returns an error rather than wait with the thread
+// for good, and the session runs nothing more; closing it frees nothing the
+// parked thread may still use.
+func TestEmbeddedSessionFailsOnceParked(t *testing.T) {
+	t.Parallel()
+	srv, store := newEmbeddedServer(t, nil)
+	es := openAs(t, srv, store, "igloo")
+	stuck := make(chan struct{})
+	defer close(stuck)
+	done := make(chan error, 1)
+	go func() {
+		done <- es.guarded(func() error {
+			<-stuck // as a call whose thread parked never returns
+			return nil
+		})
+	}()
+	srv.parked(context.Background(), es.sess, "N6duckdb20OutOfMemoryExceptionE: test")
+	select {
+	case err := <-done:
+		if !errors.Is(err, errParked) {
+			t.Fatalf("the waiting call returned %v, want errParked", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the waiting call did not return once its session parked")
+	}
+	if err := es.Run(context.Background(), "SELECT 1", &collected{}); codeOf(err) != "XX000" {
+		t.Errorf("a parked session ran a statement: %v", err)
+	}
+	if len(srv.Sessions()) != 0 {
+		t.Errorf("the parked session is still listed: %+v", srv.Sessions())
+	}
+	if err := es.Close(); err != nil {
+		t.Errorf("close: %v", err)
+	}
+}
