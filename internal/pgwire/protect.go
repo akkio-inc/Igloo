@@ -656,12 +656,17 @@ func (s *Server) checkPath(path string, allowWarehouse bool) error {
 }
 
 // sensitivity returns the session's, working it out again when the
-// policies or the catalog changed.
+// policies or the catalog's views, macros, functions or connections
+// changed (resultGeneration): what it lists. A table's DDL changes none of
+// them, and the rollups of ELT beside dashboards, replacing tables every
+// minute, had every session list them again after each.
 func (s *Server) sensitivity(ctx context.Context, sess *session, snap *policy.Snapshot) (*sensitivity, bool, error) {
-	pg, cg := s.gov.gen.Load(), s.catalogGeneration()
+	pg, cg := s.gov.gen.Load(), s.resultGeneration()
 	if c := sess.sens; c != nil && c.policyGen == pg && c.catalogGen == cg {
 		return c, false, nil
 	}
+	// The listing walks the catalog's in-memory set (see policyRewrite).
+	defer s.holdCatalog(sess)()
 	rows, err := sess.conn.QueryContext(ctx, `SELECT 'view', database_name, schema_name, view_name, sql
 			FROM system.main.duckdb_views() WHERE NOT internal
 		UNION ALL SELECT 'macro', database_name, schema_name, function_name, coalesce(macro_definition, '')
@@ -1013,13 +1018,17 @@ func (s *Server) policyRewrite(ctx context.Context, sess *session, user auth.Use
 		// of 60 s that a dashboard's 136 prepares took, 50 s went here.
 		return query, g, false, nil
 	}
-	// Applying policies resolves names and runs DESCRIBE and sensitivity
-	// checks, all of which walk the catalog's in-memory set. Most callers
-	// already hold the catalog (preparing or rechecking a statement); a
-	// materialized view's refresh calls this on its own. Hold the exclusive
-	// side so none of it runs while a table is renamed or dropped on this
-	// instance (reentrant; see holdCatalog).
-	defer s.holdCatalog(sess)()
+	// Applying policies resolves names and runs DESCRIBE, which walk the
+	// catalog's in-memory set; so do the checks of DDL, and listing what
+	// policies concern (see sensitivity). Each holds the exclusive side so
+	// none of it runs while a table is renamed or dropped on this instance
+	// (reentrant; see holdCatalog). A query that names nothing policies
+	// concern, as a dashboard's, needs none of it once the session's
+	// listing is made: holding it for every query, prepared under the
+	// shared lock, queued them all behind each other.
+	if ddl {
+		defer s.holdCatalog(sess)()
+	}
 	// Tags and data retentions follow names too, policies or not: a
 	// renamed table would escape erasure (see package erasure).
 	checked := false
@@ -1072,6 +1081,9 @@ func (s *Server) policyRewrite(ctx context.Context, sess *session, user auth.Use
 	}
 	if !sens.triggers(query, admin) {
 		return query, g, ran, nil
+	}
+	if !ddl {
+		defer s.holdCatalog(sess)()
 	}
 	ran = true
 	privs, err := s.privileges(ctx, sess, user)

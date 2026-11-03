@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/akkio-inc/igloo/internal/auth"
 	"github.com/akkio-inc/igloo/internal/distributed"
 )
 
@@ -50,6 +51,49 @@ func TestWorkersStatementTakesCatalogShared(t *testing.T) {
 			}
 			if w := lastWorkers(t, ds.history, "SELECT count(*) FROM ("+query+")"); w != 2 {
 				t.Errorf("it ran on %d workers, want 2", w)
+			}
+		})
+	}
+}
+
+// TestQueryBesidePoliciesTakesCatalogShared prepares and runs an admin's query of a
+// table no policy concerns, on a replica with a masking policy on another, while another
+// holder keeps the catalog lock shared: it finishes, where preparing it took the lock
+// exclusively to apply the policies, and queued every query behind the others' binds.
+func TestQueryBesidePoliciesTakesCatalogShared(t *testing.T) {
+	t.Parallel()
+	cs, _ := startCatalogFixture(t)
+	for name, mode := range modes {
+		t.Run(name, func(t *testing.T) {
+			ada := cs.user(t, "ada_"+name, auth.RoleAdmin, mode)
+			rita := cs.user(t, "rita_"+name, auth.RoleReader, mode)
+			ctx := context.Background()
+			query := "SELECT count(*) FROM lake.public.items_" + name
+			mustExec(t, cs.admin, "CREATE TABLE lake.public.items_"+name+" AS SELECT range AS id FROM range(10)")
+			var n int
+			// The first prepare lists what policies may reach through, holding the
+			// lock alone.
+			if err := ada.QueryRow(ctx, query).Scan(&n); err != nil || n != 10 {
+				t.Fatalf("%d rows, %v", n, err)
+			}
+			release := cs.srv.engine.CatalogShare()
+			done := make(chan error, 1)
+			go func() { done <- ada.QueryRow(ctx, query+" WHERE id > 2").Scan(&n) }()
+			select {
+			case err := <-done:
+				release()
+				if err != nil || n != 7 {
+					t.Fatalf("%d rows, %v", n, err)
+				}
+			case <-time.After(20 * time.Second):
+				release()
+				<-done
+				t.Fatal("the query waited for the catalog lock while it was held shared: something took it exclusively")
+			}
+			// One that reads the protected table still has the policy applied.
+			var code string
+			if err := rita.QueryRow(ctx, "SELECT code FROM lake.public.secrets LIMIT 1").Scan(&code); err != nil || code != "***" {
+				t.Errorf("the protected column read %q, %v", code, err)
 			}
 		})
 	}

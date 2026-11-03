@@ -16,9 +16,11 @@ import (
 // holding the catalog lock exclusively, so every statement of a
 // dashboard's burst that repeats a subquery waited for the others'
 // listings. They are the same in every session, Igloo's own macros
-// included (it makes them in each), so they are listed once for each
-// catalog generation; a session that may have temporary macros of its own
-// has its own listed every time.
+// included (it makes them in each), so they are listed once each time the
+// catalog's views, macros, functions or connections change
+// (resultGeneration), not for each table's DDL, as a rollup's every
+// minute; a session that may have temporary macros of its own has its own
+// listed every time.
 type functionList struct {
 	mu   lockorder.Mutex
 	gen  uint64
@@ -43,7 +45,7 @@ const functionListQuery = `SELECT system.main.lower(function_name) || chr(9) || 
 
 // functionSets returns the functions of the session's connection.
 func (s *Server) functionSets(ctx context.Context, sess *session) (*functionSets, error) {
-	gen := s.catalogGeneration()
+	gen := s.resultGeneration()
 	f := &s.functions
 	if !sess.temps {
 		f.mu.Lock()
