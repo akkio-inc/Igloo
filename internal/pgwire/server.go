@@ -2412,6 +2412,20 @@ type catalogHold struct{ mode catalogMode }
 // shared, for DuckDB binding a statement (the bind hold openSession sets):
 // binds are safe alongside each other, not alongside the rest. Holds are
 // reentrant per session: the several steps that reach the set while one
+// statement is handled (preparing it, binding it, rechecking it, running it,
+// and the commands that resolve or list catalog objects) each take one
+// without deadlocking, and the engine lock is held once, in the strongest
+// mode the session's holds need. A step that needs it exclusively inside one
+// that holds it shared has the session let go of it and take it exclusively,
+// and back once that step is done; that is safe because the session's steps
+// change holds only between DuckDB's calls, never during one, so nothing of
+// the session's is reaching the set while it holds no lock. The returned
+// func releases this step's hold. With no catalog attached there is no set
+// to guard, so they do nothing.
+func (s *Server) holdCatalog(sess *session) func() {
+	return s.catalogHold(sess, catalogExclusive)
+}
+
 // statementThread runs run, a session's command, on a thread of its own (see
 // terminate.Statement), from which a C++ exception that escapes DuckDB, which
 // nothing can catch, parks the thread rather than end the process: the iceberg
@@ -2447,20 +2461,6 @@ func (s *Server) parked(ctx context.Context, sess *session, what string) {
 	if c := wire.AcceptedConn(ctx); c != nil {
 		_ = c.Close()
 	}
-}
-
-// statement is handled (preparing it, binding it, rechecking it, running it,
-// and the commands that resolve or list catalog objects) each take one
-// without deadlocking, and the engine lock is held once, in the strongest
-// mode the session's holds need. A step that needs it exclusively inside one
-// that holds it shared has the session let go of it and take it exclusively,
-// and back once that step is done; that is safe because the session's steps
-// change holds only between DuckDB's calls, never during one, so nothing of
-// the session's is reaching the set while it holds no lock. The returned
-// func releases this step's hold. With no catalog attached there is no set
-// to guard, so they do nothing.
-func (s *Server) holdCatalog(sess *session) func() {
-	return s.catalogHold(sess, catalogExclusive)
 }
 
 // execHeld runs statements of Igloo's own that change the catalog, DDL of
