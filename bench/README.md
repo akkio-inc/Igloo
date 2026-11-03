@@ -323,6 +323,46 @@ does), `--dashboard-users`, `--elt-streams` and `--batch-rows`, and run
 the client next to the coordinator. The data is synthetic, computed from
 row numbers as in `load-media.sql`.
 
+## Answers beyond one machine's memory
+
+`overmemory.py` checks Igloo's answers where the data outgrows the
+coordinator: TPC-H (with joins and aggregations on a key that holds 60% of
+the rows) and TPC-DS, at a scale whose working sets exceed the
+coordinator's memory, for example scale factor 100 with
+`IGLOO_DUCKDB_MEMORY_LIMIT=8GB`. Plain DuckDB with ample memory generates
+the data, writes it as Parquet and keeps every query's answer; Igloo loads
+the same files and runs each query with distributed execution `off`, `on`
+or `auto`. Per query it records whether the rows match, where the
+statement ran, its time, the coordinator's and the workers' peak memory,
+spill, and the bytes the workers exchanged; `--writes` adds a copy and a
+bucketed copy of a table, each checked against it.
+
+```sh
+python bench/overmemory.py reference --suite tpcds --scale 100 --data /mnt/data/tpcds100 --out tpcds100.ref.json
+aws s3 sync /mnt/data/tpcds100 s3://BUCKET/bench-data/tpcds100/
+python bench/overmemory.py load --reference tpcds100.ref.json --schema lake.tpcds100 --source s3://BUCKET/bench-data/tpcds100
+python bench/overmemory.py run --reference tpcds100.ref.json --schema lake.tpcds100 --mode on --label on \
+    --out results.jsonl --workers 10.0.0.11,10.0.0.12 --worker-spill-cmd 'ssh {host} du -sb /var/lib/igloo/tmp'
+python bench/overmemory.py report results.jsonl > report.md
+```
+
+Numbers compare to six significant digits, rows in any order. A query whose
+answer has up to 1,000 rows lists the rows only one side returned.
+
+## Catalog lock waits
+
+`catalogload.py` runs dashboards, ingestion, schema changes as a dbt run
+makes them, and BI metadata discovery (`information_schema`, `pg_catalog`
+and `DESCRIBE`, each from a new session) on one replica at once, then
+reports from the history how long statements waited for the catalog lock
+(`catalog_wait_ms`) at p50 and p95 by stream and statement type, how long
+BI sessions took to open, and the replica's threads.
+
+```sh
+python bench/catalogload.py setup --schema lake.catload
+python bench/catalogload.py run --schema lake.catload --duration 600 --out catalogload.json > catalogload.md
+```
+
 ## What it does not measure yet
 
 - **Concurrency against other platforms.** `mixed.py` runs many users and
