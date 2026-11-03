@@ -358,14 +358,19 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if p.takeCommit(w, r, rest, body) {
 		return
 	}
-	// A change makes the listings kept stale: forgotten before it, so no
-	// listing begun before it is kept, and after it, so none answered
-	// while it was under way is. So does it the versions of the tables it
-	// changes.
+	// A change that may make, drop or rename a name makes the listings of its
+	// namespaces stale (see staleListings): forgotten before it, so no listing
+	// begun before it is kept, and after it, so none answered while it was
+	// under way is. A change raises the versions of the tables it changes.
 	tables, known, none := changedTables(r.Method, rest, body)
+	scopes, all := staleListings(r.Method, rest, body)
 	changed := func() {
-		if !none {
+		if all {
 			p.lists.forget()
+		} else {
+			p.lists.forgetSome(scopes)
+		}
+		if !none {
 			p.data.bumpTables(tables, known)
 		}
 	}

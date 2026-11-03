@@ -933,7 +933,11 @@ and of their tables and views) for up to 10 seconds. DuckDB lists the
 catalog again for every statement that looks a table up, and with hundreds
 of tables each listing cost tens of milliseconds; so did the checks of
 every statement of a user without the reader role. Changes made through
-this replica, and through its Iceberg REST endpoint, apply at once. A table
+this replica, and through its Iceberg REST endpoint, apply at once, and
+forget only the listings of the namespaces they change; commits to existing
+tables forget none. A listing in use is asked for again in the background
+before it expires, so walking the catalog, which holds the catalog lock
+alone, never waits for the catalog for each namespace. A table
 another replica or engine creates or drops is found at once by a query that
 names it, since DuckDB looks up a name its listing lacks; listings
 (`SHOW TABLES`, `information_schema`) show it within 10 seconds.
