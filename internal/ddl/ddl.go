@@ -23,7 +23,6 @@ import (
 	"regexp"
 	"slices"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"time"
 
@@ -34,6 +33,7 @@ import (
 	"github.com/akkio-inc/igloo/internal/catalog"
 	"github.com/akkio-inc/igloo/internal/engine"
 	"github.com/akkio-inc/igloo/internal/iddomain"
+	"github.com/akkio-inc/igloo/internal/lockorder"
 	"github.com/akkio-inc/igloo/internal/snowflake"
 )
 
@@ -71,7 +71,7 @@ type Manager struct {
 
 	// mu serializes view changes and syncs applying what they listed, and
 	// guards the fields below up to known.
-	mu sync.Mutex
+	mu lockorder.Mutex
 	// conn runs syncs.
 	conn  *duckdb.Conn
 	views map[key]catalog.View
@@ -99,8 +99,8 @@ type Manager struct {
 	// reading all of it; metaMu guards the fields below and changes to
 	// meta.
 	meta        atomic.Pointer[catalog.Metadata]
-	readMu      sync.Mutex
-	metaMu      sync.Mutex
+	readMu      lockorder.Mutex
+	metaMu      lockorder.Mutex
 	metaAt      time.Time
 	metaReading bool
 	// touched are the objects read again on their own, and when.

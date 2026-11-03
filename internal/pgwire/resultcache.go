@@ -13,7 +13,6 @@ import (
 	"math/big"
 	"slices"
 	"strings"
-	"sync"
 	"time"
 	"unicode"
 
@@ -26,6 +25,7 @@ import (
 	"github.com/akkio-inc/igloo/internal/audit"
 	"github.com/akkio-inc/igloo/internal/auth"
 	"github.com/akkio-inc/igloo/internal/catalogproxy"
+	"github.com/akkio-inc/igloo/internal/lockorder"
 	"github.com/akkio-inc/igloo/internal/sqllex"
 )
 
@@ -57,7 +57,7 @@ type resultCache struct {
 	max, entryMax int64
 	metrics       *Metrics
 
-	mu      sync.Mutex
+	mu      lockorder.Mutex
 	used    int64
 	lru     *list.List // of *cachedResult, the most recently used first
 	entries map[resultKey]*list.Element

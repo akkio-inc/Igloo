@@ -3,10 +3,10 @@ package pgwire
 import (
 	"context"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/akkio-inc/igloo/internal/catalogproxy"
+	"github.com/akkio-inc/igloo/internal/lockorder"
 )
 
 // txIdleLimit is how long an idle transaction block holds back
@@ -28,7 +28,7 @@ const holdWait = 2 * time.Second
 // runWithCommitRetry). Maintenance leaves these tables' files be (see
 // HoldTable). The session's goroutine writes them; maintenance's reads them.
 type txTables struct {
-	mu     sync.Mutex
+	mu     lockorder.Mutex
 	tables map[string]bool
 	// all says the block listed the catalog (see noteListing), and so may
 	// use any table.

@@ -8,11 +8,12 @@ import (
 	"slices"
 	"sort"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/akkio-inc/igloo/internal/lockorder"
 )
 
 // PostgresStore keeps requests in the "igloo_erasure" schema of the
@@ -258,7 +259,7 @@ func (s *PostgresStore) Close() { s.pool.Close() }
 // MemoryStore keeps requests in memory, for one replica without a
 // metadata database. They are lost on restart.
 type MemoryStore struct {
-	mu       sync.Mutex
+	mu       lockorder.Mutex
 	requests map[string][]byte
 	files    map[string][]File
 	caches   map[string]Cache

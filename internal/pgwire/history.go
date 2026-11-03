@@ -10,7 +10,6 @@ import (
 	"slices"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 	"unicode/utf8"
 
@@ -21,6 +20,7 @@ import (
 	"github.com/akkio-inc/igloo/internal/ai"
 	"github.com/akkio-inc/igloo/internal/audit"
 	"github.com/akkio-inc/igloo/internal/auth"
+	"github.com/akkio-inc/igloo/internal/lockorder"
 	"github.com/akkio-inc/igloo/internal/sqllex"
 )
 
@@ -294,7 +294,7 @@ type tagWriter struct {
 // cancel (see guardLocal) from both happening: once output has begun, the
 // guard does not fire, and once it fired, no output follows.
 type rowGate struct {
-	mu           sync.Mutex
+	mu           lockorder.Mutex
 	begun, fired bool
 }
 

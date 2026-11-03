@@ -7,12 +7,12 @@ import (
 	"io"
 	"log/slog"
 	"strings"
-	"sync"
 
 	"gocloud.dev/blob"
 
 	"github.com/akkio-inc/igloo/internal/catalog"
 	"github.com/akkio-inc/igloo/internal/config"
+	"github.com/akkio-inc/igloo/internal/lockorder"
 	"github.com/akkio-inc/igloo/internal/prefetch"
 )
 
@@ -58,7 +58,7 @@ type bucket interface {
 // credentials, keeping one file system a bucket.
 type objectOpener struct {
 	storage config.Storage
-	mu      sync.Mutex
+	mu      lockorder.Mutex
 	buckets map[string]bucket
 }
 

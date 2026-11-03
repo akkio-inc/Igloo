@@ -15,6 +15,7 @@ import (
 	"github.com/akkio-inc/igloo/internal/ddl"
 	"github.com/akkio-inc/igloo/internal/distributed"
 	"github.com/akkio-inc/igloo/internal/engine"
+	"github.com/akkio-inc/igloo/internal/lockorder"
 	"github.com/akkio-inc/igloo/internal/sqllex"
 )
 
@@ -103,7 +104,7 @@ var heavyMoveWithin = 60 * time.Second
 
 // heavyHistory is what statements of each shape took.
 type heavyHistory struct {
-	mu     sync.Mutex
+	mu     lockorder.Mutex
 	shapes map[string]*shapeRuns
 	// cpu is how much CPU time at the least makes a statement heavy, factor
 	// how many times the others' (see line), and after how long it starts again
@@ -319,7 +320,7 @@ func (s *Server) besideIsHeavy(sess *session) bool {
 
 // backgroundLane is the second DuckDB as this server uses it.
 type backgroundLane struct {
-	once sync.Mutex
+	once lockorder.Mutex
 	eng  *engine.Engine
 	// views keeps the local copies of the catalog's views there.
 	views *ddl.Manager

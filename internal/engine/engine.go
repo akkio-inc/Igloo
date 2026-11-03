@@ -24,6 +24,7 @@ import (
 	"github.com/akkio-inc/igloo/internal/catalog"
 	"github.com/akkio-inc/igloo/internal/catalogproxy"
 	"github.com/akkio-inc/igloo/internal/config"
+	"github.com/akkio-inc/igloo/internal/lockorder"
 	"github.com/akkio-inc/igloo/internal/memlimit"
 	"github.com/akkio-inc/igloo/internal/models"
 	"github.com/akkio-inc/igloo/internal/policy"
@@ -94,7 +95,7 @@ type Engine struct {
 	models *models.Runtime
 	// purges are what EmptyCache empties beside the read cache (see
 	// OnEmptyCache).
-	purgeMu sync.Mutex
+	purgeMu lockorder.Mutex
 	purges  []func()
 	// forecasting forecasts with the model pack's models (see Forecasting).
 	forecasting *tsforecast.Service
@@ -115,7 +116,7 @@ type Engine struct {
 	// bg is that one, opened at its first use, and the rest its upkeep.
 	cfg          config.Config
 	isBackground bool
-	bgMu         sync.Mutex
+	bgMu         lockorder.Mutex
 	bg           *Engine
 	bgErr        error
 	bgAt         time.Time
@@ -126,7 +127,7 @@ type Engine struct {
 	// (see applyBackgroundLimit).
 	bgLowering atomic.Bool
 	bgLowers   sync.WaitGroup
-	balanceMu  sync.Mutex
+	balanceMu  lockorder.Mutex
 	// limit is the memory limit memlimit gives it, for the two together;
 	// current what it is now set to; fgRead when a statement that reads
 	// tables last ran in it, in Unix nanoseconds.
@@ -328,12 +329,23 @@ func (e *Engine) LocalDatabase() string { return e.local }
 // once, and never takes it from inside a DuckDB call on a connection whose
 // session holds it.
 func (e *Engine) CatalogLock() func() {
+	e.checkOrder("the catalog lock")
 	e.catMu.Lock()
 	e.catLocked.Store(time.Now().UnixNano())
 	e.respell()
 	return func() {
 		e.catLocked.Store(0)
 		e.catMu.Unlock()
+	}
+}
+
+// checkOrder checks, in tests, that the goroutine about to wait for the catalog lock
+// holds none of the server's mutexes (see package lockorder). The second DuckDB's
+// lock is its own, which nothing holds while it waits for them: the server opens
+// that DuckDB holding one.
+func (e *Engine) checkOrder(what string) {
+	if !e.isBackground {
+		lockorder.Outer(what)
 	}
 }
 
@@ -367,6 +379,7 @@ func (e *Engine) CatalogTryLock(ctx context.Context, wait time.Duration) (releas
 // against the catalog's in-memory set (see CatalogLock), and returns the
 // func that releases it.
 func (e *Engine) CatalogShare() func() {
+	e.checkOrder("the catalog lock, shared")
 	e.catMu.RLock()
 	return e.shared()
 }
@@ -391,6 +404,10 @@ func (e *Engine) SharedRefusals() uint64 { return e.proxy.Refusals() }
 // came first and ahead of those that come later, and hands the lock over;
 // if ctx ended first, it lets go of the lock as soon as it gets it.
 func (e *Engine) CatalogShareContext(ctx context.Context) (func(), error) {
+	if e.catMu.TryRLock() {
+		return e.shared(), nil
+	}
+	e.checkOrder("the catalog lock, shared")
 	if e.catMu.TryRLock() {
 		return e.shared(), nil
 	}
@@ -600,7 +617,7 @@ func (e *Engine) loadSchemas(ctx context.Context, conn *duckdb.Conn, tables [][2
 	// binds.
 	jobs := make(chan [2]string)
 	var (
-		mu   sync.Mutex
+		mu   lockorder.Mutex
 		errs []error
 		wg   sync.WaitGroup
 	)

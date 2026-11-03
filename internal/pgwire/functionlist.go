@@ -3,8 +3,8 @@ package pgwire
 import (
 	"context"
 	"strings"
-	"sync"
 
+	"github.com/akkio-inc/igloo/internal/lockorder"
 	"github.com/akkio-inc/igloo/internal/sqllex"
 )
 
@@ -20,7 +20,7 @@ import (
 // catalog generation; a session that may have temporary macros of its own
 // has its own listed every time.
 type functionList struct {
-	mu   sync.Mutex
+	mu   lockorder.Mutex
 	gen  uint64
 	sets *functionSets
 }

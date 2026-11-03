@@ -5,6 +5,8 @@ import (
 	"net"
 	"sync"
 	"time"
+
+	"github.com/akkio-inc/igloo/internal/lockorder"
 )
 
 // Failed logins are limited per user and per client address: after
@@ -42,7 +44,7 @@ const (
 
 // loginLimiter counts recent failed logins, and logins in progress.
 type loginLimiter struct {
-	mu      sync.Mutex
+	mu      lockorder.Mutex
 	now     func() time.Time
 	users   map[string][]time.Time
 	addrs   map[string][]time.Time

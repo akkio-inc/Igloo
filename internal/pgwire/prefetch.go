@@ -5,7 +5,6 @@ import (
 	"regexp"
 	"slices"
 	"strings"
-	"sync"
 
 	"github.com/duckdb/duckdb-go/v2"
 	"github.com/jackc/pgx/v5/pgtype"
@@ -15,6 +14,7 @@ import (
 
 	"github.com/akkio-inc/igloo/internal/auth"
 	"github.com/akkio-inc/igloo/internal/distributed"
+	"github.com/akkio-inc/igloo/internal/lockorder"
 	"github.com/akkio-inc/igloo/internal/prefetch"
 	"github.com/akkio-inc/igloo/internal/sqllex"
 )
@@ -137,7 +137,7 @@ func (s *Server) prefetchStatement(ctx context.Context, sess *session, st *state
 	}
 	ctx, cancel := context.WithCancel(ctx)
 	var (
-		mu     sync.Mutex
+		mu     lockorder.Mutex
 		stopPf func()
 		done   = make(chan struct{})
 	)
@@ -194,12 +194,9 @@ func prefetchScans(scans []distributed.Scan) []prefetch.Scan {
 // read ahead only ever costs requests, so a name that another replica changed
 // meanwhile does no harm until this one learns of it.
 type scanNames struct {
-	mu      sync.Mutex
+	mu      lockorder.Mutex
 	gen     uint64
 	objects map[string][]object
-	// listing is held while one is listed, so that sessions that miss the
-	// same name at once list it once.
-	listing sync.Mutex
 }
 
 // scanResolver is a resolver for what sess's statement reads ahead. A session
@@ -223,12 +220,11 @@ func (s *Server) scanResolver(ctx context.Context, sess *session) (*resolver, er
 		if objs, ok := cached(name); ok {
 			return objs
 		}
+		// With no mutex held: listing takes the catalog lock, which this
+		// session may hold already while another waits for a mutex it would
+		// hold (see package lockorder). Sessions missing a name at once each
+		// read it from the server's indexes, which are built once.
 		n := &s.scanNames
-		n.listing.Lock()
-		defer n.listing.Unlock()
-		if objs, ok := cached(name); ok {
-			return objs
-		}
 		gen := s.catalogGeneration()
 		list := *r
 		list.lookup, list.objects = nil, map[string][]object{}

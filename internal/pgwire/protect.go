@@ -14,7 +14,6 @@ import (
 	"slices"
 	"strconv"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"time"
 
@@ -25,6 +24,7 @@ import (
 	"github.com/akkio-inc/igloo/internal/auth"
 	"github.com/akkio-inc/igloo/internal/cleanroom"
 	"github.com/akkio-inc/igloo/internal/iddomain"
+	"github.com/akkio-inc/igloo/internal/lockorder"
 	"github.com/akkio-inc/igloo/internal/models"
 	"github.com/akkio-inc/igloo/internal/policy"
 	"github.com/akkio-inc/igloo/internal/sqllex"
@@ -50,7 +50,7 @@ type governance struct {
 	refresh time.Duration
 	log     *slog.Logger
 
-	mu      sync.Mutex
+	mu      lockorder.Mutex
 	snap    atomic.Pointer[policy.Snapshot]
 	checked atomic.Int64
 	// confirmed is when the store last answered: the snapshot was current
@@ -63,7 +63,7 @@ type governance struct {
 
 	probe policyProbe
 
-	tmplMu    sync.Mutex
+	tmplMu    lockorder.Mutex
 	templates map[string]*bodyTemplate
 
 	// allowed are the locations users other than admins may read files

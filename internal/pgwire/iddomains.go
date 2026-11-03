@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"slices"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/duckdb/duckdb-go/v2"
@@ -19,6 +18,7 @@ import (
 	"github.com/akkio-inc/igloo/internal/catalog"
 	"github.com/akkio-inc/igloo/internal/ddl"
 	"github.com/akkio-inc/igloo/internal/iddomain"
+	"github.com/akkio-inc/igloo/internal/lockorder"
 	"github.com/akkio-inc/igloo/internal/policy"
 	"github.com/akkio-inc/igloo/internal/sqllex"
 )
@@ -596,7 +596,7 @@ const memberCheck = 5 * time.Second
 // memberCache is which tables have columns that hold ids, as of the store's
 // version when last checked.
 type memberCache struct {
-	mu      sync.Mutex
+	mu      lockorder.Mutex
 	checked time.Time
 	// confirmed is when the store last answered, which membersCurrent
 	// holds to the maximum staleness.

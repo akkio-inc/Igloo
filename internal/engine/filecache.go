@@ -49,6 +49,7 @@ import (
 
 	"github.com/duckdb/duckdb-go/v2"
 
+	"github.com/akkio-inc/igloo/internal/lockorder"
 	"github.com/akkio-inc/igloo/internal/prefetch"
 )
 
@@ -112,7 +113,7 @@ type fileCache struct {
 	path string
 	open func(ctx context.Context, path string) (prefetch.Object, error)
 
-	mu sync.Mutex
+	mu lockorder.Mutex
 	// cancel stops a restore under way, and running waits for it.
 	cancel  context.CancelFunc
 	running sync.WaitGroup

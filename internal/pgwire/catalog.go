@@ -13,6 +13,7 @@ import (
 	"github.com/akkio-inc/igloo/internal/catalog"
 	"github.com/akkio-inc/igloo/internal/engine"
 	"github.com/akkio-inc/igloo/internal/iddomain"
+	"github.com/akkio-inc/igloo/internal/lockorder"
 	"github.com/akkio-inc/igloo/internal/policy"
 	"github.com/akkio-inc/igloo/internal/sqllex"
 )
@@ -67,7 +68,7 @@ const ownersTTL = 30 * time.Second
 
 // ownerCache keeps the owners of the catalog's objects.
 type ownerCache struct {
-	mu     sync.Mutex
+	mu     lockorder.Mutex
 	at     time.Time
 	owners []auth.Ownership
 }
@@ -124,7 +125,7 @@ const (
 
 // connectionListing keeps the tables and columns of the connections.
 type connectionListing struct {
-	mu      sync.Mutex
+	mu      lockorder.Mutex
 	gen     uint64
 	at      time.Time
 	listing bool

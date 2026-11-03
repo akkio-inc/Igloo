@@ -24,6 +24,7 @@ import (
 	"github.com/akkio-inc/igloo/internal/auth"
 	"github.com/akkio-inc/igloo/internal/distributed"
 	"github.com/akkio-inc/igloo/internal/iddomain"
+	"github.com/akkio-inc/igloo/internal/lockorder"
 	"github.com/akkio-inc/igloo/internal/models"
 	"github.com/akkio-inc/igloo/internal/snowflake"
 	"github.com/akkio-inc/igloo/internal/tsforecast"
@@ -1068,7 +1069,7 @@ func columnKey(db, schema, table string, columns []distributed.Column) string {
 // columnCache is what DuckDB bound of tables' columns (see boundColumns), at
 // most maxCachedColumns tables' worth: past that it starts again.
 type columnCache struct {
-	mu   sync.Mutex
+	mu   lockorder.Mutex
 	cols map[string][]distributed.Column
 }
 
@@ -1335,7 +1336,7 @@ func macroDefinitions(ctx context.Context, conn *duckdb.Conn, cond string) ([]ma
 }
 
 var (
-	sfMacrosMu sync.Mutex
+	sfMacrosMu lockorder.Mutex
 	// sfMacros are the keys of Igloo's macros for Snowflake's functions as
 	// a session defines them, sorted.
 	sfMacros []string

@@ -10,12 +10,12 @@ import (
 	"regexp"
 	"slices"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/duckdb/duckdb-go/v2"
 
 	"github.com/akkio-inc/igloo/internal/auth"
+	"github.com/akkio-inc/igloo/internal/lockorder"
 	"github.com/akkio-inc/igloo/internal/sqllex"
 )
 
@@ -951,7 +951,7 @@ const tableIndexTTL = 10 * time.Second
 // tableIndex is the tables of every database but temp, which is each
 // session's own, by lower-cased name (see indexedTables).
 type tableIndex struct {
-	mu sync.Mutex
+	mu lockorder.Mutex
 	// gen is the generations it was built at (see indexedTables), and at
 	// when.
 	gen    uint64

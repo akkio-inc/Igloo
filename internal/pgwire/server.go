@@ -48,6 +48,7 @@ import (
 	"github.com/akkio-inc/igloo/internal/erasure"
 	"github.com/akkio-inc/igloo/internal/federation"
 	"github.com/akkio-inc/igloo/internal/iddomain"
+	"github.com/akkio-inc/igloo/internal/lockorder"
 	"github.com/akkio-inc/igloo/internal/memlimit"
 	"github.com/akkio-inc/igloo/internal/modelpack"
 	"github.com/akkio-inc/igloo/internal/models"
@@ -529,7 +530,7 @@ type Server struct {
 	// countsGen is the generation of the distinct counts last handed to
 	// DuckDB, and countsMu serializes handing them (see
 	// registerDistinctCounts).
-	countsMu  sync.Mutex
+	countsMu  lockorder.Mutex
 	countsGen atomic.Uint64
 	// beforePrepare, if set, runs as a statement a client sent (text)
 	// starts to be prepared, with the context that ends its preparing (for
@@ -584,7 +585,7 @@ type Server struct {
 	uploadStoreFor func(dir string) (uploads.Store, error)
 	// replicaWrites counts the INSERTs running on this replica by the names of their
 	// tables, under replicaWritesMu (see replicaWrite).
-	replicaWritesMu sync.Mutex
+	replicaWritesMu lockorder.Mutex
 	replicaWrites   map[string]int
 	// beforeWriteCommit, if set, runs before files workers wrote under dir
 	// are committed, and fails the commit with its error (see tableWrite).
@@ -635,7 +636,7 @@ type Server struct {
 	analyzer *analyzer
 	// sketches says DuckDB has the datasketches extension's functions,
 	// once sketchesKnown (see hasSketches).
-	sketchesMu    sync.Mutex
+	sketchesMu    lockorder.Mutex
 	sketchesKnown bool
 	sketches      bool
 }
@@ -1076,7 +1077,7 @@ type session struct {
 
 	// mu guards the fields below, which cancel requests and user changes
 	// reach from other connections.
-	mu      sync.Mutex
+	mu      lockorder.Mutex
 	user    auth.User
 	checked time.Time
 	running context.CancelFunc
@@ -3404,7 +3405,7 @@ var errDenied = pgerror.WithCode(errors.New("denied"), codes.InsufficientPrivile
 // registry tracks sessions so cancel requests, which arrive on a separate
 // connection, and user changes can reach them.
 type registry struct {
-	mu    sync.Mutex
+	mu    lockorder.Mutex
 	byPID map[int32]*session
 	// abandoned is called for each session dropped because its connection
 	// died between login and setup, to give back its connection slot.
