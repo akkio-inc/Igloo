@@ -200,10 +200,13 @@ func (s *Server) newTableWrite(ctx context.Context, sess *session, schema, name 
 
 // partitionExpr is the SQL expression, of column col of Iceberg type t,
 // whose values divide rows among the files of transform's partitions, as
-// the partition values a file's footer gives (see DataFiles); "" for a
+// the partition values a file's footer gives (see DataFilesFrom); "" for a
 // transform that divides nothing. why says why no expression will do: the
-// transform's value could not be read from a file's bounds (a bucket's), so
-// the current way writes the table.
+// transform's value could not be read from a file's bounds, so the current way
+// writes the table. A bucket's is that of a file's lowest value, as each file
+// holds one bucket's rows, for types whose Parquet bounds are values the file
+// holds (not a string's, which may be cut short), and which iceberg_bucket
+// hashes as Iceberg's spec does (see distributed's bucketHashes).
 func partitionExpr(transform iceberg.Transform, col string, t iceberg.Type) (expr, why string) {
 	utc := col
 	if _, tz := t.(iceberg.TimestampTzType); tz {
@@ -240,6 +243,12 @@ func partitionExpr(transform iceberg.Transform, col string, t iceberg.Type) (exp
 			return temporal("hour")
 		}
 		return "", "an hour of type " + t.String()
+	case iceberg.BucketTransform:
+		switch t.(type) {
+		case iceberg.Int32Type, iceberg.Int64Type, iceberg.DateType, iceberg.TimestampType, iceberg.TimestampTzType:
+			return "iceberg_bucket(" + strconv.Itoa(tr.NumBuckets) + ", " + col + ")", ""
+		}
+		return "", "bucket of type " + t.String()
 	case iceberg.TruncateTransform:
 		width := strconv.Itoa(tr.Width)
 		switch t.(type) {

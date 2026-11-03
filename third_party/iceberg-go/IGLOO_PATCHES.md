@@ -148,7 +148,11 @@ One serves materialized views' full refreshes (`internal/pgwire`, see
   `Copy` on the blob and local stores copies a file server-side, which a commit of
   files workers wrote does first, to where they cannot write. Files by way of
   `DataFilesFrom` may have columns optional that the table requires, whose null
-  counts Igloo checks.
+  counts Igloo checks. Each file workers write holds the rows of one partition,
+  so `DataFilesFrom` gives a file's partition under a transform that does not
+  keep order, bucket's, from its lowest value, which its highest must agree
+  with (`DataFileStatistics.PartitionValueOfOne` in `table/internal/utils.go`);
+  `AddFiles` and `DataFiles` still refuse such a field.
 
 Two bound the memory that writing Arrow records to Parquet takes, which
 table maintenance (`internal/maintenance`, see `budget.go`) relies on to

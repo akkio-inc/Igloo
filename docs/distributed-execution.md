@@ -477,9 +477,13 @@ statement's rows are in the table when that commit is, or not at all.
   makes more files where their partitions are mixed. Auto mode has this replica
   write a table whose files would be under 8 MiB on average, or need that sort,
   where it has the room; `distributed_execution = 'on'` still sends it to workers.
+- **Bucketed tables** too, of integers, dates and timestamps: each file holds
+  one bucket's rows, as workers divide them with `iceberg_bucket`, so a
+  file's bucket is that of its lowest value.
 - **On the coordinator's way instead**, as the log says at debug level: tables
-  partitioned by bucket, or identity of decimals, whose partition values
-  cannot be read from a file's bounds or written to its manifest; tables with
+  partitioned by bucket of a string, whose Parquet bounds may be cut short, or
+  identity of decimals, whose partition values cannot be read from a file's
+  bounds or written to its manifest; tables with
   an Iceberg sort order (Igloo keeps [its own as a property](sql.md));
   fixed, nanosecond and format-version-1 columns; a query that sorts,
   limits or groups in its last step; a fill estimated at less than 256 MiB in

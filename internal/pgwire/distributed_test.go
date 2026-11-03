@@ -226,11 +226,21 @@ func startTestWorkerLimited(t *testing.T, dir string, i int, gate *taskGate, rb 
 	if err := os.MkdirAll(tmp, 0o700); err != nil {
 		t.Fatal(err)
 	}
+	// Igloo's own extensions, as engine.OpenWorker loads them: rb if given, and
+	// Igloo's build of iceberg (whose iceberg_bucket writes bucketed tables),
+	// which loads avro from DuckDB's extension directory.
+	var own []string
+	if rb != "" {
+		own = append(own, "LOAD "+quoteLiteral(rb))
+	}
+	if ice, ext := os.Getenv("IGLOO_TEST_ICEBERG_EXTENSION"), os.Getenv("IGLOO_TEST_EXTENSION_DIR"); ice != "" && ext != "" {
+		own = append(own, "SET extension_directory = "+quoteLiteral(ext), "LOAD "+quoteLiteral(ice))
+	}
 	dsn := ""
 	var load []string
-	if rb != "" {
+	if len(own) > 0 {
 		dsn = "?allow_unsigned_extensions=true"
-		load = []string{"LOAD " + quoteLiteral(rb), "SET allow_unsigned_extensions = false"}
+		load = append(own, "SET allow_unsigned_extensions = false")
 	}
 	c, err := duckdb.NewConnector(dsn, nil)
 	if err != nil {

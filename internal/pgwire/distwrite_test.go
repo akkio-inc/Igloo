@@ -480,9 +480,9 @@ func TestWorkersWrite(t *testing.T) {
 
 // TestWorkersWritePartitions checks that workers write partitioned tables:
 // one file per partition per task, each in its partition, which readers prune
-// by; and that NULLs and values no path could hold are fine. A table
-// partitioned by bucket, whose values a file's bounds do not give, is written
-// here.
+// by; and that NULLs and values no path could hold are fine. Workers write
+// tables partitioned by bucket too, each file of one bucket; a bucket of
+// strings, whose Parquet bounds may be cut short, is written here.
 func TestWorkersWritePartitions(t *testing.T) {
 	t.Parallel()
 	env := startWriteServer(t)
@@ -511,7 +511,11 @@ func TestWorkersWritePartitions(t *testing.T) {
 		{"truncate string", "truncate(3, name)", "left(name, 3)", true},
 		{"two", "g, day(ts)", "", true},
 		{"identity decimal", "price", "", false},
-		{"bucket", "bucket(4, g)", "", false},
+		{"bucket", "bucket(4, g)", "iceberg_bucket(4, g)", true},
+		{"bucket int32", "bucket(3, small)", "iceberg_bucket(3, small)", true},
+		{"bucket date", "bucket(8, day)", "iceberg_bucket(8, day)", true},
+		{"bucket timestamp", "bucket(5, ts)", "iceberg_bucket(5, ts)", true},
+		{"bucket string", "bucket(4, name)", "", false},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			table := "w_p_" + strings.ReplaceAll(c.name, " ", "_")
