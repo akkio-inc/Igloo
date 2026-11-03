@@ -1995,8 +1995,12 @@ expect "and they are gone" "0" igloo "$admin_password" \
   "SELECT count(*) FROM information_schema.tables WHERE table_catalog = 'lake' AND table_schema = 'pgload'"
 
 echo "restart"
-# Read a table once so its files land in the read cache.
-psql_admin -c "CREATE TABLE cached AS SELECT range AS n, md5(range::VARCHAR) AS s FROM range(200000)" >/dev/null
+# Read a table once so its files land in the read cache, and in the list of
+# what DuckDB holds in memory, which a start reads back from object storage
+# before the first queries (see engine's filecache.go). A table maintenance
+# leaves be, in one row group of fewer rows than it splits a table's into:
+# files it rewrote would be in neither.
+psql_admin -c "CREATE TABLE cached AS SELECT range AS n, md5(range::VARCHAR) AS s FROM range(100000)" >/dev/null
 cached="$(psql_admin -c "SELECT sum(n), max(s) FROM cached")"
 compose restart igloo >/dev/null
 compose up -d --wait --wait-timeout 120 igloo >/dev/null
@@ -2004,13 +2008,16 @@ expect "data survives a restart" "3" walt walt-password-1 "SELECT count(*) FROM 
 if curl -s "http://127.0.0.1:$http_port/metrics" | grep -q '^igloo_cache_limit_bytes 0$'; then
   printf '  skip  %s\n' "read cache: paused, the disk is almost full"
 else
+  # The first read misses nothing: what the restore brought back DuckDB
+  # reads from memory, which the read cache does not count, and the rest
+  # from the read cache.
   got="$(printf '%s\n' "SET cache_httpfs_profile_type = 'temp';" "SELECT sum(n), max(s) FROM cached;" \
-    "SELECT cache_hit_count > 0 AND cache_miss_count = 0 FROM cache_httpfs_cache_access_info_query() WHERE cache_type = 'data';" \
+    "SELECT cache_miss_count = 0 FROM cache_httpfs_cache_access_info_query() WHERE cache_type = 'data';" \
     "SET cache_httpfs_profile_type = 'noop';" | psql_admin)" || true
   if [ "$got" = "$(printf 'SET\n%s\nt\nSET' "$cached")" ]; then
-    pass "after a restart, table files come from the read cache"
+    pass "after a restart, a table read before is read from the read cache and DuckDB's memory, none of it from object storage"
   else
-    fail "read cache after a restart: got [$got], want the result [$cached] and only cache hits"
+    fail "read cache after a restart: got [$got], want the result [$cached] and no misses"
   fi
 fi
 expect "views and comments survive a restart" "3|Test rows | :tag:e2e" rita rita-password-1 \
