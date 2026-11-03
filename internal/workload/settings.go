@@ -182,9 +182,10 @@ type Limits struct {
 	// Apart says it is to run in the replica's second DuckDB, whose memory
 	// SampleMemory does not read. It is the statement's, not the user's.
 	Apart bool
-	// Unseen says no statement of its shape has run here, so that nothing is
-	// known of what it holds (see Controller.full). It is the statement's,
-	// not the user's.
+	// Unseen says no statement like it has run here, so that nothing is known
+	// of what it holds, and its plan does not say it holds little (see
+	// Controller.full and Controller.Slight). It is the statement's, not the
+	// user's.
 	Unseen bool
 	// Estimated says Memory is what statements like it held, not what its role or
 	// user set. It is the statement's, not the user's.

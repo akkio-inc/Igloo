@@ -317,19 +317,32 @@ therefore goes before a long one that came just before it, and a long one before
 a short one that comes after it would have ended, so nothing starves. A shape
 that took under a second of CPU in one of those runs does not wait at all: it
 neither counts against the replica's limit nor reserves memory. A statement of a
-shape not seen yet, of which nothing is known, waits while DuckDB holds three
-quarters of the memory for the statements running, each such statement counting
-for a quarter of the memory until it has run 30 seconds or ended, so that a
-dashboard's heavy statements do not start together on its first run. It waits for
-the memory for at most a minute, as what holds the memory may run for hours, and
-those that have then start one at a time, the next once the one before has ended. A statement that was canceled
+shape not seen yet, of which nothing is known, has what it will hold estimated
+before it starts, as auto mode estimates it for this replica, from DuckDB's plan of
+it and the tables it reads (see [when](distributed-execution.md#when)). One the
+plan says holds under a 256th of the memory, such as a dashboard's tile or a small
+query, starts as a known statement that holds as little does: plans of joins and
+distinct counts ran up to 45 times short of what DuckDB held. Any other
+waits while another such runs, or while DuckDB holds, or statements reserved,
+three quarters of the memory, and beside it only statements that reserve a quarter
+of the memory or less start, so that a dashboard's heavy statements run one after
+another on its first run rather than fill the memory together and spill. It waits
+for at most a minute in which no other such starts or ends, as what holds the
+memory may run for hours, and those that have then start one at a time, the next
+once the one before has ended. A statement that was canceled
 or passed its timeout, or whose client went away, holds nobody up, even while DuckDB
 has yet to stop it.
 
 On a dashboard's 96 queries at ten times the data, on 8 cores, the slowest tenth
 took 94 s rather than 102 and the slowest hundredth 127 s rather than 135, and
 they ran 2,800 s in all rather than 3,370, without its build taking longer (224 s
-rather than 230); at the data's size its median took 1.1 s, as before.
+rather than 230); at the data's size its median took 1.1 s, as before. On another's
+324 queries at ten times the data, on 8 cores and 22 GB, with no history, the build
+took 1,787 s rather than 3,145, and its statements 14,100 CPU-seconds, as many as
+with history, where up to three statements nothing was known of starting together
+used 29,400. Eight users' dashboards beside a heavy report over a billion rows, with
+no history, finished 105 to 112 statements in their first minute rather than 71, at
+a median of 2.6 to 5.3 s rather than 12 to 14 s.
 
 ### Reservations from history
 

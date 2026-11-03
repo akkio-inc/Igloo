@@ -365,9 +365,10 @@ func serve() error {
 	}
 
 	// Reading ahead for statements lists their scans as distributed
-	// execution plans them.
+	// execution plans them, and so does estimating what a statement nothing
+	// like has run of holds before it starts.
 	var scanner *distributed.Scanner
-	if cfg.Prefetch.Enabled && tables != nil && eng.Prefetcher() != nil {
+	if tables != nil {
 		if scanner, err = distributed.NewScanner(tables); err != nil {
 			return err
 		}

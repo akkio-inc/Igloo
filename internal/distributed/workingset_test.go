@@ -142,6 +142,14 @@ func TestPlanShapes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// The same from the tables alone, as a replica estimates a statement before
+	// its first run.
+	if set, ok := WorkingSet(planJSON(t, e1), []*Table{people, survey}, 24); !ok || set != int64(p.set) {
+		t.Errorf("WorkingSet: %d, %v; want %d", set, ok, int64(p.set))
+	}
+	if _, ok := WorkingSet(planJSON(t, op("ICEBERG_SCAN", nil, "Projections", "pid")), nil, 24); ok {
+		t.Error("WorkingSet said what a scan of a table it was not given holds")
+	}
 	// One branch: 400 million ids of 32 bytes and a join's 32, times 1.5,
 	// and its view's survey; and the view the common table expression reads.
 	one := 400e6*64*heldFactors["join"] + 18e6*48*heldFactors["join"]

@@ -27,12 +27,15 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   row groups of about a sixteenth of it, of at least 122,880 rows.
 
 - A dashboard's first run, with no history, no longer runs its heavy statements
-  together. Statements of shapes not seen yet that have waited a minute for the
-  memory start one at a time, not one every 30 s, and a statement whose text with
-  its literals has not run goes by the most a run alike took, not the median, of
-  which runs over values with no rows had been most. Its 324 queries at ten times
-  the data, on 8 cores, took 3,145 s rather than 3,928, and none ran past its
-  timeout, where three had.
+  together. A statement of a shape not seen yet that would wait is first estimated
+  from DuckDB's plan and the tables it reads, as auto mode estimates it: one that
+  holds under a 256th of the memory, such as a tile or a small query, starts at
+  once, and any other waits while another such runs, for at most a minute in which
+  none starts or ends. A statement whose text with its literals has not run goes by
+  the most a run alike took, not the median, of which runs over values with no rows
+  had been most. Its 324 queries at ten times the data, on 8 cores, took 1,787 s
+  rather than 3,928, and none ran past its timeout, where three had; they used
+  14,100 CPU-seconds, as after a run, where running together they used 29,400.
 
 - A canceled statement holds nobody up. Statements behind one waited until DuckDB
   had stopped it, for its slots and its memory, and a statement of a shape not seen

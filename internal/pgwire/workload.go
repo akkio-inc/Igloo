@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -19,6 +20,7 @@ import (
 
 	"github.com/akkio-inc/igloo/internal/audit"
 	"github.com/akkio-inc/igloo/internal/auth"
+	"github.com/akkio-inc/igloo/internal/distributed"
 	"github.com/akkio-inc/igloo/internal/engine"
 	"github.com/akkio-inc/igloo/internal/sqllex"
 	"github.com/akkio-inc/igloo/internal/workload"
@@ -65,6 +67,10 @@ type workloadState struct {
 	// exact is the statement's text with its literals, as a key like shape's;
 	// see workload.Controller.Alike.
 	exact string
+	// planned estimates, for the statement about to run when nothing like it has
+	// run here, what it holds by its plan (see Server.planned); nil where nothing
+	// can say.
+	planned func(context.Context) (int64, bool)
 	// elsewhere gives back what the running statement holds of this replica, once it
 	// runs on workers (see workload.Limits.Elsewhere); nil for none.
 	elsewhere func()
@@ -155,6 +161,40 @@ func (sess *session) onWorkers() {
 	sess.mu.Unlock()
 }
 
+// planned estimates what st, about to run, holds on this replica, as auto mode
+// does: from DuckDB's plan of it and the tables it reads (distributed.WorkingSet).
+// One that nothing like has run of and that holds too little of the memory to
+// count (workload.Controller.Slight) starts at once, as known ones that hold as
+// little do, rather than wait while another nothing is known of runs: a
+// dashboard's tiles, or a small query, the first time. ok is false where the plan
+// cannot say, as for a statement that reads no catalog table: it may hold anything.
+func (s *Server) planned(ctx context.Context, sess *session, st *statement) (memory int64, ok bool) {
+	text := scanText(st.stmtType, st.query)
+	if s.scanner == nil || text == "" {
+		return 0, false
+	}
+	resolver, err := s.scanResolver(ctx, sess)
+	if err != nil {
+		return 0, false
+	}
+	env := &scanEnv{sessionEnv: &sessionEnv{s: s, sess: sess, user: sess.currentUser(), st: st}}
+	env.resolver = resolver
+	scans, err := s.scanner.Resolve(ctx, text, env)
+	if err != nil {
+		return 0, false
+	}
+	plan, err := env.Explain(ctx, text)
+	if err != nil {
+		return 0, false
+	}
+	threads, err := settingValue(ctx, sess.conn, "threads")
+	if err != nil {
+		return 0, false
+	}
+	n, _ := strconv.Atoi(threads)
+	return distributed.WorkingSet(plan, scans.Tables(ctx), n)
+}
+
 // admit waits until the session's limits let a statement start, and
 // returns the function to call when it ends.
 func (sess *session) admit(ctx context.Context) (release, leave func(), err error) {
@@ -173,7 +213,14 @@ func (sess *session) admit(ctx context.Context) (release, leave func(), err erro
 			// What statements like it held, when its role reserves nothing.
 			var seen bool
 			l.Memory, seen = controller.Reserve(sess.wl.exact, sess.wl.shape)
-			l.Estimated, l.Unseen = true, !seen
+			// One nothing like has run of is estimated by its plan only when it would
+			// wait: planning a dashboard's statements took up to 11 s on a busy replica.
+			l.Estimated, l.Unseen = true, !seen && !(controller.Crowded() && controller.Slight(func() (int64, bool) {
+				if sess.wl.planned == nil {
+					return 0, false
+				}
+				return sess.wl.planned(ctx)
+			}))
 		}
 	}
 	done, waited, err := sess.wl.controller.Admit(ctx, l)

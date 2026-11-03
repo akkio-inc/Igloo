@@ -61,10 +61,11 @@ type Controller struct {
 	active map[*waiter]struct{}
 	// unseen are those of them nothing was known of when they started.
 	unseen map[*waiter]struct{}
-	// patience is how long a statement nothing is known of waits while the
-	// memory is full, and lastLate when one that had waited as long last went
-	// (see unseenPatience).
+	// patience is how long a statement nothing is known of waits while none
+	// such starts or ends, lastTurn when one last did, and lastLate when one
+	// that had waited as long last went (see unseenPatience).
 	patience time.Duration
+	lastTurn time.Time
 	lastLate time.Time
 	// lateRunning counts the statements running that started late.
 	lateRunning int
@@ -95,9 +96,7 @@ type waiter struct {
 	// released says it has ended, and estimated that history set its memory, not
 	// its role or user.
 	released, estimated bool
-	// started is when it started, for one that is unseen.
-	started time.Time
-	ready   chan struct{}
+	ready               chan struct{}
 	// admitted is set, under the controller's lock, once the statement
 	// holds its slot and reservation.
 	admitted bool
@@ -218,9 +217,21 @@ func (c *Controller) elsewhere(w *waiter) {
 		w.counted = false
 	}
 	delete(c.active, w)
-	delete(c.unseen, w)
+	c.turn(w)
 	c.notLate(w)
 	c.admit()
+}
+
+// turn has w, running, no longer count as one nothing is known of that runs; if it
+// did, and did not start late, the line of such has moved (see unseenPatience). The
+// caller holds c.mu, before notLate.
+func (c *Controller) turn(w *waiter) {
+	if _, ok := c.unseen[w]; ok {
+		delete(c.unseen, w)
+		if !w.late {
+			c.lastTurn = time.Now()
+		}
+	}
 }
 
 // notLate has w, running, no longer count as the late statement that runs. The
@@ -233,7 +244,8 @@ func (c *Controller) notLate(w *waiter) {
 }
 
 // wait waits until w may start, or ctx ends. One nothing is known of stops waiting
-// for the memory once it has waited patience, one of them at a time (see admit).
+// for the memory once it has waited patience while no other such started or ended,
+// one of them at a time (see admit).
 func (c *Controller) wait(ctx context.Context, w *waiter) {
 	var late <-chan time.Time
 	if w.unseen {
@@ -251,8 +263,10 @@ func (c *Controller) wait(ctx context.Context, w *waiter) {
 			c.mu.Lock()
 			w.overdue, late = true, nil
 			c.admit()
-			if next := unseenGrows - time.Since(c.lastLate); !w.admitted && c.lateRunning == 0 && next > 0 {
-				late = time.After(next)
+			if !w.admitted {
+				// Again once the line may have stood still for patience, and the
+				// last late one had the time to grow.
+				late = time.After(max(c.patience-time.Since(c.lastTurn), unseenGrows-time.Since(c.lastLate), time.Second))
 			}
 			c.mu.Unlock()
 		}
@@ -273,7 +287,8 @@ func (c *Controller) reservation(memory int64) int64 {
 // admit starts every waiting statement that may start, in the line's order.
 // The caller holds c.mu.
 func (c *Controller) admit() {
-	if c.lateRunning == 0 && time.Since(c.lastLate) >= unseenGrows && !slices.ContainsFunc(c.queue, func(w *waiter) bool { return w.late }) {
+	if c.lateRunning == 0 && time.Since(c.lastLate) >= unseenGrows && time.Since(c.lastTurn) >= c.patience &&
+		!slices.ContainsFunc(c.queue, func(w *waiter) bool { return w.late }) {
 		// The first overdue in line goes, whatever is held (see unseenPatience).
 		if i := slices.IndexFunc(c.queue, func(w *waiter) bool { return w.overdue }); i >= 0 {
 			c.queue[i].late, c.lastLate = true, time.Now()
@@ -301,8 +316,10 @@ func (c *Controller) admit() {
 				c.active[w] = struct{}{}
 			}
 			if w.unseen {
-				w.started = time.Now()
 				c.unseen[w] = struct{}{}
+				if !w.late {
+					c.lastTurn = time.Now()
+				}
 			}
 			if w.late {
 				c.lateRunning++
@@ -334,44 +351,37 @@ func (c *Controller) admit() {
 // count as nearly full.
 const fullShare = 0.75
 
-// unseenPatience is how long a statement nothing is known of waits for the memory.
-// What holds it may not end for hours: from no history, a report at a hundred times
-// the data ran on one machine, on an estimate of 16 hours, its memory full, and a
-// statement of a shape not seen yet that would have run on workers waited behind it,
-// planning nothing, for as long as it ran. Past this they start whatever is held, one
-// at a time: the next once the one before has ended, or gone to workers. Started one
-// each unseenGrows, as many as waited, a dashboard's 324 statements at ten times its
-// data with no history ran 5 to 8 heavy ones at once, spilled, and took 3,928 s, three
-// of them past their 15-minute timeout; one at a time, with Reserve and Cost, 3,145 s.
+// unseenPatience is how long statements nothing is known of wait for the memory while
+// none such starts or ends. What holds it may not end for hours: from no history, a
+// report at a hundred times the data ran on one machine, on an estimate of 16 hours,
+// its memory full, and a statement of a shape not seen yet that would have run on
+// workers waited behind it, planning nothing, for as long as it ran. Past this they
+// start whatever is held, one at a time: the next once the one before has ended, or
+// gone to workers, as the line has not moved for them. While such statements start
+// and end in their turn, as a dashboard's do the first time, the line moves, and none
+// starts beside another: a dashboard's 324 statements at ten times its data, with no
+// history, waited up to ten minutes each. Each waiting at most a minute, 45 started
+// beside another and the dashboard took 1,916 s; with the line moving, 1,787 s.
 const unseenPatience = time.Minute
 
-// unseenShare is the share of the budget a statement nothing is known of counts for
-// until unseenGrows has passed, by when what it holds shows in what DuckDB holds.
-const (
-	unseenShare = 0.25
-	unseenGrows = 30 * time.Second
-)
+// unseenGrows is how long after one that waited its patience the next may start.
+const unseenGrows = 30 * time.Second
 
-// full reports whether DuckDB holds nearly all the budget for statements
-// running now, or will once those just started that nothing is known of hold
-// what they will: a statement nothing is known of then waits, since what it
-// holds would make those running spill. Reservations cannot say so the first
-// time a dashboard runs on a replica, when none of its statements has any:
-// its heavy ones started together and spilled, and it took half as long again
-// as the next time; five that started together at once when the memory emptied
-// held 39 GB of spill files between them, and two ran past 15 minutes. The caller
-// holds c.mu.
+// full reports whether a statement nothing is known of must wait: another such
+// runs, whose memory cannot show yet in what DuckDB holds and may grow to all of
+// it, or DuckDB holds, or statements reserved, nearly all the budget. What they
+// hold would make those running spill. One whose plan says it holds next to
+// nothing is not taken for unknown (see Slight). Reservations cannot say so
+// the first time a dashboard runs on a replica, when none of its statements has
+// any: its heavy ones started together and spilled. Its 324 statements at ten
+// times its data, from no history, took 3,145 s with up to three such at once
+// while they were young, and 29,400 CPU-seconds where they take 14,000 once known;
+// one at a time, 1,787 s and 14,100 CPU-seconds. The caller holds c.mu.
 func (c *Controller) full() bool {
 	if c.budget <= 0 || len(c.active) == 0 {
 		return false
 	}
-	share, now := float64(c.held)/float64(c.budget), time.Now()
-	for w := range c.unseen {
-		if now.Sub(w.started) < unseenGrows {
-			share += unseenShare
-		}
-	}
-	return share >= fullShare
+	return len(c.unseen) > 0 || float64(max(c.held, c.reserved)) >= fullShare*float64(c.budget)
 }
 
 // heldLeaves reports whether what DuckDB holds for the statements running leaves
@@ -381,10 +391,48 @@ func (c *Controller) full() bool {
 // estimates, and those under a sixteenth of the budget count for nothing: 8
 // statements of a dashboard at ten times its data reserved 15.6 GiB of 20.4, held all
 // of it and spilled 10 GiB more. Its 324 queries took 1,945 s with this, not 2,086.
-// The caller holds c.mu.
+// While one nothing is known of runs, DuckDB counts as holding nearly all the
+// budget (see full), so that only a reservation of a quarter of it or less starts
+// beside it. The caller holds c.mu.
 func (c *Controller) heldLeaves(memory int64) bool {
-	return len(c.active) == 0 || c.held+min(memory, c.budget/4*3) <= c.budget
+	held := c.held
+	if len(c.unseen) > 0 {
+		held = max(held, int64(fullShare*float64(c.budget)))
+	}
+	return len(c.active) == 0 || held+min(memory, c.budget/4*3) <= c.budget
 }
+
+// Crowded reports whether a statement nothing is known of would wait to start now
+// (see full): only then is what it holds worth estimating first (see Slight).
+func (c *Controller) Crowded() bool {
+	if c == nil {
+		return false
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.full()
+}
+
+// Slight reports whether a statement nothing like has run of holds too little of
+// the budget to count, as a reservation under a sixteenth of it does (see
+// estimate), by what estimate says it holds, planShort times over; ok false says it
+// cannot say. One that holds that little starts as a known one that holds as little
+// does. Without a budget every statement is slight, and estimate is not called.
+func (c *Controller) Slight(estimate func() (memory int64, ok bool)) bool {
+	if c == nil || c.budget <= 0 {
+		return true
+	}
+	memory, ok := estimate()
+	return ok && memory*planShort < c.budget/minReservationShare
+}
+
+// planShort is how many times what a plan says a statement holds Slight takes it
+// to hold. A dashboard's statements at ten times its data, joins and distinct counts
+// that plans put at 0.1 to 1.1 GB, held 0.5 to 7.4 GB each, up to 45 times as
+// much, and started together on 22 GB they spilled: the dashboard took 2,536 s.
+// Taken sixteen times over, none of them counts as slight there, and it took 1,787 s,
+// while a dashboard's tiles over a billion rows, which plans put at nothing, do.
+const planShort = 16
 
 // HeldBehindSecond reports whether statements wait in line while all that run
 // run in the second DuckDB: what they wait for is that one's memory, so the
@@ -411,6 +459,7 @@ func (c *Controller) release(w *waiter) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	w.released = true
+	c.turn(w)
 	c.notLate(w)
 	if w.slots.Max > 0 {
 		if c.running[w.slots.Key]--; c.running[w.slots.Key] <= 0 {
@@ -425,7 +474,6 @@ func (c *Controller) release(w *waiter) {
 		c.apartRunning--
 	}
 	delete(c.active, w)
-	delete(c.unseen, w)
 	c.admit()
 }
 

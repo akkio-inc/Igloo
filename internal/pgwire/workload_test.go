@@ -13,6 +13,8 @@ import (
 
 	"github.com/akkio-inc/igloo/internal/audit"
 	"github.com/akkio-inc/igloo/internal/auth"
+	"github.com/akkio-inc/igloo/internal/catalog"
+	"github.com/akkio-inc/igloo/internal/distributed"
 	"github.com/akkio-inc/igloo/internal/workload"
 )
 
@@ -337,6 +339,56 @@ func TestMemoryReservations(t *testing.T) {
 	release, _, _ = ctl.Admit(ctx, workload.Limits{Memory: 1 << 40})
 	defer release()
 	mustExec(t, cs.admin, "SELECT 2")
+}
+
+// TestUnseenSlightStartsAtOnce checks that a statement nothing like has run of
+// starts at once beside another such when its plan says it holds little, as a
+// dashboard's tile does, and that one whose plan says it may hold much waits.
+func TestUnseenSlightStartsAtOnce(t *testing.T) {
+	t.Parallel()
+	vc := newViewCatalog(t)
+	ctx := context.Background()
+	cat, err := catalog.Open(ctx, vc.cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	scanner, err := distributed.NewScanner(distributed.NewIceberg(cat))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = scanner.Close() })
+	// Sixteen times what its plan says it holds must be under a sixteenth of 64
+	// MiB: a distinct count of 300,000 strings is over, a sum of a few rows holds
+	// next to nothing.
+	ctl := workload.NewController(64 << 20)
+	ctl.LimitReplica(8)
+	r := vc.replica(t, func(o *Options) { o.Scanner, o.Workload = scanner, ctl })
+	admin := r.admin(t, pgx.QueryExecModeSimpleProtocol)
+	for _, q := range []string{
+		"CREATE SCHEMA IF NOT EXISTS lake.public",
+		"CREATE TABLE lake.public.tiles AS SELECT i AS day, i * 2 AS clicks FROM range(30) r(i)",
+		"CREATE TABLE lake.public.people AS SELECT md5(CAST(i AS VARCHAR)) AS person FROM range(300000) r(i)",
+	} {
+		mustExec(t, admin, q)
+	}
+	// Another statement nothing is known of runs.
+	release, _, err := ctl.Admit(ctx, workload.Limits{Counted: true, Unseen: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+	mustExec(t, admin, "SET statement_queued_timeout = '2s'")
+	start := time.Now()
+	expectRows(t, admin, "SELECT CAST(sum(clicks) AS BIGINT) FROM lake.public.tiles WHERE day < 7", "42")
+	if took := time.Since(start); took > time.Second {
+		t.Errorf("a slight statement took %s beside an unseen one", took)
+	}
+	if _, err := admin.Exec(ctx, "SELECT count(DISTINCT person) FROM lake.public.people"); pgCode(err) != "57014" || !strings.Contains(err.Error(), "waited") {
+		t.Errorf("a statement that may hold much, beside an unseen one: %v", err)
+	}
+	// Once the other has ended, it starts.
+	release()
+	expectRows(t, admin, "SELECT count(DISTINCT person) FROM lake.public.people", "300000")
 }
 
 // TestStatementShape checks the shapes that reservations learn by: the same

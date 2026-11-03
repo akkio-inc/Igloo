@@ -196,7 +196,9 @@ type Options struct {
 	// means a store in memory.
 	Policies policy.Store
 	// Scanner lists statements' scans, and Prefetcher reads ahead what they
-	// are about to read (see prefetch.go); either nil turns it off.
+	// are about to read (see prefetch.go); either nil turns that off. Without
+	// a Scanner, nothing estimates what a statement holds before its first run
+	// (see Server.planned).
 	Scanner    *distributed.Scanner
 	Prefetcher *prefetch.Prefetcher
 	// IDDomains keeps ID domains and their members (package iddomain). Nil
@@ -457,7 +459,8 @@ type Server struct {
 	// idComplete caches which member tables' snapshots have every row's
 	// ids (see idcount.go).
 	idComplete idComplete
-	// scanner and prefetcher read ahead for statements, or are nil.
+	// scanner and prefetcher read ahead for statements, or are nil; scanner
+	// also lists what statements read for Server.planned.
 	scanner    *distributed.Scanner
 	scanNames  scanNames
 	prefetcher *prefetch.Prefetcher
@@ -2237,6 +2240,7 @@ func (s *Server) preparedQuery(ctx context.Context, sess *session, user auth.Use
 		}
 		shape, exact := sess.wl.shape, sess.wl.exact
 		sess.wl.apart = s.runsApart(sess, st)
+		sess.wl.planned = func(ctx context.Context) (int64, bool) { return s.planned(ctx, sess, st) }
 		err = sess.runCancelable(ctx, q.Query, func(ctx context.Context) error {
 			runOnce := func() error {
 				p, done, err := s.runDistributed(ctx, sess, sess.currentUser(), st, args, tw, sessionMode(sess, sess.currentUser()))
@@ -2316,7 +2320,7 @@ func (s *Server) preparedQuery(ctx context.Context, sess *session, user auth.Use
 			spend = &sp
 			aiNotice(w, sp)
 		}
-		sess.wl.counted, sess.wl.shape, sess.wl.exact, sess.wl.apart = false, "", "", false
+		sess.wl.counted, sess.wl.shape, sess.wl.exact, sess.wl.apart, sess.wl.planned = false, "", "", false, nil
 		if st.filled != nil {
 			// A fill's query ran on workers, or here, as a read of it would
 			// (see fillOn): the history says where, and auto mode learns how

@@ -164,27 +164,46 @@ type planStats struct {
 // newPlanStats collects the columns of a plan's tables, for a machine of
 // threads DuckDB threads.
 func newPlanStats(stages []*Stage, threads int) planStats {
-	st := planStats{width: map[string]float64{}, distinct: map[string]float64{}, threads: max(threads, 1)}
+	var tables []*Table
 	seen := map[*Table]bool{}
 	for _, s := range stages {
 		for _, in := range s.Inputs {
-			if in.Table == nil {
-				continue
-			}
-			if !seen[in.Table] {
+			if in.Table != nil && !seen[in.Table] {
 				seen[in.Table] = true
-				st.tables = append(st.tables, in.Table)
+				tables = append(tables, in.Table)
 			}
-			for _, c := range in.Table.Columns {
-				name := strings.ToLower(c.Name)
-				st.width[name] = max(st.width[name], memoryBytes(c.Type))
-				if n := in.Table.Distinct[name]; n > 0 {
-					st.distinct[name] = max(st.distinct[name], float64(n))
-				}
+		}
+	}
+	return tableStats(tables, threads)
+}
+
+// tableStats collects the columns of tables, for a machine of threads DuckDB
+// threads.
+func tableStats(tables []*Table, threads int) planStats {
+	st := planStats{width: map[string]float64{}, distinct: map[string]float64{}, tables: tables, threads: max(threads, 1)}
+	for _, t := range tables {
+		for _, c := range t.Columns {
+			name := strings.ToLower(c.Name)
+			st.width[name] = max(st.width[name], memoryBytes(c.Type))
+			if n := t.Distinct[name]; n > 0 {
+				st.distinct[name] = max(st.distinct[name], float64(n))
 			}
 		}
 	}
 	return st
+}
+
+// WorkingSet is what a statement holds on one machine whose DuckDB runs
+// threads threads, as auto mode estimates it for this replica: from plan,
+// DuckDB's EXPLAIN (FORMAT JSON) of the statement, and tables, those it
+// reads (see ScanPlan.Tables). ok is false where they cannot say, as for a
+// scan of a table not among tables.
+func WorkingSet(plan string, tables []*Table, threads int) (bytes int64, ok bool) {
+	p, err := planOf(plan, tableStats(tables, threads))
+	if err != nil {
+		return 0, false
+	}
+	return int64(p.set), true
 }
 
 // memoryBytes guesses how many bytes a value of type typ takes in a hash

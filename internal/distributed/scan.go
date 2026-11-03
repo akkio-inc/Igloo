@@ -155,6 +155,27 @@ func (p *ScanPlan) Files(ctx context.Context) ([]Scan, error) {
 	return out, nil
 }
 
+// Tables loads each table the plan's statement reads, as the plan's
+// Scanner's Source has them, without listing their files: those it cannot
+// load are left out. It calls no ScanEnv.
+func (p *ScanPlan) Tables(ctx context.Context) []*Table {
+	w := p.w
+	tables := make([]*Table, len(w.order))
+	g, gctx := errgroup.WithContext(ctx)
+	g.SetLimit(maxScanLoads)
+	for i, key := range w.order {
+		u := w.uses[key]
+		g.Go(func() error {
+			if t, err := p.src.Table(gctx, u.schema, u.name); err == nil {
+				tables[i] = t
+			}
+			return nil
+		})
+	}
+	_ = g.Wait()
+	return slices.DeleteFunc(tables, func(t *Table) bool { return t == nil })
+}
+
 // walkScans walks query, one SELECT, for the catalog tables it reads and
 // the columns it names.
 func walkScans(ctx context.Context, p *parser, query string, env ScanEnv) (*scanWalk, error) {

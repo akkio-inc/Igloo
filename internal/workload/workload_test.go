@@ -673,8 +673,8 @@ func TestCosts(t *testing.T) {
 }
 
 // TestUnseenWaitsWhileMemoryIsFull checks that a statement nothing is known of
-// waits while DuckDB holds nearly all the memory for those running, and that
-// one known to hold little does not.
+// waits while DuckDB holds, or statements reserved, nearly all the memory for
+// those running, and that one known to hold little does not.
 func TestUnseenWaitsWhileMemoryIsFull(t *testing.T) {
 	const gb = int64(1) << 30
 	c := NewController(8 * gb)
@@ -686,7 +686,12 @@ func TestUnseenWaitsWhileMemoryIsFull(t *testing.T) {
 	if err != nil || waited != 0 {
 		t.Fatalf("with nothing running: waited %s: %v", waited, err)
 	}
-	// Below the mark, another starts too.
+	first()
+	// One known to reserve little runs; below the mark, an unseen one starts beside it.
+	running, _, err := c.Admit(ctx, Limits{Counted: true})
+	if err != nil {
+		t.Fatal(err)
+	}
 	c.sample(gb)
 	second, waited, err := c.Admit(ctx, Limits{Counted: true, Unseen: true})
 	if err != nil || waited != 0 {
@@ -721,7 +726,18 @@ func TestUnseenWaitsWhileMemoryIsFull(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("an unseen statement did not start once there was room")
 	}
-	first()
+	// What is reserved counts as held before DuckDB holds it.
+	reserved, _, err := c.Admit(ctx, Limits{Memory: 7 * gb})
+	if err != nil {
+		t.Fatal(err)
+	}
+	soon, stop := context.WithTimeout(ctx, 50*time.Millisecond)
+	defer stop()
+	if _, _, err := c.Admit(soon, Limits{Counted: true, Unseen: true}); !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("beside a reservation of nearly all the memory, not yet held: %v", err)
+	}
+	reserved()
+	running()
 	// Without a replica's limit, it waits all the same.
 	free := NewController(8 * gb)
 	r, _, _ := free.Admit(ctx, Limits{Memory: gb})
@@ -1032,22 +1048,24 @@ func TestRunsThatReadNothing(t *testing.T) {
 	seen("only", 0, 0, true)
 }
 
-// TestUnseenStartAFewAtATime checks that statements nothing is known of do not all
-// start at once while what they will hold cannot show yet, and that one that ends
-// leaves room for the next.
-func TestUnseenStartAFewAtATime(t *testing.T) {
+// TestUnseenStartOneAtATime checks that statements nothing is known of start one at
+// a time, as what each will hold cannot show yet, while known ones start beside
+// them; that only reservations of a quarter of the memory or less start beside one;
+// and that one that ends leaves room for the next.
+func TestUnseenStartOneAtATime(t *testing.T) {
 	const gb = int64(1) << 30
 	c := NewController(16 * gb)
 	c.LimitReplica(8)
 	ctx := context.Background()
-	// The first with nothing running; then until those just started make it full.
-	var running []func() (int64, bool)
-	for range 3 {
-		r, waited, err := c.Admit(ctx, Limits{Counted: true, Unseen: true})
-		if err != nil || waited != 0 {
-			t.Fatalf("waited %s: %v", waited, err)
-		}
-		running = append(running, r)
+	if c.Crowded() {
+		t.Error("crowded with nothing running")
+	}
+	first, waited, err := c.Admit(ctx, Limits{Counted: true, Unseen: true})
+	if err != nil || waited != 0 {
+		t.Fatalf("waited %s: %v", waited, err)
+	}
+	if !c.Crowded() {
+		t.Error("not crowded beside one nothing is known of")
 	}
 	started := make(chan func() (int64, bool), 1)
 	go func() {
@@ -1059,38 +1077,128 @@ func TestUnseenStartAFewAtATime(t *testing.T) {
 	}()
 	select {
 	case <-started:
-		t.Fatal("a fourth started beside three just started")
+		t.Fatal("a second started beside the first")
 	case <-time.After(50 * time.Millisecond):
 	}
-	// One that knows what it reserves starts all the same.
+	// One that knows it reserves nothing starts all the same, and one that
+	// reserves a quarter of the memory; one that reserves more waits.
 	known, waited, err := c.Admit(ctx, Limits{Counted: true})
 	if err != nil || waited != 0 {
 		t.Fatalf("a known statement waited %s: %v", waited, err)
 	}
 	known()
-	// One that ends leaves room.
-	running[0]()
-	var r func() (int64, bool)
-	select {
-	case r = <-started:
-	case <-time.After(5 * time.Second):
-		t.Fatal("the fourth did not start once one had ended")
-	}
-	r()
-	// Once they have had the time to grow, what is held says.
-	c.mu.Lock()
-	for w := range c.unseen {
-		w.started = time.Now().Add(-unseenGrows)
-	}
-	c.mu.Unlock()
-	c.sample(gb)
-	r, waited, err = c.Admit(ctx, Limits{Counted: true, Unseen: true})
+	quarter, waited, err := c.Admit(ctx, Limits{Counted: true, Memory: 4 * gb})
 	if err != nil || waited != 0 {
-		t.Fatalf("with room, past their time to grow: waited %s: %v", waited, err)
+		t.Fatalf("a quarter of the memory waited %s: %v", waited, err)
 	}
+	quarter()
+	short, cancel := context.WithTimeout(ctx, 50*time.Millisecond)
+	defer cancel()
+	if _, _, err := c.Admit(short, Limits{Counted: true, Memory: 5 * gb}); !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("more than a quarter beside an unseen one: %v", err)
+	}
+	// One that ends leaves room.
+	first()
+	select {
+	case r := <-started:
+		r()
+	case <-time.After(5 * time.Second):
+		t.Fatal("the second did not start once the first had ended")
+	}
+}
+
+// TestSlight checks which statements nothing like has run of count as holding too
+// little to wait for others such: under a sixteenth of the budget by their plan,
+// taken planShort times over.
+func TestSlight(t *testing.T) {
+	const gb = int64(1) << 30
+	says := func(memory int64, ok bool) func() (int64, bool) { return func() (int64, bool) { return memory, ok } }
+	c := NewController(16 * gb)
+	for _, tc := range []struct {
+		memory int64
+		ok     bool
+		want   bool
+	}{{0, true, true}, {gb / 32, true, true}, {gb / 8, true, false}, {0, false, false}} {
+		if got := c.Slight(says(tc.memory, tc.ok)); got != tc.want {
+			t.Errorf("%d bytes, ok %v: slight %v", tc.memory, tc.ok, got)
+		}
+	}
+	if !NewController(0).Slight(func() (int64, bool) { t.Error("estimated without a budget"); return 0, false }) {
+		t.Error("without a budget, not slight")
+	}
+}
+
+// TestUnseenLineMoves checks that statements nothing is known of do not start late,
+// beside one another, while they start and end one after another, however long each
+// waits; and that one waits no more than its patience once none starts or ends.
+func TestUnseenLineMoves(t *testing.T) {
+	const gb = int64(1) << 30
+	c := NewController(16 * gb)
+	c.LimitReplica(8)
+	c.patience = 200 * time.Millisecond
+	ctx := context.Background()
+	release, _, err := c.Admit(ctx, Limits{Counted: true, Unseen: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Four more wait, and each starts as the one before it ends, 100 ms apart:
+	// the last waits twice its patience.
+	next := make(chan func() (int64, bool), 4)
+	for range 4 {
+		go func() {
+			r, _, err := c.Admit(ctx, Limits{Counted: true, Unseen: true})
+			if err != nil {
+				t.Error(err)
+			}
+			next <- r
+		}()
+	}
+	for range 4 {
+		time.Sleep(100 * time.Millisecond)
+		c.mu.Lock()
+		late := c.lateRunning
+		c.mu.Unlock()
+		if late > 0 {
+			t.Fatal("one started late while the line moved")
+		}
+		release()
+		select {
+		case release = <-next:
+		case <-time.After(5 * time.Second):
+			t.Fatal("the next did not start once the one before ended")
+		}
+	}
+	// The line stands still: the next waits its patience, then starts beside it.
+	r, waited, err := c.Admit(ctx, Limits{Counted: true, Unseen: true})
+	if err != nil || waited < c.patience || waited > 5*time.Second {
+		t.Errorf("with the line standing still: waited %s: %v", waited, err)
+	}
+	// One more, overdue too, goes as soon as that late one ends: the late one did not
+	// move the line.
+	after := make(chan func() (int64, bool), 1)
+	go func() {
+		r, _, err := c.Admit(ctx, Limits{Counted: true, Unseen: true})
+		if err != nil {
+			t.Error(err)
+		}
+		after <- r
+	}()
+	time.Sleep(c.patience + 100*time.Millisecond)
+	c.mu.Lock()
+	c.lastLate = time.Now().Add(-unseenGrows)
+	c.mu.Unlock()
+	ended := time.Now()
 	r()
-	running[1]()
-	running[2]()
+	select {
+	case r = <-after:
+		if took := time.Since(ended); took >= c.patience {
+			t.Errorf("the next late one started %s after the one before ended", took)
+		}
+		r()
+	case <-time.After(5 * time.Second):
+		t.Fatal("the next late one did not start")
+	}
+	release()
 }
 
 // TestAlike checks that a statement goes by the runs of the same text with the same
