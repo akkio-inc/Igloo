@@ -2419,6 +2419,11 @@ func (s *Server) preparedQuery(ctx context.Context, sess *session, user auth.Use
 				// What it held here, against what its plan said it would.
 				s.dist.ObservePeak(parts.key, peak)
 			}
+			if ops, ok := sess.wl.meter.LastOperators(); ok && parts.workers == 0 && !sess.wl.ranInBackground {
+				// The rows its operators made here, which later statements'
+				// estimates learn from.
+				s.dist.ObserveOperators(parts.key, operatorRows(ops))
+			}
 		}
 		s.recordQuery(sess, queryRecord{text: q.Query, start: start, err: err, rows: tw.rows(), acc: st.access,
 			policies: st.policies(), used: used, queued: queued, analyze: st.sourceText(), stmtType: st.stmtType, parts: parts, ai: spend,

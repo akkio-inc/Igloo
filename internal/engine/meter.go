@@ -29,13 +29,14 @@ import (
 
 // profilingStatements turn the profiler on, without output, for every kind
 // of statement. QUERY_NAME tells a statement's own measurements from those
-// of one before it. (ROWS_RETURNED is left out: DuckDB 1.5.6 fails with an
-// internal error rendering it.)
+// of one before it. Each operator's name and the rows it made are what the
+// working-set estimate learns from (see LastOperators). (ROWS_RETURNED is
+// left out: DuckDB 1.5.6 fails with an internal error rendering it.)
 var profilingStatements = []string{
 	"SET enable_profiling = 'no_output'",
 	"SET profiling_coverage = 'ALL'",
 	`SET custom_profiling_settings = '{"CPU_TIME": "true", "TOTAL_BYTES_READ": "true", ` +
-		`"TOTAL_MEMORY_ALLOCATED": "true", "QUERY_NAME": "true"}'`,
+		`"TOTAL_MEMORY_ALLOCATED": "true", "QUERY_NAME": "true", "OPERATOR_NAME": "true", "OPERATOR_CARDINALITY": "true"}'`,
 }
 
 // Meter reads back what DuckDB measured of the statements one connection
@@ -43,6 +44,8 @@ var profilingStatements = []string{
 type Meter struct {
 	db   *sql.DB
 	conn *sql.Conn
+	// last is the profile Last read, of the statement it measured.
+	last *duckdb.ProfilingInfo
 }
 
 // ConnectMetered opens a connection for a client session, like Connect,
@@ -73,10 +76,12 @@ func (m *Meter) Last(query string) *audit.Resources {
 	if m == nil {
 		return nil
 	}
+	m.last = nil
 	info, err := duckdb.GetProfilingInfo(m.conn)
 	if err != nil || !sameQuery(info.Metrics["QUERY_NAME"], query) {
 		return nil
 	}
+	m.last = &info
 	metric := func(name string) int64 {
 		n, _ := strconv.ParseInt(info.Metrics[name], 10, 64)
 		return n
@@ -87,6 +92,32 @@ func (m *Meter) Last(query string) *audit.Resources {
 		BytesRead:       metric("TOTAL_BYTES_READ"),
 		MemoryAllocated: metric("TOTAL_MEMORY_ALLOCATED"),
 	}
+}
+
+// Operator is an operator of a statement's run, as DuckDB's profiler saw
+// it: its name, the rows it made, and its children.
+type Operator struct {
+	Name     string
+	Rows     float64
+	Children []Operator
+}
+
+// LastOperators are the operators of the statement Last measured last, as
+// a tree under the profile's root; ok is false if it measured none.
+func (m *Meter) LastOperators() (ops Operator, ok bool) {
+	if m == nil || m.last == nil {
+		return Operator{}, false
+	}
+	var conv func(p duckdb.ProfilingInfo) Operator
+	conv = func(p duckdb.ProfilingInfo) Operator {
+		rows, _ := strconv.ParseFloat(p.Metrics["OPERATOR_CARDINALITY"], 64)
+		o := Operator{Name: p.Metrics["OPERATOR_NAME"], Rows: rows}
+		for _, c := range p.Children {
+			o.Children = append(o.Children, conv(c))
+		}
+		return o
+	}
+	return conv(*m.last), true
 }
 
 // ExplainAnalyze runs fn, which runs an EXPLAIN ANALYZE, with DuckDB's own

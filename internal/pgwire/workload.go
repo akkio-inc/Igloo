@@ -343,6 +343,16 @@ func statementShape(text string) string {
 	return string(sum[:])
 }
 
+// operatorRows are the operators of a statement's run, as the coordinator
+// learns from them.
+func operatorRows(o engine.Operator) distributed.OperatorRows {
+	out := distributed.OperatorRows{Name: o.Name, Rows: o.Rows}
+	for _, c := range o.Children {
+		out.Children = append(out.Children, operatorRows(c))
+	}
+	return out
+}
+
 // measure returns what DuckDB measured of st, which just ran.
 func (sess *session) measure(st *statement) *audit.Resources {
 	sess.wl.ranInBackground = sess.wl.backgroundUsed != nil
