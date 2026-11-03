@@ -2,8 +2,11 @@ package pgwire
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"time"
+
+	"github.com/jackc/pgx/v5"
 
 	"github.com/akkio-inc/igloo/internal/auth"
 	"github.com/akkio-inc/igloo/internal/distributed"
@@ -56,10 +59,12 @@ func TestWorkersStatementTakesCatalogShared(t *testing.T) {
 	}
 }
 
-// TestQueryBesidePoliciesTakesCatalogShared prepares and runs an admin's query of a
-// table no policy concerns, on a replica with a masking policy on another, while another
-// holder keeps the catalog lock shared: it finishes, where preparing it took the lock
-// exclusively to apply the policies, and queued every query behind the others' binds.
+// TestQueryBesidePoliciesTakesCatalogShared prepares and runs queries of a table no
+// policy concerns, an admin's and a reader's, on a replica with a masking policy on
+// another, while another holder keeps the catalog lock shared: they finish. Preparing
+// one took the lock exclusively to apply the policies, and running a reader's again
+// took it to recheck the reader's grants, with nothing changed: both queued every
+// query behind the others' binds.
 func TestQueryBesidePoliciesTakesCatalogShared(t *testing.T) {
 	t.Parallel()
 	cs, _ := startCatalogFixture(t)
@@ -70,26 +75,44 @@ func TestQueryBesidePoliciesTakesCatalogShared(t *testing.T) {
 			ctx := context.Background()
 			query := "SELECT count(*) FROM lake.public.items_" + name
 			mustExec(t, cs.admin, "CREATE TABLE lake.public.items_"+name+" AS SELECT range AS id FROM range(10)")
-			var n int
-			// The first prepare lists what policies may reach through, holding the
-			// lock alone.
-			if err := ada.QueryRow(ctx, query).Scan(&n); err != nil || n != 10 {
-				t.Fatalf("%d rows, %v", n, err)
-			}
-			release := cs.srv.engine.CatalogShare()
-			done := make(chan error, 1)
-			go func() { done <- ada.QueryRow(ctx, query+" WHERE id > 2").Scan(&n) }()
-			select {
-			case err := <-done:
-				release()
-				if err != nil || n != 7 {
+			for _, conn := range []*pgx.Conn{ada, rita} {
+				var n int
+				// The first prepare lists what policies may reach through, holding
+				// the lock alone.
+				if err := conn.QueryRow(ctx, query).Scan(&n); err != nil || n != 10 {
 					t.Fatalf("%d rows, %v", n, err)
 				}
-			case <-time.After(20 * time.Second):
-				release()
-				<-done
-				t.Fatal("the query waited for the catalog lock while it was held shared: something took it exclusively")
 			}
+			release := cs.srv.engine.CatalogShare()
+			done := make(chan error, 2)
+			for _, conn := range []*pgx.Conn{ada, rita} {
+				go func() {
+					var n int
+					err := conn.QueryRow(ctx, query+" WHERE id > 2").Scan(&n)
+					if err == nil && n != 7 {
+						err = fmt.Errorf("%d rows", n)
+					}
+					if err == nil {
+						// Run again, as a dashboard's statements are.
+						err = conn.QueryRow(ctx, query+" WHERE id > 2").Scan(&n)
+					}
+					done <- err
+				}()
+			}
+			timeout := time.After(20 * time.Second)
+			for range 2 {
+				select {
+				case err := <-done:
+					if err != nil {
+						t.Error(err)
+					}
+				case <-timeout:
+					release()
+					<-done
+					t.Fatal("a query waited for the catalog lock while it was held shared: something took it exclusively")
+				}
+			}
+			release()
 			// One that reads the protected table still has the policy applied.
 			var code string
 			if err := rita.QueryRow(ctx, "SELECT code FROM lake.public.secrets LIMIT 1").Scan(&code); err != nil || code != "***" {

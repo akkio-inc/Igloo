@@ -2048,10 +2048,13 @@ func (s *Server) recheckPolicies(ctx context.Context, sess *session, st *stateme
 
 // recheck checks a prepared statement again before it runs: its policies,
 // then its grants.
-// needsRecheck reports whether rechecking st could do anything: it has
-// grants to check again, or its policies could apply otherwise now, as
-// policies, the catalog or the session's settings changed, or as they
-// read the user's privileges. Like recheck, it first reads the user again,
+// needsRecheck reports whether rechecking st could do anything: its grants
+// could allow otherwise now (see grantsStale), or its policies could apply
+// otherwise, as policies, the catalog or the session's settings changed, or
+// as they read the user's privileges. Rechecking holds the catalog lock
+// exclusively, and a statement of a user whose grants are checked was
+// rechecked before every run, so each run of a reader's dashboard waited for
+// the binds before it and held up those after it, with nothing to check. Like recheck, it first reads the user again,
 // failing for a user dropped or disabled meanwhile, and the grants and
 // policies, as changed elsewhere, failing for any not read for too long
 // (see refreshAccess); neither holds the catalog lock.
@@ -2063,7 +2066,7 @@ func (s *Server) needsRecheck(ctx context.Context, sess *session, st *statement)
 	if err != nil {
 		return false, err
 	}
-	if st.access != nil {
+	if st.access != nil && s.grantsStale(ctx, sess, user, st) {
 		return true, nil
 	}
 	g := st.guard

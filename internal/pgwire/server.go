@@ -3266,10 +3266,7 @@ func (s *Server) recheckGrants(ctx context.Context, sess *session, st *statement
 	if err != nil {
 		return err
 	}
-	privs, err := s.privileges(ctx, sess, user)
-	if !force && err == nil && (privs == st.access.privs || st.access.privs == nil && user.Role == auth.RoleAdmin) &&
-		time.Since(st.access.checked) < s.roleRefresh &&
-		st.access.catalogGen == s.catalogGeneration() && st.access.settingGen == sess.settingGen {
+	if !force && !s.grantsStale(ctx, sess, user, st) {
 		return nil
 	}
 	// A refusal leaves st.access as it was, stale, so the statement is
@@ -3298,6 +3295,16 @@ func (s *Server) recheckGrants(ctx context.Context, sess *session, st *statement
 	}
 	st.access = acc
 	return nil
+}
+
+// grantsStale reports whether st's grants, which were checked (st.access), must be
+// checked again for user: the user's privileges, the catalog or the session's
+// settings changed, or they were checked longer than roleRefresh ago.
+func (s *Server) grantsStale(ctx context.Context, sess *session, user auth.User, st *statement) bool {
+	privs, err := s.privileges(ctx, sess, user)
+	return err != nil || !(privs == st.access.privs || st.access.privs == nil && user.Role == auth.RoleAdmin) ||
+		time.Since(st.access.checked) >= s.roleRefresh ||
+		st.access.catalogGen != s.catalogGeneration() || st.access.settingGen != sess.settingGen
 }
 
 // statementTimeoutCommand handles SET, RESET and SHOW statement_timeout,
