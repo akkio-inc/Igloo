@@ -501,6 +501,10 @@ created, renamed or dropped there:
   `INSERT`, `UPDATE`, `DELETE` and `MERGE` writing and committing a new
   snapshot of the tables bound — holds nothing.
 
+Steps that need the catalog to themselves and wait together take their turns
+one after another, for up to a tenth of a second, before the binds that came
+meanwhile, so a queue of DDL and listings holds binds up once rather than once
+for each.
 
 Opening a session shares the catalog too, as a bind does: it selects the
 catalog's default schema. A login waits at most 30 seconds for a listing or

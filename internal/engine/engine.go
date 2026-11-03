@@ -102,7 +102,7 @@ type Engine struct {
 	// catMu keeps binding, walking and changing the attached catalog's
 	// in-memory set of tables apart. See CatalogLock. catLocked is when it
 	// was taken exclusively, in Unix nanoseconds, or 0 while it is not.
-	catMu     sync.RWMutex
+	catMu     catalogMutex
 	catLocked atomic.Int64
 	// catShared counts the holders of its shared side.
 	catShared atomic.Int64
@@ -324,7 +324,8 @@ func (e *Engine) LocalDatabase() string { return e.local }
 //
 //	defer e.CatalogLock()()
 //
-// It is not reentrant (sync.RWMutex): the pgwire layer makes it reentrant
+// It is not reentrant (see catalogMutex, which keeps a writer from stalling
+// binds for long): the pgwire layer makes it reentrant
 // per session (see holdCatalog); a caller outside a session holds it at most
 // once, and never takes it from inside a DuckDB call on a connection whose
 // session holds it.
@@ -399,7 +400,7 @@ func (e *Engine) shared() func() {
 func (e *Engine) SharedRefusals() uint64 { return e.proxy.Refusals() }
 
 // CatalogShareContext is CatalogShare that stops waiting, and returns ctx's
-// error, when ctx ends. A sync.RWMutex cannot stop waiting, so a goroutine
+// error, when ctx ends. The lock cannot stop waiting, so a goroutine
 // waits in its place in the lock's queue, as RLock does, behind writers that
 // came first and ahead of those that come later, and hands the lock over;
 // if ctx ended first, it lets go of the lock as soon as it gets it.
