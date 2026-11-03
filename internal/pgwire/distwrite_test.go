@@ -23,6 +23,7 @@ import (
 	"time"
 
 	icebergio "github.com/apache/iceberg-go/io"
+	"github.com/duckdb/duckdb-go/v2"
 	"github.com/jackc/pgx/v5"
 
 	"github.com/akkio-inc/igloo/internal/catalog"
@@ -1088,6 +1089,63 @@ func TestWorkersWriteAuto(t *testing.T) {
 	env.checkWrote(t, "w_auto")
 }
 
+// TestWideFillFirstRun checks that auto mode runs on workers, from its first run,
+// a fill whose rows an expression makes far wider than its table's, which this
+// replica's row groups would not hold, however small the table: a copy of TPC-H's
+// lineitem, each comment repeated 400 times, ran out of memory here four times of
+// four. A copy of the table as it is stays here.
+func TestWideFillFirstRun(t *testing.T) {
+	t.Parallel()
+	env := startWriteServerOn(t, writeWorkers{cores: 2, memory: 4 << 30}, func(o *distributed.Options) { o.MemoryBytes, o.Threads = 32<<20, 2 })
+	wide := "SELECT id, repeat(name, 400) AS c FROM src"
+	mustExec(t, env.admin, "CREATE TABLE w_wide AS "+wide)
+	env.checkWrote(t, "w_wide")
+	if got, want := env.local(t, "SELECT count(*), sum(length(c)), sum(id) FROM w_wide"), env.local(t, "SELECT count(*), sum(length(c)), sum(id) FROM ("+wide+")"); got != want {
+		t.Errorf("%s, want %s", got, want)
+	}
+	mustExec(t, env.admin, "RESET distributed_execution")
+	mustExec(t, env.admin, "CREATE TABLE w_narrow AS SELECT id, name FROM src")
+	data, _ := liveFiles(t, env.admin, "w_narrow")
+	if len(data) == 0 {
+		t.Fatal("no files")
+	}
+	for _, f := range data {
+		if strings.Contains(f, "/"+distributed.SealedDirMark) {
+			t.Errorf("workers wrote a copy of a small table: %s", f)
+		}
+	}
+}
+
+// TestFillOutOfMemoryHere checks that a fill auto mode does not run on workers,
+// which runs out of memory here, runs there all the same, rather than fail: a fill
+// auto mode had not planned for workers, its table taken for small, ran out of
+// memory here, where forced onto workers it wrote.
+func TestFillOutOfMemoryHere(t *testing.T) {
+	t.Parallel()
+	// Workers too small for a task to hold these rows as it writes them: auto mode
+	// keeps the fill here (see distributed.features.writeFits).
+	env := startWriteServerOn(t, writeWorkers{cores: 2, memory: 8 << 20}, func(o *distributed.Options) { o.MemoryBytes = 1 << 30 })
+	wide := "SELECT id, repeat(name, 400) AS c FROM src"
+	var failed atomic.Int32
+	env.srv.failFill = func(_ context.Context, query string) error {
+		if strings.Contains(query, "repeat(name, 400)") {
+			failed.Add(1)
+			return &duckdb.Error{Type: duckdb.ErrorTypeOutOfMemory, Msg: "Out of Memory Error: failed to pin block of size 256.0 KiB"}
+		}
+		return nil
+	}
+	defer func() { env.srv.failFill = nil }()
+	if _, err := env.admin.Exec(context.Background(), "CREATE TABLE w_oom AS "+wide); err != nil {
+		t.Fatal(err)
+	}
+	if n := failed.Load(); n != 1 {
+		t.Errorf("ran here %d times", n)
+	}
+	if got, want := env.local(t, "SELECT count(*), sum(length(c)), sum(id) FROM w_oom"), env.local(t, "SELECT count(*), sum(length(c)), sum(id) FROM ("+wide+")"); got != want {
+		t.Errorf("%s, want %s", got, want)
+	}
+}
+
 // TestWorkersWriteManyPartitionsAuto checks that auto mode has this replica write
 // a table whose files would be small on workers, with the same rows, and workers
 // one of few partitions, and that a statement forced onto workers still goes there.
@@ -1735,9 +1793,10 @@ func TestWorkersShortOfMemoryWriting(t *testing.T) {
 	})
 	t.Run("no room here", func(t *testing.T) {
 		t.Parallel()
-		// By the estimates: this replica's 1 MB would not hold what the
-		// exchange's stage reads.
-		env := startWriteServerWith(t, func(o *distributed.Options) { o.MemoryBytes = 1 << 20 })
+		// By the estimates: this replica's 512 MiB would not hold what the
+		// exchange's stage reads, three times its tables' 300 MiB, and would
+		// its row groups of the rows, of about 3 KB by those.
+		env := startWriteServerWith(t, func(o *distributed.Options) { o.MemoryBytes = 512 << 20 })
 		env.force(t)
 		short(env)
 		query := "SELECT a.id, b.x FROM src AS a JOIN src AS b ON a.id = b.id"
@@ -1750,6 +1809,23 @@ func TestWorkersShortOfMemoryWriting(t *testing.T) {
 		}
 		if data, _ := liveFiles(t, env.admin, "w_short"); slices.ContainsFunc(data, inDir) {
 			t.Errorf("files of tasks: %q", data)
+		}
+		env.checkNoNotes(t)
+	})
+	t.Run("no room here for its rows either", func(t *testing.T) {
+		t.Parallel()
+		// This replica's 1 MiB holds neither the query nor its row groups of the
+		// rows: it fails as the workers did, and leaves no table, rather than run
+		// out of memory here too, as one writing 600 partitions of 10.8 KB rows did.
+		env := startWriteServerWith(t, func(o *distributed.Options) { o.MemoryBytes = 1 << 20 })
+		env.force(t)
+		short(env)
+		_, err := env.admin.Exec(context.Background(), "CREATE TABLE w_short AS SELECT a.id, b.x FROM src AS a JOIN src AS b ON a.id = b.id")
+		if pgCode(err) != "53200" {
+			t.Fatalf("got %v, want the workers' running out of memory", err)
+		}
+		if n := texts(t, env.admin, "SELECT count(*) FROM information_schema.tables WHERE table_name = 'w_short'"); len(n) != 1 || n[0] != "0" {
+			t.Errorf("tables named w_short: %v", n)
 		}
 		env.checkNoNotes(t)
 	})

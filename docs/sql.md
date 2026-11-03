@@ -79,7 +79,7 @@ Snowflake databases are catalogs of their own, such as
 | `CREATE TABLE`, `CREATE TABLE AS SELECT` | Yes |
 | `INSERT`, `INSERT ... SELECT`, `INSERT ... RETURNING`, `MERGE INTO` | Yes |
 | `UPDATE`, `DELETE` | Yes |
-| `DROP TABLE`, `CREATE SCHEMA`, `DROP SCHEMA` | Yes; `CASCADE` drops only the table, see below |
+| `DROP TABLE`, `CREATE SCHEMA`, `DROP SCHEMA` | Yes; `DROP TABLE ... CASCADE` drops only the table, `DROP SCHEMA ... CASCADE` what is in the schema, see below |
 | `ALTER TABLE ... RENAME TO`, `ADD COLUMN`, `DROP COLUMN` | Yes |
 | `CREATE OR REPLACE TABLE` | Yes; see below |
 | `CREATE [OR REPLACE] VIEW`, `DROP VIEW`, `ALTER VIEW ... RENAME TO` | Yes; see [views](#views) |
@@ -87,6 +87,7 @@ Snowflake databases are catalogs of their own, such as
 | `ALTER TABLE`, `VIEW`, `SCHEMA ... OWNER TO` | Yes; see [the catalog](catalog.md#owners) |
 | `CREATE TEMP TABLE`, `CREATE TEMP VIEW` | Yes; held in memory for the session only |
 | `COPY INTO table FROM 'location'` | Yes, outside transactions; see [loading](loading.md#copy-into) |
+| `COPY table [(columns)] FROM STDIN` | Yes, in text, CSV and binary; see [loading](loading.md#copy-from-stdin) |
 | `CREATE [OR REPLACE] MATERIALIZED VIEW`, `REFRESH MATERIALIZED VIEW` | Yes, outside transactions; see [materialized views](loading.md#materialized-views) |
 | `CREATE [OR REPLACE] DYNAMIC TABLE`, `ALTER DYNAMIC TABLE ... REFRESH` | Yes, outside transactions; see [dynamic tables](loading.md#dynamic-tables) |
 | `CREATE [OR REPLACE] TABLE ... CLONE`, `CREATE [OR REPLACE] SCHEMA ... CLONE` | Yes, outside transactions; see [clones](#clones) |
@@ -115,6 +116,15 @@ as are those of a table `CREATE OR REPLACE TABLE` replaces, `... CLONE`
 included, unless [clones](#clones) read them. What a drop leaves,
 erasure requests delete ([privacy](privacy.md#what-is-left-of-dropped-tables)).
 A dropped table cannot be restored.
+
+`DROP SCHEMA ... CASCADE` drops what the schema holds, one object at a time,
+each as its own `DROP` would: its materialized views and dynamic tables with
+their tables and state, its views, and its tables, whose files go as `DROP
+TABLE`'s do; then the schema. Before it drops anything it checks that the
+user may drop all of it (a materialized view only its owner or an admin
+may drop). Something refused after that, as a table an erasure request is
+erasing from, stops it there, and the error names it; what came before it
+is dropped. Without `CASCADE`, a schema that holds anything is kept.
 
 ### Sort orders and clustering
 
@@ -796,6 +806,7 @@ FROM igloo.login_history WHERE result = 'failure';
 | `workers`, `stages`, `exchanges` | How many workers ran parts of the statement ([distributed execution](distributed-execution.md)), in how many stages of tasks, and how many exchanges of rows from one stage to later ones the stages wrote; 0 when it ran on one replica |
 | `plan_key` | For a statement that could run on workers, what identifies it across runs: its text without literals other than integers, and its tables' sizes to a factor of two; `auto` mode runs it where it was faster before ([distributed execution](distributed-execution.md#when)); `NULL` for others |
 | `placement` | For such a statement, where it ran and why: `this replica`, how many workers, or `the large worker`, and `auto` mode's reason, such as `4 workers: one machine should take 97 s and workers 33 s; 4 workers, 33 s, within a fifth of the fastest, 16 workers at 28 s, for 30% of its cost` (see [when](distributed-execution.md#when)); `NULL` for others |
+| `catalog_wait_ms` | Time it waited for the replica's catalog lock, which DDL and listings of the catalog (`information_schema`, `SHOW`, `DESCRIBE`) hold alone and binding other statements holds shared (see [concurrency on a replica](operations.md#concurrency-on-a-replica)) |
 
 `igloo.login_history` has `event_time`, `user_name`, `result` (`success` or
 `failure`), `reason`, `client_address`, `application_name`, `session_id`,
@@ -1282,7 +1293,8 @@ the same users and grants; see [other engines](external-engines.md).
   changes (see [transactions](#transactions)).
 - `COPY (query) TO STDOUT` and `COPY table TO STDOUT` work, in text, CSV and
   binary format, with `HEADER`, `DELIMITER` and `NULL`; they need `SELECT`
-  on what they read, like the query. `COPY ... FROM STDIN` is not supported.
+  on what they read, like the query. `COPY table FROM STDIN` loads what the
+  client sends ([loading](loading.md#copy-from-stdin)).
 - `TO_CHAR` formats dates and timestamps; number formats are not supported.
 - `SET` of DuckDB settings that affect every session (memory, threads,
   secrets) is limited to admins, as are the read cache's functions and

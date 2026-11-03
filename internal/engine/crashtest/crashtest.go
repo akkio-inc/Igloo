@@ -22,6 +22,7 @@ static void crash_foreign_thread(void) {
 }
 
 void igloo_throw_foreign_thread(void);
+void igloo_throw_in_destructor(void);
 */
 import "C"
 
@@ -32,3 +33,8 @@ func CrashForeignThread() { C.crash_foreign_thread() }
 // ThrowForeignThread starts a C++ thread outside Go that throws an
 // exception nothing catches, as one escaping a DuckDB worker would.
 func ThrowForeignThread() { C.igloo_throw_foreign_thread() }
+
+// ThrowInDestructor throws a C++ exception out of a destructor on the calling
+// thread, as the iceberg extension's scan state did at the memory limit, which
+// calls std::terminate. It returns only if the handler does not end the thread.
+func ThrowInDestructor() { C.igloo_throw_in_destructor() }

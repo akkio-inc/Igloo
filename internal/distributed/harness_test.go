@@ -25,6 +25,7 @@ import (
 	"github.com/duckdb/duckdb-go/v2"
 
 	"github.com/akkio-inc/igloo/internal/config"
+	"github.com/akkio-inc/igloo/internal/engine"
 )
 
 // The harness runs distributed execution in one process: tables are
@@ -274,6 +275,7 @@ func newHarnessRB(t *testing.T, sf float64, files, n int, rb string) *harness {
 
 // newHarnessWith is newHarnessRB whose session and workers also load
 // extensions, DuckDB's, from IGLOO_TEST_EXTENSION_DIR, as Igloo loads them.
+// With sf 0 it has no TPC-H tables.
 func newHarnessWith(t *testing.T, sf float64, files, n int, rb string, extensions ...string) *harness {
 	t.Helper()
 	h := &harness{t: t, dir: t.TempDir(), tables: map[string]*Table{}, files: map[string][]File{}, rb: rb, extensions: extensions}
@@ -298,21 +300,38 @@ func newHarnessWith(t *testing.T, sf float64, files, n int, rb string, extension
 	for _, stmt := range h.extensionLoads() {
 		h.exec(stmt)
 	}
-	h.exec("INSTALL tpch")
-	h.exec("LOAD tpch")
-	h.exec(fmt.Sprintf("CALL dbgen(sf = %g)", sf))
-	for _, name := range []string{"lineitem", "orders", "customer", "part", "partsupp", "supplier", "nation", "region"} {
-		h.addTable(name, name, files)
+	if sf > 0 {
+		h.exec("INSTALL tpch")
+		h.exec("LOAD tpch")
+		h.exec(fmt.Sprintf("CALL dbgen(sf = %g)", sf))
+		for _, name := range []string{"lineitem", "orders", "customer", "part", "partsupp", "supplier", "nation", "region"} {
+			h.addTable(name, name, files)
+		}
 	}
 	h.startWorkers(n)
 	return h
 }
 
+// packOnce installs Igloo's extension pack in IGLOO_TEST_EXTENSION_DIR
+// once a process, as scripts/test.sh and CI do before every run: a pack
+// kept from before an extension joined it, as a runner's volume is, gets it
+// then, and the tests that load it run rather than fail.
+var (
+	packOnce sync.Once
+	packErr  error
+)
+
 // extensionLoads load the harness's extensions from
-// IGLOO_TEST_EXTENSION_DIR.
+// IGLOO_TEST_EXTENSION_DIR, which holds Igloo's extension pack.
 func (h *harness) extensionLoads() []string {
 	if len(h.extensions) == 0 {
 		return nil
+	}
+	packOnce.Do(func() {
+		packErr = engine.InstallExtensions(context.Background(), os.Getenv("IGLOO_TEST_EXTENSION_DIR"))
+	})
+	if packErr != nil {
+		h.t.Fatalf("installing the extension pack: %v", packErr)
 	}
 	out := []string{"SET extension_directory = " + quoteLiteral(os.Getenv("IGLOO_TEST_EXTENSION_DIR"))}
 	for _, e := range h.extensions {

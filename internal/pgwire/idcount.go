@@ -7,11 +7,11 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
-	"sync"
 
 	"github.com/apache/iceberg-go/table"
 
 	"github.com/akkio-inc/igloo/internal/iddomain"
+	"github.com/akkio-inc/igloo/internal/lockorder"
 	"github.com/akkio-inc/igloo/internal/policy"
 )
 
@@ -479,7 +479,7 @@ func (s *Server) idSnapshot(ctx context.Context, sess *session, schema, table, c
 // idComplete caches idsComplete's answers, which never change for a
 // snapshot.
 type idComplete struct {
-	mu   sync.Mutex
+	mu   lockorder.Mutex
 	seen map[string]bool
 }
 

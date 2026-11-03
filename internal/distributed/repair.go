@@ -33,6 +33,13 @@ import (
 // plan divides its tasks by in any case. Those write to directories of their own, so
 // that what the lost worker wrote, should it turn up late, is never read; and the
 // exchange lists only what they wrote, in place of what the task had.
+//
+// And it runs again as soon as the worker is found lost, rather than when a reader
+// finds its files gone: at ten times the data, with one of 16 workers powered off,
+// what it held ran again 53 to 113 s after it was found, once the stages before the
+// readers had run, and the readers waited on it. So while a statement runs, the
+// coordinator watches every worker that holds its exchange files, as it watches those
+// that run its tasks.
 
 // repairRounds bounds how many times a task runs again for workers lost.
 const repairRounds = 3
@@ -73,7 +80,7 @@ func (e *taskLostError) Unwrap() error { return e.err }
 // usable counts the workers the run goes on with that are not set aside.
 func (e *execution) usable() int {
 	n := 0
-	for _, w := range e.workers() {
+	for _, w := range e.targets() {
 		if !e.co.pool.isDown(w.addr) {
 			n++
 		}
@@ -95,15 +102,65 @@ func (e *execution) ranOn(t *ranTask) {
 	}
 	x := e.exchanges[t.stage.Out.ID]
 	x.mu.Lock()
-	defer x.mu.Unlock()
 	x.ran = append(x.ran, t)
+	x.mu.Unlock()
+	if t.onDisk() {
+		e.watchHolder(t.worker)
+	}
 }
 
-// workers returns the workers the run goes on with.
+// watchHolder watches the worker at addr, which holds exchange files of the run on its
+// disk, while the run's exchanges are kept: should it be lost, what readers yet to run
+// need of what it held runs again at once.
+func (e *execution) watchHolder(addr string) {
+	e.mu.Lock()
+	ctx := e.watching
+	if ctx == nil || e.holders[addr] || e.lost[addr] {
+		e.mu.Unlock()
+		return
+	}
+	if e.holders == nil {
+		e.holders = map[string]bool{}
+	}
+	e.holders[addr] = true
+	e.mu.Unlock()
+	lost, why, release := e.co.pool.beats.watch(addr)
+	go func() {
+		defer release()
+		select {
+		case <-ctx.Done():
+		case <-lost:
+			e.recover(ctx, addr, why(), false)
+		}
+	}()
+}
+
+// stopWatching ends the run's watches of the workers holding its exchange files.
+func (e *execution) stopWatching() {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.stopWatch != nil {
+		e.stopWatch()
+	}
+}
+
+// workers returns the workers of the run, whose disks its tasks may read: those it
+// goes on with, and one it went without until what it held is written again.
 func (e *execution) workers() []*worker {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	return e.ws
+}
+
+// targets returns the workers the run gives tasks to: its workers but those it
+// went without.
+func (e *execution) targets() []*worker {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if len(e.lost) == 0 {
+		return e.ws
+	}
+	return slices.DeleteFunc(slices.Clone(e.ws), func(w *worker) bool { return e.lost[w.addr] })
 }
 
 // wentWithout reports whether the run went on without the worker at addr. A run may
@@ -142,12 +199,23 @@ func (e *execution) repair(ctx context.Context, err error) bool {
 	if !e.local || !errors.As(err, &lost) || ctx.Err() != nil {
 		return false
 	}
+	return e.recover(ctx, lost.worker, err, true)
+}
+
+// recover goes on without the worker at addr, found lost with err by a reader or by
+// its heartbeat, and has what readers yet to run need of what it held written again on
+// the others, as repair says. Found by a reader, it is first asked whether it is lost;
+// its heartbeat has.
+func (e *execution) recover(ctx context.Context, addr string, err error, reader bool) bool {
+	by := "its heartbeat"
+	if reader {
+		by = "a reader"
+	}
 	e.repairing.Lock()
 	defer e.repairing.Unlock()
-	addr := lost.worker
 	if !e.wentWithout(addr) {
 		ws := e.workers()
-		if !e.co.confirmLost(ctx, ws, addr) {
+		if reader && !e.co.confirmLost(ctx, ws, addr) {
 			// It answers as the run it was, which has its files: the reader
 			// gave up on it too soon, as may happen on a machine run ragged.
 			e.co.log.Warn("a reader gave up on a worker that still answers; running its task again", "query", e.qid, "worker", addr, "err", err)
@@ -159,7 +227,6 @@ func (e *execution) repair(ctx context.Context, err error) bool {
 		}
 		e.co.pool.markDown(addr)
 		e.mu.Lock()
-		e.ws = rest
 		if e.lost == nil {
 			e.lost = map[string]bool{}
 		}
@@ -168,13 +235,22 @@ func (e *execution) repair(ctx context.Context, err error) bool {
 	}
 	start := time.Now()
 	n, rerr := e.writeAgain(ctx, addr)
+	// Tasks may read its disk no more: what readers need of it is on the others.
+	// Until now they could, as a task made meanwhile still lists its files, and
+	// finds them gone as lost, rather than not the statement's.
+	e.mu.Lock()
+	e.ws = slices.DeleteFunc(slices.Clone(e.ws), func(w *worker) bool { return w.addr == addr })
+	e.mu.Unlock()
 	if rerr != nil {
-		e.co.log.Warn("could not run again only what a lost worker held; the statement's parts run again", "query", e.qid, "worker", addr, "err", rerr)
+		if ctx.Err() == nil {
+			e.co.log.Warn("could not run again only what a lost worker held; the statement's parts run again", "query", e.qid, "worker", addr,
+				"found_by", by, "err", rerr)
+		}
 		return false
 	}
 	if n > 0 {
 		e.co.log.Warn("a worker holding exchanged rows on its disk was lost; ran again only its tasks that readers still need", "query", e.qid,
-			"worker", addr, "tasks", n, "seconds", time.Since(start).Seconds())
+			"worker", addr, "found_by", by, "tasks", n, "seconds", time.Since(start).Seconds())
 	}
 	return true
 }
@@ -274,7 +350,7 @@ func (e *execution) taskAgain(ctx context.Context, t *ranTask) (int, error) {
 		g.Go(func() error {
 			task, _ := t.request(p, round)
 			first := t.first + 1 + n
-			w, head, err := e.co.dispatch(gctx, task, e.workers(), first, "", nil)
+			w, head, err := e.co.dispatch(gctx, task, e.targets(), first, "", nil)
 			if err != nil {
 				return err
 			}
@@ -309,6 +385,11 @@ func (e *execution) taskAgain(ctx context.Context, t *ranTask) (int, error) {
 	x.mu.Unlock()
 	if err != nil {
 		return 0, err
+	}
+	for _, a := range again {
+		if a.onDisk() {
+			t.run.watchHolder(a.worker)
+		}
 	}
 	t.run.writtenAgain.Add(1)
 	e.writtenAgain.Add(1)

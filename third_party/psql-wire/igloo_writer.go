@@ -93,3 +93,27 @@ type Drainer interface {
 func (writer *dataWriter) Drains() bool {
 	return writer.batchable
 }
+
+// CopyIner is a DataWriter that can receive the data of COPY ... FROM STDIN.
+type CopyIner interface {
+	CopyInColumns(format FormatCode, columns int) (*CopyReader, error)
+}
+
+// CopyInColumns starts COPY ... FROM STDIN: it sends a CopyInResponse for
+// columns in format, whatever columns the statement was described with (a
+// COPY returns no rows), and returns the reader of what the client sends.
+func (writer *dataWriter) CopyInColumns(format FormatCode, columns int) (*CopyReader, error) {
+	if writer.closed {
+		return nil, ErrClosedWriter
+	}
+	writer.client.Start(types.ServerCopyInResponse)
+	writer.client.AddByte(byte(format))
+	writer.client.AddInt16(int16(columns))
+	for range columns {
+		writer.client.AddInt16(int16(format))
+	}
+	if err := writer.client.End(); err != nil {
+		return nil, err
+	}
+	return NewCopyReader(writer.session, writer.reader, writer.client, nil), nil
+}

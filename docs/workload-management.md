@@ -265,12 +265,14 @@ case it no longer is. A write (`INSERT`, `UPDATE`, `DELETE`, `MERGE`, the fill o
 after it is known to be heavy, and commits as another replica's would.
 
 Only what gives the same result there runs there: a statement outside a
-transaction block, of what the catalog holds, on which no masking or row
-access policy applies, in a session with no temporary tables or views and
+transaction block, of what the catalog holds, not of a table a clean room
+keeps to its party, in a session with no temporary tables or views and
 none of the settings tasks do not take over, calling no function tied to the
 session, and not one that fills ID domains' ids; a statement the second
 DuckDB cannot bind, such as one of a connection's tables or a view not yet
-copied there, runs in the first. Materialized views' refreshes run in the
+copied there, runs in the first. Masking and row access policies apply
+there as in the first: they are in the statement's text, which runs there as
+Igloo rewrote it for its user. Materialized views' refreshes run in the
 first. `placement` in the history says which reads ran there, and
 `igloo_background_statements_total` counts them. A heavy statement stays in
 the first while most of what runs there or waits to is of some size itself, known to take
@@ -319,8 +321,8 @@ shape not seen yet, of which nothing is known, waits while DuckDB holds three
 quarters of the memory for the statements running, each such statement counting
 for a quarter of the memory until it has run 30 seconds or ended, so that a
 dashboard's heavy statements do not start together on its first run. It waits for
-the memory for at most a minute, and those that have then start one every 30
-seconds, as what holds the memory may run for hours. A statement that was canceled
+the memory for at most a minute, as what holds the memory may run for hours, and
+those that have then start one at a time, the next once the one before has ended. A statement that was canceled
 or passed its timeout, or whose client went away, holds nobody up, even while DuckDB
 has yet to stop it.
 
@@ -359,7 +361,10 @@ DuckDB holds for running statements (their hash tables, sorts and the like,
 not its caches) and shares it among them by what they reserved, which is
 exact only for a statement alone. A shape's footprint is the median of its
 latest eight runs, and the runs of the same text with the same literals, if there
-are any, go before those of its shape, here and in [the line](#the-line). A run that ends early, cancelled or out of memory, raises
+are any, go before those of its shape, here and in [the line](#the-line). With none,
+a statement goes by the most any run of its shape held and took, since its literals
+may make it any of them; a run that read nothing, planned to no rows for its
+literals, counts only for its own. A run that ends early, cancelled or out of memory, raises
 it to what it was seen holding, or, if it ran ten seconds or more, to all
 the memory, so that heavy statements cancelled at their timeout do not start
 together again, unseen, next time. When it starts, a replica reads what the

@@ -128,7 +128,7 @@ func (pl *planner) relationKey(q node, scope cteScope) string {
 	if err != nil {
 		return ""
 	}
-	return sql
+	return pl.withoutMark(sql)
 }
 
 // measured returns the size to plan the relation of key with, of columns

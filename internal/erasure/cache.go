@@ -6,8 +6,9 @@ import (
 	"encoding/hex"
 	"log/slog"
 	"strings"
-	"sync"
 	"time"
+
+	"github.com/akkio-inc/igloo/internal/lockorder"
 )
 
 // ReadCache is a replica's read cache of object storage files, on disk and
@@ -83,7 +84,7 @@ type Purger struct {
 	holder  string
 	refused time.Time
 	now     func() time.Time
-	mu      sync.Mutex
+	mu      lockorder.Mutex
 }
 
 // NewPurger purges cache, identified by id, on host.

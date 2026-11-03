@@ -24,6 +24,7 @@ import (
 	"github.com/akkio-inc/igloo/internal/auth"
 	"github.com/akkio-inc/igloo/internal/distributed"
 	"github.com/akkio-inc/igloo/internal/iddomain"
+	"github.com/akkio-inc/igloo/internal/lockorder"
 	"github.com/akkio-inc/igloo/internal/models"
 	"github.com/akkio-inc/igloo/internal/snowflake"
 	"github.com/akkio-inc/igloo/internal/tsforecast"
@@ -344,9 +345,10 @@ func (s *Server) startDistributed(ctx context.Context, sess *session, user auth.
 			s.dist.Metrics().Fallback("worker_memory")
 			s.log.Warn("workers ran out of memory on a fill, which this replica has the room for; running it here", "user", user.Name, "err", err)
 			return nil, parts, false, nil
-		case distributed.OutOfMemory(err) && st.writer != nil && plan.WorkersWrite():
+		case distributed.OutOfMemory(err) && st.writer != nil && plan.WorkersWrite() && plan.WriteFitsHere():
 			// Too much for this replica's memory: its tasks may fare better
-			// with this replica writing the table from their results.
+			// with this replica writing the table from their results, where
+			// this replica has the room for that.
 			s.dist.Metrics().Fallback("worker_memory")
 			s.log.Warn("workers ran out of memory writing a table's files; this replica writes them", "user", user.Name, "err", err)
 			st.writer = nil
@@ -674,35 +676,69 @@ func (s *Server) afterOutOfMemory(outer, ctx context.Context, sess *session, st 
 	return err
 }
 
-// policyReason says why masking and row access policies keep st on this
-// replica, or is empty. Workers read table files directly and know nothing
-// of the requesting user, so they cannot apply policies: a statement that
-// reads a protected table, directly or through a view, is not distributed.
+// policyReason says why the rules of the tables st reads keep it on this
+// replica, in its first DuckDB, or is empty.
+//
+// Masking and row access policies apply in st's text: the rewrite reads
+// each protected table through a subquery that masks its columns and
+// leaves out the rows its row access policy hides, with the user, roles
+// and tags the policies ask for written in as values. The second DuckDB
+// runs that text as the first would. Workers run it too, and the planner
+// keeps each stage's read of a protected table, and of the tables its
+// policies read, in the rewrite's subquery as written, so that a stage
+// writes only masked values of the rows the user may see to an exchange or
+// to this replica (see distributed's governed.go, and sessionEnv.Table,
+// which marks the tables). A table read as written, its policies leaving it
+// as it is for the user, is read as any other.
 //
 // Which tables a statement reads is what the rewriter found resolving its
-// names (touched, applied), not what names it spells: a statement is
-// analyzed when any word of it, or of a view it reads, spells a protected
-// table's name, as a column named like one does, or one named like an ID
-// domain, whose dictionary, Igloo's own and protected, is named after it.
-// Analyzed and found to read none, it runs on workers as the text the
-// rewriter left, views it expanded included. sessionEnv.Table refuses
-// protected tables as well, should a statement reach the planner without
-// the rewriter having seen one.
+// names, not what names it spells: a statement is analyzed when any word
+// of it, or of a view it reads, spells a protected table's name, as a
+// column named like one does, or one named like an ID domain, whose
+// dictionary, Igloo's own and protected, is named after it. sessionEnv.Table
+// refuses protected tables the rewrite did not read, should a statement
+// reach the planner without the rewriter having seen one.
+//
+// A clean room's tables, and external tables with rules, stay here: what
+// confines them to their parties is not in the statement's text.
 func policyReason(st *statement) string {
 	g := st.guard
 	switch {
 	case g == nil && st.original != "":
 		return "masking or row access policies rewrote it"
-	case g == nil, g.hiddenOnly:
-		// Only ID domains' columns of ids left out: nothing a worker could
-		// fail to apply.
+	case g == nil:
 		return ""
-	case len(g.applied) > 0:
-		return "masking or row access policies apply to what it reads"
-	case g.touched:
-		return "masking or row access policies, or a clean room, concern a table it reads"
+	case g.room:
+		return "a clean room, or an external table's rules, concern a table it reads"
 	}
 	return ""
+}
+
+// RewriteMark is the mark of the policies' rewrite of the statement, for
+// the planner, which keeps stages' reads of protected tables in its
+// subqueries (see distributed.Governance); "" when the rewrite only left
+// out ID domains' columns of ids, which workers read as any statement's.
+func (e *sessionEnv) RewriteMark() string {
+	if g := e.st.guard; g != nil && !g.hiddenOnly {
+		return g.nonce
+	}
+	return ""
+}
+
+// policyRead reports how st reads the catalog table schema.table, which
+// has rules: through the rewrite's subquery, which applies its policies
+// (wrapped), or as written, its policies leaving it as it is for the
+// user. ok is false when the rewrite did not read it, or a clean room
+// concerns what st reads, or it is one of Igloo's own, an ID domain's
+// dictionary or a bitmap index, whose policy denies every user's statement
+// all of it: workers would read its files for nothing.
+func (st *statement) policyRead(schema, table string) (wrapped, ok bool) {
+	g := st.guard
+	if g == nil || g.room || strings.EqualFold(schema, iddomain.DictionarySchema) || strings.EqualFold(schema, iddomain.IndexSchema) {
+		return false, false
+	}
+	wrapped, ok = g.read[strings.ToLower(schema+"."+table)]
+	return wrapped, ok
 }
 
 // runFinal runs the part of a distributed statement that combines its
@@ -835,23 +871,27 @@ func (e *sessionEnv) Table(ctx context.Context, parts []string) (*distributed.Ta
 			return nil, false, nil
 		}
 	}
+	governed := false
 	if e.s.Protected(ctx, o.schema, o.name) {
-		return &distributed.Table{Schema: o.schema, Name: o.name, Unsupported: "masking or row access policies, or a clean room, apply to it"}, true, nil
+		wrapped, ok := e.st.policyRead(o.schema, o.name)
+		if !ok {
+			return &distributed.Table{Schema: o.schema, Name: o.name, Unsupported: "masking or row access policies, or a clean room, apply to it"}, true, nil
+		}
+		governed = wrapped
 	}
 	t, err := e.s.dist.Table(ctx, o.schema, o.name)
 	if err != nil {
 		return nil, false, err
 	}
-	// Workers must read the columns as DuckDB does here. The statement was
-	// bound, so DuckDB has loaded them. Listing them with duckdb_columns()
-	// walks the catalog's in-memory set; hold the exclusive side for that one
-	// scan so it does not run while a table is renamed or dropped on this
-	// instance (the read's run holds nothing; see catalogRunLock, holdCatalog).
-	release := e.s.holdCatalog(e.sess)
-	cols, err := tableColumns(ctx, e.sess, catalogName, o.schema, o.name)
-	release()
+	if governed && t != nil {
+		c := *t
+		c.Governed = true
+		t = &c
+	}
+	// Workers must read the columns as DuckDB does here.
+	cols, err := e.s.boundColumns(ctx, e.sess, catalogName, o.schema, o.name, t.Columns)
 	if err != nil {
-		return nil, false, err
+		t.Unsupported = "DuckDB's columns of it could not be read: " + err.Error()
 	}
 	if len(cols) != len(t.Columns) && t.Unsupported == "" {
 		t.Unsupported = "its columns differ between DuckDB and the catalog"
@@ -994,14 +1034,69 @@ func (e *sessionEnv) ViewDefinition(ctx context.Context, parts []string) (*distr
 	}, true, nil
 }
 
-// tableColumns lists a table's columns as DuckDB has them. Names match as
-// DuckDB matches them, whatever their case: a statement in Snowflake's
-// dialect names lower-case tables in upper case.
-func tableColumns(ctx context.Context, sess *session, db, schema, table string) ([]distributed.Column, error) {
-	rows, err := sess.conn.QueryContext(ctx, `SELECT column_name, data_type FROM duckdb_columns()
-		WHERE lower(database_name) = lower($1) AND lower(schema_name) = lower($2) AND lower(table_name) = lower($3)
-		ORDER BY column_index`,
-		[]driver.NamedValue{{Ordinal: 1, Value: db}, {Ordinal: 2, Value: schema}, {Ordinal: 3, Value: table}})
+// boundColumns returns a table's columns as DuckDB binds them, for a table whose
+// columns the catalog has as columns: what DuckDB gives a statement that selects them
+// all, which it binds as any statement, holding the catalog lock shared. Listing
+// them with duckdb_columns() walks the catalog's in-memory set and held it
+// exclusively, for each table of every statement planned for workers, and under
+// dashboards and ELT, each such listing waited for every bind before it and held
+// up every bind after it: dashboards on workers waited 34 s at the median to run
+// for 0.3 s. DuckDB binds the same columns of the same catalog columns each time,
+// so the server keeps what it bound, by table and columns (see columnCache).
+func (s *Server) boundColumns(ctx context.Context, sess *session, db, schema, table string, columns []distributed.Column) ([]distributed.Column, error) {
+	key := columnKey(db, schema, table, columns)
+	if cols, ok := s.columns.get(key); ok {
+		return cols, nil
+	}
+	cols, err := describedColumns(ctx, sess.conn, "SELECT * FROM "+quoteIdent(db)+"."+quoteIdent(schema)+"."+quoteIdent(table))
+	if err != nil {
+		return nil, err
+	}
+	s.columns.put(key, cols)
+	return cols, nil
+}
+
+// columnKey names a table's columns as the catalog has them, for columnCache.
+func columnKey(db, schema, table string, columns []distributed.Column) string {
+	var b strings.Builder
+	b.WriteString(strings.ToLower(db + "\x00" + schema + "\x00" + table))
+	for _, c := range columns {
+		b.WriteString("\x00" + c.Name + "\x01" + c.Type)
+	}
+	return b.String()
+}
+
+// columnCache is what DuckDB bound of tables' columns (see boundColumns), at
+// most maxCachedColumns tables' worth: past that it starts again.
+type columnCache struct {
+	mu   lockorder.Mutex
+	cols map[string][]distributed.Column
+}
+
+// maxCachedColumns bounds columnCache: a table whose columns change has an entry
+// for each version of them.
+const maxCachedColumns = 4096
+
+func (c *columnCache) get(key string) ([]distributed.Column, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	cols, ok := c.cols[key]
+	return cols, ok
+}
+
+func (c *columnCache) put(key string, cols []distributed.Column) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.cols == nil || len(c.cols) >= maxCachedColumns {
+		c.cols = map[string][]distributed.Column{}
+	}
+	c.cols[key] = cols
+}
+
+// describedColumns returns the names and types of the columns of query's result, as
+// DuckDB binds it.
+func describedColumns(ctx context.Context, conn *duckdb.Conn, query string) ([]distributed.Column, error) {
+	rows, err := conn.QueryContext(ctx, "SELECT column_name, column_type FROM (DESCRIBE "+query+")", nil)
 	if err != nil {
 		return nil, err
 	}
@@ -1241,7 +1336,7 @@ func macroDefinitions(ctx context.Context, conn *duckdb.Conn, cond string) ([]ma
 }
 
 var (
-	sfMacrosMu sync.Mutex
+	sfMacrosMu lockorder.Mutex
 	// sfMacros are the keys of Igloo's macros for Snowflake's functions as
 	// a session defines them, sorted.
 	sfMacros []string

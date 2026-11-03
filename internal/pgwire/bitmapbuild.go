@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"time"
 
@@ -17,6 +16,7 @@ import (
 
 	"github.com/akkio-inc/igloo/internal/auth"
 	"github.com/akkio-inc/igloo/internal/iddomain"
+	"github.com/akkio-inc/igloo/internal/lockorder"
 )
 
 // Keeping bitmap indexes up to date. An index's table holds the bitmaps of
@@ -117,7 +117,7 @@ func (s *Server) builtSnapshots(ctx context.Context, conn *duckdb.Conn, x iddoma
 // run a table at a time, and another after it if the table was written
 // again meanwhile.
 type indexBuilds struct {
-	mu      sync.Mutex
+	mu      lockorder.Mutex
 	running map[string]bool
 	again   map[string]bool
 	// failed counts each index's builds that failed in a row, which are

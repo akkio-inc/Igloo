@@ -9,10 +9,10 @@ import (
 	"io"
 	"slices"
 	"strings"
-	"sync"
 
 	"github.com/duckdb/duckdb-go/v2"
 
+	"github.com/akkio-inc/igloo/internal/lockorder"
 	"github.com/akkio-inc/igloo/internal/policy"
 	"github.com/akkio-inc/igloo/internal/sqllex"
 )
@@ -331,7 +331,7 @@ func (r *resolver) parseBody(p policy.Policy) (*bodyTemplate, error) {
 // no user's temporary objects or settings reach, against a relation with
 // one column per argument whose values DuckDB cannot know.
 type policyProbe struct {
-	mu      sync.Mutex
+	mu      lockorder.Mutex
 	conn    *duckdb.Conn
 	connect func(context.Context) (*duckdb.Conn, error)
 	results map[string]bool

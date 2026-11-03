@@ -212,6 +212,12 @@ dataset whose table gains one stops running.
 - **Every way in.** Statements over the Postgres protocol, the web console
   and [Arrow Flight SQL](flight-sql.md) take the same path, so policies
   apply to all of them alike, Flight SQL's Arrow results included.
+- **Wherever they run.** A statement runs through its policies on
+  [workers](distributed-execution.md#masking-and-row-access-policies) and in
+  the replica's [second DuckDB](workload-management.md#heavy-statements-beside-short-ones)
+  as on the replica: every stage reads a protected table through the
+  policies' subquery, so no exchange holds a raw masked value or a hidden
+  row.
 - **Tasks, pipes and materialized views** ([loading](loading.md)) run as
   their owners, through the owner's policies at each run. A materialized
   view holds what its owner may see, and whoever may read the view sees

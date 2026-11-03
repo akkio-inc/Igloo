@@ -72,6 +72,13 @@ type rewriter struct {
 	touched      bool
 	beyondHiding bool
 	applied      []string
+	// read are the catalog's tables with rules the statement reads, by
+	// lower-case schema.table: true for those it reads through a subquery
+	// of the rewrite's, false for those read as written, whose policies
+	// leave them as they are for the session. room says a clean room's
+	// confinement, or an external table's rules, concern what it reads.
+	read map[string]bool
+	room bool
 	// indexTables are the bitmap indexes, lower case, whose tables Igloo
 	// wrote the statement to read (its indexPins): the references to them
 	// it wrote, qualified in full, are its own (see refEdit).
@@ -103,6 +110,22 @@ func (rw *rewriter) okColumn() string { return quoteIdent("__igloo_ok_" + rw.non
 // statement: a subquery whose alias marks it as the policy's.
 func (rw *rewriter) markTable(table string) string {
 	return "(SELECT * FROM " + table + " AS " + quoteIdent(rw.alias("p")) + ")"
+}
+
+// reads records how the statement reads o, a table with rules: through
+// the rewrite's subquery (wrapped) or as written.
+func (rw *rewriter) reads(o object, rules *policy.TableRules, wrapped bool) {
+	if len(rules.Confined) > 0 {
+		rw.room = true
+	}
+	if !strings.EqualFold(o.db, rw.r.catalog) {
+		return
+	}
+	if rw.read == nil {
+		rw.read = map[string]bool{}
+	}
+	key := strings.ToLower(o.schema + "." + o.name)
+	rw.read[key] = rw.read[key] || wrapped
 }
 
 func (rw *rewriter) apply(names ...string) {
@@ -579,7 +602,7 @@ func (rw *rewriter) refEdit(text string, ref *refNode, view *object, depth int, 
 		// files only its proxy serves; policies cannot be attached to
 		// one (see policyTable), but a clean room can confine it.
 		if rules := rw.snap.Rules(o.schema, o.name); rules != nil {
-			rw.touched, rw.beyondHiding = true, true
+			rw.touched, rw.beyondHiding, rw.room = true, true, true
 			if err := rw.confined(o, rules); err != nil {
 				return nil, err
 			}
@@ -593,6 +616,7 @@ func (rw *rewriter) refEdit(text string, ref *refNode, view *object, depth int, 
 		if rw.realRules(o) || plan.guards() {
 			rw.beyondHiding = true
 		}
+		rw.reads(o, rw.rules(o), !plan.noop())
 		if plan.noop() {
 			return rw.qualify(text, &at, o, view)
 		}
@@ -1206,6 +1230,9 @@ func (rw *rewriter) target(name []string) (object, bool, error) {
 		return o, false, nil
 	}
 	rw.touched = true
+	if len(rw.rules(o).Confined) > 0 {
+		rw.room = true
+	}
 	if rw.realRules(o) {
 		rw.beyondHiding = true
 	}

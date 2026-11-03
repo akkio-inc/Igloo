@@ -497,7 +497,39 @@ const (
 	// combineList concatenates the lists of list() and array_agg(), whose
 	// order is arbitrary without ORDER BY.
 	combineList = "list"
+	// combineMoments merges each part's count, mean and sum of squared
+	// deviations from it, pairwise (Chan, Golub and LeVeque's update), as
+	// DuckDB merges its threads' for a variance or standard deviation.
+	// Over sums of values and of their squares, the variance of values near
+	// a large mean would lose its digits.
+	combineMoments = "moments"
 )
+
+// moments are the variances and standard deviations, which combine by
+// their parts' moments (combineMoments), to whether they are of a sample.
+var moments = map[string]bool{
+	"var_samp": true, "variance": true, "stddev_samp": true, "stddev": true, "var_pop": false, "stddev_pop": false,
+}
+
+// isMoments reports whether an aggregate is one of moments.
+func isMoments(name string) bool {
+	_, ok := moments[name]
+	return ok
+}
+
+// mergedMoments is the merge of the parts' moments of combineMoments, of
+// partial results n (a count), m (a mean) and v (a population variance):
+// a struct of n, the count, and q, the sum of squared deviations. NULL
+// where no part counted a value. Its fields are read by struct_extract:
+// DuckDB binds a lambda's __x.n in HAVING as a column n.
+func mergedMoments(n, m, v string) string {
+	f := func(s, field string) string { return "struct_extract(" + s + ", '" + field + "')" }
+	xn, xm, xq, yn, ym, yq := f("__x", "n"), f("__x", "m"), f("__x", "q"), f("__y", "n"), f("__y", "m"), f("__y", "q")
+	d := "(" + ym + " - " + xm + ")"
+	return "list_reduce(list({'n': CAST(" + n + " AS DOUBLE), 'm': " + m + ", 'q': " + v + " * " + n + "}) FILTER (WHERE " + n + " > 0), " +
+		"lambda __x, __y: {'n': " + xn + " + " + yn + ", 'm': " + xm + " + " + d + " * " + yn + " / (" + xn + " + " + yn + "), " +
+		"'q': " + xq + " + " + yq + " + " + d + " * " + d + " * " + xn + " * " + yn + " / (" + xn + " + " + yn + ")})"
+}
 
 // collecting are the aggregates that collect their values in a list,
 // which partial lists concatenate into (combineList).
@@ -689,6 +721,10 @@ func partialArgs(name string, args int) error {
 		if args != 1 {
 			return unsupported("%s with %d arguments", name, args)
 		}
+	case isMoments(name):
+		if args != 1 {
+			return unsupported("%s with %d arguments", name, args)
+		}
 	case combinable[name] == "":
 		return unsupported("%s() cannot be computed in parts", name)
 	case (name == "min" || name == "max") && args != 1:
@@ -773,6 +809,11 @@ func (a *aggregation) plan() error {
 	for _, ac := range a.aggs {
 		if ac.distinct >= 0 && (a.mode == aggGather || a.mode == aggByGroup) {
 			ac.kind = combineDistinct
+			continue
+		}
+		if isMoments(ac.name) {
+			ac.kind = combineMoments
+			ac.partials = []int{a.partial(ac, "count"), a.partial(ac, "avg"), a.partial(ac, "var_pop")}
 			continue
 		}
 		if ac.bitmap {
@@ -1647,10 +1688,10 @@ func (a *aggregation) wholeFirstRows() ([]any, bool) {
 				if k, ok := intConstant(e); ok && k >= 1 && int(k) <= len(a.items) {
 					e = bare(a.items[k-1])
 				} else if str(e["class"]) == "COLUMN_REF" && len(columnNames(e)) == 1 {
+					// ORDER BY binds a bare name to the select list's alias before a
+					// column of FROM by that name, as firstRows reads it.
 					if i, isAlias := a.aliases[strings.ToLower(columnNames(e)[0])]; isAlias {
-						if has, _ := a.c.scope.hasColumn(strings.ToLower(columnNames(e)[0])); !has {
-							e = bare(a.items[i])
-						}
+						e = bare(a.items[i])
 					}
 				} else if str(e["class"]) == "STAR" {
 					return nil, false
@@ -1874,9 +1915,19 @@ func (a *aggregation) rewrite(e node, part string) (node, error) {
 			case "SUBQUERY":
 				// A scalar subquery that stands on its own (see analyze),
 				// which the coordinator computes, its tables read at the
-				// workers' snapshots (see pinReads).
+				// workers' snapshots (see pinReads). It defines the common
+				// table expressions it reads, which the statement the
+				// coordinator runs does not: TPC-DS q24's HAVING reads
+				// ssales, which workers compute for its FROM.
 				if !a.c.relation {
-					return n, true
+					q, serr := standalone(subqueryNode(n), a.c.ctes)
+					if serr != nil {
+						err = serr
+						return nil, false
+					}
+					s := clone(n).(node)
+					child(s, "subquery")["node"] = q
+					return s, true
 				}
 			}
 			err = unsupported("%s outside WHERE", strings.ToLower(str(n["class"])))
@@ -1921,6 +1972,17 @@ func (a *aggregation) combined(ac *aggCall) (node, error) {
 		text = "rb_cardinality(rb_or_agg(" + col(0) + "))"
 	case ac.kind == combineList:
 		text = combineLists(col(0))
+	case ac.kind == combineMoments:
+		// Of a sample, n - 1 degrees of freedom: none for one value.
+		n, least, df := "sum("+col(0)+")", "0", "sum("+col(0)+")"
+		if moments[ac.name] {
+			least, df = "1", "(sum("+col(0)+") - 1)"
+		}
+		text = "struct_extract(" + mergedMoments(col(0), col(1), col(2)) + ", 'q') / " + df
+		if strings.HasPrefix(ac.name, "stddev") {
+			text = "sqrt(" + text + ")"
+		}
+		text = "CASE WHEN " + n + " > " + least + " THEN " + text + " END"
 	case ac.kind == combineDistinct:
 		c := clone(ac.call).(node)
 		ref, err := a.pl.p.expr(quoteIdent("__dk" + strconv.Itoa(ac.distinct)))

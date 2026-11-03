@@ -14,7 +14,6 @@ import (
 	"slices"
 	"strconv"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"time"
 
@@ -25,6 +24,7 @@ import (
 	"github.com/akkio-inc/igloo/internal/auth"
 	"github.com/akkio-inc/igloo/internal/cleanroom"
 	"github.com/akkio-inc/igloo/internal/iddomain"
+	"github.com/akkio-inc/igloo/internal/lockorder"
 	"github.com/akkio-inc/igloo/internal/models"
 	"github.com/akkio-inc/igloo/internal/policy"
 	"github.com/akkio-inc/igloo/internal/sqllex"
@@ -50,7 +50,7 @@ type governance struct {
 	refresh time.Duration
 	log     *slog.Logger
 
-	mu      sync.Mutex
+	mu      lockorder.Mutex
 	snap    atomic.Pointer[policy.Snapshot]
 	checked atomic.Int64
 	// confirmed is when the store last answered: the snapshot was current
@@ -63,7 +63,7 @@ type governance struct {
 
 	probe policyProbe
 
-	tmplMu    sync.Mutex
+	tmplMu    lockorder.Mutex
 	templates map[string]*bodyTemplate
 
 	// allowed are the locations users other than admins may read files
@@ -656,12 +656,17 @@ func (s *Server) checkPath(path string, allowWarehouse bool) error {
 }
 
 // sensitivity returns the session's, working it out again when the
-// policies or the catalog changed.
+// policies or the catalog's views, macros, functions or connections
+// changed (resultGeneration): what it lists. A table's DDL changes none of
+// them, and the rollups of ELT beside dashboards, replacing tables every
+// minute, had every session list them again after each.
 func (s *Server) sensitivity(ctx context.Context, sess *session, snap *policy.Snapshot) (*sensitivity, bool, error) {
-	pg, cg := s.gov.gen.Load(), s.catalogGeneration()
+	pg, cg := s.gov.gen.Load(), s.resultGeneration()
 	if c := sess.sens; c != nil && c.policyGen == pg && c.catalogGen == cg {
 		return c, false, nil
 	}
+	// The listing walks the catalog's in-memory set (see policyRewrite).
+	defer s.holdCatalog(sess)()
 	rows, err := sess.conn.QueryContext(ctx, `SELECT 'view', database_name, schema_name, view_name, sql
 			FROM system.main.duckdb_views() WHERE NOT internal
 		UNION ALL SELECT 'macro', database_name, schema_name, function_name, coalesce(macro_definition, '')
@@ -955,6 +960,14 @@ type guard struct {
 	// names them, so workers may run it as they run a statement over tables
 	// with nothing to hide (see policyReason).
 	hiddenOnly bool
+	// read are the catalog's tables with rules it reads, by lower-case
+	// schema.table: true for those it reads through the rewrite's
+	// subqueries, which apply their policies, false for those whose
+	// policies leave them as they are for the user. room says a clean
+	// room's confinement, or an external table's rules, concern what it
+	// reads (see policyReason).
+	read map[string]bool
+	room bool
 }
 
 func newNonce() string {
@@ -1005,13 +1018,17 @@ func (s *Server) policyRewrite(ctx context.Context, sess *session, user auth.Use
 		// of 60 s that a dashboard's 136 prepares took, 50 s went here.
 		return query, g, false, nil
 	}
-	// Applying policies resolves names and runs DESCRIBE and sensitivity
-	// checks, all of which walk the catalog's in-memory set. Most callers
-	// already hold the catalog (preparing or rechecking a statement); a
-	// materialized view's refresh calls this on its own. Hold the exclusive
-	// side so none of it runs while a table is renamed or dropped on this
-	// instance (reentrant; see holdCatalog).
-	defer s.holdCatalog(sess)()
+	// Applying policies resolves names and runs DESCRIBE, which walk the
+	// catalog's in-memory set; so do the checks of DDL, and listing what
+	// policies concern (see sensitivity). Each holds the exclusive side so
+	// none of it runs while a table is renamed or dropped on this instance
+	// (reentrant; see holdCatalog). A query that names nothing policies
+	// concern, as a dashboard's, needs none of it once the session's
+	// listing is made: holding it for every query, prepared under the
+	// shared lock, queued them all behind each other.
+	if ddl {
+		defer s.holdCatalog(sess)()
+	}
 	// Tags and data retentions follow names too, policies or not: a
 	// renamed table would escape erasure (see package erasure).
 	checked := false
@@ -1065,6 +1082,9 @@ func (s *Server) policyRewrite(ctx context.Context, sess *session, user auth.Use
 	if !sens.triggers(query, admin) {
 		return query, g, ran, nil
 	}
+	if !ddl {
+		defer s.holdCatalog(sess)()
+	}
 	ran = true
 	privs, err := s.privileges(ctx, sess, user)
 	if err != nil {
@@ -1092,7 +1112,7 @@ func (s *Server) policyRewrite(ctx context.Context, sess *session, user auth.Use
 			return "", nil, ran, err
 		}
 	}
-	g.touched, g.applied, g.nonce, g.privs = rw.touched, rw.applied, rw.nonce, privs
+	g.touched, g.applied, g.nonce, g.privs, g.read, g.room = rw.touched, rw.applied, rw.nonce, privs, rw.read, rw.room
 	g.hiddenOnly = rw.touched && !rw.beyondHiding && len(rw.applied) == 0
 	return text, g, ran, nil
 }
@@ -2028,10 +2048,13 @@ func (s *Server) recheckPolicies(ctx context.Context, sess *session, st *stateme
 
 // recheck checks a prepared statement again before it runs: its policies,
 // then its grants.
-// needsRecheck reports whether rechecking st could do anything: it has
-// grants to check again, or its policies could apply otherwise now, as
-// policies, the catalog or the session's settings changed, or as they
-// read the user's privileges. Like recheck, it first reads the user again,
+// needsRecheck reports whether rechecking st could do anything: its grants
+// could allow otherwise now (see grantsStale), or its policies could apply
+// otherwise, as policies, the catalog or the session's settings changed, or
+// as they read the user's privileges. Rechecking holds the catalog lock
+// exclusively, and a statement of a user whose grants are checked was
+// rechecked before every run, so each run of a reader's dashboard waited for
+// the binds before it and held up those after it, with nothing to check. Like recheck, it first reads the user again,
 // failing for a user dropped or disabled meanwhile, and the grants and
 // policies, as changed elsewhere, failing for any not read for too long
 // (see refreshAccess); neither holds the catalog lock.
@@ -2043,7 +2066,7 @@ func (s *Server) needsRecheck(ctx context.Context, sess *session, st *statement)
 	if err != nil {
 		return false, err
 	}
-	if st.access != nil {
+	if st.access != nil && s.grantsStale(ctx, sess, user, st) {
 		return true, nil
 	}
 	g := st.guard
@@ -2087,6 +2110,16 @@ func (st *statement) policies() []string {
 		return nil
 	}
 	return st.guard.applied
+}
+
+// shapeText is the text DuckDB prepared without the mark of the policies'
+// rewrite, which is new each time they rewrite the statement: its shape is
+// the same from one run to the next (see workloadShape).
+func (st *statement) shapeText() string {
+	if g := st.guard; g != nil && g.nonce != "" {
+		return strings.ReplaceAll(st.prepared, g.nonce, "")
+	}
+	return st.prepared
 }
 
 // policyMarker is the alias prefix of the tables policies read in the

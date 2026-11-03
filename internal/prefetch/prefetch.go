@@ -209,16 +209,10 @@ func New(opts Options) (*Prefetcher, error) {
 	if opts.Log == nil {
 		opts.Log = slog.New(slog.DiscardHandler)
 	}
+	started := time.Now()
 	atime, err := probe(opts.Dir)
 	if err != nil {
 		return nil, err
-	}
-	// Blocks a crash left half written, each in a file of its own (see
-	// writeBlock).
-	if left, err := filepath.Glob(filepath.Join(opts.Dir, "*"+tmpSuffix)); err == nil {
-		for _, f := range left {
-			_ = os.Remove(f)
-		}
 	}
 	p := &Prefetcher{opts: opts,
 		fetched: prometheus.NewCounter(prometheus.CounterOpts{Name: "igloo_prefetch_bytes_total",
@@ -233,6 +227,13 @@ func New(opts Options) (*Prefetcher, error) {
 			Help: "Reads ahead that failed, which the scans then made themselves."}),
 	}
 	p.cond = sync.NewCond(&p.mu)
+	// Listing a cache of tens of thousands of blocks takes a second on a
+	// disk just started, so it goes on beside the server's start.
+	p.wg.Add(1)
+	go func() {
+		defer p.wg.Done()
+		removeLeftovers(opts.Dir, started)
+	}()
 	for range opts.Concurrency {
 		p.wg.Add(1)
 		go p.work()
@@ -249,6 +250,21 @@ func New(opts Options) (*Prefetcher, error) {
 		}
 	}
 	return p, nil
+}
+
+// removeLeftovers removes the blocks a crash left half written, each in a
+// file of its own (see writeBlock), from before this process's prefetcher
+// started.
+func removeLeftovers(dir string, before time.Time) {
+	left, err := filepath.Glob(filepath.Join(dir, "*"+tmpSuffix))
+	if err != nil {
+		return
+	}
+	for _, f := range left {
+		if fi, err := os.Stat(f); err == nil && fi.ModTime().Before(before) {
+			_ = os.Remove(f)
+		}
+	}
 }
 
 // Collectors returns the prefetcher's metrics.

@@ -2,9 +2,10 @@ package engine
 
 import (
 	"errors"
-	"sync"
 
 	"github.com/duckdb/duckdb-go/v2/mapping"
+
+	"github.com/akkio-inc/igloo/internal/lockorder"
 )
 
 // parser counts the statements in a query without running any of them.
@@ -13,7 +14,7 @@ import (
 // first count them here. It uses its own empty in-memory DuckDB, which only
 // ever parses.
 type parser struct {
-	mu   sync.Mutex
+	mu   lockorder.Mutex
 	db   mapping.Database
 	conn mapping.Connection
 }

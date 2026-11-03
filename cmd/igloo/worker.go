@@ -70,7 +70,7 @@ func serveWorker() error {
 	locations := append([]string{cfg.Storage.Root()}, cfg.Storage.AllowedLocations...)
 	opts := distributed.WorkerOptions{
 		Engine: eng, Secret: cfg.Workers.Secret, Version: version, TempDir: cfg.DuckDB.TempDir,
-		Locations: locations, MemoryBytes: memory, Threads: threads, ExchangeBytes: cfg.Workers.ExchangeMax,
+		Locations: locations, MemoryBytes: memory, MemoryNow: eng.MemoryLimit, Threads: threads, ExchangeBytes: cfg.Workers.ExchangeMax,
 		Metrics: distributed.NewWorkerMetrics(reg),
 	}
 	if p := eng.Prefetcher(); p != nil {
@@ -421,7 +421,6 @@ func seedHistory(ctx context.Context, seed func([]distributed.Run), fp footprint
 			continue
 		}
 		if f.empty {
-			fp.ObserveEmpty(f.shape)
 			fp.ObserveEmpty(f.exact)
 			continue
 		}

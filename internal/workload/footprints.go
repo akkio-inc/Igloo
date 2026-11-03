@@ -106,8 +106,10 @@ func ReadNothing(bytesRead int64, cpu time.Duration) bool {
 	return bytesRead == 0 && cpu < LightCPU
 }
 
-// ObserveEmpty records a run of shape that ReadNothing says of: as holding and taking
-// nothing, if the shape has no other runs, and until it has one.
+// ObserveEmpty records a run of key that ReadNothing says of: as holding and taking
+// nothing, if the key has no other runs, and until it has one. It is for the same text
+// with the same literals (see Alike), which plan to no rows again; those alike but for
+// their literals may take a minute of all the cores.
 func (c *Controller) ObserveEmpty(shape string) {
 	if c == nil || shape == "" {
 		return
@@ -126,6 +128,48 @@ func (c *Controller) ObserveEmpty(shape string) {
 	if len(k.runs[shape]) == 0 {
 		k.runs[shape] = []time.Duration{0}
 	}
+}
+
+// most is the most any of its latest runs held, or one that ended early held.
+func (f *footprint) most() int64 {
+	m := f.unfinished
+	for _, r := range f.runs {
+		m = max(m, r)
+	}
+	return m
+}
+
+// pick returns which of a statement's keys to go by (see Alike), and whether by the
+// most its runs took, not what they took most of the time: a statement whose text
+// with its literals has not run may be any of those alike but for them.
+func (c *Controller) pick(exact, shape string) (key string, most bool) {
+	if key = c.Alike(exact, shape); key != exact && exact != "" {
+		return key, true
+	}
+	return key, false
+}
+
+// Reserve returns what a statement is to reserve (see Estimate) and whether its runs
+// say so (seen), by those of the same text with the same literals if there are any,
+// and otherwise by the most any run alike but for its literals held. Those alike can
+// differ by as much as their literals do: over the empty audience or the value nothing
+// has, a dashboard's statements took seconds, and others of them with no runs of
+// their own, so estimated, reserved nothing, started together and spilled.
+func (c *Controller) Reserve(exact, shape string) (memory int64, seen bool) {
+	key, most := c.pick(exact, shape)
+	if !most {
+		_, seen = c.Footprint(key)
+		return c.Estimate(key), seen
+	}
+	f := &c.history
+	f.mu.Lock()
+	fp, ok := f.held[key]
+	var held int64
+	if ok {
+		held = fp.most()
+	}
+	f.mu.Unlock()
+	return c.estimate(held), ok
 }
 
 // Alike returns which of a statement's two keys to go by, what it reserves and how
@@ -304,6 +348,15 @@ func (c *Controller) Estimate(shape string) int64 {
 		return 0
 	}
 	held, _, _ := c.footprint(shape)
+	return c.estimate(held)
+}
+
+// estimate is the reservation for what statements held: none under a sixteenth of the
+// replica's memory.
+func (c *Controller) estimate(held int64) int64 {
+	if c == nil || c.history.fraction == 0 || c.budget <= 0 {
+		return 0
+	}
 	r := int64(float64(held) * c.history.fraction)
 	if r < c.budget/minReservationShare {
 		return 0

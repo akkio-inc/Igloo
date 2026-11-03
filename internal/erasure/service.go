@@ -26,6 +26,7 @@ import (
 	"github.com/akkio-inc/igloo/internal/catalog"
 	"github.com/akkio-inc/igloo/internal/deletefiles"
 	"github.com/akkio-inc/igloo/internal/iddomain"
+	"github.com/akkio-inc/igloo/internal/lockorder"
 	"github.com/akkio-inc/igloo/internal/policy"
 	"github.com/akkio-inc/igloo/internal/tasks"
 	"github.com/akkio-inc/igloo/internal/uploads"
@@ -174,12 +175,14 @@ type Service struct {
 	// lease takes the lock that runs one request at a time, on any
 	// replica.
 	lease func(ctx context.Context) (tasks.Lease, bool, error)
-	// mu stands in for the scheduler's locks without one.
+	// mu stands in for the scheduler's locks without one. It is only ever
+	// tried, never waited for, so a run holds it across the catalog lock
+	// (see package lockorder).
 	mu sync.Mutex
 	// targets are what position delete files delete rows of.
 	targets *deletefiles.Targets
 	// cacheMu guards dirs.
-	cacheMu sync.Mutex
+	cacheMu lockorder.Mutex
 	// dirs are the directories of the files tables reference, by
 	// metadata file (see dirsOf).
 	dirs map[string]*tableDirs
@@ -745,7 +748,7 @@ func (s *Service) folding(ctx context.Context) (*folding, error) {
 // folds are DuckDB's normalization tables, the same for every connection
 // of the DuckDB this process links.
 var folds struct {
-	mu sync.Mutex
+	mu lockorder.Mutex
 	f  *folding
 }
 

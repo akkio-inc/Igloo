@@ -606,12 +606,35 @@ if [ -n "$(files_of written_wide)" ] && [ -z "$(files_of written_wide | grep -v 
 else
   fail "wide rows: its files: $(files_of written_wide | head -3)"
 fi
-psql_admin -c "CREATE TABLE written_wide_auto AS $slow_copy" >/dev/null 2>&1 || true
+# On a replica of 2 GB, which its row groups of these rows would not fit (a copy of
+# them at scale factor 1 held 13 GB on 8 threads), auto mode runs the copy on workers
+# from its first run, however small the table it reads.
+echo "IGLOO_MEMORY_LIMIT=2GB" >>"$env_file"
+compose up -d --no-build --wait igloo >/dev/null
+psql_admin -c "CREATE TABLE written_wide_auto AS $slow_copy" >"$work/written_wide_auto" 2>&1 || true
+ran_on="$(psql_admin -c "SELECT workers FROM igloo.query_history WHERE query_text LIKE 'CREATE TABLE written_wide_auto%' ORDER BY start_time DESC LIMIT 1")"
+if [ "${ran_on:-0}" -gt 0 ] 2>/dev/null; then
+  pass "wide rows on a small replica: on $ran_on workers, from the first run"
+else
+  fail "wide rows on a small replica ran on [${ran_on}] workers: $(tail -2 "$work/written_wide_auto")"
+fi
+# Read back on a replica of the memory it had, which reads them on its every thread.
+sed -i.bak '/^IGLOO_MEMORY_LIMIT=2GB$/d' "$env_file"
+compose up -d --no-build --wait igloo >/dev/null
 wide_rows "wide rows, wherever auto mode runs them" written_wide_auto
 psql_admin -c "SET distributed_execution = 'off'" -c "CREATE TABLE written_wide_parts AS $slow_copy LIMIT 0" \
   -c "ALTER TABLE written_wide_parts SET PARTITIONED BY (truncate(10000, l_orderkey))" >/dev/null
+since="$(date -u +%FT%TZ)"
 psql_admin -c "SET distributed_execution = 'on'" -c "INSERT INTO written_wide_parts $slow_copy" >/dev/null 2>&1 || true
 wide_rows "wide rows in partitions, forced onto workers" written_wide_parts
+# Rows this wide its tasks write as they come, not sorted by partition, which ran
+# them out of memory, a task holding what it writes within its memory.
+ran_out="$(compose logs --no-color --since "$since" igloo 2>&1 | grep -c 'a task ran out of memory' || true)"
+if [ "$ran_out" = 0 ]; then
+  pass "wide rows in partitions: no task ran out of memory"
+else
+  fail "wide rows in partitions: tasks ran out of memory $ran_out times"
+fi
 if [ -z "$(files_of written_wide_parts | grep -v '/igloo-sealed-')" ]; then
   pass "and workers wrote them"
 else
@@ -676,9 +699,9 @@ if [ "${got:-0}" -ge 1 ]; then pass "and runs on workers"; else fail "a compacte
 check_distributed "a compacted table with nested columns" nested_compacted "$nested_query"
 
 echo "policies"
-# Workers read table files and could not apply masking or row access
-# policies: a statement over a protected table runs on one replica and
-# returns what the policies let through, however it aggregates.
+# A statement over a protected table runs on workers, which read the table
+# through the subquery the policies' rewrite wrote, and returns what the
+# policies let through, however it aggregates.
 {
   echo "CREATE TABLE contacts AS SELECT c_custkey AS id, c_name AS name, c_nationkey AS nation FROM customer;"
   echo "CREATE MASKING POLICY hide_name AS (val VARCHAR) RETURNS VARCHAR -> '***';"
@@ -690,8 +713,8 @@ got="$(psql_admin -c "SET distributed_execution = 'on'" \
   -c "/* masked */ SELECT count(DISTINCT name), min(name), max(name), max(nation) FROM contacts" | grep -v '^SET$')"
 if [ "$got" = "1|***|***|4" ]; then pass "a protected table returns what its policies let through"; else fail "protected table: [$got]"; fi
 sleep 2
-expect "and runs on one replica" "0" \
-  "SELECT workers FROM igloo.query_history WHERE query_text LIKE '/* masked */%' ORDER BY start_time DESC LIMIT 1"
+got="$(psql_admin -c "SELECT workers FROM igloo.query_history WHERE query_text LIKE '/* masked */%' ORDER BY start_time DESC LIMIT 1")"
+if [ "${got:-0}" -ge 1 ]; then pass "and runs on workers"; else fail "a protected table ran on $got workers"; fi
 
 echo "worker endpoint"
 if docker run --rm --network "$network" curlimages/curl:8.22.0 -sk --max-time 10 "https://worker:7433/v1/status" >/dev/null 2>&1; then

@@ -10,10 +10,10 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"sync"
 	"sync/atomic"
 
 	"github.com/akkio-inc/igloo/internal/distributed"
+	"github.com/akkio-inc/igloo/internal/lockorder"
 )
 
 // Recognizing audience reports (IGLOO_REPORT_REWRITE): the counting CTEs of
@@ -859,7 +859,7 @@ type reportTemplates struct {
 	caseOn jnode // CASE igloo_api.dimension WHEN '' THEN NULL END
 	star   jnode // SELECT * FROM x
 
-	mu    sync.Mutex
+	mu    lockorder.Mutex
 	casts map[string]jnode // DESCRIBE's type names -> cast_type
 }
 

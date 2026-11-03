@@ -70,8 +70,9 @@ GROUP BY ALL;
 Each worker reads a share of the large table's data files and all of the
 smaller tables, filters, joins and aggregates its rows, and sends back
 partial results; the coordinator combines them (sums of sums, counts of
-counts, minimums of minimums, and aggregates over `DISTINCT` values over the
-values the workers found) and runs the rest of the statement: `HAVING`,
+counts, minimums of minimums, variances and standard deviations from each
+part's count, mean and variance, and aggregates over `DISTINCT` values over
+the values the workers found) and runs the rest of the statement: `HAVING`,
 `ORDER BY`, `LIMIT`, window functions over the aggregates, other joins and
 subqueries. A statement that ranks the groups with `ROW_NUMBER()`, `RANK()`
 or `DENSE_RANK()` and keeps the first few of each partition (`WHERE rank <=
@@ -339,7 +340,7 @@ In detail, a part runs distributed when:
 
 Everything else runs on one machine: median and other aggregates that do
 not combine (`median`, `quantile`, `approx_count_distinct`, `string_agg`,
-`list(x ORDER BY y)`, `stddev`), except over a relation workers compute, which is then
+`list(x ORDER BY y)`), except over a relation workers compute, which is then
 partitioned by the groups so that each worker computes whole groups;
 aggregates over `DISTINCT` values of unrelated
 expressions in one `SELECT` (`count(DISTINCT a), count(DISTINCT b)`),
@@ -356,19 +357,44 @@ read through a name mapping) or that nest a struct's fields otherwise
 than the table does now (a field renamed, or dropped and added again,
 since they were written), tables of Iceberg format version 3 with a
 column or nested field that has an initial default (workers would read it
-as `NULL` from the files written before it was added), tables with
-[masking or row access policies](security-policies.md) and statements that
-read them (directly or through a view), views that group, sort or
-limit, [connections](federation.md)' tables and Delta
-Sharing's [external tables](sharing.md). Workers read table files
-directly and could not apply policies; a connection's table or an external
-table may still be read in the part of a statement the coordinator runs
-itself, such as a scalar subquery over a distributed part, but never on a
-worker. An [ID domain](sql.md#id-domains)'s member table is not one of these
-for its columns of ids alone: statements read it without them, and
-workers run them as they run any other. Igloo's own text names those
-columns where it counts through ids. A member table with a policy of its
-own stays on the replica.
+as `NULL` from the files written before it was added), tables a [clean
+room](clean-rooms.md) keeps to its party and statements that read them,
+views that group, sort or limit, [connections](federation.md)' tables and
+Delta Sharing's [external tables](sharing.md). A connection's table or an
+external table may still be read in the part of a statement the
+coordinator runs itself, such as a scalar subquery over a distributed
+part, but never on a worker. An [ID domain](sql.md#id-domains)'s member
+table is not one of these for its columns of ids alone: statements read it
+without them, and workers run them as they run any other. Igloo's own text
+names those columns where it counts through ids. Tables with masking or row
+access policies run on workers through their policies (below).
+
+### Masking and row access policies
+
+Statements that [masking and row access policies](security-policies.md)
+apply to run on workers as any other does, for every user. Igloo writes the
+policies into the statement as it does on one machine: each protected
+table is read through a subquery that masks its columns and leaves out the
+rows its row access policy hides, with the user's name, roles and tags
+written in as values. Every stage that reads a protected table reads it
+through that subquery as written, from the table's files, and the tables a
+policy reads only inside it. So a stage writes nothing to an exchange or to
+the coordinator but masked values of the rows the user may see, however
+the statement joins, partitions, windows or aggregates them; the planner
+checks every stage for that before any runs. Where a join or a window would
+partition a protected table's rows by a key, or a statement reads the table
+twice, the stages partition the rows the subquery makes instead: they
+compute it as a relation, applying the policies where they read the table.
+A part whose stages the planner cannot keep so runs on the replica.
+
+A row access policy that reads a table, as one that looks up the roles a
+client's rows belong to, has every worker read that table in full, as a
+filter's subquery does. One too large for that keeps the part of the
+statement on the replica. A user a policy exempts reads the table as
+written, on workers as anyone reads a table without policies. Fills from
+protected tables run where reads of them would and write what their user
+sees. Statements that read a table a clean room keeps to its party stay
+on the replica: what keeps it to its party is not in the statement.
 
 ### Fills
 
@@ -396,14 +422,28 @@ the workers at 400 MB/s. So a copy workers write runs there where they are
 faster, and one the coordinator would write takes about as long either way
 and stays on the replica unless workers are faster still by the margin auto
 mode asks of any statement.
+No size of a fill's tables says what its rows take where an expression makes
+them: `repeat(l_comment, 400)` makes 10.8 KB of each row of a TPC-H lineitem
+of 205 MB, 65 GB of 6 million rows. So auto mode reads the first 2,048 rows of a
+fill's query, for up to 3 s, unless it is an aggregate's: what their strings
+take, and their other values by their types. Rows that take more than what the
+query reads say more of a fill's bytes, and of what the replica would hold
+writing them: a row group of 122,880 rows of each partition on each of its
+threads, which DuckDB's Parquet writer holds whole and cannot spill. Past the
+replica's room, the fill runs on workers, however small its tables: that copy
+held 13 GB on 8 threads of a replica of 10.4 GiB, and ran out of memory on one of
+7 GiB four times of four, beside 3 workers on one machine of 16 GB; its workers'
+tasks, which bound their row groups by bytes, wrote it in 17 to 23 s. A fill is
+planned for workers whatever its tables' sizes, and auto mode then decides.
 Fills keep their own history, apart from reads of the same query. A fill
 auto mode runs on the replica is guarded as a read is (see [when](#when)):
 past its time, or once it runs out of memory there, its query runs on
-workers, into the table its run on the replica left empty. One whose
+workers, into the table its run on the replica left empty; one that runs out
+of memory there goes to workers whatever kept it on the replica. One whose
 workers run out of memory goes on in passes on the replica where its
 query allows (see [aggregates too large for memory](sql.md#aggregates-too-large-for-memory)). A fill from a table
-masking or row access policies apply to, directly or through a view,
-stays on the replica, as reads of it do. `query_history.placement` says
+masking or row access policies apply to runs where a read of it would,
+through the policies (see [above](#masking-and-row-access-policies)). `query_history.placement` says
 where the fill's query ran, and a refresh's detail says so where it ran
 on workers. Fills of tables of member columns of ID domains, sorted
 writes and fills in a transaction block run on the replica, as before.
@@ -440,23 +480,32 @@ statement's rows are in the table when that commit is, or not at all.
   [maintenance](operations.md#table-maintenance) and erasure requests. The partition
   directories are named by a hash, so no value of the table is in a path.
 - **Memory.** A task bounds what its writer holds by its share of the worker's
-  memory: row groups of at most 128 MiB, an eighth of its share over its threads
-  or the partitions' files it keeps open, which rows of many kilobytes need on a
-  small worker. Auto mode takes rows wider than a task could hold (at least two
-  vectors of 2,048 rows a thread, by what its scans read a row) to this replica
-  where it has the room. A fill that still runs out of memory on workers, after
-  the retries with smaller tasks, runs on the replica if it has the room for the
-  query, or else with the replica writing the table from the workers' results.
+  memory as it stands, which the memory watch lowers while the machine runs short:
+  row groups of at most 128 MiB, an eighth of its share over its threads or the
+  partitions' files it keeps open, which rows of many kilobytes need on a small
+  worker. Auto mode takes rows wider than a task could hold (at least two vectors
+  of 2,048 rows a thread, by what its scans read a row or its first rows took) to
+  this replica where it has the room. A fill that still runs out of memory on
+  workers, after the retries with smaller tasks, runs on the replica if it has the
+  room for the query and its rows' row groups, or else with the replica writing
+  the table from the workers' results if it has the room for those, and fails
+  otherwise, leaving the table as it was.
 - **Partitions.** Identity of booleans, integers, dates, timestamps and
   strings, truncate of integers and strings, and year, month, day and hour are
   written by workers, one file per partition per task until compaction merges
   them. So a table of many partitions gets many small files at first. A look at
   a fill's first rows, for up to 3 s, says how many partitions to expect: a task
-  keeps that many files open, if they fit in half of a worker's memory at about 8
-  MiB each, and otherwise sorts its rows by partition first, which takes longer but
-  makes a file of each. Auto mode has this replica write a table whose files would
-  be under 8 MiB on average, or need that sort; `distributed_execution = 'on'` still
-  sends it to workers.
+  keeps that many files open, if their upload buffers of 5.25 MB and their row
+  groups, at 2.7 times theirs, fit in half of its memory, and otherwise sorts its
+  rows by partition first, which takes longer but makes a file of each. A task of
+  953 MiB keeps 29 open, one of 497 MiB 15. Rows of a kilobyte or more it sorts only
+  if about 70% of its share of them fits in half of its memory, as DuckDB's sort
+  held them: half a million rows of 10.8 KB ran a task of 953 MiB out of memory at
+  once, and every task of a write of 6 million into 600 partitions, where written
+  as they came they took 427 MiB at 497 MiB. It writes those as they come, which
+  makes more files where their partitions are mixed. Auto mode has this replica
+  write a table whose files would be under 8 MiB on average, or need that sort,
+  where it has the room; `distributed_execution = 'on'` still sends it to workers.
 - **On the coordinator's way instead**, as the log says at debug level: tables
   partitioned by bucket, or identity of decimals, whose partition values
   cannot be read from a file's bounds or written to its manifest; tables with
@@ -466,7 +515,8 @@ statement's rows are in the table when that commit is, or not at all.
   auto mode, which would make small files; an `INSERT` that leaves out a column
   with a default.
   So do fills of ID domains' member tables, sorted writes and fills in a
-  transaction block, on the replica, and fills from tables with policies. A
+  transaction block, on the replica, and fills from tables a clean room
+  keeps to its party. A
   commit that fails after workers wrote runs the fill on the replica, unless
   the commit may have been made.
 
@@ -952,6 +1002,19 @@ floating-point sums and averages can differ in their last digits, as they
 do in DuckDB on one machine between runs with different numbers of threads.
 Rows without `ORDER BY` come in no particular order, as on one machine.
 
+A stage keeps only some groups early (those `HAVING` keeps, the first under
+`ORDER BY ... LIMIT`, those a ranking may keep) only where it applies first
+everything SQL applies before that cut: the whole `HAVING`, and no window
+function that sees every group on the way. Otherwise it sends every group and
+the coordinator cuts them, as one machine would. Two tests run in the full
+suites to hold the planner to this. One runs all 22 TPC-H and 99 TPC-DS queries
+on one machine and on workers, forced with the planner's joins, forced with
+every join partitioned, and in auto mode, and compares the rows. The other
+writes random queries in the shapes the planner rewrites, in combination:
+groups ranked, limited and filtered by `HAVING` with subqueries, windows,
+`QUALIFY`, `DISTINCT`, set operations, outer joins, `IN`, `ANY`, `ALL` and
+`EXISTS` subqueries, over `NULL`s and ties.
+
 A statement reads each table at one snapshot, its current one when the
 statement's parts start, everywhere: workers read that snapshot's data
 files, and where the part the coordinator runs itself reads the same table
@@ -969,9 +1032,11 @@ clones do: workers read the files the metadata lists, wherever they lie in
 the warehouse.
 
 If a worker cannot be reached, stops in the middle of a statement or stops
-answering its status (three checks 10 seconds apart) while it runs a task,
-its share runs on another worker, and the failed worker is left out for 30
-seconds. A worker that answers a task with an error ran it and is healthy:
+answering its status while it runs a task, what it held runs again on the
+others, and the failed worker is left out for 30 seconds. One whose machine
+takes no connection either, as one without power, is found after three
+answers missed a second apart, about 7 seconds; one whose machine still takes
+connections, busy past answering or hung, after a minute without an answer. A worker that answers a task with an error ran it and is healthy:
 the statement then runs on the coordinator at once, without trying other
 workers or leaving any out. Object storage turning requests away for now
 (S3's 503 SlowDown) is not such an error: DuckDB tries the request again
@@ -1037,17 +1102,21 @@ give the workers more memory.
   other than `unnest`, `json_each` and `json_tree` of values and `range`
   and `generate_series` of literals, a table by name). Their DuckDB is locked down as the server's is: no local
   files, no other locations, no SQL from strings.
-- **Policies keep a statement on one machine.** A statement that reads a
-  table masking or row access policies apply to, directly or through a
-  view, runs on the replica, where Igloo applies them. Workers never see a
-  masked column's raw values or a hidden row. So does one that reads a
-  table a [clean room](clean-rooms.md) keeps to its party, a room's runs
-  included. What a statement reads is what applying the policies finds,
-  resolving its names: one that only spells a protected table's name, as a
-  column named like it does, or a column named like an ID domain, whose
-  dictionary is Igloo's own protected table, or that reads a view whose
-  text does, runs on workers when it reads none. The planner refuses a
-  protected table besides, whatever reaches it.
+- **Policies apply where a table is read.** A statement that reads a table
+  masking or row access policies apply to reads it through the policies'
+  subquery on every machine, and the planner checks that every stage reads
+  the table there, from its files, before any runs (see [masking and row
+  access policies](#masking-and-row-access-policies)). No exchange, and no
+  result a worker sends the coordinator, holds a masked column's raw value
+  or anything of a hidden row. One that reads a table a [clean
+  room](clean-rooms.md) keeps to its party runs on the replica, a room's
+  runs included. What a statement reads is what applying the policies
+  finds, resolving its names: one that only spells a protected table's
+  name, as a column named like it does, or a column named like an ID
+  domain, whose dictionary is Igloo's own protected table, or that reads a
+  view whose text does, runs on workers as written when it reads none. The
+  planner refuses a protected table the policies did not apply to, whatever
+  reaches it.
 - **Workers accept no one but Igloo.** Coordinators and workers talk TLS 1.3
   and authenticate each other with keys derived from `IGLOO_WORKER_SECRET`;
   without the secret, neither SQL users nor anything else on the network
@@ -1168,8 +1237,8 @@ other manifests only with that port open between them, or say `object`.
   task runs again a few times before the statement fails (and runs on the
   server if it fits there). A worker too busy to send a
   file says so within five seconds and is asked again for up to five
-  minutes; one that stops sending for a minute, or answering its status for
-  about 7 seconds, counts as lost. A statement
+  minutes; one that stops sending for a minute, or stops answering its status
+  and taking connections for about 7 seconds, counts as lost. A statement
   never returns
   rows short of a lost file: a task checks that the files it reads hold the
   rows written.

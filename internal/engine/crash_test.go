@@ -5,11 +5,14 @@ import (
 	"log/slog"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/akkio-inc/igloo/internal/engine/crashtest"
+	"github.com/akkio-inc/igloo/internal/engine/terminate"
 )
 
 // crashChildEnv, when set, makes TestExitOnCrash crash rather than spawn a
@@ -33,6 +36,43 @@ func TestExitOnCrash(t *testing.T) {
 	var exit *exec.ExitError
 	if !errors.As(err, &exit) || exit.ExitCode() != 2 || !strings.Contains(string(out), "crashed outside Go code") {
 		t.Fatalf("a crash on a foreign thread did not end the process with status 2: %v\n%s", err, out)
+	}
+}
+
+// parkChildEnv, when set, makes TestParkOnTerminate throw rather than spawn a
+// subprocess to.
+const parkChildEnv = "IGLOO_PARK_CHILD"
+
+// TestParkOnTerminate throws a C++ exception out of a destructor on a thread a
+// statement runs on (see terminate.Statement), in a subprocess, as the iceberg
+// extension's scan state did at the memory limit: the handler parks the thread,
+// the statement's end hears what escaped, and the process goes on, here to
+// write that it did and exit 0. A throw on any other thread still exits 134
+// (see TestExitOnTerminate).
+func TestParkOnTerminate(t *testing.T) {
+	if os.Getenv(parkChildEnv) != "" {
+		ended := make(chan string, 1)
+		var heard atomic.Bool
+		terminate.Watch(func(what string, known bool) { heard.Store(known) })
+		go terminate.Statement(func(what string) { ended <- what }, crashtest.ThrowInDestructor)
+		select {
+		case what := <-ended:
+			// The process goes on, and so do statements on other threads.
+			n := 0
+			terminate.Statement(func(string) {}, func() { n++ })
+			os.Stdout.WriteString("ended: " + what + "; heard " + strconv.FormatBool(heard.Load()) + "; then ran " + strconv.Itoa(n) + "\n")
+			os.Exit(0)
+		case <-time.After(30 * time.Second):
+			os.Stdout.WriteString("no end\n")
+			os.Exit(3)
+		}
+	}
+	cmd := exec.Command(os.Args[0], "-test.run=^TestParkOnTerminate$", "-test.timeout=2m")
+	cmd.Env = append(os.Environ(), parkChildEnv+"=1")
+	out, err := cmd.CombinedOutput()
+	if err != nil || !strings.Contains(string(out), "ended: Out of Memory Error: failed to pin block of size 4.0 KiB, thrown out of a destructor; heard true; then ran 1") ||
+		!strings.Contains(string(out), "parking its statement's thread") {
+		t.Fatalf("an exception out of a destructor on a statement's thread did not end only the statement: %v\n%s", err, out)
 	}
 }
 

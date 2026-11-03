@@ -26,6 +26,14 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   each on one thread. A maintenance pass now rewrites one that has too few, into
   row groups of about a sixteenth of it, of at least 122,880 rows.
 
+- A dashboard's first run, with no history, no longer runs its heavy statements
+  together. Statements of shapes not seen yet that have waited a minute for the
+  memory start one at a time, not one every 30 s, and a statement whose text with
+  its literals has not run goes by the most a run alike took, not the median, of
+  which runs over values with no rows had been most. Its 324 queries at ten times
+  the data, on 8 cores, took 3,145 s rather than 3,928, and none ran past its
+  timeout, where three had.
+
 - A canceled statement holds nobody up. Statements behind one waited until DuckDB
   had stopped it, for its slots and its memory, and a statement of a shape not seen
   yet waited for memory for as long as what held it ran: behind a report estimated
@@ -397,6 +405,15 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
 
 ### Loading and scheduling
 
+- `COPY table FROM STDIN`, in PostgreSQL's text, CSV and binary formats, so
+  psql's `\copy`, psycopg's `copy`, pgx's `CopyFrom` and a `pg_dump`'s data
+  load. It is the user's own `INSERT`, checked before the client sends the
+  rows, and fails whole with the line and column of a value that does not
+  convert. psql loads a dump's settings too: `set_config('search_path', ...)`
+  and the settings Igloo has no use for, as `row_security`.
+- `DROP SCHEMA ... CASCADE` drops a schema of the catalog with its tables,
+  views, materialized views and dynamic tables, as their own `DROP`s would,
+  having first checked that the user may drop all of them.
 - `COPY INTO table FROM 'location'` loads CSV, TSV, Parquet, JSON and
   NDJSON files, gzip- or zstd-compressed or not (detected from the name or
   the file), from the warehouse and `IGLOO_ALLOWED_LOCATIONS`: a prefix, a
@@ -571,10 +588,39 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
 
 ### Distributed execution
 
+- Statements that masking and row access policies apply to run on workers and in the
+  replica's second DuckDB, for every user, where they ran only in the first DuckDB of
+  the replica, so a team whose main tables have policies had neither. Every stage reads
+  a protected table through the subquery Igloo writes for its policies, and the tables
+  a row access policy reads only inside it; the planner checks each stage for that, from
+  the tables' files, before any runs, so no exchange, and nothing a worker sends the
+  coordinator, holds a masked column's raw value or a hidden row. A join or window that
+  would partition such a table's rows, or a join of it to itself, partitions the rows the
+  subquery makes instead. Across 17 statements and five users of a table with both kinds
+  of policy, results match one machine's, and every statement that runs on workers over
+  the table without policies does over it with them. A table a clean room keeps to its
+  party stays on the replica, in its first DuckDB.
+- Statements on workers return the rows one machine does in cases they did not. TPC-DS
+  q44 returned no rows where one machine returned 10: a stage kept the groups a later
+  ranking could keep before `HAVING`, which read a subquery, filtered them. A ranking's
+  cut also fed window functions over the groups, and `ORDER BY` a name that was both an
+  alias and a column ordered by the column. Every early cut now waits for what SQL
+  applies before it. Tests compare all of TPC-H and TPC-DS, and random queries in the
+  shapes the planner rewrites, with one machine's rows; see [same results as one
+  machine](docs/distributed-execution.md#same-results-as-one-machine). TPC-DS q33, q56,
+  q58, q60 and q83 run on workers too, where they stayed on the coordinator, and so does
+  q24, which failed on workers when the coordinator had 16 cores.
+- Variances and standard deviations (`stddev_samp`, `stddev_pop`, `var_samp`,
+  `var_pop`, `stddev`, `variance`) are computed on workers: each part's count, mean
+  and variance merge pairwise, as DuckDB merges its threads', which keeps their digits
+  near a large mean where sums of squares would lose them. They kept the statement on
+  the coordinator.
 - A worker that stops answering is found in about 7 seconds, not a minute. Powered off,
   closing no socket, one of 16 workers took 69 s to find. Whoever waits on a worker,
   the coordinator on its tasks and readers on its exchange files, now asks it for its
-  status every second and takes it for lost after three answers missed, of 2 s each.
+  status every second and takes it for lost after three answers missed, of 2 s each,
+  when its machine takes no connection either. One busy past answering, whose machine
+  still takes connections, is lost only after a minute without an answer.
   And only what it held runs again: the tasks it ran of exchanges still to be read, those
   whose inputs it also held before them, and the readers that failed, rather than all
   of the statement's parts, unless those tasks could write something else each time.
@@ -678,10 +724,9 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   WHERE` that filters the large table by a column equal to a constant or a
   list, also as a subquery the coordinator reads; and scalar subqueries
   in an aggregation's select list, `HAVING` and `ORDER BY`, which the
-  coordinator computes over the combined groups. Masking and row access
-  policies keep a statement on one machine only when they apply to a
-  table it reads, not when it, or a view it reads, spells a protected
-  table's name, as a column named like an ID domain did.
+  coordinator computes over the combined groups. A statement that only
+  spells a protected table's name, or reads a view that does, as a column
+  named like an ID domain did, runs on workers as written.
 - Reports' last steps run on workers too, rather than on the coordinator
   over what workers sent: an `ORDER BY` without `LIMIT` that what reads it
   sorts again or aggregates is left out; inputs too large for every
@@ -744,9 +789,8 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   Auto mode counts the replica's writing of the rows on both sides, and
   their fetch from the workers, so a copy stays on the replica unless
   workers are clearly faster. The guard, a run out of memory, the failure
-  history and the fallbacks work as for reads, a fill whose workers run
-  out of memory goes on in passes, and a fill from a table with masking
-  or row access policies stays on the replica.
+  history and the fallbacks work as for reads, and a fill whose workers run
+  out of memory goes on in passes.
 - Workers write tables: where the tasks of such a fill hold its rows, as a
   copy's do, each writes its own as Parquet with the table's field IDs and
   partitions, under a directory of the statement's under the table's
@@ -2566,11 +2610,16 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
 - Users' writes win over maintenance: compaction leaves the files of a table
   alone while a write that reads or writes it runs, or a transaction block
   that has read or written it is open (every table, once the block has
-  listed the catalog, as dbt does before each `MERGE`; a block idle for 15
-  minutes no longer counts), and checks again with sessions held off the
-  table just before it commits. A compaction that committed between a MERGE's read and its
-  commit made dbt's microbatch batches, each a `BEGIN` ... `COMMIT`, fail
-  with `CatalogCommitConflicts`, and had writes outside blocks run again.
+  listed the catalog, as dbt does before each `MERGE`, and from its `BEGIN`
+  for a user who may write; a block idle for 15 minutes no longer counts),
+  and checks again with sessions held off the table just before it commits.
+  A compaction that committed between a MERGE's read and its commit made
+  dbt's microbatch batches, each a `BEGIN` ... `COMMIT`, fail with
+  `CatalogCommitConflicts`, and had writes outside blocks run again. So did
+  one that committed after a batch's `BEGIN` and before the batch read the
+  model: DuckDB reads a table changed since its transaction began as it was
+  then, and the batch's `COMMIT`, or the comment dbt's `persist_docs` makes
+  before it, was refused, in 1 of 5 e2e runs.
 - `CREATE TABLE ... PARTITIONED BY (...) AS`, as Snowflake's `CLUSTER BY
   (BUCKET(n, column))` makes it, runs in steps like any `CREATE TABLE ...
   AS`, holding the catalog lock only to create and rename the table: as one

@@ -24,6 +24,7 @@ import (
 	"github.com/akkio-inc/igloo/internal/catalog"
 	"github.com/akkio-inc/igloo/internal/catalogproxy"
 	"github.com/akkio-inc/igloo/internal/config"
+	"github.com/akkio-inc/igloo/internal/lockorder"
 	"github.com/akkio-inc/igloo/internal/memlimit"
 	"github.com/akkio-inc/igloo/internal/models"
 	"github.com/akkio-inc/igloo/internal/policy"
@@ -36,12 +37,13 @@ import (
 const attachRetryInterval = 2 * time.Second
 
 // Extensions are the DuckDB extensions Igloo uses: object storage (httpfs,
-// aws, azure), Iceberg (which reads manifests with avro), TPC-H data for
-// demos and benchmarks, the read cache (cache_httpfs, see cache.go),
+// aws, azure), Iceberg (which reads manifests with avro), TPC-H and TPC-DS
+// data for demos, benchmarks and the tests that compare distributed results
+// with one machine's, the read cache (cache_httpfs, see cache.go),
 // geospatial functions and sketches (see media.go), and connections to
 // PostgreSQL and MySQL databases (see package federation), which are loaded
 // only when a connection needs them. The image installs them at build time.
-var Extensions = append([]string{"httpfs", "aws", "azure", "iceberg", "avro", "tpch", "cache_httpfs", "postgres", "mysql"}, mediaExtensions...)
+var Extensions = append([]string{"httpfs", "aws", "azure", "iceberg", "avro", "tpch", "tpcds", "cache_httpfs", "postgres", "mysql"}, mediaExtensions...)
 
 // communityExtensions come from DuckDB's community repository rather than
 // the core one. DuckDB checks their signatures on load just the same.
@@ -69,6 +71,12 @@ type Engine struct {
 	cache *readCache
 	// prefetcher reads ahead into the cache, or is nil (see setupPrefetch).
 	prefetcher *prefetch.Prefetcher
+	// objects reads table files in object storage for the prefetcher and
+	// the restore of fileCache.
+	objects *objectOpener
+	// fileCache keeps what DuckDB holds of table files in memory across
+	// restarts, or is nil (see filecache.go).
+	fileCache *fileCache
 	// history supplies the history functions; see SetHistory.
 	history atomic.Pointer[historyConfig]
 	// jobHistory supplies the job history functions; see SetJobHistory.
@@ -87,14 +95,14 @@ type Engine struct {
 	models *models.Runtime
 	// purges are what EmptyCache empties beside the read cache (see
 	// OnEmptyCache).
-	purgeMu sync.Mutex
+	purgeMu lockorder.Mutex
 	purges  []func()
 	// forecasting forecasts with the model pack's models (see Forecasting).
 	forecasting *tsforecast.Service
 	// catMu keeps binding, walking and changing the attached catalog's
 	// in-memory set of tables apart. See CatalogLock. catLocked is when it
 	// was taken exclusively, in Unix nanoseconds, or 0 while it is not.
-	catMu     sync.RWMutex
+	catMu     catalogMutex
 	catLocked atomic.Int64
 	// catShared counts the holders of its shared side.
 	catShared atomic.Int64
@@ -108,7 +116,7 @@ type Engine struct {
 	// bg is that one, opened at its first use, and the rest its upkeep.
 	cfg          config.Config
 	isBackground bool
-	bgMu         sync.Mutex
+	bgMu         lockorder.Mutex
 	bg           *Engine
 	bgErr        error
 	bgAt         time.Time
@@ -119,7 +127,7 @@ type Engine struct {
 	// (see applyBackgroundLimit).
 	bgLowering atomic.Bool
 	bgLowers   sync.WaitGroup
-	balanceMu  sync.Mutex
+	balanceMu  lockorder.Mutex
 	// limit is the memory limit memlimit gives it, for the two together;
 	// current what it is now set to; fgRead when a statement that reads
 	// tables last ran in it, in Unix nanoseconds.
@@ -175,6 +183,9 @@ func Open(ctx context.Context, cfg config.Config, log *slog.Logger, opts ...Opti
 	if e.cache != nil && !e.isBackground {
 		// The first DuckDB keeps the cache they share to its size.
 		e.startCache(log)
+		if e.prefetcher != nil && e.bitmaps {
+			e.startFileCache(cfg.Cache.Dir, e.objects.open, log)
+		}
 	}
 
 	return e, nil
@@ -313,17 +324,29 @@ func (e *Engine) LocalDatabase() string { return e.local }
 //
 //	defer e.CatalogLock()()
 //
-// It is not reentrant (sync.RWMutex): the pgwire layer makes it reentrant
+// It is not reentrant (see catalogMutex, which keeps a writer from stalling
+// binds for long): the pgwire layer makes it reentrant
 // per session (see holdCatalog); a caller outside a session holds it at most
 // once, and never takes it from inside a DuckDB call on a connection whose
 // session holds it.
 func (e *Engine) CatalogLock() func() {
+	e.checkOrder("the catalog lock")
 	e.catMu.Lock()
 	e.catLocked.Store(time.Now().UnixNano())
 	e.respell()
 	return func() {
 		e.catLocked.Store(0)
 		e.catMu.Unlock()
+	}
+}
+
+// checkOrder checks, in tests, that the goroutine about to wait for the catalog lock
+// holds none of the server's mutexes (see package lockorder). The second DuckDB's
+// lock is its own, which nothing holds while it waits for them: the server opens
+// that DuckDB holding one.
+func (e *Engine) checkOrder(what string) {
+	if !e.isBackground {
+		lockorder.Outer(what)
 	}
 }
 
@@ -357,6 +380,7 @@ func (e *Engine) CatalogTryLock(ctx context.Context, wait time.Duration) (releas
 // against the catalog's in-memory set (see CatalogLock), and returns the
 // func that releases it.
 func (e *Engine) CatalogShare() func() {
+	e.checkOrder("the catalog lock, shared")
 	e.catMu.RLock()
 	return e.shared()
 }
@@ -376,11 +400,15 @@ func (e *Engine) shared() func() {
 func (e *Engine) SharedRefusals() uint64 { return e.proxy.Refusals() }
 
 // CatalogShareContext is CatalogShare that stops waiting, and returns ctx's
-// error, when ctx ends. A sync.RWMutex cannot stop waiting, so a goroutine
+// error, when ctx ends. The lock cannot stop waiting, so a goroutine
 // waits in its place in the lock's queue, as RLock does, behind writers that
 // came first and ahead of those that come later, and hands the lock over;
 // if ctx ended first, it lets go of the lock as soon as it gets it.
 func (e *Engine) CatalogShareContext(ctx context.Context) (func(), error) {
+	if e.catMu.TryRLock() {
+		return e.shared(), nil
+	}
+	e.checkOrder("the catalog lock, shared")
 	if e.catMu.TryRLock() {
 		return e.shared(), nil
 	}
@@ -590,7 +618,7 @@ func (e *Engine) loadSchemas(ctx context.Context, conn *duckdb.Conn, tables [][2
 	// binds.
 	jobs := make(chan [2]string)
 	var (
-		mu   sync.Mutex
+		mu   lockorder.Mutex
 		errs []error
 		wg   sync.WaitGroup
 	)
@@ -677,6 +705,7 @@ func (e *Engine) Close() error {
 		e.bg = nil
 	}
 	e.bgMu.Unlock()
+	e.stopFileCache(e.log)
 	if e.prefetcher != nil {
 		e.prefetcher.Close()
 	}

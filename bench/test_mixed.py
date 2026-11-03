@@ -88,12 +88,14 @@ class SummarizeTest(unittest.TestCase):
         self.assertEqual(out["elt.merge"]["max"], 4.0)
 
     def test_history(self):
-        rows = [("dashboard", "a.x", 0, 100, 0), ("dashboard", "a.x", 2000, 300, 0), ("elt", "rollup", None, 10000, 4)]
+        rows = [("dashboard", "a.x", 0, 100, 0, 5.0), ("dashboard", "a.x", 2000, 300, 0, 1500.0), ("elt", "rollup", None, 10000, 4, None)]
         h = mixed.history_summary(rows)
         self.assertEqual(h["dashboard"]["statements"], 2)
         self.assertEqual(h["dashboard"]["queued_max"], 2.0)
         self.assertEqual(h["dashboard"]["on_workers"], 0)
         self.assertEqual(h["dashboard.a.x"]["queued_p50"], 1.0)
+        self.assertEqual(h["dashboard"]["catalog_wait_max"], 1.5)
+        self.assertEqual(h["elt"]["catalog_wait_p95"], 0.0)
         self.assertEqual(h["elt"]["on_workers"], 1)
         self.assertEqual(h["elt"]["worker_busy_seconds"], 40.0)
 
@@ -151,7 +153,7 @@ class CostTest(unittest.TestCase):
         s.samples, s.seconds, s.failures = [(1.0, 16.0)], 9600.0, 2
         args = mixed.parse(["run"])
         res = {"t0": 0.0, "t1": 600.0, "records": [], "skipped": {}}
-        hist = [("dashboard", "delivery.kpis", 0, 100000, 16)] * 50   # 50 overlapping statements on 16 workers
+        hist = [("dashboard", "delivery.kpis", 0, 100000, 16, 0)] * 50   # 50 overlapping statements on 16 workers
         out = mixed.report(res, hist, args, 0.85, 0.43, s)
         self.assertEqual(out["worker_seconds"], 9600.0)
         self.assertTrue(out["worker_seconds_source"].startswith("metrics (2 failed scrapes"))
@@ -214,7 +216,7 @@ class RunTest(unittest.TestCase):
         self.assertTrue(ingests)
         self.assertIn("4 AS batch_id", ingests[0])
         self.assertIn("range(1030, 1040)", ingests[0])
-        out = mixed.report(res, [("dashboard", "delivery.kpis", 10, 20, 0)], args, 1.0, 1.0, None)
+        out = mixed.report(res, [("dashboard", "delivery.kpis", 10, 20, 0, 0)], args, 1.0, 1.0, None)
         self.assertEqual(out["worker_seconds_source"], "history (statements' workers times duration)")
         self.assertIn("dashboard", out["classes"])
 

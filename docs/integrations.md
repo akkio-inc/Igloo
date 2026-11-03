@@ -202,10 +202,6 @@ writes Parquet from Igloo directly, much faster (see
 
 ## Known limitations
 
-- `COPY ... FROM STDIN` is not supported, so `psql`'s `\copy ... from`,
-  `pandas.to_sql(method=...)` with COPY, and ADBC's bulk ingestion fail;
-  `INSERT`, `to_sql` and `write_database` work. Load files with `COPY ...
-  FROM` an allowed location instead.
 - `ROLLBACK TO SAVEPOINT` works only when nothing changed since the
   savepoint (enough for psycopg's and SQLAlchemy's nested blocks that just
   read); otherwise roll back the whole transaction.

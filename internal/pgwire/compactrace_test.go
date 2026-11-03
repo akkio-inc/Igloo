@@ -211,6 +211,88 @@ func TestCompactionGivesWayToUserWrites(t *testing.T) {
 		r.rows(t, "unhooked_listing", unmergedRows)
 	})
 
+	// dbt's microbatch batch, as dbt-postgres sends it: in a block, the
+	// day's rows into a temporary table, the columns of it and of the model
+	// listed, a MERGE of them into the model, persist_docs' comment, which
+	// commits what came before it (see outsideTransaction), and COMMIT;
+	// between runs after the BEGIN.
+	batch := func(t *testing.T, block *pgx.Conn, name string, day int, between func()) error {
+		t.Helper()
+		tmp := fmt.Sprintf("%s__dbt_tmp_%d", name, day)
+		for i, q := range []string{
+			"BEGIN",
+			fmt.Sprintf("create temporary table %q as (select %d as k, %d as v)", tmp, day, day*10),
+			"select column_name, data_type, character_maximum_length, numeric_precision, numeric_scale from INFORMATION_SCHEMA.columns " +
+				"where table_name = '" + tmp + "' order by ordinal_position",
+			"select column_name, data_type, character_maximum_length, numeric_precision, numeric_scale from \"lake\".INFORMATION_SCHEMA.columns " +
+				"where table_name = '" + name + "' and table_schema = 'public' order by ordinal_position",
+			fmt.Sprintf(`merge into "lake"."public".%q as t using %q as s on (s.k = t.k) when matched then update set "k" = s."k", "v" = s."v" `+
+				`when not matched then insert ("k", "v") values (s."k", s."v")`, name, tmp),
+			fmt.Sprintf(`comment on table "lake"."public".%q is $dbt_comment_literal_block$Built a day at a time.$dbt_comment_literal_block$;`, name),
+			"COMMIT",
+		} {
+			if _, err := block.Exec(ctx, q); err != nil {
+				_, _ = block.Exec(ctx, "ROLLBACK")
+				return fmt.Errorf("%s: %w", q, err)
+			}
+			if i == 0 && between != nil {
+				between()
+			}
+		}
+		return nil
+	}
+
+	// The batch after the one before it, with compaction committing just
+	// after the batch's BEGIN, before the block reads anything of the
+	// model: DuckDB reads the model as of the BEGIN, and commits the MERGE
+	// on top of what it read.
+	begunBlock := func(t *testing.T, name string, opts maintenance.Options) (error, int) {
+		r.fill(t, name)
+		block := r.testServer.admin(t, pgx.QueryExecModeSimpleProtocol)
+		if err := batch(t, block, name, 10, nil); err != nil {
+			t.Fatalf("the first batch: %v", err)
+		}
+		before := r.fake.Conflicts()
+		err := batch(t, block, name, 11, func() { r.maintainer(opts).RunOnce(ctx) })
+		return err, r.fake.Conflicts() - before
+	}
+	batched := append(slices.Clone(unmergedRows), "10|100", "11|110")
+	slices.Sort(batched)
+
+	t.Run("a batch whose block began before compaction committed", func(t *testing.T) {
+		if err, conflicts := begunBlock(t, "batched", r.hooked); err != nil || conflicts != 0 || r.compacted(t, "batched") {
+			t.Fatalf("the second batch: %v, conflicts %d, compacted %v", err, conflicts, r.compacted(t, "batched"))
+		}
+		r.rows(t, "batched", batched)
+		r.maintainer(r.hooked).RunOnce(ctx)
+		if !r.compacted(t, "batched") {
+			t.Error("not compacted once the block ended")
+		}
+		r.rows(t, "batched", batched)
+	})
+
+	t.Run("the same batch without the hooks", func(t *testing.T) {
+		if err, conflicts := begunBlock(t, "batched_unhooked", maintenance.Options{}); err == nil || conflicts != 1 || !r.compacted(t, "batched_unhooked") {
+			t.Fatalf("the second batch: %v, conflicts %d: the test no longer forces the race", err, conflicts)
+		}
+	})
+
+	// A reader's block, which commits no write, holds back nothing.
+	t.Run("a reader's block", func(t *testing.T) {
+		r.fill(t, "read_in_block")
+		mustExec(t, r.admin, "CREATE USER rena WITH PASSWORD 'rena-password' ROLE reader")
+		reader := connect(t, r.url("rena", "rena-password"), pgx.QueryExecModeSimpleProtocol)
+		mustExec(t, reader, "BEGIN")
+		r.maintainer(r.hooked).RunOnce(ctx)
+		if !r.compacted(t, "read_in_block") {
+			t.Error("a reader's open block held compaction back")
+		}
+		if got := texts(t, reader, "SELECT count(*) FROM read_in_block"); !slices.Equal(got, []string{"6"}) {
+			t.Errorf("the reader's block read %q", got)
+		}
+		mustExec(t, reader, "COMMIT")
+	})
+
 	t.Run("an autocommit MERGE committing", func(t *testing.T) {
 		if conflicts := r.autocommit(t, "committing_merge", r.hooked); conflicts != 0 || r.compacted(t, "committing_merge") {
 			t.Fatalf("conflicts %d, compacted %v", conflicts, r.compacted(t, "committing_merge"))

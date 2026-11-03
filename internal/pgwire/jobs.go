@@ -538,21 +538,7 @@ func (s *Server) runJobCommand(ctx context.Context, sess *session, user auth.Use
 	case "ALTER":
 		err = s.alterJob(ctx, user, c, j)
 	case "DROP":
-		if tasks.Refreshed(c.kind) {
-			schema, table, _ := strings.Cut(j.Name, ".")
-			err = s.execDDL(ctx, sess, user, "DROP TABLE IF EXISTS "+quoteName([]string{s.catalogName(), schema, table}))
-			if err == nil {
-				s.dropViewState(ctx, sess, j)
-			}
-		}
-		if err == nil {
-			if err = store.DropJob(ctx, c.kind, j.Name); errors.Is(err, tasks.ErrNotFound) {
-				err = nil // dropping the table dropped it
-			}
-		}
-		if err == nil {
-			s.log.Info("job changed", "action", "drop", "kind", c.kind, "name", j.Name, "by", user.Name)
-		}
+		err = s.dropJob(ctx, sess, user, j)
 	case "EXECUTE", "REFRESH":
 		_, err = s.tasks.RunNow(ctx, s, j)
 		switch {
@@ -614,6 +600,28 @@ func (s *Server) jobName(ctx context.Context, sess *session, c jobCommand) (stri
 		return strings.Join(c.name, "."), nil
 	}
 	return o.String(), nil
+}
+
+// dropJob drops j, and a materialized view's or dynamic table's table and
+// state with it.
+func (s *Server) dropJob(ctx context.Context, sess *session, user auth.User, j tasks.Job) error {
+	var err error
+	if tasks.Refreshed(j.Kind) {
+		schema, table, _ := strings.Cut(j.Name, ".")
+		err = s.execDDL(ctx, sess, user, "DROP TABLE IF EXISTS "+quoteName([]string{s.catalogName(), schema, table}))
+		if err == nil {
+			s.dropViewState(ctx, sess, j)
+		}
+	}
+	if err == nil {
+		if err = s.tasks.Store().DropJob(ctx, j.Kind, j.Name); errors.Is(err, tasks.ErrNotFound) {
+			err = nil // dropping the table dropped it
+		}
+	}
+	if err == nil {
+		s.log.Info("job changed", "action", "drop", "kind", j.Kind, "name", j.Name, "by", user.Name)
+	}
+	return err
 }
 
 func jobMissing(c jobCommand, name string) error {

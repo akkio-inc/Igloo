@@ -6,10 +6,12 @@ import (
 	"cmp"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/subtle"
 	"crypto/tls"
 	"database/sql/driver"
 	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -42,9 +44,11 @@ import (
 	"github.com/akkio-inc/igloo/internal/deletefiles"
 	"github.com/akkio-inc/igloo/internal/distributed"
 	"github.com/akkio-inc/igloo/internal/engine"
+	"github.com/akkio-inc/igloo/internal/engine/terminate"
 	"github.com/akkio-inc/igloo/internal/erasure"
 	"github.com/akkio-inc/igloo/internal/federation"
 	"github.com/akkio-inc/igloo/internal/iddomain"
+	"github.com/akkio-inc/igloo/internal/lockorder"
 	"github.com/akkio-inc/igloo/internal/memlimit"
 	"github.com/akkio-inc/igloo/internal/modelpack"
 	"github.com/akkio-inc/igloo/internal/models"
@@ -526,7 +530,7 @@ type Server struct {
 	// countsGen is the generation of the distinct counts last handed to
 	// DuckDB, and countsMu serializes handing them (see
 	// registerDistinctCounts).
-	countsMu  sync.Mutex
+	countsMu  lockorder.Mutex
 	countsGen atomic.Uint64
 	// beforePrepare, if set, runs as a statement a client sent (text)
 	// starts to be prepared, with the context that ends its preparing (for
@@ -581,7 +585,7 @@ type Server struct {
 	uploadStoreFor func(dir string) (uploads.Store, error)
 	// replicaWrites counts the INSERTs running on this replica by the names of their
 	// tables, under replicaWritesMu (see replicaWrite).
-	replicaWritesMu sync.Mutex
+	replicaWritesMu lockorder.Mutex
 	replicaWrites   map[string]int
 	// beforeWriteCommit, if set, runs before files workers wrote under dir
 	// are committed, and fails the commit with its error (see tableWrite).
@@ -599,9 +603,12 @@ type Server struct {
 	// of them that may change what a statement's text means other than
 	// through the tables it loads (see resultGeneration).
 	ddlGen, defsGen atomic.Uint64
-	// tables is the index of tables the checks resolve names with (see
-	// indexedTables).
-	tables tableIndex
+	// tables and views are the indexes of tables and views the checks
+	// resolve names with (see indexedTables).
+	tables, views tableIndex
+	// columns is what DuckDB bound of tables' columns, for planning
+	// statements for workers (see boundColumns).
+	columns columnCache
 	// mockSecret derives the credentials a login for an unknown user runs
 	// against (see mockCredentials).
 	mockSecret []byte
@@ -629,7 +636,7 @@ type Server struct {
 	analyzer *analyzer
 	// sketches says DuckDB has the datasketches extension's functions,
 	// once sketchesKnown (see hasSketches).
-	sketchesMu    sync.Mutex
+	sketchesMu    lockorder.Mutex
 	sketchesKnown bool
 	sketches      bool
 }
@@ -849,6 +856,7 @@ func New(engine Engine, opts Options, log *slog.Logger) (*Server, error) {
 		wire.BackendKeyData(s.backendKeyData),
 		wire.CancelRequest(s.cancelRequest),
 		wire.SessionMiddleware(s.openSession),
+		wire.CommandWrapper(s.statementThread),
 		wire.CloseConn(s.closeSession),
 		wire.Statements(newStatementCache),
 		wire.Portals(newPortalCache),
@@ -1057,6 +1065,11 @@ type session struct {
 	catHolds   []*catalogHold
 	catHeld    catalogMode
 	catRelease func()
+	// catWait is how long the session waited for the engine lock since its
+	// last statement was recorded (see recordQuery), and catSince when it
+	// last took it exclusively, for logging long holds (see unlockCatalog).
+	catWait  time.Duration
+	catSince time.Time
 	// sharedPrepare is set while prepareChecked prepares a statement holding
 	// the catalog lock shared, which stops at DuckDB's first failure to
 	// prepare it (see sharedprepare.go).
@@ -1064,7 +1077,7 @@ type session struct {
 
 	// mu guards the fields below, which cancel requests and user changes
 	// reach from other connections.
-	mu      sync.Mutex
+	mu      lockorder.Mutex
 	user    auth.User
 	checked time.Time
 	running context.CancelFunc
@@ -1703,6 +1716,17 @@ func (s *Server) parse(ctx context.Context, q wire.Query) (wire.PreparedStatemen
 	if ps, ok := s.sessionResetCommand(sess, q.Query); ok {
 		return ps, nil
 	}
+	if ps, ok := s.setConfigCommand(sess, q.Query); ok {
+		return ps, nil
+	}
+	// COPY ... FROM STDIN, in either dialect: it is PostgreSQL's.
+	if c, ok, err := parseCopyFromStdin(q.Query); ok {
+		if err != nil {
+			s.recordQuery(sess, queryRecord{text: q.Query, start: time.Now(), err: err, rows: -1})
+			return nil, err
+		}
+		return s.copyFromStdinStatement(sess, q.Query, c), nil
+	}
 	if ps, ok := s.dialectCommand(sess, q.Query); ok {
 		return ps, nil
 	}
@@ -1749,6 +1773,11 @@ func (s *Server) parse(ctx context.Context, q wire.Query) (wire.PreparedStatemen
 		if strings.IndexByte(q.Query, 0) >= 0 {
 			return nil, pgerror.WithCode(errors.New(`invalid byte sequence for encoding "UTF8": 0x00`), codes.CharacterNotInRepertoire)
 		}
+	}
+	// DROP SCHEMA ... CASCADE of the catalog's schema, which Igloo carries
+	// out drop by drop.
+	if c, ok := s.parseSchemaCascade(ctx, sess, q.Query); ok {
+		return s.schemaCascadeStatement(sess, q.Query, c), nil
 	}
 	if tr == nil || tr.Untranslated {
 		ps, err := s.parseDuckDB(ctx, sess, user, q, tr)
@@ -2175,8 +2204,8 @@ func (s *Server) preparedQuery(ctx context.Context, sess *session, user auth.Use
 		sess.wl.counted = countsOnReplica(sess, st)
 		sess.wl.shape, sess.wl.exact = "", ""
 		if sess.wl.counted || st.staged != nil {
-			sess.wl.shape = s.workloadShape(ctx, sess, st.prepared)
-			sess.wl.exact = s.workloadExact(sess, st.prepared)
+			sess.wl.shape = s.workloadShape(ctx, sess, st.shapeText())
+			sess.wl.exact = s.workloadExact(sess, st.shapeText())
 		}
 		shape, exact := sess.wl.shape, sess.wl.exact
 		sess.wl.apart = s.runsApart(sess, st)
@@ -2241,6 +2270,8 @@ func (s *Server) preparedQuery(ctx context.Context, sess *session, user auth.Use
 					}
 				}
 				switch {
+				case st.stmtType == duckdb.STATEMENT_TYPE_TRANSACTION && !sess.inTx && opensBlock(st):
+					return s.beginBlock(ctx, sess, func() error { return sess.runTransaction(ctx, st, tw, run) })
 				case st.stmtType == duckdb.STATEMENT_TYPE_TRANSACTION:
 					return sess.runTransaction(ctx, st, tw, run)
 				case st.changesIceberg:
@@ -2296,7 +2327,6 @@ func (s *Server) preparedQuery(ctx context.Context, sess *session, user auth.Use
 			}
 			s.workload.ObserveTook(shape, time.Since(start)-sess.wl.queued)
 		case used != nil:
-			s.workload.ObserveEmpty(shape)
 			s.workload.ObserveEmpty(exact)
 		case err != nil && sampled:
 			// It ended before its end, holding at least that much, or, if it
@@ -2396,6 +2426,43 @@ func (s *Server) holdCatalog(sess *session) func() {
 	return s.catalogHold(sess, catalogExclusive)
 }
 
+// statementThread runs run, a session's command, on a thread of its own (see
+// terminate.Statement), from which a C++ exception that escapes DuckDB, which
+// nothing can catch, parks the thread rather than end the process: the iceberg
+// extension's scan state threw Out of Memory out of its destructor in the
+// optimizer of a statement bound again at the replica's memory limit, and the
+// process ended with every session's statement.
+func (s *Server) statementThread(ctx context.Context, run func() error) error {
+	sess := sessionFrom(ctx)
+	if sess == nil {
+		return run()
+	}
+	var err error
+	terminate.Statement(func(what string) { s.parked(ctx, sess, what) }, func() { err = run() })
+	return err
+}
+
+// parked ends the session whose statement's thread parked, as what escaped
+// DuckDB there says: it lets go of the session's hold on the catalog lock and of
+// what its statement was admitted with, which the thread, waiting for good,
+// would keep from every other session, and closes the client's connection. The
+// thread keeps its DuckDB connection, and what DuckDB held for its statement.
+func (s *Server) parked(ctx context.Context, sess *session, what string) {
+	sess.mu.Lock()
+	text, user, pid := sess.statement, sess.user.Name, sess.pid
+	sess.mu.Unlock()
+	sum := sha256.Sum256([]byte(text))
+	s.log.Error("a C++ exception escaped DuckDB on a statement's thread, where nothing could catch it; the statement and its session end, "+
+		"and its thread and DuckDB connection wait for good", "pid", pid, "user", user, "statement_sha256", hex.EncodeToString(sum[:8]), "what", what)
+	s.unlockCatalog(sess)
+	if done := sess.wl.admitted; done != nil {
+		done()
+	}
+	if c := wire.AcceptedConn(ctx); c != nil {
+		_ = c.Close()
+	}
+}
+
 // execHeld runs statements of Igloo's own that change the catalog, DDL of
 // its tables and schemas, holding the catalog lock exclusively, as a user's
 // DDL runs (see catalogRunLock): a drop erases from the catalog's in-memory
@@ -2441,21 +2508,40 @@ func (s *Server) relockCatalog(sess *session) {
 		return
 	}
 	s.unlockCatalog(sess)
+	start := time.Now()
 	switch want {
 	case catalogExclusive:
 		sess.catRelease = s.engine.CatalogLock()
+		sess.catSince = time.Now()
+		sess.catWait += sess.catSince.Sub(start)
 	case catalogShared:
 		sess.catRelease = s.engine.CatalogShare()
+		sess.catWait += time.Since(start)
 	}
 	sess.catHeld = want
 }
+
+// catalogHoldLogged is how long a session holds the catalog lock
+// exclusively, keeping every other session's binds, listings and DDL
+// waiting, before letting go of it is logged.
+const catalogHoldLogged = time.Second
 
 // unlockCatalog lets go of the engine's catalog lock the session holds, if
 // any, keeping its holds.
 func (s *Server) unlockCatalog(sess *session) {
 	if sess.catRelease != nil {
+		var held time.Duration
+		if sess.catHeld == catalogExclusive {
+			held = time.Since(sess.catSince)
+		}
 		sess.catRelease()
 		sess.catRelease = nil
+		if held >= catalogHoldLogged {
+			// The session's backend pid, which its client was given (not its
+			// history's session_id, which takes the session's mutex).
+			s.log.Info("held the catalog lock exclusively, keeping other sessions' statements waiting",
+				"pid", sess.pid, "held", held.Round(time.Millisecond))
+		}
 	}
 	sess.catHeld = catalogFree
 }
@@ -3180,10 +3266,7 @@ func (s *Server) recheckGrants(ctx context.Context, sess *session, st *statement
 	if err != nil {
 		return err
 	}
-	privs, err := s.privileges(ctx, sess, user)
-	if !force && err == nil && (privs == st.access.privs || st.access.privs == nil && user.Role == auth.RoleAdmin) &&
-		time.Since(st.access.checked) < s.roleRefresh &&
-		st.access.catalogGen == s.catalogGeneration() && st.access.settingGen == sess.settingGen {
+	if !force && !s.grantsStale(ctx, sess, user, st) {
 		return nil
 	}
 	// A refusal leaves st.access as it was, stale, so the statement is
@@ -3212,6 +3295,16 @@ func (s *Server) recheckGrants(ctx context.Context, sess *session, st *statement
 	}
 	st.access = acc
 	return nil
+}
+
+// grantsStale reports whether st's grants, which were checked (st.access), must be
+// checked again for user: the user's privileges, the catalog or the session's
+// settings changed, or they were checked longer than roleRefresh ago.
+func (s *Server) grantsStale(ctx context.Context, sess *session, user auth.User, st *statement) bool {
+	privs, err := s.privileges(ctx, sess, user)
+	return err != nil || !(privs == st.access.privs || st.access.privs == nil && user.Role == auth.RoleAdmin) ||
+		time.Since(st.access.checked) >= s.roleRefresh ||
+		st.access.catalogGen != s.catalogGeneration() || st.access.settingGen != sess.settingGen
 }
 
 // statementTimeoutCommand handles SET, RESET and SHOW statement_timeout,
@@ -3321,7 +3414,7 @@ var errDenied = pgerror.WithCode(errors.New("denied"), codes.InsufficientPrivile
 // registry tracks sessions so cancel requests, which arrive on a separate
 // connection, and user changes can reach them.
 type registry struct {
-	mu    sync.Mutex
+	mu    lockorder.Mutex
 	byPID map[int32]*session
 	// abandoned is called for each session dropped because its connection
 	// died between login and setup, to give back its connection slot.

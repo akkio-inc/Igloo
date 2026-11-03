@@ -71,8 +71,18 @@ func NewEC2(ctx context.Context, ids []string) (*EC2, error) {
 }
 
 // Start starts the instances that are stopped. An instance that is still
-// stopping cannot be started, so it waits for that to finish.
+// stopping cannot be started, so it waits for that to finish. It asks to
+// start them all first, which succeeds for those already running, and
+// looks at their states only when that fails: a client waits for the start,
+// and a look first costs it a round trip to EC2.
 func (e *EC2) Start(ctx context.Context) error {
+	_, err := e.client.StartInstances(ctx, &ec2.StartInstancesInput{InstanceIds: e.ids})
+	if err == nil {
+		return nil
+	}
+	if !strings.Contains(err.Error(), "IncorrectInstanceState") {
+		return fmt.Errorf("start instances: %w", err)
+	}
 	for {
 		states, err := e.states(ctx)
 		if err != nil {

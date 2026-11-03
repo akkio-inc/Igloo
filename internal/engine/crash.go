@@ -36,6 +36,11 @@ var crashSignals = []os.Signal{syscall.SIGSEGV, syscall.SIGBUS, syscall.SIGFPE, 
 // raising it again. A crash in Go code still panics, and one in C code on a
 // thread Go runs still ends the process, as before.
 func ExitOnCrash(log *slog.Logger) {
+	terminate.Watch(func(what string, known bool) {
+		if !known {
+			log.Error("a C++ exception escaped DuckDB on a statement's thread no statement claimed; the thread waits for good", "what", what)
+		}
+	})
 	c := make(chan os.Signal, 1)
 	signal.Notify(c, crashSignals...)
 	go func() {

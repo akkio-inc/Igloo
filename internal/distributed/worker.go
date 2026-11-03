@@ -69,6 +69,9 @@ type WorkerOptions struct {
 	// means those Go may use (runtime.GOMAXPROCS).
 	Cores       int
 	MemoryBytes int64
+	// MemoryNow, if set, is DuckDB's memory limit as it stands, which the
+	// memory watch lowers while the machine runs short (see memoryNow).
+	MemoryNow func(context.Context) int64
 	// Threads are DuckDB's threads, reported to coordinators, which
 	// estimate how fast workers read object storage cold by their threads
 	// a core; zero for unknown.
@@ -116,6 +119,9 @@ type Worker struct {
 	// beforeTask, if set, runs before each task; tests use it to make a
 	// worker fail or hang. r's context is the task's.
 	beforeTask func(rw http.ResponseWriter, r *http.Request) bool
+	// beforeStatus, if set, runs before each status answer; tests use it to
+	// make a worker answer late.
+	beforeStatus func()
 	// retiring says a coordinator retired the worker: it takes no more
 	// tasks and is not ready, so that it is stopped alone (see Retiring).
 	retiring atomic.Bool
@@ -302,6 +308,9 @@ func (w *Worker) Drain(ctx context.Context) error {
 
 func (w *Worker) serveStatus(rw http.ResponseWriter, _ *http.Request) {
 	w.hear()
+	if w.beforeStatus != nil {
+		w.beforeStatus()
+	}
 	running, idle := w.activity.Snapshot()
 	rw.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(rw).Encode(workerStatus{

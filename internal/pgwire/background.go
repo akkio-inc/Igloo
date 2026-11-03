@@ -15,6 +15,7 @@ import (
 	"github.com/akkio-inc/igloo/internal/ddl"
 	"github.com/akkio-inc/igloo/internal/distributed"
 	"github.com/akkio-inc/igloo/internal/engine"
+	"github.com/akkio-inc/igloo/internal/lockorder"
 	"github.com/akkio-inc/igloo/internal/sqllex"
 )
 
@@ -36,9 +37,11 @@ import (
 // more, and dashboards see its later ones only as the cores they leave idle.
 //
 // Only what would give the same rows there runs there: a read outside a
-// transaction block, of what the catalog holds, with no policies on it, no
-// temporary objects or settings of the session's that the other DuckDB has
-// not got, and no function tied to the session. Anything else that the
+// transaction block, of what the catalog holds, with no temporary objects
+// or settings of the session's that the other DuckDB has not got, and no
+// function tied to the session. Masking and row access policies apply in
+// the statement's text, which runs there as here; a clean room's tables
+// stay here (see policyReason). Anything else that the
 // second DuckDB cannot bind, as Igloo's functions over its own state, a
 // connection's tables or a view not yet copied there, fails as it is
 // prepared, and runs in the first.
@@ -101,7 +104,7 @@ var heavyMoveWithin = 60 * time.Second
 
 // heavyHistory is what statements of each shape took.
 type heavyHistory struct {
-	mu     sync.Mutex
+	mu     lockorder.Mutex
 	shapes map[string]*shapeRuns
 	// cpu is how much CPU time at the least makes a statement heavy, factor
 	// how many times the others' (see line), and after how long it starts again
@@ -317,7 +320,7 @@ func (s *Server) besideIsHeavy(sess *session) bool {
 
 // backgroundLane is the second DuckDB as this server uses it.
 type backgroundLane struct {
-	once sync.Mutex
+	once lockorder.Mutex
 	eng  *engine.Engine
 	// views keeps the local copies of the catalog's views there.
 	views *ddl.Manager

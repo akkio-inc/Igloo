@@ -386,7 +386,7 @@ func TestPlanKey(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		return planKey(stmt, []*Stage{{Inputs: []Input{{Table: h.tables["lineitem"], Split: true}}}})
+		return planKey(stmt, []*Stage{{Inputs: []Input{{Table: h.tables["lineitem"], Split: true}}}}, "")
 	}
 	a := key(q("1995-01-01", 10))
 	if b := key(q("1996-06-30", 10)); a != b {

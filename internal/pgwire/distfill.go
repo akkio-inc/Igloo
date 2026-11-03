@@ -29,9 +29,10 @@ import (
 // workers, the replica holds only its thousand rows.
 //
 // The fill runs on workers only as a read of its query by its user would:
-// not where masking or row access policies apply to, or concern, what the
-// query reads (see policyReason), nor over tables the user's grants were
-// not checked for. Erasure is as before: workers read table files as for
+// through the masking and row access policies that apply to what the query
+// reads, as its rewrite wrote them, and not where a clean room concerns it
+// (see policyReason), nor over tables the user's grants were not checked
+// for. Erasure is as before: workers read table files as for
 // any read, and their read caches are purged for erasure requests as for
 // reads; the table written is a table like any other.
 
@@ -134,12 +135,13 @@ func (s *Server) fillOn(f *stagedFill, src *statement, here func(context.Context
 	if err == nil || !f.again(err) {
 		return rows, p, false, err
 	}
-	if p.key == "" {
-		return rows, p, true, err
+	// It ran out of memory here: on workers, under what is left of the
+	// statement's time, whether auto mode chose this replica or did not
+	// plan it for workers at all, as for a table it took for small whose
+	// rows a fill makes far larger.
+	if p.key != "" {
+		s.dist.ObserveOutOfMemory(p.key)
 	}
-	// It ran out of memory here, where auto mode chose to run it: on
-	// workers, under what is left of the statement's time.
-	s.dist.ObserveOutOfMemory(p.key)
 	s.log.Warn("a fill ran out of memory on this replica; running its query on workers", "user", user.Name, "key", p.key, "err", err)
 	since := time.Now()
 	n, q, done, werr := s.fillOnWorkers(f.ctx, sess, src, distributed.ModeOn, from)

@@ -23,16 +23,17 @@ import (
 	"regexp"
 	"slices"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"time"
 
 	icecat "github.com/apache/iceberg-go/catalog"
+	"github.com/apache/iceberg-go/table"
 	"github.com/duckdb/duckdb-go/v2"
 
 	"github.com/akkio-inc/igloo/internal/catalog"
 	"github.com/akkio-inc/igloo/internal/engine"
 	"github.com/akkio-inc/igloo/internal/iddomain"
+	"github.com/akkio-inc/igloo/internal/lockorder"
 	"github.com/akkio-inc/igloo/internal/snowflake"
 )
 
@@ -70,7 +71,7 @@ type Manager struct {
 
 	// mu serializes view changes and syncs applying what they listed, and
 	// guards the fields below up to known.
-	mu sync.Mutex
+	mu lockorder.Mutex
 	// conn runs syncs.
 	conn  *duckdb.Conn
 	views map[key]catalog.View
@@ -98,8 +99,8 @@ type Manager struct {
 	// reading all of it; metaMu guards the fields below and changes to
 	// meta.
 	meta        atomic.Pointer[catalog.Metadata]
-	readMu      sync.Mutex
-	metaMu      sync.Mutex
+	readMu      lockorder.Mutex
+	metaMu      lockorder.Mutex
 	metaAt      time.Time
 	metaReading bool
 	// touched are the objects read again on their own, and when.
@@ -787,4 +788,17 @@ func quoteList(names []string) string {
 		quoted[i] = quoteIdent(n)
 	}
 	return strings.Join(quoted, ", ")
+}
+
+// TableNames returns the names of the catalog's tables in schema, as the
+// catalog lists them now.
+func (m *Manager) TableNames(ctx context.Context, schema string) ([]string, error) {
+	var out []string
+	for ident, err := range m.cat.ListTables(ctx, table.Identifier{schema}) {
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, ident[len(ident)-1])
+	}
+	return out, nil
 }

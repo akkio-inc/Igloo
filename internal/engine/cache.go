@@ -173,8 +173,6 @@ func cacheStatements(dir, warehouseRoot string, reserve uint64, on bool, readThr
 		// distributed-execution workers exchange.
 		"SELECT cache_httpfs_add_exclusion_regex("+literal("^(?!"+regexp.QuoteMeta(warehouseRoot)+")")+")",
 		"SELECT cache_httpfs_add_exclusion_regex("+literal("^"+regexp.QuoteMeta(warehouseRoot+config.ShuffleDir+"/"))+")",
-		// Remove blocks a crash left half written.
-		"SELECT cache_httpfs_cleanup_dead_temp()",
 		"SET GLOBAL cache_httpfs_type = "+literal(cacheType),
 	)
 }
@@ -241,12 +239,23 @@ func cacheLimits(total, avail, used, maxSize uint64, dedicated bool) (limit, res
 	return usable - reserve, reserve
 }
 
-// start measures the cache in the background until Close.
+// cleanupStatement removes the files of blocks that a crash left half
+// written, those of them older than ten minutes, so never one a read of
+// this process is writing. It lists every file of the cache, which on a
+// disk just started takes seconds for a cache of tens of thousands of
+// blocks (1.25 s for 51,000), so it runs in the background, once Igloo is
+// up, rather than before.
+const cleanupStatement = "SELECT cache_httpfs_cleanup_dead_temp()"
+
+// start cleans up and measures the cache in the background until Close.
 func (e *Engine) startCache(log *slog.Logger) {
 	c := e.cache
 	c.stop, c.done = make(chan struct{}), make(chan struct{})
 	go func() {
 		defer close(c.done)
+		if err := e.cleanupCache(); err != nil {
+			log.Warn("could not remove the read cache's half-written blocks", "err", err)
+		}
 		t := time.NewTicker(cacheMeasureInterval)
 		defer t.Stop()
 		for {
@@ -260,6 +269,19 @@ func (e *Engine) startCache(log *slog.Logger) {
 			}
 		}
 	}()
+}
+
+// cleanupCache runs cleanupStatement.
+func (e *Engine) cleanupCache() error {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	conn, err := e.connector.Connect(ctx)
+	if err != nil {
+		return err
+	}
+	defer conn.Close() //nolint:errcheck
+	_, err = conn.(*duckdb.Conn).ExecContext(ctx, cleanupStatement, nil)
+	return err
 }
 
 // stopCache waits for the background measurements to end.

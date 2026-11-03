@@ -5,9 +5,9 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"runtime/debug"
-	"sync"
 	"time"
 
+	"github.com/akkio-inc/igloo/internal/lockorder"
 	"github.com/akkio-inc/igloo/internal/memlimit"
 )
 
@@ -63,7 +63,7 @@ const (
 // orphans is what ShedMemory knows of the statements it canceled, for when
 // memory is critical with nothing running (see the top of this file).
 type orphans struct {
-	mu sync.Mutex
+	mu lockorder.Mutex
 	// last is the statement the watch canceled last.
 	last struct {
 		pid       int32

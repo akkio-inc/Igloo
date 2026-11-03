@@ -8,7 +8,6 @@ import (
 	"regexp"
 	"slices"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"time"
 
@@ -16,6 +15,7 @@ import (
 
 	"github.com/akkio-inc/igloo/internal/audit"
 	"github.com/akkio-inc/igloo/internal/auth"
+	"github.com/akkio-inc/igloo/internal/lockorder"
 	"github.com/akkio-inc/igloo/internal/sqllex"
 )
 
@@ -145,13 +145,13 @@ type analyzer struct {
 	queue  chan analysis
 	done   chan struct{}
 
-	sendMu sync.Mutex
+	sendMu lockorder.Mutex
 	closed bool
 
 	// mu guards the connections and the snapshot. conn lists the
 	// catalog's objects; parser, on a DuckDB of its own, parses
 	// statements, so analyzing contends with no query.
-	mu     sync.Mutex
+	mu     lockorder.Mutex
 	conn   *duckdb.Conn
 	parser *duckdb.Conn
 	snap   *objectSnapshot
@@ -159,7 +159,7 @@ type analyzer struct {
 	// as of the last snapshot: a query that mentions none reads none.
 	known atomic.Pointer[map[string]bool]
 
-	dropMu   sync.Mutex
+	dropMu   lockorder.Mutex
 	dropped  int
 	lastWarn time.Time
 }
@@ -281,6 +281,10 @@ func (a *analyzer) objects(j analysis) *statementObjects {
 		return nil
 	}
 	snap := a.snapshot(ctx)
+	if a.parser == nil {
+		// Closed while the snapshot waited for the catalog lock.
+		return nil
+	}
 	parsed := map[string]any{}
 	r := &resolver{
 		s: a.s, ctx: ctx, path: j.names.path, databases: snap.databases,
@@ -336,19 +340,32 @@ func (a *analyzer) connect(ctx context.Context) error {
 }
 
 // snapshot returns the catalog's objects, read again after this replica's
-// DDL and once snapshotTTL old. a.mu must be held.
+// DDL and once snapshotTTL old. a.mu must be held; snapshot lets go of it
+// while it waits for the catalog lock.
 func (a *analyzer) snapshot(ctx context.Context) *objectSnapshot {
 	gen := a.s.catalogGeneration()
-	if a.snap != nil && a.snap.gen == gen && time.Since(a.snap.at) < snapshotTTL {
+	fresh := func() bool { return a.snap != nil && a.snap.gen == gen && time.Since(a.snap.at) < snapshotTTL }
+	if fresh() {
 		return a.snap
 	}
-	snap := &objectSnapshot{gen: gen, at: time.Now(), databases: map[string]string{}, byName: map[string][]object{}}
 	// This runs on the analyzer's own connection, off the statement that
 	// queued the work, so it takes the catalog lock itself: listing the
 	// catalog's tables and views walks its in-memory set, which must not
 	// happen while a table is renamed or dropped on this instance (see
-	// engine.Engine.CatalogLock).
+	// engine.Engine.CatalogLock). The catalog lock comes before a.mu (see
+	// package lockorder): a session holding it may wait for a.mu, to record
+	// its statement.
+	a.mu.Unlock()
 	releaseCatalog := a.s.engine.CatalogLock()
+	a.mu.Lock()
+	if fresh() || a.conn == nil {
+		releaseCatalog()
+		if a.snap != nil {
+			return a.snap
+		}
+		return &objectSnapshot{gen: gen, at: time.Now(), databases: map[string]string{}, byName: map[string][]object{}}
+	}
+	snap := &objectSnapshot{gen: gen, at: time.Now(), databases: map[string]string{}, byName: map[string][]object{}}
 	rows, err := queryRows(ctx, a.conn, `SELECT database_name, schema_name, table_name, false, '', false
 			FROM system.main.duckdb_tables() WHERE NOT temporary
 		UNION ALL SELECT database_name, schema_name, view_name, true, sql, internal

@@ -185,6 +185,7 @@ func (pl *planner) asRelation(c *candidate, sc, top *scope) error {
 		sc.item.columns = append(sc.item.columns, strings.ToLower(col.Name))
 	}
 	renameColumns(sc.item, list(sc.ref, "column_name_alias"))
+	projected := false
 	// Its stages write only the columns the candidate reads: a view of a
 	// wide table, joined in each of a report's 16 branches on one key and
 	// read for three columns, was written whole, 420 columns of 400
@@ -195,9 +196,7 @@ func (pl *planner) asRelation(c *candidate, sc, top *scope) error {
 			return err
 		}
 		if pcols, err := pl.relationColumns(pq, c.ctes, nil); err == nil {
-			q, cols, sc.item.columns = pq, pcols, used
-			// The view's columns are named as the candidate reads them.
-			sc.ref[viewColumns] = []any{}
+			q, cols, sc.item.columns, projected = pq, pcols, used, true
 		}
 	}
 	bytes, err := pl.estimate(q, c.ctes)
@@ -207,7 +206,7 @@ func (pl *planner) asRelation(c *candidate, sc, top *scope) error {
 	key := pl.relationKey(q, c.ctes)
 	bytes, rows, known := pl.measured(key, bytes, cols)
 	c.rels = append(c.rels, &relUse{ref: sc.ref, q: q, scope: c.ctes, columns: cols, bytes: bytes, splittable: sc.splittable,
-		outer: sc.outerSide, sc: top, item: sc.item, key: key, known: known, rows: rows})
+		outer: sc.outerSide, sc: top, item: sc.item, key: key, known: known, rows: rows, projected: projected})
 	return nil
 }
 
@@ -431,7 +430,7 @@ func (pl *planner) keyInputs(c *candidate) error {
 	if err := pl.outerPairs(c); err != nil {
 		return err
 	}
-	if !pl.opts.force && !c.relation && largest < pl.opts.minBytes {
+	if !pl.opts.force && !pl.opts.fill && !c.relation && largest < pl.opts.minBytes {
 		return unsupported("its inputs are small (%d bytes)", largest)
 	}
 	if len(c.keyed) == 0 {

@@ -71,11 +71,11 @@ running all the time, and its first query of the day is not slowed by a
 start.
 
 How long a start takes depends on the platform. On AWS, a stopped
-c7g.4xlarge with Igloo's
-single-machine stack (Igloo, its catalog and local storage under Docker
-Compose) took about 16 seconds from the first connection to the first
-query. Kubernetes pods on a node that is already running start in a few
-seconds; a cluster that must first add a node takes a minute or two.
+c7g.8xlarge or c7g.16xlarge with Igloo's single-machine stack (Igloo and its
+catalog under Docker Compose) took about 15 seconds from the first connection
+to the first query, about 7 of them before Linux starts. Kubernetes pods on a
+node that is already running start in a few seconds; a cluster that must
+first add a node takes a minute or two.
 
 The first queries after a start are slower for a second reason: memory
 starts empty, and table files fetched from object storage are slow to read
@@ -83,7 +83,13 @@ starts empty, and table files fetched from object storage are slow to read
 seconds from memory). Igloo keeps the files it has read in a
 [read cache](operations.md#read-cache) on local disk, which survives the
 stop, so after a start it reads them from the machine's disk instead of
-object storage. That works only on storage that outlives the compute: the
+object storage. Beside the cache it keeps a list of what DuckDB held of
+those files in memory, and after a start it reads that back from object
+storage in the background, many requests at once, at the speed of the
+machine's network rather than its disk
+([memory after a start](operations.md#memory-after-a-start)): on a
+c7g.16xlarge, TPC-H's first run at scale factor 100 after a start took 17 s,
+against 16 s warm. That works only on storage that outlives the compute: the
 EBS volume of a stopped EC2 instance (Docker Compose keeps the cache in the
 `igloo-cache` volume there), or a PersistentVolumeClaim on Kubernetes.
 Instance-store disks, `emptyDir` volumes and the disks of nodes the
@@ -154,6 +160,21 @@ same VPC.
    Leave out `IGLOO_GATEWAY_CONSOLE_BACKEND`, `IGLOO_GATEWAY_FLIGHT_BACKEND`
    and `IGLOO_GATEWAY_ICEBERG_BACKEND` to
    forward SQL only.
+
+4. **Start Docker without waiting for the network.** Docker's unit waits for
+   `network-online.target`, which on Amazon Linux waits for cloud-init to
+   read the instance's metadata; Docker starts the stack's containers
+   without it. On the Igloo instance, copy the unit with that wait left out
+   (and copy it again after an upgrade of Docker that changes the unit):
+
+   ```sh
+   sed -e '/^After=/s/network-online.target/network.target/' -e '/^Wants=/s/network-online.target //' \
+     /usr/lib/systemd/system/docker.service | sudo tee /etc/systemd/system/docker.service >/dev/null
+   sudo systemctl daemon-reload
+   ```
+
+   On a c7g.16xlarge this started Igloo's containers 1.6 seconds sooner
+   after each start.
 
 On a machine with 512 MB of memory, package installs can run out of memory;
 add a swap file first, or use a `t4g.micro`.

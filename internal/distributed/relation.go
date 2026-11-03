@@ -166,6 +166,9 @@ type relUse struct {
 	query bool
 	// semi and outer are as for tables.
 	semi, outer bool
+	// projected says its stages write only the columns the candidate
+	// reads, named as it reads them (see asRelation).
+	projected bool
 	// key identifies the relation across plans of the statement (see
 	// relationKey); known says its size was measured, and rows are the
 	// rows it was measured at.
@@ -906,7 +909,10 @@ func (pl *planner) relationExchange(r *relUse, keys, casts []string, buckets int
 	}
 	x := pl.exchange("relation", xkeys, casts)
 	x.Buckets, x.UUIDHash = buckets, uuidHash
-	if err := pl.produce(r.q, r.scope, x, r.columns, nil); err != nil {
+	// Without the marks of the fragment that reads it: a subquery's query is
+	// also its own reference (see relUse.query), which that fragment marks with
+	// the view it reads it as, and its stages would read that view, or nothing.
+	if err := pl.produce(unmarked(r.q).(node), r.scope, x, r.columns, nil); err != nil {
 		return nil, err
 	}
 	if r.def != nil {

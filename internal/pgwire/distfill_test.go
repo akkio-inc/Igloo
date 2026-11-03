@@ -2,6 +2,7 @@ package pgwire
 
 import (
 	"context"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -9,6 +10,7 @@ import (
 	"github.com/duckdb/duckdb-go/v2"
 	"github.com/jackc/pgx/v5"
 
+	"github.com/akkio-inc/igloo/internal/auth"
 	"github.com/akkio-inc/igloo/internal/distributed"
 )
 
@@ -106,8 +108,9 @@ func TestFillOnWorkers(t *testing.T) {
 }
 
 // TestFillPolicies checks that a fill from a table masking or row access
-// policies apply to stays here, as reads of it do, even forced onto
-// workers, and holds what its user may see.
+// policies apply to runs on workers as reads of it do, through the
+// policies, and holds what its user may see: a row copied as it is, which
+// tasks write themselves, and an aggregate the coordinator writes.
 func TestFillPolicies(t *testing.T) {
 	t.Parallel()
 	ds := startDistServer(t, 2)
@@ -116,23 +119,39 @@ func TestFillPolicies(t *testing.T) {
 	}
 	mustExec(t, ds.admin, `INSERT INTO lake.crm.contacts SELECT i, CASE WHEN i % 2 = 0 THEN 'acme' ELSE 'globex' END,
 		'user' || i || '@acme.com', 'dev-' || i, i FROM range(5, 3000) t(i)`)
-	mustExec(t, ds.admin, "SET distributed_execution = on")
+	rita := ds.user(t, "rita", auth.RoleWriter, pgx.QueryExecModeSimpleProtocol)
+	mustExec(t, ds.admin, "GRANT acme_team TO rita")
+	for _, conn := range []*pgx.Conn{ds.admin, rita} {
+		mustExec(t, conn, "SET distributed_execution = on")
+	}
 	ctx := context.Background()
-	for _, fill := range []string{
-		"CREATE TABLE lake.public.fill_contacts AS SELECT client, count(*) AS n, max(email) AS e FROM lake.crm.contacts GROUP BY client",
-		"INSERT INTO lake.public.fill_contacts SELECT client, count(*), min(email) FROM lake.crm.contacts GROUP BY client",
+	for _, fill := range []struct {
+		conn       *pgx.Conn
+		user, text string
+	}{
+		{ds.admin, "igloo", "CREATE TABLE lake.public.fill_contacts AS SELECT client, count(*) AS n, max(email) AS e FROM lake.crm.contacts GROUP BY client"},
+		{ds.admin, "igloo", "INSERT INTO lake.public.fill_contacts SELECT client, count(*), min(email) FROM lake.crm.contacts GROUP BY client"},
+		{rita, "rita", "CREATE TABLE lake.public.fill_rita AS SELECT id, client, email FROM lake.crm.contacts"},
+		{rita, "rita", "INSERT INTO lake.public.fill_contacts SELECT client, count(*), max(email) FROM lake.crm.contacts GROUP BY client"},
 	} {
-		if _, err := ds.admin.Exec(ctx, fill); err != nil {
+		if _, err := fill.conn.Exec(ctx, fill.text); err != nil {
 			t.Fatal(err)
 		}
-		if q := lastRun(t, ds.history, fill); q.Workers != 0 {
-			t.Errorf("%s: ran on %d workers: %q", fill, q.Workers, q.Placement)
+		if q := lastRun(t, ds.history, fill.text); q.Workers == 0 || len(q.Policies) == 0 {
+			t.Errorf("%s: ran on %d workers, through %q: %q", fill.text, q.Workers, q.Policies, q.Placement)
 		}
 	}
-	for _, row := range texts(t, ds.admin, "SELECT e FROM lake.public.fill_contacts") {
+	for _, row := range texts(t, ds.admin, "SELECT e FROM lake.public.fill_contacts UNION ALL SELECT email FROM lake.public.fill_rita") {
 		if row != "***" {
 			t.Errorf("a raw value was written: %s", row)
 		}
+	}
+	// acme's rows alone: ids 1 and 2, and the even ids from 6 to 2998.
+	if got := texts(t, ds.admin, "SELECT client, count(*) FROM lake.public.fill_rita GROUP BY 1"); !slices.Equal(got, []string{"acme|1499"}) {
+		t.Errorf("rita's copy holds %q", got)
+	}
+	if got := texts(t, ds.admin, "SELECT n FROM lake.public.fill_contacts WHERE client = 'globex'"); !slices.Equal(got, []string{"1500", "1500"}) {
+		t.Errorf("globex's counts: %q, want the admin's two alone", got)
 	}
 	// A fill from a table without policies, forced, runs on workers.
 	plain := "CREATE TABLE lake.public.fill_orders AS SELECT amount, count(*) AS n FROM lake.public.orders GROUP BY amount"

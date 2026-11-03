@@ -7,12 +7,12 @@ import (
 	"io"
 	"log/slog"
 	"strings"
-	"sync"
 
 	"gocloud.dev/blob"
 
 	"github.com/akkio-inc/igloo/internal/catalog"
 	"github.com/akkio-inc/igloo/internal/config"
+	"github.com/akkio-inc/igloo/internal/lockorder"
 	"github.com/akkio-inc/igloo/internal/prefetch"
 )
 
@@ -24,16 +24,17 @@ func (e *Engine) setupPrefetch(cfg config.Config, dir string, log *slog.Logger) 
 		return
 	}
 	c := e.cache
+	objects := &objectOpener{storage: cfg.Storage}
 	p, err := prefetch.New(prefetch.Options{
 		Dir: dir, Concurrency: cfg.Prefetch.Concurrency, Log: log,
-		Open: (&objectOpener{storage: cfg.Storage}).open,
+		Open: objects.open,
 		Room: c.room,
 	})
 	if err != nil {
 		log.Warn("prefetch off", "err", err)
 		return
 	}
-	e.prefetcher = p
+	e.prefetcher, e.objects = p, objects
 	// Unset, the concurrency is the prefetcher's default, which the log
 	// says rather than 0.
 	concurrency := cfg.Prefetch.Concurrency
@@ -57,7 +58,7 @@ type bucket interface {
 // credentials, keeping one file system a bucket.
 type objectOpener struct {
 	storage config.Storage
-	mu      sync.Mutex
+	mu      lockorder.Mutex
 	buckets map[string]bucket
 }
 

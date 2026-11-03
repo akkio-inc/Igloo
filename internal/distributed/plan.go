@@ -134,6 +134,10 @@ type Table struct {
 	// Unsupported, if set, says why workers cannot read the table, such as
 	// delete files they cannot apply.
 	Unsupported string
+	// Governed says the statement reads the table through the subquery of
+	// its masking and row access policies, and stages may read it only
+	// there (see governed.go).
+	Governed bool
 	// Snapshot is the table's snapshot ID. Execute reads every table at its
 	// current snapshot, and the coordinator's own reads of the table in the
 	// same statement at that snapshot too.
@@ -186,6 +190,9 @@ type Plan struct {
 	// than farBeyondRatio times the coordinator's room for it.
 	shortOfMemory bool
 	farBeyond     bool
+	// writeBeyond says the coordinator's row groups of the rows it fills a
+	// table with would be more than its room (see features.writeHeld).
+	writeBeyond bool
 	// uncertain are relations of uncertain size its stages read by
 	// partition, with large tables partitioned to meet them; relKeys are
 	// the keys of the relations its exchanges hold, by exchange ID.
@@ -206,6 +213,9 @@ type Plan struct {
 	// writeParts is how many partitions the table's rows are estimated to have,
 	// for how its tasks write them; zero for not known.
 	writeParts int64
+	// writeUnsorted says its tasks write the rows as they come, as sorting them
+	// would not fit (see features.sortFits).
+	writeUnsorted bool
 	// versions are the snapshots the statement reads tables at, AT
 	// (VERSION => n), by key: Execute runs it on workers only if each is
 	// the snapshot it loads (see pinVersion).
@@ -229,6 +239,14 @@ func (p *Plan) StreamMerged() { p.streamMerged = true }
 // coordinator's memory, so that running it there instead of on workers
 // would fail, slowly.
 func (p *Plan) ShortOfMemory() bool { return p.shortOfMemory }
+
+// WriteFitsHere reports whether the coordinator could write the rows the
+// statement fills a table with from its workers' results, should they fail to
+// write them: not where its Parquet writer's row groups of them, which it cannot
+// spill, would be more than its room. After workers' tasks ran out of memory
+// writing 600 partitions of rows of 10.8 KB, it tried, holding 5.2 GiB, and ran
+// out of memory too.
+func (p *Plan) WriteFitsHere() bool { return !p.writeBeyond }
 
 // FitsHere reports whether the coordinator could run the statement itself,
 // should the workers chosen fail: not when its working set by DuckDB's
@@ -280,8 +298,10 @@ type view struct {
 
 // planOptions decide when a statement is worth distributing.
 type planOptions struct {
-	// force distributes whatever the tables' sizes.
-	force bool
+	// force distributes whatever the tables' sizes; so does fill, for a
+	// statement that fills a table, whose cost its rows decide (see
+	// features.fillOut).
+	force, fill bool
 	// minBytes is the smallest split table worth distributing.
 	minBytes int64
 	// maxBroadcast caps the total size of the tables every worker reads in
@@ -398,6 +418,11 @@ type planner struct {
 	// bucketNotes say where bucketed tables were read by bucket, without
 	// an exchange, or why they were exchanged all the same (see bucket.go).
 	bucketNotes []string
+	// gov is what masking and row access policies made of the statement,
+	// if they applied (see governed.go), and govRetried the jobs planned
+	// again with protected tables' subqueries as relations.
+	gov        *governance
+	govRetried map[uintptr]bool
 }
 
 type tableResult struct {
@@ -413,6 +438,7 @@ func newPlanner(ctx context.Context, env Env, p *parser, aggs map[string]bool, o
 // errUnsupported error when no part of it can run distributed.
 func (pl *planner) plan(stmt node) (*Plan, error) {
 	q := clone(stmt).(node)
+	pl.gov = pl.newGovernance(q)
 	pl.dropOrders(q)
 	pl.markTopK(q)
 	out, err := pl.query(q, true, nil)
@@ -432,6 +458,9 @@ func (pl *planner) plan(stmt node) (*Plan, error) {
 	}
 	if err := pl.fusePartitions(); err != nil {
 		return nil, err
+	}
+	if bad := pl.governedReads(pl.stages); len(bad) > 0 {
+		return nil, unsupported("a stage would read a table with masking or row access policies outside the subquery that applies them")
 	}
 
 	// Every machine must see the same now(): the time the statement was
@@ -787,6 +816,23 @@ func (pl *planner) job(sel node, top bool, ctes cteScope) (node, error) {
 	if err == nil {
 		combine, err = pl.finish(j, b)
 	}
+	if err == nil && len(pl.governedReads(pl.stages[sp.stages:])) > 0 {
+		err = unsupported("it would read a table with masking or row access policies outside the subquery that applies them")
+	}
+	if err != nil && IsUnsupported(err) && pl.gov != nil && !pl.govRetried[identity(sel)] && pl.forceRoots(sel) {
+		// Its stages would read a protected table's rows as they are, as a
+		// join that partitions them by its key does, or its policies'
+		// subqueries are where its rows cannot be divided or partitioned,
+		// as a window's or a join's to itself are: it reads instead the rows
+		// those subqueries make, masked and filtered, as relations whose
+		// stages read the tables through them (see governed.go).
+		pl.restore(sp)
+		if pl.govRetried == nil {
+			pl.govRetried = map[uintptr]bool{}
+		}
+		pl.govRetried[identity(sel)] = true
+		return pl.job(sel, top, ctes)
+	}
 	if err == nil {
 		pl.uncertain = append(pl.uncertain, pl.uncertainOf(c)...)
 	}
@@ -1137,7 +1183,8 @@ func (pl *planner) combinedSubqueries(v any, ctes cteScope) error {
 // that groups nothing as (SELECT min(m.day) FROM <its FROM and WHERE>),
 // which DuckDB computes once (see pgwire's wholecount.go), and such a
 // subquery reads the large tables and common table expressions its SELECT
-// does. A correlated one, or another kind, keeps the part off the workers.
+// does. A correlated one keeps the part off the workers. EXISTS, IN and
+// ANY subqueries are computed where the rows are, as a filter's.
 func (pl *planner) scalarRelations(v any, ctes cteScope, rd *reads) error {
 	var err error
 	walk(v, func(n node) bool {
@@ -1148,14 +1195,22 @@ func (pl *planner) scalarRelations(v any, ctes cteScope, rd *reads) error {
 			return true
 		}
 		q := subqueryNode(n)
-		cols, cerr := pl.relationColumns(q, ctes, nil)
-		switch {
-		case str(n["subquery_type"]) != "SCALAR":
-			err = unsupported("a subquery outside WHERE")
-		case cerr != nil || len(cols) != 1:
-			err = unsupported("a scalar subquery in the select list that does not stand on its own")
+		if str(n["subquery_type"]) != "SCALAR" {
+			// EXISTS, IN or ANY, computed for each row where it is made, over
+			// tables every task reads in full, as a filter's are (see
+			// filterSubqueries): a row access policy's is one (see
+			// governed.go).
+			before := len(rd.uses)
+			err = pl.fullRead(q, ctes.names(), nil, rd)
+			rd.subs = append(rd.subs, n)
+			for _, u := range rd.uses[before:] {
+				u.sub = len(rd.subs)
+			}
+			return false
 		}
-		if err != nil {
+		cols, cerr := pl.relationColumns(q, ctes, nil)
+		if cerr != nil || len(cols) != 1 {
+			err = unsupported("a scalar subquery in the select list that does not stand on its own")
 			return false
 		}
 		bytes, eerr := pl.estimate(q, ctes)
@@ -1436,10 +1491,11 @@ func (pl *planner) budget() error {
 // view's query, every table name in it qualified as DuckDB resolves it in
 // the view's body, aliased as the reference was (or by the view's name),
 // with the view's column names. It is used only when it describes as the
-// view itself does in the session, column for column. Masking and row
-// access policies, which views may hide, kept the statement from the
-// planner if they concern anything it reads (see pgwire's policyReason),
-// and the tables of the query are checked as any are.
+// view itself does in the session, column for column. A view that reads
+// a table with masking or row access policies is never one: pgwire's
+// rewrite read it as its query already, the table through the policies'
+// subquery (see governed.go). The tables of the query are checked as any
+// are.
 func (pl *planner) expandView(ref node, parts []string) (node, bool, error) {
 	if child(ref, "sample") != nil || child(ref, "at_clause") != nil {
 		return nil, false, nil
@@ -2094,7 +2150,7 @@ func (pl *planner) chooseSplit(c *candidate) error {
 			second = u
 		}
 	}
-	if !pl.opts.force && !c.relation && c.split.table.Bytes < pl.opts.minBytes {
+	if !pl.opts.force && !pl.opts.fill && !c.relation && c.split.table.Bytes < pl.opts.minBytes {
 		return unsupported("%s is small (%d bytes)", c.split.table, c.split.table.Bytes)
 	}
 	if broadcast+c.wholeBytes <= pl.opts.maxBroadcast {
@@ -2144,7 +2200,9 @@ const (
 	viewQuery = "__igloo_view_query"
 	// viewColumns, on a subquery read as a view, replaces its column
 	// aliases: its relation's stages wrote only some of its columns, named
-	// as the candidate reads them (see asRelation).
+	// as the candidate reads them (see asRelation). Like the others it is
+	// set only while the fragment is built, so a candidate given up on
+	// leaves none in the statement.
 	viewColumns = "__igloo_view_columns"
 )
 
@@ -2161,6 +2219,9 @@ func (pl *planner) views(c *candidate) (*job, error) {
 	for i, k := range c.keyed {
 		k.view = fmt.Sprintf("__igloo_k%d", i)
 		k.ref()[viewMark] = k.view
+		if k.rel != nil && k.rel.projected {
+			k.rel.ref[viewColumns] = []any{}
+		}
 	}
 	for i, r := range c.whole {
 		v := fmt.Sprintf("__igloo_w%d", i)
@@ -2174,6 +2235,9 @@ func (pl *planner) views(c *candidate) (*job, error) {
 			r.ref[viewQuery] = q
 		} else {
 			r.ref[viewMark] = v
+			if r.projected {
+				r.ref[viewColumns] = []any{}
+			}
 		}
 	}
 	names := map[string]string{}

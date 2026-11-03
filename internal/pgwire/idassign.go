@@ -12,7 +12,6 @@ import (
 	"slices"
 	"strconv"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"time"
 
@@ -22,6 +21,7 @@ import (
 	"github.com/akkio-inc/igloo/internal/auth"
 	"github.com/akkio-inc/igloo/internal/ddl"
 	"github.com/akkio-inc/igloo/internal/iddomain"
+	"github.com/akkio-inc/igloo/internal/lockorder"
 )
 
 // How member columns get their ids (see iddomains.go and idwrite.go).
@@ -635,7 +635,7 @@ var idDeferredDelay = 30 * time.Second
 
 // idDeferral holds the mapping passes due, by table.
 type idDeferral struct {
-	mu      sync.Mutex
+	mu      lockorder.Mutex
 	pending map[string]*time.Timer
 	stopped bool
 }
@@ -719,7 +719,7 @@ func (s *Server) mapDeferred(schema, table string) {
 // idMapped remembers, by member column, the table snapshot maintenance
 // last found fully mapped, so it does not look again until it changes.
 type idMapped struct {
-	mu   sync.Mutex
+	mu   lockorder.Mutex
 	seen map[string]int64
 }
 

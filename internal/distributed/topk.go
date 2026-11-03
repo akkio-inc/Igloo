@@ -470,6 +470,12 @@ func (pl *planner) selectItems(q node, readOnce func(node) node, depth int) ([]s
 // read once computes, that relation's aggregations. It reports whether it
 // marked every one.
 func (pl *planner) markSelect(q, keep node, readOnce func(node) node, depth int) bool {
+	// A window function of its own sees every row it reads, and would see
+	// only those the cut keeps: row_number() OVER (ORDER BY g) numbered the
+	// five groups kept 1 to 5.
+	if hasClass(q["select_list"], "WINDOW") {
+		return false
+	}
 	if projectionOnly(q) && !pl.hasAggregate(q["select_list"]) {
 		return pl.markRows(readOnce(child(q, "from_table")), keep, readOnce, depth+1)
 	}

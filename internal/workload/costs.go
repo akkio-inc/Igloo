@@ -93,6 +93,28 @@ func (c *Controller) Expect(shape string) time.Duration {
 	return cpu / time.Duration(c.costs.cores)
 }
 
+// Cost returns where a statement waits in line (see Expect) and whether it is light
+// (see Light), by the runs of the same text with the same literals if there are any,
+// and otherwise by the most a run alike but for its literals took (see Reserve).
+func (c *Controller) Cost(exact, shape string) (expect time.Duration, light bool) {
+	key, most := c.pick(exact, shape)
+	if !most {
+		return c.Expect(key), c.Light(key)
+	}
+	if c == nil || key == "" || c.costs.cores == 0 {
+		return 0, false
+	}
+	k := &c.costs
+	k.mu.Lock()
+	runs := k.runs[key]
+	k.mu.Unlock()
+	if len(runs) == 0 {
+		return 0, false
+	}
+	cpu := slices.Max(runs)
+	return cpu / time.Duration(c.costs.cores), c.costs.below > 0 && cpu < c.costs.below
+}
+
 // Light reports whether statements of shape are light: one of the shape's
 // latest runs took less than the CPU time WeighCosts gave. A light statement
 // neither counts against the replica's limit nor reserves memory, since it

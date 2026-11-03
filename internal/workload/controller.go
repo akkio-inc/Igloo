@@ -66,6 +66,8 @@ type Controller struct {
 	// (see unseenPatience).
 	patience time.Duration
 	lastLate time.Time
+	// lateRunning counts the statements running that started late.
+	lateRunning int
 	// held is what DuckDB last held for running statements, as SampleMemory
 	// read it; zero before it has.
 	held int64
@@ -83,9 +85,9 @@ type waiter struct {
 	// unseen says nothing is known of what it holds, so that it waits while
 	// the memory is nearly full (see full).
 	unseen bool
-	// late says it is unseen, and has waited for as long as it does (see
-	// unseenPatience).
-	late bool
+	// overdue says it is unseen and has waited for as long as it does (see
+	// unseenPatience), and late that it is the one of them that may start.
+	overdue, late bool
 	// apart says it runs in the second DuckDB (see Limits.Apart).
 	apart bool
 	// due is its place in line: when it came, plus how long it takes alone.
@@ -217,11 +219,21 @@ func (c *Controller) elsewhere(w *waiter) {
 	}
 	delete(c.active, w)
 	delete(c.unseen, w)
+	c.notLate(w)
 	c.admit()
 }
 
+// notLate has w, running, no longer count as the late statement that runs. The
+// caller holds c.mu.
+func (c *Controller) notLate(w *waiter) {
+	if w.late && w.admitted {
+		c.lateRunning--
+		w.late = false
+	}
+}
+
 // wait waits until w may start, or ctx ends. One nothing is known of stops waiting
-// for the memory once it has waited patience, one of them each unseenGrows.
+// for the memory once it has waited patience, one of them at a time (see admit).
 func (c *Controller) wait(ctx context.Context, w *waiter) {
 	var late <-chan time.Time
 	if w.unseen {
@@ -237,12 +249,10 @@ func (c *Controller) wait(ctx context.Context, w *waiter) {
 			return
 		case <-late:
 			c.mu.Lock()
-			if next := unseenGrows - time.Since(c.lastLate); next > 0 {
+			w.overdue, late = true, nil
+			c.admit()
+			if next := unseenGrows - time.Since(c.lastLate); !w.admitted && c.lateRunning == 0 && next > 0 {
 				late = time.After(next)
-			} else {
-				c.lastLate, w.late = time.Now(), true
-				late = nil
-				c.admit()
 			}
 			c.mu.Unlock()
 		}
@@ -263,6 +273,12 @@ func (c *Controller) reservation(memory int64) int64 {
 // admit starts every waiting statement that may start, in the line's order.
 // The caller holds c.mu.
 func (c *Controller) admit() {
+	if c.lateRunning == 0 && time.Since(c.lastLate) >= unseenGrows && !slices.ContainsFunc(c.queue, func(w *waiter) bool { return w.late }) {
+		// The first overdue in line goes, whatever is held (see unseenPatience).
+		if i := slices.IndexFunc(c.queue, func(w *waiter) bool { return w.overdue }); i >= 0 {
+			c.queue[i].late, c.lastLate = true, time.Now()
+		}
+	}
 	blocked := map[string]bool{}
 	memoryBlocked, replicaBlocked := false, false
 	kept := c.queue[:0]
@@ -287,6 +303,9 @@ func (c *Controller) admit() {
 			if w.unseen {
 				w.started = time.Now()
 				c.unseen[w] = struct{}{}
+			}
+			if w.late {
+				c.lateRunning++
 			}
 			w.admitted = true
 			close(w.ready)
@@ -319,8 +338,11 @@ const fullShare = 0.75
 // What holds it may not end for hours: from no history, a report at a hundred times
 // the data ran on one machine, on an estimate of 16 hours, its memory full, and a
 // statement of a shape not seen yet that would have run on workers waited behind it,
-// planning nothing, for as long as it ran. Past this they start, one each unseenGrows,
-// by when what the one before holds shows, whatever is held.
+// planning nothing, for as long as it ran. Past this they start whatever is held, one
+// at a time: the next once the one before has ended, or gone to workers. Started one
+// each unseenGrows, as many as waited, a dashboard's 324 statements at ten times its
+// data with no history ran 5 to 8 heavy ones at once, spilled, and took 3,928 s, three
+// of them past their 15-minute timeout; one at a time, with Reserve and Cost, 3,145 s.
 const unseenPatience = time.Minute
 
 // unseenShare is the share of the budget a statement nothing is known of counts for
@@ -389,6 +411,7 @@ func (c *Controller) release(w *waiter) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	w.released = true
+	c.notLate(w)
 	if w.slots.Max > 0 {
 		if c.running[w.slots.Key]--; c.running[w.slots.Key] <= 0 {
 			delete(c.running, w.slots.Key)

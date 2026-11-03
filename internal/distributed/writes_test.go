@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestUnderDir(t *testing.T) {
@@ -177,9 +178,10 @@ func TestPartitionFiles(t *testing.T) {
 		memory int64
 		want   int
 	}{
-		{953 * mib, 59},
-		{2355 * mib, 147},
-		{64 * gib, 4096},
+		{953 * mib, 29},
+		{497 * mib, 15},
+		{2355 * mib, 72},
+		{64 * gib, 2028},
 		{100 * mib, leastWriteFiles},
 		{0, 100},
 	} {
@@ -228,7 +230,7 @@ func TestWriteBounds(t *testing.T) {
 			t.Errorf("writeRowGroup(%d MiB, %d, %d) = %d MiB, want about %d", c.memory/mib, c.shares, c.writers, got/mib, c.want/mib)
 		}
 	}
-	if got := writeFilesOpen(953*mib, 1, true); got < 40 || got > 50 {
+	if got := writeFilesOpen(953*mib, 1, true); got != 29 {
 		t.Errorf("files open on a small worker, uploading: %d", got)
 	}
 	if got := writeFilesOpen(64*gib, 4, true); got != mostWriteFiles {
@@ -268,9 +270,119 @@ func TestWriteFits(t *testing.T) {
 		{"rows of 10 KB of files on a large worker", features{bytes: 1e11, rows: 1e7, fill: true}, large, true},
 		{"rows not known", features{bytes: 1e11, fill: true}, small, true},
 		{"memory not known", wide, fleet{cores: 2, threads: 2}, true},
+		// By its DuckDB threads, not its cores: 2 of 16.
+		{"rows of 10.8 KB as measured, on a worker of 2 threads of 16 cores", features{bytes: 4.2e7, rows: 6e6, fill: true, fillWidth: 10.8e3},
+			fleet{memory: 1e9, cores: 16, threads: 2}, true},
+		{"rows of 10.8 KB as measured, on a worker of 16 threads", features{bytes: 4.2e7, rows: 6e6, fill: true, fillWidth: 10.8e3},
+			fleet{memory: 1e9, cores: 16, threads: 16}, false},
 	} {
 		if got := c.x.writeFits(c.f); got != c.want {
 			t.Errorf("%s: %v (rows of %.0f bytes)", c.name, got, c.x.rowBytes())
+		}
+	}
+}
+
+// TestWideFillFirstRun checks where auto mode runs a fill whose rows an
+// expression makes wide, on its first run: a copy of TPC-H's lineitem at scale
+// factor 1, 205 MB, each row's comment repeated 400 times, 10.8 KB a row. This
+// replica's row groups of it, which DuckDB cannot spill, are 10.6 GB on 8 threads,
+// past its room: it ran out of memory four times of four on a replica of 7 GiB
+// beside 3 workers, and wrote on workers. As the table's types took it, it was a
+// copy of a table auto mode took for small, and stayed here; a copy of the table
+// as it is still does, and not where the replica has the room for it after workers.
+func TestWideFillFirstRun(t *testing.T) {
+	const gib = 1 << 30
+	replica := machine{cores: 8, threads: 8, memory: 7 * gib}
+	workers := fleet{cores: 8, threads: 2, running: 3, most: 3, memory: 1 * gib}
+	copyOf := func(width float64) features {
+		return features{bytes: 2e8, rows: 6e6, levels: 1, stages: 1, fill: true, planned: true, planBytes: 1.1e8, planKeeps: 1, planRows: 6e6,
+			fillWidth: width, workersWrite: true}
+	}
+	now := time.Now()
+	wide := copyOf(10.8e3)
+	if held := wide.writeHeld(8); held < 10e9 || held > 11e9 {
+		t.Errorf("row groups of 10.8 KB rows on 8 threads: %.1f GB", held/1e9)
+	}
+	e := wide.estimate(replica, workers)
+	if !e.farBeyond || !e.spills || e.workers == 0 {
+		t.Fatalf("wide rows here: far beyond %v, spills %v, %d workers, %s", e.farBeyond, e.spills, e.workers, e.local)
+	}
+	if on, explore, why := choose(e, runs{}, false, DefaultThreshold, now); !on || explore {
+		t.Errorf("wide rows, first run: on workers %v, trying %v (%s)", on, explore, why)
+	}
+	if p := (&Plan{farBeyond: e.farBeyond, shortOfMemory: e.memory}); p.FitsHere() {
+		t.Error("after workers, this replica writes wide rows it has no room for")
+	}
+	// What the rows took, measured, is what they write: a quarter of it in files.
+	if got := wide.fillOut(); got < 16e9 || got > 16.5e9 {
+		t.Errorf("wide rows write %.1f GB", got/1e9)
+	}
+	for _, c := range []struct {
+		name  string
+		width float64
+	}{{"as the types take them", 0}, {"a copy of the table as it is", 150}} {
+		x := copyOf(c.width)
+		x.workersWrite = false
+		e := x.estimate(replica, workers)
+		if e.farBeyond || e.spills {
+			t.Errorf("%s: far beyond %v, spills %v, %s", c.name, e.farBeyond, e.spills, e.local)
+		}
+		if on, _, why := choose(e, runs{}, false, DefaultThreshold, now); on {
+			t.Errorf("%s: on workers (%s)", c.name, why)
+		}
+	}
+	// One that ran here before, holding what it did, fits.
+	ran := machine{cores: 8, threads: 8, memory: 7 * gib, ranHere: true, allocated: 2 * gib}
+	if e := wide.estimate(ran, workers); e.farBeyond || e.spills {
+		t.Errorf("after a run here: far beyond %v, spills %v", e.farBeyond, e.spills)
+	}
+}
+
+// TestSortFits checks when a task sorts a fill's rows by partition before it
+// writes them: narrow rows, which DuckDB's sort spills, always; rows of 10.8 KB,
+// six million of them in 600 partitions, which the sort of a worker of 953 MiB
+// ran out of memory on at once, not, though a smaller share of 1.1 KB rows would.
+func TestSortFits(t *testing.T) {
+	small := fleet{cores: 8, threads: 2, running: 3, most: 3, memory: 1 << 30}
+	rows := func(width, n float64) features {
+		return features{bytes: 2e8, rows: n, fill: true, planned: true, planRows: n, fillWidth: width}
+	}
+	for _, c := range []struct {
+		name string
+		x    features
+		f    fleet
+		want bool
+	}{
+		{"narrow rows", rows(150, 6e6), small, true},
+		{"rows of 10.8 KB", rows(10.8e3, 6e6), small, false},
+		{"a few rows of 10.8 KB", rows(10.8e3, 1e4), small, true},
+		{"rows of 1.1 KB, fewer than a task holds", rows(1.1e3, 5e5), small, true},
+		{"rows of 2.7 KB, more than a task holds", rows(2.7e3, 6e6), small, false},
+		{"rows not known", features{bytes: 2e8, fill: true}, small, true},
+		{"memory not known", rows(10.8e3, 6e6), fleet{cores: 8, threads: 2, running: 3, most: 3}, true},
+	} {
+		if got := c.x.sortFits(c.f); got != c.want {
+			t.Errorf("%s: %v", c.name, got)
+		}
+	}
+}
+
+// TestValueWidth checks the SQL of what a value takes in memory: a string's text
+// beside its 16 bytes, a nested value's as text, any other its type's width.
+func TestValueWidth(t *testing.T) {
+	for typ, want := range map[string]string{
+		"VARCHAR":               "(16 + coalesce(strlen(c), 0))",
+		"BLOB":                  "(16 + coalesce(octet_length(c), 0))",
+		"INTEGER[]":             "(16 + coalesce(strlen(CAST(c AS VARCHAR)), 0))",
+		"STRUCT(a INTEGER)":     "(16 + coalesce(strlen(CAST(c AS VARCHAR)), 0))",
+		"MAP(VARCHAR, INTEGER)": "(16 + coalesce(strlen(CAST(c AS VARCHAR)), 0))",
+		"BIGINT":                "8",
+		"DOUBLE":                "8",
+		"BOOLEAN":               "4",
+		"DECIMAL(18,2)":         "8",
+	} {
+		if got := valueWidth("c", typ); got != want {
+			t.Errorf("%s: %s, want %s", typ, got, want)
 		}
 	}
 }

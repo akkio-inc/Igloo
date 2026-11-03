@@ -8,10 +8,11 @@ import (
 	"net"
 	"net/netip"
 	"os"
-	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
+
+	"github.com/akkio-inc/igloo/internal/lockorder"
 )
 
 // A connection is held to limits until its client has signed in. It must
@@ -46,7 +47,7 @@ type startupLimits struct {
 	max, perAddr int
 	log          *slog.Logger
 
-	mu     sync.Mutex
+	mu     lockorder.Mutex
 	open   int
 	byAddr map[string]int
 	// warned is when a refusal or a timeout was last logged.

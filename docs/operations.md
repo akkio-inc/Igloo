@@ -493,14 +493,28 @@ created, renamed or dropped there:
   listings, drops and renames while the catalog is shared), and is
   prepared again on its own. `igloo_shared_prepares_total` counts both;
   `IGLOO_SHARED_PREPARES=false` prepares every statement on its own.
+- Planning a statement for workers shares the catalog too: the names it
+  resolves and the columns workers read come from indexes of the catalog's
+  tables and views and of the columns DuckDB binds, which the replica builds
+  again, on its own, when the catalog changes.
 - Everything else — reading table data once the statement is bound, and
   `INSERT`, `UPDATE`, `DELETE` and `MERGE` writing and committing a new
   snapshot of the tables bound — holds nothing.
+
+Steps that need the catalog to themselves and wait together take their turns
+one after another, for up to a tenth of a second, before the binds that came
+meanwhile, so a queue of DDL and listings holds binds up once rather than once
+for each.
 
 Opening a session shares the catalog too, as a bind does: it selects the
 catalog's default schema. A login waits at most 30 seconds for a listing or
 DDL that has the catalog to itself, and then fails with SQLSTATE `57P03`,
 saying how long the catalog has been held, rather than waiting with it.
+
+`igloo.query_history` records how long each statement waited for the
+catalog as `catalog_wait_ms`, and a statement that has it to itself for a
+second or more is logged when it lets go (`held the catalog lock
+exclusively`), with its session's backend pid and how long it held it.
 
 These serialized steps are brief (preparing or binding a statement, a
 listing, most DDL), and they do not wait for data queries to finish, nor data
@@ -733,6 +747,38 @@ more than DuckDB alone.
   `prefetch on`, or why it is off. The Helm chart gives its igloo pods and
   its workers a cache volume (`cacheVolume`, `workers.cacheVolume`), so
   both can read ahead.
+
+### Memory after a start
+
+DuckDB keeps the parts of table files that queries read in memory, in
+front of the disk cache, and a stopped machine loses them. Its first
+queries then read everything again from the disk cache, as fast as the
+disk is provisioned for: TPC-H at scale factor 100 reads 24 GB, which a
+gp3 volume of 500 MB/s gives in about 50 s. Object storage gives the
+same bytes several times faster to many requests at once, so Igloo reads
+them back from there when it starts:
+
+- While it runs, the server keeps a list of the ranges of files DuckDB
+  holds in memory, in the order queries first read them, in
+  `memory.json` beside the cache's blocks: written every 30 seconds while
+  they change, and when Igloo stops.
+- After a start, in the background, it reads the list's ranges from object
+  storage in that order, 256 requests of up to 8 MiB at a time, and hands
+  them to DuckDB, which uses them as if its queries had read them. A query
+  that reads a range before it is back reads it as it would have, from
+  the disk cache, and the restore skips it. On a c7g.16xlarge it read the
+  24 GB back in 7 to 8 s, at its network's 3.6 GB/s, and the first run of
+  the 22 queries took 22 s, against 58 s from the disk alone.
+- It takes at most three quarters of DuckDB's memory, and stops when
+  DuckDB has no memory to spare: the ranges are buffers DuckDB drops
+  first when queries need the room.
+- It reads only files DuckDB had: Iceberg's data files, which never
+  change, and other files only while their ETag is the one DuckDB had.
+  Emptying the cache, as [erasure requests](#erasure-requests) do, deletes
+  the list too.
+- It runs on the server, with `IGLOO_PREFETCH` on, as it is by default; the
+  log says `restored what DuckDB held in memory from object storage`, with
+  how much and how long it took.
 
 ## Result cache
 
@@ -1117,10 +1163,13 @@ the snapshots it read, so users' writes always win: maintenance leaves the
 files of a table alone while a write that reads or writes it runs, or while
 a transaction block (`BEGIN` ... `COMMIT`, as dbt's incremental models run)
 that has read or written it is open, unless the block has sat idle for 15
-minutes. A block that has listed the catalog (`information_schema`,
-`pg_catalog`, `SHOW`), as dbt does before each `MERGE`, holds back every
-table, since a listing takes the tables it lists into the block without
-saying which. It checks again just before it commits a rewrite, with sessions
+minutes. A block of a user who may write holds back every table from its
+`BEGIN`: DuckDB reads a table that changed after the block began as it was
+when the block began, and would commit a write on top of that. So does a
+block that has listed the catalog (`information_schema`, `pg_catalog`,
+`SHOW`), as dbt does before each `MERGE`, since a listing takes the tables
+it lists into the block without saying which. A reader's block holds back
+only what it read. It checks again just before it commits a rewrite, with sessions
 held off the table for that moment, and gives up the rewrite until the next
 pass if one uses it. It sees only its own replica's sessions: a write
 through another replica that loses to compaction is run again if it runs on
@@ -1519,6 +1568,7 @@ and the catalog runs its database migrations before it serves. Read
 | SQLSTATE `57P03`, `cannot open a session: waited 30s for the catalog lock, which a statement listing or changing the catalog has held for ...` | A listing or DDL has had the catalog to itself for that long ([concurrency on a replica](#concurrency-on-a-replica)); logins wait for it no longer. Try again; if it lasts, find the statement among those running in the console and cancel it. |
 | Log says `crashed outside Go code, in DuckDB or an extension; exiting`, and the replica restarts | DuckDB crashed on one of its own threads. Igloo exits with status 2 so that Docker or Kubernetes restarts it, rather than keep a session that will never finish; the goroutine dump that follows in the log shows the statements that were running. |
 | Log says `igloo: a C++ exception escaped DuckDB or an extension (...); exiting`, and the replica or worker restarts with status 134 | An exception nothing caught reached C++'s terminate, often while DuckDB cleaned up after running out of memory (the type in parentheses, mangled, says which: `N6duckdb20OutOfMemoryExceptionE`). Igloo exits at once rather than abort, which left workers hung; look at the memory warnings before it, and lower the statements' memory or raise the limit. |
+| Log says `...; parking its statement's thread, whose session ends`, then `a C++ exception escaped DuckDB on a statement's thread, where nothing could catch it` | The same, on the thread a client's statement ran on, as the iceberg extension's scan of a table's manifests throws Out of Memory out of a destructor when a statement is bound at the memory limit. That statement fails and its client's connection closes; the thread and its DuckDB connection wait for good, and the server goes on. Past 64 such threads it exits as above. Statements of the console, Flight SQL and background work still exit. Look at the memory warnings before it, as above. |
 | Startup fails with `warehouse already exists in bucket ...` | `IGLOO_WAREHOUSE_LOCATION` does not match the existing warehouse. Point it at the existing data or use a different `IGLOO_CATALOG_WAREHOUSE`. |
 | Startup retries `catalog not reachable yet` | The catalog or its database is not up. Igloo waits up to 3 minutes. |
 | `/readyz` returns 503 | The body names the failing dependency: engine, metadata database or catalog. |
