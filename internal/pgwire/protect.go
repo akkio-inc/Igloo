@@ -501,7 +501,12 @@ func (g *governance) externalFiles(prefix string) bool {
 // concern, worked out from the protected tables and the definitions of the
 // session's views and macros. Names are lower-cased.
 type sensitivity struct {
-	policyGen, catalogGen uint64
+	// snap is the policies it was worked out under, and catalogGen the
+	// catalog's views, macros, functions and connections (resultGeneration).
+	// A snapshot is replaced whenever the policies change, those of Igloo's
+	// own tables included, which leave the policies' generation as it was.
+	snap       *policy.Snapshot
+	catalogGen uint64
 	// names are the protected tables', and those of views and macros that
 	// read them, directly or through others.
 	names map[string]bool
@@ -656,14 +661,28 @@ func (s *Server) checkPath(path string, allowWarehouse bool) error {
 }
 
 // sensitivity returns the session's, working it out again when the
-// policies or the catalog's views, macros, functions or connections
+// policies, snap, or the catalog's views, macros, functions or connections
 // changed (resultGeneration): what it lists. A table's DDL changes none of
 // them, and the rollups of ELT beside dashboards, replacing tables every
-// minute, had every session list them again after each.
+// minute, had every session list them again after each. Sessions with no
+// temporary views or macros of their own list the same, and share what the
+// first of them listed: each listing walks the catalog, holding the catalog
+// lock alone, and after each change every dashboard's session took it in
+// turn.
 func (s *Server) sensitivity(ctx context.Context, sess *session, snap *policy.Snapshot) (*sensitivity, bool, error) {
-	pg, cg := s.gov.gen.Load(), s.resultGeneration()
-	if c := sess.sens; c != nil && c.policyGen == pg && c.catalogGen == cg {
+	cg := s.resultGeneration()
+	if c := sess.sens; c != nil && c.snap == snap && c.catalogGen == cg {
 		return c, false, nil
+	}
+	shared := !sess.temps && !sess.tempMacros
+	if shared {
+		s.sharedSens.mu.Lock()
+		c := s.sharedSens.sens
+		s.sharedSens.mu.Unlock()
+		if c != nil && c.snap == snap && c.catalogGen == cg {
+			sess.sens = c
+			return c, false, nil
+		}
 	}
 	// The listing walks the catalog's in-memory set (see policyRewrite).
 	defer s.holdCatalog(sess)()
@@ -681,7 +700,7 @@ func (s *Server) sensitivity(ctx context.Context, sess *session, snap *policy.Sn
 		toks            defTokens
 	}
 	var defs []def
-	sens := &sensitivity{policyGen: pg, catalogGen: cg, names: map[string]bool{}, risky: map[string]bool{},
+	sens := &sensitivity{snap: snap, catalogGen: cg, names: map[string]bool{}, risky: map[string]bool{},
 		viewProtected: map[string]bool{}, viewRisky: map[string]bool{}, macroProtected: map[string]bool{},
 		macroRisky: map[string]bool{}, macros: map[string]bool{}, unsafeFns: map[string]bool{}}
 	dest := make([]driver.Value, 5)
@@ -773,6 +792,11 @@ func (s *Server) sensitivity(ctx context.Context, sess *session, snap *policy.Sn
 		}
 	}
 	sess.sens = sens
+	if shared {
+		s.sharedSens.mu.Lock()
+		s.sharedSens.sens = sens
+		s.sharedSens.mu.Unlock()
+	}
 	return sens, true, nil
 }
 

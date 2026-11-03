@@ -47,7 +47,7 @@ const functionListQuery = `SELECT system.main.lower(function_name) || chr(9) || 
 func (s *Server) functionSets(ctx context.Context, sess *session) (*functionSets, error) {
 	gen := s.resultGeneration()
 	f := &s.functions
-	if !sess.temps {
+	if !sess.tempMacros {
 		f.mu.Lock()
 		if f.sets != nil && f.gen == gen {
 			defer f.mu.Unlock()
@@ -63,7 +63,7 @@ func (s *Server) functionSets(ctx context.Context, sess *session) (*functionSets
 		return nil, err
 	}
 	sets := functionSetsOf(rows)
-	if !sess.temps {
+	if !sess.tempMacros {
 		f.mu.Lock()
 		f.gen, f.sets = gen, sets
 		f.mu.Unlock()

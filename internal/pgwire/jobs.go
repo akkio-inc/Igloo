@@ -1167,6 +1167,11 @@ func (s *Server) RunJob(ctx context.Context, j tasks.Job) (int64, error) {
 		return rows, err
 
 	case tasks.KindMaterializedView, tasks.KindDynamicTable:
+		// A refresh makes its temporary views and tables itself, after it
+		// plans (see refresher.temp): until then its session has none, and
+		// resolves names from the server's indexes rather than a listing that
+		// walks the catalog, holding the catalog lock alone.
+		sess.temps = false
 		if j.Kind == tasks.KindDynamicTable {
 			if err := s.refreshUpstream(ctx, sess, j); err != nil {
 				return -1, err

@@ -453,6 +453,12 @@ type Server struct {
 	// functions is what statements' rewrites and the result cache know of
 	// DuckDB's functions (see functionlist.go).
 	functions functionList
+	// sharedSens is the sensitivity of sessions with no temporary views or
+	// macros of their own (see sensitivity).
+	sharedSens struct {
+		mu   lockorder.Mutex
+		sens *sensitivity
+	}
 	// afterNewValues, if set, runs when an assignment has found new values
 	// and is about to take the lease, for tests.
 	afterNewValues func()
@@ -937,8 +943,10 @@ type session struct {
 	// running with it on (see setBitmaps); nil otherwise.
 	bitmapsRestore func()
 	// temps says the session may have temporary tables or views, which
-	// the server's index of tables leaves out (see indexedTables).
-	temps bool
+	// the server's index of tables leaves out (see indexedTables), and
+	// tempMacros that it may have temporary macros of its own, which the
+	// server's list of functions leaves out (see functionSets).
+	temps, tempMacros bool
 	// open holds every DuckDB statement prepared for this client, keyed by
 	// the wire statement that owns it, so none outlive the connection.
 	open     map[*wire.PreparedStatement]*statement
@@ -2838,8 +2846,8 @@ func (s *Server) prepareHeld(ctx context.Context, sess *session, user auth.User,
 		sess.memo = &checkMemo{plans: map[string]any{}}
 		defer func() { sess.memo = nil }()
 	}
-	if !sess.temps && mayCreateTemporary(text) {
-		sess.temps = true
+	if !(sess.temps && sess.tempMacros) && mayCreateTemporary(text) {
+		sess.temps, sess.tempMacros = true, true
 	}
 	// The counting CTEs of audience reports become calls of the report API
 	// (see reportrecognize.go), which the statement then goes through as

@@ -17,6 +17,7 @@ import (
 
 	"github.com/akkio-inc/igloo/internal/audit"
 	"github.com/akkio-inc/igloo/internal/auth"
+	"github.com/akkio-inc/igloo/internal/distributed"
 	"github.com/akkio-inc/igloo/internal/incremental"
 	"github.com/akkio-inc/igloo/internal/policy"
 	"github.com/akkio-inc/igloo/internal/tasks"
@@ -268,17 +269,19 @@ func digest(s string) string {
 }
 
 func (r *refresher) run(ctx context.Context) (refreshResult, error) {
-	// Planning resolves the query's tables and lists their columns, which
-	// walk the catalog's in-memory set: it holds the catalog lock
-	// exclusively. The rest holds it only to change the catalog (temporary
-	// tables, the state table) and while DuckDB binds what it runs, as a
-	// user's statements do (see catalogRunLock): a full refresh runs a
-	// query as long as any read, and held it for its whole run.
+	// A refresh holds the catalog lock while DuckDB binds what it runs, shared,
+	// as a user's statements do (see catalogRunLock), and alone only to change
+	// the catalog: to write the view's table and its state table. Planning
+	// resolves the query's tables from the server's index (see indexedTables),
+	// binds the query and its tables to read their columns, and loads their
+	// snapshots from the catalog itself; its temporary views and tables are
+	// the session's own. A full refresh runs a query as long as any read, and
+	// held the lock for its whole run; planning, which listed the columns from
+	// information_schema, walking the catalog, held it alone for up to 13 s,
+	// while every dashboard waited.
 	defer r.dropTemps()
 	r.st.Incremental, r.st.Reason = false, ""
-	release := r.s.holdCatalog(r.sess)
 	reason := r.planQuery(ctx)
-	release()
 	if reason == "" {
 		r.st.Incremental = true
 	} else {
@@ -319,9 +322,8 @@ func (r *refresher) planQuery(ctx context.Context) string {
 	if err != nil {
 		return "Igloo could not resolve its tables: " + err.Error()
 	}
-	conn := r.sess.conn
 	env := incremental.Env{
-		Parser: connParser{conn},
+		Parser: connParser{r.sess.conn},
 		Table: func(_ context.Context, parts []string) (string, string, bool, error) {
 			rs, err := res.resolve(tableRef{parts: parts}, nil)
 			if err != nil {
@@ -337,20 +339,15 @@ func (r *refresher) planQuery(ctx context.Context) string {
 			}
 			return o.schema, o.name, true, nil
 		},
-		Columns: func(ctx context.Context, schema, name string) ([]string, error) {
-			return queryStrings(ctx, r.sess, `SELECT column_name FROM information_schema.columns
-				WHERE table_catalog = $1 AND table_schema = $2 AND table_name = $3 ORDER BY ordinal_position`, s.catalogName(), schema, name)
-		},
+		Columns: r.columnNames,
 		Describe: func(ctx context.Context, query string) ([]incremental.Column, error) {
-			rows, err := queryRows(ctx, conn, "DESCRIBE "+query)
+			cols, err := r.described(ctx, query)
 			if err != nil {
 				return nil, err
 			}
-			out := make([]incremental.Column, len(rows))
-			for i, row := range rows {
-				name, _ := row[0].(string)
-				typ, _ := row[1].(string)
-				out[i] = incremental.Column{Name: name, Type: typ}
+			out := make([]incremental.Column, len(cols))
+			for i, c := range cols {
+				out[i] = incremental.Column{Name: c.Name, Type: c.Type}
 			}
 			return out, nil
 		},
@@ -999,12 +996,35 @@ func (r *refresher) stateColumns() string {
 	return strings.Join(names, ", ")
 }
 
-// viewColumns lists the columns of the view's table, holding the catalog
-// lock to list them.
+// viewColumns lists the columns of the view's table.
 func (r *refresher) viewColumns(ctx context.Context) ([]string, error) {
-	defer r.s.holdCatalog(r.sess)()
-	return queryStrings(ctx, r.sess, `SELECT column_name FROM information_schema.columns
-		WHERE table_catalog = $1 AND table_schema = $2 AND table_name = $3 ORDER BY ordinal_position`, r.s.catalogName(), r.schema, r.table)
+	return r.columnNames(ctx, r.schema, r.table)
+}
+
+// columnNames lists the columns of the catalog's table schema.name, as DuckDB
+// binds a query of them all.
+func (r *refresher) columnNames(ctx context.Context, schema, name string) ([]string, error) {
+	cols, err := r.described(ctx, "SELECT * FROM "+quoteName([]string{r.s.catalogName(), schema, name}))
+	if err != nil {
+		return nil, err
+	}
+	names := make([]string, len(cols))
+	for i, c := range cols {
+		names[i] = c.Name
+	}
+	return names, nil
+}
+
+// described returns the names and types of the columns of query's result, as
+// DuckDB binds it, which holds the catalog lock shared (see runBound).
+func (r *refresher) described(ctx context.Context, query string) ([]distributed.Column, error) {
+	var cols []distributed.Column
+	err := r.s.runBound(r.sess, nil, func() error {
+		var err error
+		cols, err = describedColumns(ctx, r.sess.conn, query)
+		return err
+	})
+	return cols, err
 }
 
 // pinAt returns how to read table at its snapshot v: AT (VERSION => v),
@@ -1020,31 +1040,35 @@ func (r *refresher) pinAt(ctx context.Context, table string, v int64) (increment
 }
 
 // temp makes a temporary view or table, which the refresh drops when it
-// ends: a table empty, holding the catalog lock, and then filled, which
-// holds it only while DuckDB binds the query (see runTempCreate).
+// ends: a table empty, and then filled. The session's temporary objects are
+// its own, outside the Iceberg catalog: making one holds the catalog lock only
+// while DuckDB binds its query, as filling it does (see runBound).
 func (r *refresher) temp(ctx context.Context, kind, name, query string) error {
 	create := "CREATE OR REPLACE TEMP " + kind + " " + quoteIdent(name) + " AS " + query
 	if kind == "TABLE" {
 		create += "\nWITH NO DATA"
 	}
-	release := r.s.holdCatalog(r.sess)
-	_, err := r.exec(ctx, create)
-	release()
-	if err != nil {
+	run := func(q string) error {
+		return r.s.runBound(r.sess, nil, func() error {
+			_, err := r.exec(ctx, q)
+			return err
+		})
+	}
+	r.sess.temps = true
+	if err := run(create); err != nil {
 		return err
 	}
 	if !slices.Contains(r.temps, kind+" "+name) {
 		r.temps = append(r.temps, kind+" "+name)
 	}
 	if kind == "TABLE" {
-		_, err = r.exec(ctx, "INSERT INTO temp.main."+quoteIdent(name)+"\n"+query)
+		return run("INSERT INTO temp.main." + quoteIdent(name) + "\n" + query)
 	}
-	return err
+	return nil
 }
 
 func (r *refresher) dropTemps() {
 	ctx := context.Background()
-	defer r.s.holdCatalog(r.sess)()
 	for _, t := range slices.Backward(r.temps) {
 		kind, name, _ := strings.Cut(t, " ")
 		_, _ = r.sess.conn.ExecContext(ctx, "DROP "+kind+" IF EXISTS temp.main."+quoteIdent(name), nil)
@@ -1209,7 +1233,6 @@ func (s *Server) refreshReason(ctx context.Context, sess *session, user auth.Use
 		return "", err
 	}
 	r := &refresher{s: s, sess: sess, query: rewritten, digest: digest(rewritten), st: refreshState{Mode: refreshAuto}}
-	defer s.holdCatalog(sess)()
 	return r.planQuery(ctx), nil
 }
 
@@ -1269,14 +1292,12 @@ func (s *Server) refreshUpstream(ctx context.Context, sess *session, j tasks.Job
 	if len(downstream) == 0 {
 		return nil
 	}
-	release := s.holdCatalog(sess)
 	r, err := s.newResolver(ctx, sess)
 	var reads readSet
 	if err == nil {
 		r.lenient = true
 		reads, err = r.analyze(j.Statement, nil, 0)
 	}
-	release()
 	if err != nil {
 		return err
 	}
