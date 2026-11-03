@@ -353,11 +353,15 @@ type planner struct {
 	producing map[string]bool
 	depth     int
 	// started is when planning began, progress when it last planned a
-	// stage or described a part (Unix nanoseconds), and stalled why its
-	// limits ended it (see limitPlanning).
-	started  time.Time
-	progress atomic.Int64
-	stalled  atomic.Value
+	// stage or described a part (Unix nanoseconds), waited how long the
+	// session had waited for the catalog lock then and waitedFrom when planning
+	// began (see CatalogWaits), and stalled why its limits ended it (see
+	// limitPlanning).
+	started    time.Time
+	progress   atomic.Int64
+	waited     atomic.Int64
+	waitedFrom time.Duration
+	stalled    atomic.Value
 	// describes are the session's descriptions of parts, by their text,
 	// for the statement (see describe), and profile what planning spent.
 	describes *describeCache

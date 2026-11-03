@@ -1172,6 +1172,16 @@ func (e *sessionEnv) Setting(ctx context.Context, name string) (string, error) {
 	return settingValue(ctx, e.sess.conn, name)
 }
 
+// CatalogWaited is how long the session has waited for the engine's catalog
+// lock in all, the wait under way included (see distributed.CatalogWaits).
+func (e *sessionEnv) CatalogWaited() time.Duration {
+	waited := time.Duration(e.sess.catWaited.Load())
+	if from := e.sess.catWaitFrom.Load(); from != 0 {
+		waited += time.Since(time.Unix(0, from))
+	}
+	return waited
+}
+
 // Explain returns DuckDB's plan of query as the session would run it,
 // EXPLAIN (FORMAT JSON), its parameters bound to NULL, for auto mode's
 // estimate of what it holds (see distributed.Explainer).

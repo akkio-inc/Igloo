@@ -952,14 +952,16 @@ on one machine. In auto mode planning stops once it stalls: a statement
 runs on one machine once planning has planned no stage and described no
 new part for a tenth of the time the statement is expected to take there
 (what it took before, else the estimate), between half a second and a
-minute, or once planning has taken that time in all. A report expected
-to take minutes plans as long as it progresses; a cheap statement whose
-planning stalls waits half a second for it. `distributed_execution = on`
+minute, or once planning has taken that time in all. Time the session
+spends waiting for the catalog lock, behind DDL or a refresh that holds it,
+counts for neither: the statement waits for the lock wherever it runs. A
+report expected to take minutes plans as long as it progresses; a cheap
+statement whose planning stalls waits half a second for it. `distributed_execution = on`
 and `EXPLAIN DISTRIBUTED` plan for as long as planning takes. Planning
 describes each part of the statement in the session once, keeps the SQL
 it printed of each part, and logs `planned a statement` with its time,
-stages, descriptions and other lookups in the session when it takes a
-second or more.
+stages, descriptions, other lookups in the session and its wait for the
+catalog lock when it takes a second or more.
 
 ## Same results as one machine
 

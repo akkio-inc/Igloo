@@ -120,7 +120,26 @@ type planProfile struct {
 
 // progressed records that planning progressed: it planned a stage or
 // described a part (see limitPlanning).
-func (pl *planner) progressed() { pl.progress.Store(time.Now().UnixNano()) }
+func (pl *planner) progressed() {
+	pl.waited.Store(int64(pl.catalogWaited()))
+	pl.progress.Store(time.Now().UnixNano())
+}
+
+// CatalogWaits is an Env whose session says how long it has waited for the
+// engine's catalog lock, in all, so far, the wait under way included. It may be
+// asked from any goroutine.
+type CatalogWaits interface {
+	CatalogWaited() time.Duration
+}
+
+// catalogWaited is how long pl's session has waited for the catalog lock so
+// far; zero for a session that cannot say.
+func (pl *planner) catalogWaited() time.Duration {
+	if w, ok := pl.env.(CatalogWaits); ok {
+		return w.CatalogWaited()
+	}
+	return 0
+}
 
 // looked records a lookup in the session begun at start.
 func (pl *planner) looked(start time.Time) {
@@ -282,15 +301,23 @@ func (co *Coordinator) logPlanning(pl *planner, plan *Plan, err error, limits pl
 		"describes", pl.profile.describes, "describes_cached", pl.profile.cached,
 		"describe_seconds", math.Round(pl.profile.describing.Seconds()*1000)/1000,
 		"lookups", pl.profile.lookups, "lookup_seconds", math.Round(pl.profile.looking.Seconds()*1000)/1000,
+		"catalog_wait_seconds", math.Round((pl.catalogWaited()-pl.waitedFrom).Seconds()*1000)/1000,
 		"stall_limit", limits.stall, "limit", limits.total, "gave_up", why, "err", err)
 }
 
 // limitPlanning returns the context planner pl plans in: ctx, ended
 // (errPlanBudget) once pl has made no progress for limits.stall, or
 // planned for limits.total, when they are set; pl.stalled then says which.
-// stop ends the watch.
+// stop ends the watch. Time the session spends waiting for the catalog lock
+// counts for neither: the statement waits for it to run wherever it runs,
+// and a writer holding it is no sign that planning does not get on. Beside a
+// refresh that took the lock alone 12 times for up to 13 s, 275 of a mixed
+// load's dashboard statements gave up planning for it and ran on one machine,
+// a tile that took 10 to 14 s on workers taking 75 to 88 s there.
 func limitPlanning(ctx context.Context, pl *planner, limits planLimits) (context.Context, func()) {
 	pl.started = time.Now()
+	pl.waitedFrom = pl.catalogWaited()
+	pl.waited.Store(int64(pl.waitedFrom))
 	pl.progress.Store(pl.started.UnixNano())
 	if limits.stall <= 0 && limits.total <= 0 {
 		return ctx, func() {}
@@ -311,11 +338,12 @@ func limitPlanning(ctx context.Context, pl *planner, limits planLimits) (context
 			case <-pctx.Done():
 				return
 			case now := <-t.C:
-				idle := now.Sub(time.Unix(0, pl.progress.Load()))
+				waited := pl.catalogWaited()
+				idle := now.Sub(time.Unix(0, pl.progress.Load())) - (waited - time.Duration(pl.waited.Load()))
 				switch {
 				case limits.stall > 0 && idle >= limits.stall:
 					pl.stalled.Store("planning planned no stage and described no part for " + limits.stall.String())
-				case limits.total > 0 && now.Sub(pl.started) >= limits.total:
+				case limits.total > 0 && now.Sub(pl.started)-(waited-pl.waitedFrom) >= limits.total:
 					pl.stalled.Store("planning took " + limits.total.String() + ", as long as one machine should take the statement")
 				default:
 					continue

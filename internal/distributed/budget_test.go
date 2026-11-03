@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -58,6 +59,63 @@ func TestPlanningProgress(t *testing.T) {
 	}
 	if why, _ := pl.stalled.Load().(string); !strings.Contains(why, "for "+stall.String()) || !errors.Is(context.Cause(ctx), errPlanBudget) {
 		t.Errorf("ended as %q (%v)", why, context.Cause(ctx))
+	}
+}
+
+// lockWaitEnv is a session that waits for the catalog lock when told to.
+type lockWaitEnv struct {
+	harnessEnv
+	mu    sync.Mutex
+	total time.Duration
+	from  time.Time
+}
+
+func (e *lockWaitEnv) wait(on bool) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if on {
+		e.from = time.Now()
+		return
+	}
+	e.total += time.Since(e.from)
+	e.from = time.Time{}
+}
+
+func (e *lockWaitEnv) CatalogWaited() time.Duration {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.from.IsZero() {
+		return e.total
+	}
+	return e.total + time.Since(e.from)
+}
+
+// TestPlanningWaitsForTheCatalog keeps planning whose session waits for the
+// catalog lock, past its limits, as a writer holding the lock is no sign that
+// planning does not get on; and ends it as before once the wait is over.
+func TestPlanningWaitsForTheCatalog(t *testing.T) {
+	const stall = 200 * time.Millisecond
+	env := &lockWaitEnv{}
+	pl := &planner{env: env}
+	ctx, stop := limitPlanning(context.Background(), pl, planLimits{stall: stall, total: 2 * stall})
+	defer stop()
+	env.wait(true)
+	time.Sleep(5 * stall)
+	if ctx.Err() != nil {
+		t.Fatalf("ended while its session waited for the catalog lock: %v", pl.stalled.Load())
+	}
+	env.wait(false)
+	ended := time.Now()
+	select {
+	case <-ctx.Done():
+	case <-time.After(5 * stall):
+		t.Fatalf("not ended %s after the wait", 5*stall)
+	}
+	if took := time.Since(ended); took < stall-10*time.Millisecond {
+		t.Errorf("ended %s after the wait, within its limit of %s", took, stall)
+	}
+	if why, _ := pl.stalled.Load().(string); !strings.Contains(why, "for "+stall.String()) {
+		t.Errorf("ended as %q", why)
 	}
 }
 

@@ -591,6 +591,13 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
 
 ### Distributed execution
 
+- Auto mode no longer gives up planning a statement for workers while its session
+  waits for the catalog lock. A refresh beside a fleet's dashboards took the lock
+  alone 12 times for up to 13 s, and 275 dashboard statements counted that wait
+  as planning that made no progress and ran on one machine: a tile that took 10
+  to 14 s on workers took 75 to 88 s there, and loaded the coordinator for
+  everything else. `planned a statement` logs the wait.
+
 - Statements that masking and row access policies apply to run on workers and in the
   replica's second DuckDB, for every user, where they ran only in the first DuckDB of
   the replica, so a team whose main tables have policies had neither. Every stage reads

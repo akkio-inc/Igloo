@@ -1082,6 +1082,11 @@ type session struct {
 	// last took it exclusively, for logging long holds (see unlockCatalog).
 	catWait  time.Duration
 	catSince time.Time
+	// catWaited is how long the session has waited for the engine lock in all,
+	// and catWaitFrom when the wait under way began (Unix nanoseconds, zero for
+	// none), for planning on other goroutines (see sessionEnv.CatalogWaited).
+	catWaited   atomic.Int64
+	catWaitFrom atomic.Int64
 	// sharedPrepare is set while prepareChecked prepares a statement holding
 	// the catalog lock shared, which stops at DuckDB's first failure to
 	// prepare it (see sharedprepare.go).
@@ -2536,6 +2541,7 @@ func (s *Server) relockCatalog(sess *session) {
 	}
 	s.unlockCatalog(sess)
 	start := time.Now()
+	sess.catWaitFrom.Store(start.UnixNano())
 	switch want {
 	case catalogExclusive:
 		sess.catRelease = s.engine.CatalogLock()
@@ -2545,6 +2551,8 @@ func (s *Server) relockCatalog(sess *session) {
 		sess.catRelease = s.engine.CatalogShare()
 		sess.catWait += time.Since(start)
 	}
+	sess.catWaited.Add(int64(time.Since(start)))
+	sess.catWaitFrom.Store(0)
 	sess.catHeld = want
 }
 
