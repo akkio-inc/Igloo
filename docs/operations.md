@@ -493,9 +493,14 @@ created, renamed or dropped there:
   listings, drops and renames while the catalog is shared), and is
   prepared again on its own. `igloo_shared_prepares_total` counts both;
   `IGLOO_SHARED_PREPARES=false` prepares every statement on its own.
+- Planning a statement for workers shares the catalog too: the names it
+  resolves and the columns workers read come from indexes of the catalog's
+  tables and views and of the columns DuckDB binds, which the replica builds
+  again, on its own, when the catalog changes.
 - Everything else — reading table data once the statement is bound, and
   `INSERT`, `UPDATE`, `DELETE` and `MERGE` writing and committing a new
   snapshot of the tables bound — holds nothing.
+
 
 Opening a session shares the catalog too, as a bind does: it selects the
 catalog's default schema. A login waits at most 30 seconds for a listing or

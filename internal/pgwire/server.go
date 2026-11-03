@@ -599,9 +599,12 @@ type Server struct {
 	// of them that may change what a statement's text means other than
 	// through the tables it loads (see resultGeneration).
 	ddlGen, defsGen atomic.Uint64
-	// tables is the index of tables the checks resolve names with (see
-	// indexedTables).
-	tables tableIndex
+	// tables and views are the indexes of tables and views the checks
+	// resolve names with (see indexedTables).
+	tables, views tableIndex
+	// columns is what DuckDB bound of tables' columns, for planning
+	// statements for workers (see boundColumns).
+	columns columnCache
 	// mockSecret derives the credentials a login for an unknown user runs
 	// against (see mockCredentials).
 	mockSecret []byte

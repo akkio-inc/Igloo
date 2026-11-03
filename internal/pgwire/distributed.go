@@ -887,16 +887,10 @@ func (e *sessionEnv) Table(ctx context.Context, parts []string) (*distributed.Ta
 		c.Governed = true
 		t = &c
 	}
-	// Workers must read the columns as DuckDB does here. The statement was
-	// bound, so DuckDB has loaded them. Listing them with duckdb_columns()
-	// walks the catalog's in-memory set; hold the exclusive side for that one
-	// scan so it does not run while a table is renamed or dropped on this
-	// instance (the read's run holds nothing; see catalogRunLock, holdCatalog).
-	release := e.s.holdCatalog(e.sess)
-	cols, err := tableColumns(ctx, e.sess, catalogName, o.schema, o.name)
-	release()
+	// Workers must read the columns as DuckDB does here.
+	cols, err := e.s.boundColumns(ctx, e.sess, catalogName, o.schema, o.name, t.Columns)
 	if err != nil {
-		return nil, false, err
+		t.Unsupported = "DuckDB's columns of it could not be read: " + err.Error()
 	}
 	if len(cols) != len(t.Columns) && t.Unsupported == "" {
 		t.Unsupported = "its columns differ between DuckDB and the catalog"
@@ -1039,14 +1033,69 @@ func (e *sessionEnv) ViewDefinition(ctx context.Context, parts []string) (*distr
 	}, true, nil
 }
 
-// tableColumns lists a table's columns as DuckDB has them. Names match as
-// DuckDB matches them, whatever their case: a statement in Snowflake's
-// dialect names lower-case tables in upper case.
-func tableColumns(ctx context.Context, sess *session, db, schema, table string) ([]distributed.Column, error) {
-	rows, err := sess.conn.QueryContext(ctx, `SELECT column_name, data_type FROM duckdb_columns()
-		WHERE lower(database_name) = lower($1) AND lower(schema_name) = lower($2) AND lower(table_name) = lower($3)
-		ORDER BY column_index`,
-		[]driver.NamedValue{{Ordinal: 1, Value: db}, {Ordinal: 2, Value: schema}, {Ordinal: 3, Value: table}})
+// boundColumns returns a table's columns as DuckDB binds them, for a table whose
+// columns the catalog has as columns: what DuckDB gives a statement that selects them
+// all, which it binds as any statement, holding the catalog lock shared. Listing
+// them with duckdb_columns() walks the catalog's in-memory set and held it
+// exclusively, for each table of every statement planned for workers, and under
+// dashboards and ELT, each such listing waited for every bind before it and held
+// up every bind after it: dashboards on workers waited 34 s at the median to run
+// for 0.3 s. DuckDB binds the same columns of the same catalog columns each time,
+// so the server keeps what it bound, by table and columns (see columnCache).
+func (s *Server) boundColumns(ctx context.Context, sess *session, db, schema, table string, columns []distributed.Column) ([]distributed.Column, error) {
+	key := columnKey(db, schema, table, columns)
+	if cols, ok := s.columns.get(key); ok {
+		return cols, nil
+	}
+	cols, err := describedColumns(ctx, sess.conn, "SELECT * FROM "+quoteIdent(db)+"."+quoteIdent(schema)+"."+quoteIdent(table))
+	if err != nil {
+		return nil, err
+	}
+	s.columns.put(key, cols)
+	return cols, nil
+}
+
+// columnKey names a table's columns as the catalog has them, for columnCache.
+func columnKey(db, schema, table string, columns []distributed.Column) string {
+	var b strings.Builder
+	b.WriteString(strings.ToLower(db + "\x00" + schema + "\x00" + table))
+	for _, c := range columns {
+		b.WriteString("\x00" + c.Name + "\x01" + c.Type)
+	}
+	return b.String()
+}
+
+// columnCache is what DuckDB bound of tables' columns (see boundColumns), at
+// most maxCachedColumns tables' worth: past that it starts again.
+type columnCache struct {
+	mu   sync.Mutex
+	cols map[string][]distributed.Column
+}
+
+// maxCachedColumns bounds columnCache: a table whose columns change has an entry
+// for each version of them.
+const maxCachedColumns = 4096
+
+func (c *columnCache) get(key string) ([]distributed.Column, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	cols, ok := c.cols[key]
+	return cols, ok
+}
+
+func (c *columnCache) put(key string, cols []distributed.Column) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.cols == nil || len(c.cols) >= maxCachedColumns {
+		c.cols = map[string][]distributed.Column{}
+	}
+	c.cols[key] = cols
+}
+
+// describedColumns returns the names and types of the columns of query's result, as
+// DuckDB binds it.
+func describedColumns(ctx context.Context, conn *duckdb.Conn, query string) ([]distributed.Column, error) {
+	rows, err := conn.QueryContext(ctx, "SELECT column_name, column_type FROM (DESCRIBE "+query+")", nil)
 	if err != nil {
 		return nil, err
 	}

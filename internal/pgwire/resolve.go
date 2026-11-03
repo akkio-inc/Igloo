@@ -311,6 +311,29 @@ func (r *resolver) load(names []string) error {
 		}
 		return nil
 	}
+	if !r.sess.temps && !slices.ContainsFunc(missing, func(n string) bool { return setupTempViews[n] }) {
+		// A session with no temporary tables or views of its own, and a name
+		// none of the views it starts with has, sees the tables and views
+		// every session sees, which the server keeps indexes of: no listing,
+		// and so no exclusive hold of the catalog lock, which the planning of
+		// every statement for workers took, and every dashboard's bind
+		// waited behind.
+		tables, err := r.s.indexedTables(r.ctx, r.sess)
+		if err != nil {
+			return err
+		}
+		views, err := r.s.indexedViews(r.ctx, r.sess)
+		if err != nil {
+			return err
+		}
+		for _, n := range missing {
+			r.objects[n] = append(r.objects[n], tables[n]...)
+			for _, o := range views[n] {
+				r.objects[n] = append(r.objects[n], r.viewObject(o))
+			}
+		}
+		return nil
+	}
 	// Listing tables and views walks the catalog's in-memory set of tables,
 	// which takes the catalog lock exclusively (see
 	// engine.Engine.CatalogLock): held already while a statement is
@@ -325,20 +348,6 @@ func (r *resolver) load(names []string) error {
 			FROM system.main.duckdb_tables() WHERE system.main.lower(table_name) IN (` + in + `)
 		UNION ALL SELECT database_name, schema_name, view_name, true, sql, internal
 			FROM system.main.duckdb_views() WHERE system.main.lower(view_name) IN (` + in + `)`
-	if !r.sess.temps {
-		// A session with no temporary tables sees the tables every session
-		// sees, which the server keeps an index of (see indexedTables), so
-		// only views, cheap to list, are listed here.
-		idx, err := r.s.indexedTables(r.ctx, r.sess)
-		if err != nil {
-			return err
-		}
-		for _, n := range missing {
-			r.objects[n] = append(r.objects[n], idx[n]...)
-		}
-		query = `SELECT database_name, schema_name, view_name, true, sql, internal
-			FROM system.main.duckdb_views() WHERE system.main.lower(view_name) IN (` + in + `)`
-	}
 	rows, err := r.sess.conn.QueryContext(r.ctx, query, nil)
 	if err != nil {
 		return err
@@ -359,13 +368,22 @@ func (r *resolver) load(names []string) error {
 		o.view, _ = dest[3].(bool)
 		o.sql, _ = dest[4].(string)
 		o.internal, _ = dest[5].(bool)
-		o.catalogView = o.view && r.s.ddl != nil && strings.EqualFold(o.db, r.local) && r.s.ddl.IsView(o.schema, o.name)
-		if o.view && r.s.external != nil && strings.EqualFold(o.db, r.local) {
-			o.externalScans, o.external = r.s.external.IsExternal(o.schema, o.name)
+		if o.view {
+			o = r.viewObject(o)
 		}
 		k := strings.ToLower(o.name)
 		r.objects[k] = append(r.objects[k], o)
 	}
+}
+
+// viewObject is view o as the resolver's objects have it: whether it is a local
+// copy of a view of the Iceberg catalog, or the view of an external table.
+func (r *resolver) viewObject(o object) object {
+	o.catalogView = r.s.ddl != nil && strings.EqualFold(o.db, r.local) && r.s.ddl.IsView(o.schema, o.name)
+	if r.s.external != nil && strings.EqualFold(o.db, r.local) {
+		o.externalScans, o.external = r.s.external.IsExternal(o.schema, o.name)
+	}
+	return o
 }
 
 // searchPath is DuckDB's search path for a name in the body of view, or at
@@ -951,25 +969,49 @@ type tableIndex struct {
 // listings as DuckDB sees them (engine.ListingsGeneration, which changes
 // when a table DuckDB loads by name was not in them, so that the checks of
 // a statement that bound a table made elsewhere see it), and after
-// tableIndexTTL. Callers hold the catalog lock (see holdCatalog), as for
-// any listing. The map returned is never changed.
+// tableIndexTTL. Building it lists the catalog, holding the catalog lock
+// exclusively (see holdCatalog); using it holds nothing. The map returned is
+// never changed.
 func (s *Server) indexedTables(ctx context.Context, sess *session) (map[string][]object, error) {
+	return s.tables.get(ctx, s, sess, `SELECT database_name, schema_name, table_name, false, '', false
+		FROM system.main.duckdb_tables() WHERE database_name <> 'temp'`)
+}
+
+// indexedViews is indexedTables for views: every database's but temp, built
+// again when that index is, with their definitions.
+func (s *Server) indexedViews(ctx context.Context, sess *session) (map[string][]object, error) {
+	return s.views.get(ctx, s, sess, `SELECT database_name, schema_name, view_name, true, sql, internal
+		FROM system.main.duckdb_views() WHERE database_name <> 'temp'`)
+}
+
+// get returns the index, built again from query, a listing of (database,
+// schema, name, view, sql, internal), if what it was built from may have
+// changed (see indexedTables).
+func (x *tableIndex) get(ctx context.Context, s *Server, sess *session, query string) (map[string][]object, error) {
 	gen := s.catalogGeneration() + s.engine.ListingsGeneration()
-	s.tables.mu.Lock()
-	if s.tables.byName != nil && s.tables.gen == gen && time.Since(s.tables.at) < tableIndexTTL {
-		m := s.tables.byName
-		s.tables.mu.Unlock()
+	fresh := func() map[string][]object {
+		x.mu.Lock()
+		defer x.mu.Unlock()
+		if x.byName != nil && x.gen == gen && time.Since(x.at) < tableIndexTTL {
+			return x.byName
+		}
+		return nil
+	}
+	if m := fresh(); m != nil {
 		return m, nil
 	}
-	s.tables.mu.Unlock()
-	rows, err := sess.conn.QueryContext(ctx, `SELECT database_name, schema_name, table_name
-		FROM system.main.duckdb_tables() WHERE database_name <> 'temp'`, nil)
+	defer s.holdCatalog(sess)()
+	if m := fresh(); m != nil {
+		// Another session built it meanwhile.
+		return m, nil
+	}
+	rows, err := sess.conn.QueryContext(ctx, query, nil)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close() //nolint:errcheck
 	m := map[string][]object{}
-	dest := make([]driver.Value, 3)
+	dest := make([]driver.Value, 6)
 	for {
 		if err := rows.Next(dest); err != nil {
 			if !errors.Is(err, io.EOF) {
@@ -981,12 +1023,15 @@ func (s *Server) indexedTables(ctx context.Context, sess *session) (map[string][
 		o.db, _ = dest[0].(string)
 		o.schema, _ = dest[1].(string)
 		o.name, _ = dest[2].(string)
+		o.view, _ = dest[3].(bool)
+		o.sql, _ = dest[4].(string)
+		o.internal, _ = dest[5].(bool)
 		k := strings.ToLower(o.name)
 		m[k] = append(m[k], o)
 	}
-	s.tables.mu.Lock()
-	s.tables.gen, s.tables.at, s.tables.byName = gen, time.Now(), m
-	s.tables.mu.Unlock()
+	x.mu.Lock()
+	x.gen, x.at, x.byName = gen, time.Now(), m
+	x.mu.Unlock()
 	return m, nil
 }
 
