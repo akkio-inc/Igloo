@@ -1150,6 +1150,7 @@ func (co *Coordinator) Execute(ctx context.Context, plan *Plan, settings []Setti
 				releaseLocal = co.holdLocal(id, r.ws)
 			}
 			cleanups = append(cleanups, func() {
+				r.stopWatching()
 				release()
 				releaseLocal()
 				co.removeLater(id, r.roots...)

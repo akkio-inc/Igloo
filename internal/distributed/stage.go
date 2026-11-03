@@ -293,6 +293,11 @@ type execution struct {
 	finished  map[int]bool
 	lost      map[string]bool
 	repairing sync.Mutex
+	// holders are the workers watched for the exchange files they hold of the run,
+	// while watching, the run's first context, lasts (see watchHolder).
+	holders   map[string]bool
+	watching  context.Context
+	stopWatch context.CancelFunc
 	// writtenAgain counts the tasks written again, which change what exchanges hold.
 	writtenAgain atomic.Int64
 }
@@ -340,6 +345,9 @@ func (e *execution) run(ctx context.Context, stages []*Stage) error {
 func (e *execution) start(ctx context.Context, stages []*Stage) (wait func() error) {
 	e.mu.Lock()
 	e.started = append(e.started, stages...)
+	if e.watching == nil {
+		e.watching, e.stopWatch = context.WithCancel(ctx)
+	}
 	e.mu.Unlock()
 	for _, s := range stages {
 		if s.Out == nil {
@@ -554,7 +562,7 @@ func (e *execution) stage(ctx context.Context, s *Stage) error {
 	}
 	if in := s.split(); in != nil {
 		split := e.files[in.Table.key()]
-		ws := e.workers()
+		ws := e.targets()
 		n := len(ws)
 		if want := int((in.Table.Bytes + bytesPerWorker - 1) / bytesPerWorker); want < n && !e.force {
 			n = max(want, min(2, n))
@@ -747,7 +755,7 @@ func (e *execution) stage(ctx context.Context, s *Stage) error {
 	run = func(p piece, first, round int) ([]ranPiece, error) {
 		task, bytes := request(p, round)
 		task.splittable = !p.split() && units(p.i) > 1
-		w, head, err := e.co.dispatch(tctx, task, e.workers(), first, outOf(p), sp)
+		w, head, err := e.co.dispatch(tctx, task, e.targets(), first, outOf(p), sp)
 		// A worker lost with files the task reads: once what they held is
 		// written again, the task runs on what is there now (see repair).
 		rounds := round
@@ -755,7 +763,7 @@ func (e *execution) stage(ctx context.Context, s *Stage) error {
 			rounds++
 			task, bytes = request(p, rounds)
 			task.splittable = !p.split() && units(p.i) > 1
-			w, head, err = e.co.dispatch(tctx, task, e.workers(), first, outOf(p), sp)
+			w, head, err = e.co.dispatch(tctx, task, e.targets(), first, outOf(p), sp)
 		}
 		var lost *taskLostError
 		if errors.As(err, &lost) && tctx.Err() == nil {
@@ -763,7 +771,7 @@ func (e *execution) stage(ctx context.Context, s *Stage) error {
 			if k < 2 {
 				// Not worth dividing after all: as one task, on the others.
 				task.splittable = false
-				w, head, err = e.co.dispatch(tctx, task, e.workers(), first+1, outOf(p), sp)
+				w, head, err = e.co.dispatch(tctx, task, e.targets(), first+1, outOf(p), sp)
 			} else {
 				e.co.log.Warn("a worker was lost while it ran a task; running the task as smaller ones on the others", "query", e.qid,
 					"stage", s.ID, "task", p.i, "worker", lost.worker, "tasks", k)

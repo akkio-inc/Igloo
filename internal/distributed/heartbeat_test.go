@@ -1,9 +1,12 @@
 package distributed
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -295,6 +298,97 @@ func TestLostWorkerRunsAgainOnlyWhatItHeld(t *testing.T) {
 			t.Errorf("after %d stages: %d tasks, %d with nothing lost", afterStages, tasks.Load(), whole.Load())
 		}
 	}
+}
+
+// TestLostHolderRunsAgainAtOnce has a worker powered off once its tasks wrote exchange
+// files to its disk, and holds back every task that reads them: what it held runs again
+// as soon as its heartbeat finds it lost, while no reader has found its files gone, and
+// the rows are what one machine returns. Before, nothing watched a worker that ran no
+// task, and what it held ran again 21 s on, once the held readers found it gone.
+func TestLostHolderRunsAgainAtOnce(t *testing.T) {
+	fastBeats(t, 50*time.Millisecond, 200*time.Millisecond, 5*time.Second)
+	h := localHarness(t, 3)
+	f := frozenWorker(t, h, 1)
+	off := h.lns[1].Addr().String()
+	want, _, err := h.query(context.Background(), exchangeQuery)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ranAgain := make(chan struct{})
+	var once sync.Once
+	var held atomic.Int32
+	for i, w := range h.workers {
+		if i == 1 {
+			continue
+		}
+		w.beforeTask = func(_ http.ResponseWriter, r *http.Request) bool {
+			if !f.frozen.Load() {
+				return true
+			}
+			body, err := io.ReadAll(r.Body)
+			if err != nil {
+				return false
+			}
+			r.Body = io.NopCloser(bytes.NewReader(body))
+			var req taskRequest
+			if json.Unmarshal(body, &req) != nil || !readsFrom(&req, off) {
+				return true
+			}
+			held.Add(1)
+			select {
+			case <-ranAgain:
+			case <-time.After(20 * time.Second):
+			case <-r.Context().Done():
+			}
+			return true
+		}
+	}
+	var ran atomic.Int32
+	var frozenAt, againAt atomic.Int64
+	var foundBy atomic.Value
+	hook := func(r slog.Record) {
+		switch {
+		case r.Message == "ran a stage" && strings.Contains(attr(r, "stage"), " to exchange ") && ran.Add(1) == 1:
+			frozenAt.Store(time.Now().UnixNano())
+			f.frozen.Store(true)
+		case strings.Contains(r.Message, "ran again only its tasks that readers still need"):
+			foundBy.CompareAndSwap(nil, attr(r, "found_by"))
+			againAt.CompareAndSwap(0, time.Now().UnixNano())
+			once.Do(func() { close(ranAgain) })
+		}
+	}
+	h.hook.Store(&hook)
+	got, _, _, _, err := h.run(context.Background(), exchangeQuery, ModeOn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if msg := compareRows(want, got, true); msg != "" {
+		t.Error(msg)
+	}
+	// Readers made before it ran again were held; those made after read what it
+	// wrote. Either way none may have found the worker's files gone first.
+	t.Logf("%d readers held", held.Load())
+	if againAt.Load() == 0 {
+		t.Fatal("what it held did not run again")
+	}
+	if by := foundBy.Load(); by != "its heartbeat" {
+		t.Errorf("what it held ran again when %v found it lost", by)
+	}
+	if took := time.Duration(againAt.Load() - frozenAt.Load()); took > 10*time.Second {
+		t.Errorf("what it held ran again %s after it went", took)
+	}
+}
+
+// readsFrom reports whether a task reads exchange files on the disk of the worker at addr.
+func readsFrom(req *taskRequest, addr string) bool {
+	for _, v := range req.Views {
+		for _, f := range v.Files {
+			if strings.HasPrefix(f, localScheme+addr+"/") {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // TestRepeatable checks which stages' tasks may run again beside what they wrote before.
