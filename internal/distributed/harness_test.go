@@ -25,6 +25,7 @@ import (
 	"github.com/duckdb/duckdb-go/v2"
 
 	"github.com/akkio-inc/igloo/internal/config"
+	"github.com/akkio-inc/igloo/internal/engine"
 )
 
 // The harness runs distributed execution in one process: tables are
@@ -311,11 +312,24 @@ func newHarnessWith(t *testing.T, sf float64, files, n int, rb string, extension
 	return h
 }
 
+// packOnce installs Igloo's extension pack in IGLOO_TEST_EXTENSION_DIR
+// once a process, as scripts/test.sh and CI do before every run: a pack
+// kept from before an extension joined it, as a runner's volume is, gets it
+// then, and the tests that load it run rather than fail.
+var (
+	packOnce sync.Once
+	packErr  error
+)
+
 // extensionLoads load the harness's extensions from
-// IGLOO_TEST_EXTENSION_DIR.
+// IGLOO_TEST_EXTENSION_DIR, which holds Igloo's extension pack.
 func (h *harness) extensionLoads() []string {
 	if len(h.extensions) == 0 {
 		return nil
+	}
+	packOnce.Do(func() { packErr = engine.InstallExtensions(context.Background(), os.Getenv("IGLOO_TEST_EXTENSION_DIR")) })
+	if packErr != nil {
+		h.t.Fatalf("installing the extension pack: %v", packErr)
 	}
 	out := []string{"SET extension_directory = " + quoteLiteral(os.Getenv("IGLOO_TEST_EXTENSION_DIR"))}
 	for _, e := range h.extensions {
