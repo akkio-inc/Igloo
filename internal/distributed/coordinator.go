@@ -215,6 +215,11 @@ type Coordinator struct {
 	// memory corrects the working sets DuckDB's plans give by what
 	// statements were seen holding (see ObservePeak).
 	memory memoryScale
+	// learned are the rows completed statements' operators made, and plans
+	// the plans of the statements estimated, by plan key, to learn from when
+	// they complete (see ObserveOperators).
+	learned *learned
+	plans   *recentPlans
 
 	// running are the statements whose exchanges are in use, by ID, which
 	// sweeps leave (see hold); heartbeat is how often they write under
@@ -280,6 +285,7 @@ func NewCoordinator(opts Options, log *slog.Logger) (*Coordinator, error) {
 		opts: opts, parser: p, aggs: aggs, dir: dir, log: log, stop: stop,
 		pool: newPool(opts.Pool, t, opts.Version, opts.Metrics, log), history: newHistory(), outcomes: &outcomes{byKey: map[string]outcome{}},
 		running: map[string]bool{}, heartbeat: heartbeatEvery, removeCtx: removeCtx, cancelRemovals: cancelRemovals,
+		learned: newLearned(), plans: newRecentPlans(),
 	}
 	if len(opts.Large.Addresses) > 0 {
 		lo := opts.Large
@@ -609,7 +615,7 @@ func (co *Coordinator) planOn(ctx context.Context, query string, env Env, mode M
 		// session plans it, read once for a statement run again; a forced
 		// fill's too, for whether this replica could write it after its
 		// workers (see Plan.FitsHere).
-		p, ok := co.planSet(ctx, env, query, plan.Stages, r)
+		p, ok := co.planSet(ctx, env, query, plan.Key, plan.Stages, r)
 		if ok && !dry && r.planSet != p.set {
 			co.history.update(plan.Key, func(r *runs) {
 				r.planSet, r.planBytes, r.planWork, r.planKeeps, r.planFields, r.planSorted = p.set, p.bytes, p.work, p.keeps, p.fields, p.sorted
@@ -790,11 +796,13 @@ func (co *Coordinator) fleet(ctx context.Context, ws []*worker, mayStart, large 
 }
 
 // planSet is what DuckDB's plan of a statement, query, of stages, as env's
-// session plans it, says one machine does with it (see planOf), or what r,
-// its runs, found it to be before; ok is false where the session cannot
-// plan it or the plan says too little. Its parts are what the plan's
-// operators hold, when it was read now.
-func (co *Coordinator) planSet(ctx context.Context, env Env, query string, stages []*Stage, r runs) (planEstimate, bool) {
+// session plans it, says one machine does with it (see planOf), with what
+// statements before it made (see learned), or what r, its runs, found it to
+// be before; ok is false where the session cannot plan it or the plan says
+// too little. Its parts are what the plan's operators hold, when it was
+// read now; the plan is kept by key, its plan key, to learn from when it
+// completes (see ObserveOperators).
+func (co *Coordinator) planSet(ctx context.Context, env Env, query, key string, stages []*Stage, r runs) (planEstimate, bool) {
 	if r.planSet > 0 {
 		return planEstimate{set: r.planSet, bytes: r.planBytes, work: r.planWork, keeps: r.planKeeps, fields: r.planFields, sorted: r.planSorted,
 			joins: r.planJoins, rows: r.planRows}, true
@@ -806,13 +814,37 @@ func (co *Coordinator) planSet(ctx context.Context, env Env, query string, stage
 	plan, err := ex.Explain(ctx, query)
 	var p planEstimate
 	if err == nil {
-		p, err = planOf(plan, newPlanStats(stages, max(co.opts.Threads, co.opts.Cores)))
+		co.listFiles(ctx, stages)
+		st := newPlanStats(stages, max(co.opts.Threads, co.opts.Cores))
+		st.learned = co.learned
+		co.plans.put(key, plan, st)
+		p, err = planOf(plan, st)
 	}
 	if err != nil {
 		co.log.Debug("no working set from DuckDB's plan; estimating it from what the stages read", "err", err)
 		return planEstimate{}, false
 	}
 	return p, true
+}
+
+// listFiles lists the data files of the tables stages read, which the
+// source keeps for each snapshot, for the statistics their manifests give
+// the estimate of a statement's working set (Table.Bounds and ColumnBytes):
+// a statement planned on workers lists them anyway before it runs (see
+// preflight). A table that cannot be listed is estimated without them.
+func (co *Coordinator) listFiles(ctx context.Context, stages []*Stage) {
+	if co.opts.Source == nil {
+		return
+	}
+	seen := map[*Table]bool{}
+	for _, s := range stages {
+		for _, in := range s.Inputs {
+			if t := in.Table; t != nil && !seen[t] && t.Bounds == nil && t.ColumnBytes == nil {
+				seen[t] = true
+				_, _ = co.opts.Source.Files(ctx, t)
+			}
+		}
+	}
 }
 
 // largeWorker describes the large worker for an estimate, as it answered

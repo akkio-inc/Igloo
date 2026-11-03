@@ -741,6 +741,39 @@ partitions are sized to their memory and a task that runs out runs again
 over more of them. `EXPLAIN DISTRIBUTED`'s `spill` rows show the working
 set against each machine's room, and what it would spill.
 
+**How the working set is checked.** `bench/estimates.py` runs a corpus of
+statements alone on a replica, at two scales: TPC-H's and TPC-DS's queries,
+reports' shapes, `bench/mixed.py`'s dashboard tiles, synthetic stand-ins for
+a dashboard burst's distinct counts, joins to audiences, `FLATTEN`s and
+windows, and one statement for each kind of operator. It records DuckDB's
+plan of each, the rows each operator made, and the peak of what DuckDB held
+for it, sampled every few milliseconds; `TestEstimateCorpus` replays the
+estimate over them (`internal/distributed/testdata/estimates`) and fails if
+it gets worse. Over 450 statements, the estimate on a first run is within
+twice what they held for 67% of them, and more than four times short for 2,
+where it was 50% and 43; with DuckDB's estimates of each operator's rows
+replaced by the rows it made, 86% and 2, where it was 49% and 67. What it
+counts besides each operator's rows: what a scan's readers hold, about three
+times the part of a row group the columns it reads take, compressed, on each
+thread (Iceberg's manifests give the columns' sizes), which held 100 to 300
+MB for dashboard tiles whose hash tables held next to nothing; a correlated
+or `LATERAL` subquery's join, which materializes its input whole and, as
+`UNNEST` of a list the statement writes, makes as many rows of each as the
+list has values; aggregates that keep their values (`list`, `string_agg`);
+and distinct aggregates sized by their pairs of groups and values where
+their distinct counts are known. The bounds Iceberg's manifests keep of
+columns of integer types, dates and timestamps bound how many distinct
+values they have, and so how many groups a grouping by them makes
+(`date_trunc` and casts of timestamps to dates included), and how many rows a
+join of them makes at least. And what operators made in statements that ran
+to their end on the replica (DuckDB's profiler counts each one's rows)
+corrects later statements by the same columns, whatever their shape: how
+many groups a grouping's keys made of how many rows, how many rows a join of
+two columns made of its inputs', and what share of a table a scan with the
+same filters kept, their constants aside. A statement grouping 400 million
+rows by a key of 500 strings was estimated at 32 GB; after another grouping
+by the same key ran, at 0.4 GB.
+
 **How many workers.** Igloo weighs the statement on 1, 2, 4 and so on of
 the workers, up to `IGLOO_WORKER_MAX`, and on the workers running now, each
 with its own estimate (its start, its stages' levels, what its cores read,

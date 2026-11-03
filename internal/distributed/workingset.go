@@ -75,7 +75,7 @@ const (
 	// next row of its chain, and its slot in the directory, twice as many
 	// slots as rows.
 	hashEntryBytes = 8
-	joinEntryBytes = 32
+	joinEntryBytes = 20
 	// maxBuildWidth bounds the columns a join's build side is taken to
 	// keep, of the many its input has.
 	maxBuildWidth = 48
@@ -140,7 +140,8 @@ func groupEntries(in, groups, threads float64) float64 {
 // of 16 million rows (see TestWorkingSetCalibration).
 // A window over the whole input without an order (OVER ()) buffers its
 // rows once.
-var heldFactors = map[string]float64{"join": 1.5, "group": 1.5, "distinct": 1.3, "sort": 1.2, "window": 2.0, "constant window": 1.0}
+var heldFactors = map[string]float64{"join": 1.6, "group": 1.65, "distinct": 1.45, "sort": 1.2, "window": 1.65, "constant window": 1.0,
+	"materialized": 1.2, "list": 1.0}
 
 // planNode is an operator of DuckDB's EXPLAIN (FORMAT JSON).
 type planNode struct {
@@ -157,8 +158,20 @@ type planNode struct {
 type planStats struct {
 	width    map[string]float64
 	distinct map[string]float64
-	tables   []*Table
-	threads  int
+	// owner is the table of the statement's that has a column, by its
+	// lower-case name, where exactly one has it; span how many values its
+	// bounds allow it, where they are known (see Table.Bounds), and
+	// timestamp the columns that are timestamps.
+	owner     map[string]string
+	span      map[string]float64
+	timestamp map[string]bool
+	tables    []*Table
+	threads   int
+	// learned are the rows operators made before (see learned), if any;
+	// with observe, the plan's estimates are the rows its operators made in
+	// a run, and walking it teaches learned.
+	learned *learned
+	observe bool
 }
 
 // newPlanStats collects the columns of a plan's tables, for a machine of
@@ -180,13 +193,32 @@ func newPlanStats(stages []*Stage, threads int) planStats {
 // tableStats collects the columns of tables, for a machine of threads DuckDB
 // threads.
 func tableStats(tables []*Table, threads int) planStats {
-	st := planStats{width: map[string]float64{}, distinct: map[string]float64{}, tables: tables, threads: max(threads, 1)}
+	st := planStats{width: map[string]float64{}, distinct: map[string]float64{}, owner: map[string]string{}, span: map[string]float64{},
+		timestamp: map[string]bool{}, tables: tables, threads: max(threads, 1)}
+	owners := map[string]map[string]bool{}
 	for _, t := range tables {
 		for _, c := range t.Columns {
 			name := strings.ToLower(c.Name)
+			if owners[name] == nil {
+				owners[name] = map[string]bool{}
+			}
+			owners[name][strings.ToLower(t.Schema+"."+t.Name)] = true
 			st.width[name] = max(st.width[name], memoryBytes(c.Type))
+			if b, ok := t.Bounds[name]; ok && b[1] >= b[0] {
+				st.span[name] = max(st.span[name], b[1]-b[0]+1)
+			}
+			if strings.HasPrefix(strings.ToUpper(c.Type), "TIMESTAMP") {
+				st.timestamp[name] = true
+			}
 			if n := t.Distinct[name]; n > 0 {
 				st.distinct[name] = max(st.distinct[name], float64(n))
+			}
+		}
+	}
+	for name, ts := range owners {
+		if len(ts) == 1 {
+			for t := range ts {
+				st.owner[name] = t
 			}
 		}
 	}
@@ -218,6 +250,68 @@ func memoryBytes(typ string) float64 {
 		return 32
 	}
 	return max(typeBytes(t), 4)
+}
+
+// What a scan's readers hold: each of the threads that read a row group of
+// the table at once holds the part of it the columns the scan reads take,
+// compressed, about scanChunkShare times over (the chunk as read, its pages
+// decoded, the next one read ahead), as the table's data files' statistics
+// give their sizes (see Table.ColumnBytes); where they do not, a buffer of
+// scanThreadBytes and scanWidthShare of the columns' width a row. A sum of
+// a column of a hundred million doubles held 230 MB on 19 threads, of the
+// same rows' column of a thousand values 22 MB; a dashboard's tiles, joining
+// a few thousand impressions to campaigns and grouping them, held 100 to
+// 300 MB, where their hash tables held next to nothing. The table's row
+// groups are as many rows as rowGroupRows makes of its bytes. Scans run
+// one pipeline at a time, so the largest counts.
+const (
+	scanChunkShare  = 3.0
+	scanThreadBytes = 11 << 20
+	scanWidthShare  = 0.135
+)
+
+// scanBytes is what a scan of t's columns cols, width bytes wide a row,
+// holds on threads threads.
+func scanBytes(t *Table, cols []column, threads int) float64 {
+	if t == nil || t.Rows <= 0 {
+		return 0
+	}
+	rows := float64(rowGroupRows(t))
+	busy := min(float64(threads), math.Ceil(float64(t.Rows)/rows))
+	if compressed, ok := columnsBytes(t, cols); ok {
+		return busy * scanChunkShare * compressed * min(rows/float64(t.Rows), 1)
+	}
+	// No more than the columns take whole, about as often over: a table of
+	// a few rows holds next to nothing.
+	return min(busy*(scanThreadBytes+scanWidthShare*min(rows, float64(t.Rows))*width(cols)), scanChunkShare*float64(t.Rows)*width(cols))
+}
+
+// columnsBytes is what cols take in t's data files, compressed; ok is
+// false if one's size is not known.
+func columnsBytes(t *Table, cols []column) (float64, bool) {
+	if len(t.ColumnBytes) == 0 || len(cols) == 0 {
+		return 0, false
+	}
+	var sum float64
+	for _, c := range cols {
+		n, ok := t.ColumnBytes[c.name]
+		if !ok {
+			return 0, false
+		}
+		sum += float64(n)
+	}
+	return sum, true
+}
+
+// rowGroupRows is how many rows t's row groups have, as Igloo writes them:
+// about 16 MiB of its compressed bytes a row (see filerewrite.TargetRows),
+// 500,000 where its bytes are not known.
+func rowGroupRows(t *Table) int64 {
+	const target, least, most, unknown = 16 << 20, 122_880, 16 << 20, 500_000
+	if t.Bytes <= 0 || t.Rows <= 0 {
+		return unknown
+	}
+	return min(max(int64(float64(target)*float64(t.Rows)/float64(t.Bytes)), least), most)
 }
 
 // memoryScale corrects the working sets DuckDB's plans give by what
@@ -379,6 +473,9 @@ func planOf(plan string, st planStats) (planEstimate, error) {
 		// it took 449 s there and 25 s on 16.
 		result = min(result, aggregateKeeps*w.scanned)
 	}
+	if w.scanHeld > 0 {
+		w.parts = append(w.parts, heldPart{op: "SCAN", bytes: w.scanHeld})
+	}
 	out := planEstimate{parts: w.parts, work: w.work, bytes: w.bytes(), fields: result * float64(max(columns, 1)), rows: result}
 	var joins, all float64
 	for _, p := range w.parts {
@@ -419,6 +516,8 @@ type setWalker struct {
 	work  float64
 	// scanned is the rows of the tables its scans read.
 	scanned float64
+	// scanHeld is what its largest scan's readers hold (see scanBytes).
+	scanHeld float64
 }
 
 // cte is a common table expression's rows and columns, for its scans.
@@ -475,6 +574,11 @@ func hashRate(bytes float64) float64 {
 type column struct {
 	name            string
 	width, distinct float64
+	// table is the statement's table it is a column of, where that is
+	// known: what learned keeps what its groupings and joins made by.
+	table string
+	// span is how many values its bounds allow it, zero if not known.
+	span float64
 }
 
 // estimate is an operator's rows: as DuckDB estimates them, and as the
@@ -569,7 +673,7 @@ func (w *setWalker) walk(n *planNode) (rowsEstimate, []column) {
 		// guesses for a table of many small files as a thousand rows a file
 		// (a TPC-H nation of 25 rows in 8 files it took for 8,000), and
 		// estimates not at all for an Iceberg scan.
-		t := w.tableOf(cols)
+		t := w.scanTable(cols, n.strs("Filters"))
 		switch {
 		case t != nil && t.Rows > 0 && (!ok || card > float64(t.Rows)):
 			est.ours = float64(t.Rows)
@@ -582,6 +686,15 @@ func (w *setWalker) walk(n *planNode) (rowsEstimate, []column) {
 		case !ok:
 			w.unknown = name
 		}
+		// What scans of the table with the same filters kept before (see
+		// learned).
+		if key := scanKey(t, n.strs("Filters")); key != "" && t.Rows > 0 {
+			if w.st.observe && ok {
+				w.st.learned.observeScan(key, card/float64(t.Rows))
+			} else if share, known := w.st.learned.scanFor(key); known {
+				est.ours = max(share*float64(t.Rows), 1)
+			}
+		}
 		switch {
 		case t != nil && t.Rows > 0:
 			w.scanned += float64(t.Rows)
@@ -589,6 +702,7 @@ func (w *setWalker) walk(n *planNode) (rowsEstimate, []column) {
 			w.scanned += card
 		}
 		if t != nil {
+			w.scanHeld = max(w.scanHeld, scanBytes(t, cols, w.st.threads))
 			read := columnSet{}
 			for _, c := range cols {
 				read[c.name] = true
@@ -601,6 +715,29 @@ func (w *setWalker) walk(n *planNode) (rowsEstimate, []column) {
 		return est, limitDistinct(cols, est.ours)
 	case name == "PROJECTION" || name == "FILTER" && len(n.strs("Projections")) > 0:
 		return est, limitDistinct(w.columns(n.strs("Projections"), inCols), est.ours)
+	case strings.HasSuffix(name, "DELIM_JOIN") && len(rows) == 3:
+		// A correlated subquery's join, or a LATERAL one's, as UNNEST over a
+		// row's own values makes: its first child's rows are materialized
+		// whole, and joined to what the subquery makes of their distinct
+		// values (its second child's join, the third their grouping). A right
+		// one builds its join's hash table on those rows, which the join's
+		// own build side, an empty scan, stands for; a left one keeps them
+		// apart and builds on the subquery's. Each of the rows gets the rows
+		// the subquery makes of its values: as many as an UNNEST's list has,
+		// one otherwise (DuckDB takes the subquery for one row a value).
+		lhs, lhsCols := child(0)
+		if strings.HasPrefix(name, "RIGHT") {
+			w.hold(name, "join", lhs.ours, min(width(lhsCols), maxBuildWidth)+joinEntryBytes)
+		} else {
+			w.hold(name, "materialized", lhs.ours, width(lhsCols))
+		}
+		fan := 1.0
+		if u := findUnnest(n.Children[1]); u != nil {
+			fan = listValues(u)
+		}
+		est.ours, est.kept = lhs.ours*fan, lhs.kept
+		_, sub := child(1)
+		return est, limitDistinct(append(slices.Clone(lhsCols), sub...), est.ours)
 	case strings.Contains(name, "JOIN") || name == "CROSS_PRODUCT":
 		// DuckDB builds on the right, the last child, keeping its keys and
 		// the columns the operators above read, which the plan does not
@@ -627,9 +764,18 @@ func (w *setWalker) walk(n *planNode) (rowsEstimate, []column) {
 		if in.duck > 0 && len(rows) > 0 {
 			est.ours = card * min(1, in.ours/in.duck)
 		}
-		if ndv := product(groups); ndv > 0 {
+		key := groupingKey(groups)
+		if w.st.observe && len(rows) > 0 && ok {
+			w.st.learned.observeGroups(key, card, in.duck)
+		}
+		learnedGroups, known := w.st.learned.groupsFor(key, in.ours)
+		if known && !w.st.observe {
+			est.ours = learnedGroups
+		}
+		ndv := w.distinctCount(groups)
+		if ndv > 0 {
 			est.ours = min(est.ours, ndv)
-		} else if len(groups) > 0 {
+		} else if len(groups) > 0 && !known {
 			// One group by DuckDB's estimate, of keys nothing knows, is no
 			// one row to join to (see joinRows): it took a report's two
 			// cohorts' sizes for one, and the report's scans below that join
@@ -640,7 +786,7 @@ func (w *setWalker) walk(n *planNode) (rowsEstimate, []column) {
 		// Each thread aggregates its share of the rows apart, all the
 		// groups it meets, before they are merged.
 		entries := groupEntries(in.ours, est.ours, float64(w.st.threads))
-		if product(groups) <= 0 {
+		if ndv <= 0 && !known {
 			// How many groups only by DuckDB's estimate, often far too many:
 			// what the steps say of them is no better than a thread's count.
 			entries = min(entries, est.ours*float64(w.st.threads))
@@ -651,7 +797,8 @@ func (w *setWalker) walk(n *planNode) (rowsEstimate, []column) {
 		aggs := n.strs("Aggregates")
 		entry := width(groups) + float64(len(aggs))*planExprWidth + hashEntryBytes
 		w.hold(name, "group", entries, entry)
-		w.distinct(name, aggs, inCols, in.ours, width(groups))
+		w.distinct(name, aggs, inCols, groups, in.ours)
+		w.lists(name, aggs, inCols, in.ours)
 		w.work += in.ours / hashRate(entries*entry)
 		if computedKeys(groups) {
 			// Keys it computes, as a report's dimensions and their values:
@@ -661,11 +808,13 @@ func (w *setWalker) walk(n *planNode) (rowsEstimate, []column) {
 		}
 		return est, append(groups, make([]column, len(aggs))...)
 	case name == "UNGROUPED_AGGREGATE":
-		w.distinct(name, n.strs("Aggregates"), inCols, in.ours, 0)
+		w.distinct(name, n.strs("Aggregates"), inCols, nil, in.ours)
 		return rowsEstimate{duck: 1, ours: 1, kept: 1}, make([]column, len(n.strs("Aggregates")))
-	case name == "UNNEST":
-		// As many rows as its lists have values, which nothing here knows.
-		est.ours *= unnestValues
+	case name == "UNNEST", name == "INOUT_FUNCTION" && unnestFunction(n):
+		// As many rows as its lists have values: a list the statement writes,
+		// of the row's own values, has as many as it names; any other, which
+		// nothing here knows, unnestValues.
+		est.ours *= listValues(n)
 		return est, limitDistinct(inCols, est.ours)
 	case name == "ORDER_BY" || name == "WINDOW":
 		est = in
@@ -674,7 +823,11 @@ func (w *setWalker) walk(n *planNode) (rowsEstimate, []column) {
 			if constantWindow(n.strs("Projections")) {
 				kind = "constant window"
 			}
-			w.hold(name, kind, in.ours, width(inCols)+hashEntryBytes)
+			entry := width(inCols) + hashEntryBytes
+			if kind == "constant window" {
+				entry = width(inCols)
+			}
+			w.hold(name, kind, in.ours, entry)
 			return est, append(inCols, column{width: planExprWidth})
 		}
 		w.hold(name, "sort", in.ours, width(inCols)+hashEntryBytes)
@@ -715,6 +868,9 @@ func unionColumns(branches [][]column) []column {
 			}
 			if i < len(b) {
 				out[i].width = max(out[i].width, b[i].width)
+				if b[i].table != out[i].table || b[i].name != out[i].name {
+					out[i].table = ""
+				}
 			}
 		}
 	}
@@ -766,6 +922,16 @@ func (w *setWalker) joinRows(n *planNode, rows []rowsEstimate, outs [][]column, 
 		equal = equal && equality.MatchString(c)
 	}
 	small := func(i int) bool { return rows[i].ours <= smallSource && scans[i] == scans[i+1] }
+	if equal && typ == "INNER" {
+		// What a join by the same columns made before (see learned).
+		if key := joinKeyOf(joinPairs(conds, outs)); key != "" {
+			if w.st.observe {
+				w.st.learned.observeJoin(key, l.duck, r.duck, card)
+			} else if out, ok := w.st.learned.joinFor(key, l.ours, r.ours); ok {
+				return out, kept
+			}
+		}
+	}
 	name := strings.ToUpper(n.Name)
 	loop := strings.Contains(name, "NL_JOIN") || strings.Contains(name, "NESTED_LOOP")
 	switch {
@@ -790,7 +956,10 @@ func (w *setWalker) joinRows(n *planNode, rows []rowsEstimate, outs [][]column, 
 			w.scans[i].selective = true
 		}
 		return max(other.ours*share, 1), other.kept * share
-	case equal && typ == "INNER":
+	case (equal || strings.Contains(name, "HASH")) && typ == "INNER":
+		// A hash join compares at least one pair of columns for equality,
+		// whatever else its conditions compare (a report's join of a year's
+		// sales to the next year's by item and store, syear = syear + 1).
 		if exact, found := w.distinctJoin(conds, rows, outs); found {
 			return exact, kept
 		}
@@ -798,7 +967,15 @@ func (w *setWalker) joinRows(n *planNode, rows []rowsEstimate, outs [][]column, 
 		if r.ours > l.ours {
 			fact, dim = r, l
 		}
-		return max(min(scaled, fact.ours), fact.ours*dim.kept), kept
+		capped := max(min(scaled, fact.ours), fact.ours*dim.kept)
+		// No fewer than its keys' bounds make of its inputs' rows: keys of at
+		// most span values, drawn apart, make l*r/span rows or more, as five
+		// memberships of each person, joined to each person's events, made
+		// five rows of each event.
+		if span := joinSpan(joinPairs(conds, outs)); span > 0 {
+			capped = max(capped, l.ours*r.ours/span)
+		}
+		return capped, kept
 	case equal && typ == "SEMI":
 		// Each key of the other side keeps a row at least, where its rows are
 		// that many: DuckDB takes it to keep a fifth of them.
@@ -807,6 +984,59 @@ func (w *setWalker) joinRows(n *planNode, rows []rowsEstimate, outs [][]column, 
 		return max(min(scaled, max(l.ours, r.ours)), l.ours), l.kept
 	}
 	return scaled, kept
+}
+
+// joinPairs are the columns, of a join's two inputs' (outs), that its
+// conditions of equal columns compare, nil if one compares columns not
+// found so.
+func joinPairs(conds []string, outs [][]column) [][2]column {
+	if len(outs) != 2 {
+		return nil
+	}
+	find := func(name string, side []column) (column, bool) {
+		name = bareName(name)
+		for _, c := range side {
+			if c.name == name {
+				return c, true
+			}
+		}
+		return column{}, false
+	}
+	var pairs [][2]column
+	for _, c := range conds {
+		m := equality.FindStringSubmatch(c)
+		if m == nil {
+			return nil
+		}
+		a, okA := find(m[1], outs[0])
+		b, okB := find(m[2], outs[1])
+		if !okA || !okB {
+			a, okA = find(m[2], outs[0])
+			b, okB = find(m[1], outs[1])
+		}
+		if !okA || !okB {
+			return nil
+		}
+		pairs = append(pairs, [2]column{a, b})
+	}
+	return pairs
+}
+
+// joinSpan is the most combinations of values the keys of a join's pairs
+// of columns allow, by their bounds: the product over the pairs of the
+// larger span of each; zero unless every pair's bounds are known.
+func joinSpan(pairs [][2]column) float64 {
+	if len(pairs) == 0 {
+		return 0
+	}
+	span := 1.0
+	for _, p := range pairs {
+		if p[0].span <= 0 || p[1].span <= 0 {
+			return 0
+		}
+		span *= max(p[0].span, p[1].span)
+	}
+	return span
 }
 
 // joinKey is the column of side, a join's input's columns, that a join
@@ -830,31 +1060,37 @@ func (w *setWalker) joinKey(cond string, side []column) (column, bool) {
 // distinct counts are all known: the product of its inputs' rows over the
 // larger distinct count of each pair; found is false where one is not.
 func (w *setWalker) distinctJoin(conds []string, rows []rowsEstimate, outs [][]column) (float64, bool) {
-	find := func(name string) (column, bool) {
-		name = bareName(name)
-		for _, o := range outs {
-			for _, c := range o {
-				if c.name == name && c.distinct > 0 {
-					return c, true
-				}
-			}
-		}
-		return column{}, false
+	pairs := joinPairs(conds, outs)
+	if len(pairs) == 0 {
+		return 0, false
 	}
-	out := rows[0].ours * rows[1].ours
-	for _, c := range conds {
-		m := equality.FindStringSubmatch(c)
-		if m == nil {
+	// Each row of one side meets no more rows of the other than the other's
+	// table has of a value of its keys: a fact's row meets one dimension's.
+	// So the inputs' estimates, however far off, are not multiplied past it.
+	out, dupL, dupR := rows[0].ours*rows[1].ours, math.Inf(1), math.Inf(1)
+	for _, p := range pairs {
+		if p[0].distinct <= 0 || p[1].distinct <= 0 {
 			return 0, false
 		}
-		a, okA := find(m[1])
-		b, okB := find(m[2])
-		if !okA || !okB {
-			return 0, false
-		}
-		out /= max(a.distinct, b.distinct, 1)
+		out /= max(p[0].distinct, p[1].distinct, 1)
+		dupL, dupR = min(dupL, w.dup(p[0])), min(dupR, w.dup(p[1]))
 	}
+	out = min(out, rows[1].ours*dupL, rows[0].ours*dupR)
 	return max(out, 1), true
+}
+
+// dup is how many rows of its table a value of column c has, on average,
+// by its distinct count; infinity where that is not known.
+func (w *setWalker) dup(c column) float64 {
+	if c.distinct <= 0 || c.table == "" {
+		return math.Inf(1)
+	}
+	for _, t := range w.st.tables {
+		if t.Rows > 0 && strings.EqualFold(t.Schema+"."+t.Name, c.table) {
+			return max(float64(t.Rows)/c.distinct, 1)
+		}
+	}
+	return math.Inf(1)
 }
 
 // largestBranch keeps, of the parts the branches of a UNION hold, those of
@@ -902,6 +1138,76 @@ func constantWindow(projections []string) bool {
 		}
 	}
 	return len(projections) > 0
+}
+
+// unnestFunction says a table in-out function is UNNEST, as DuckDB plans
+// the UNNEST of a LATERAL join.
+func unnestFunction(n *planNode) bool {
+	return strings.EqualFold(strings.TrimSpace(strings.Join(n.strs("Name"), "")), "unnest")
+}
+
+// findUnnest is the first UNNEST in n's subtree, if any.
+func findUnnest(n *planNode) *planNode {
+	name := strings.ToUpper(n.Name)
+	if name == "UNNEST" || name == "INOUT_FUNCTION" && unnestFunction(n) {
+		return n
+	}
+	for _, c := range n.Children {
+		if u := findUnnest(c); u != nil {
+			return u
+		}
+	}
+	return nil
+}
+
+// listValues is how many rows an UNNEST makes of a row: as many as the
+// list it unnests has, where the statement writes it, as a report's
+// FLATTEN of its row's own values does (list_value(a, b, c) makes three);
+// unnestValues otherwise.
+func listValues(n *planNode) float64 {
+	var exprs []string
+	for _, c := range n.Children {
+		exprs = append(exprs, c.strs("Projections")...)
+	}
+	exprs = append(exprs, n.strs("Projections")...)
+	for _, e := range exprs {
+		if k := listArgs(e); k > 0 {
+			return float64(k)
+		}
+	}
+	return unnestValues
+}
+
+// listArgs is how many values a list_value(...) expression at the start of
+// e lists, zero if e is not one.
+func listArgs(e string) int {
+	e = strings.TrimSpace(e)
+	const head = "list_value("
+	if !strings.HasPrefix(strings.ToLower(e), head) {
+		return 0
+	}
+	depth, args, quote := 0, 1, byte(0)
+	for i := len(head); i < len(e); i++ {
+		c := e[i]
+		switch {
+		case quote != 0:
+			if c == quote {
+				quote = 0
+			}
+		case c == '\'' || c == '"':
+			quote = c
+		case c == '(' || c == '[' || c == '{':
+			depth++
+		case c == ')' || c == ']' || c == '}':
+			if depth == 0 {
+				return args
+			}
+			depth--
+		case c == ',' && depth == 0:
+			args++
+		}
+	}
+	return 0
 }
 
 // joinedDistinct gives the columns an inner join compares for equality
@@ -968,7 +1274,17 @@ func (w *setWalker) hold(op, kind string, rows, width float64) {
 // tableOf is the one table of the statement's that has every column of
 // cols, by name, if exactly one has.
 func (w *setWalker) tableOf(cols []column) *Table {
-	var found *Table
+	found := w.tablesOf(cols)
+	if len(found) != 1 {
+		return nil
+	}
+	return found[0]
+}
+
+// tablesOf are the statement's tables that have every column of cols, by
+// name.
+func (w *setWalker) tablesOf(cols []column) []*Table {
+	var found []*Table
 	for _, t := range w.st.tables {
 		names := map[string]bool{}
 		for _, c := range t.Columns {
@@ -979,31 +1295,108 @@ func (w *setWalker) tableOf(cols []column) *Table {
 			all = all && c.name != "" && names[c.name]
 		}
 		if all {
-			if found != nil {
-				return nil
-			}
-			found = t
+			found = append(found, t)
 		}
 	}
 	return found
+}
+
+// identifier matches the names a scan's filters compare.
+var identifier = regexp.MustCompile(`[A-Za-z_][A-Za-z0-9_]*`)
+
+// scanTable is the table a scan reads, by the columns it projects and those
+// its filters compare: a dashboard's campaigns and impressions both have
+// campaign_id, which is all a scan of either for a join may project, and
+// only the campaigns' scan filters by advertiser.
+func (w *setWalker) scanTable(cols []column, filters []string) *Table {
+	found := w.tablesOf(cols)
+	if len(found) <= 1 {
+		return w.tableOf(cols)
+	}
+	all := slices.Clone(cols)
+	for _, f := range filters {
+		f = literal.ReplaceAllString(f, "")
+		for _, name := range identifier.FindAllString(f, -1) {
+			if _, ok := w.st.width[strings.ToLower(name)]; ok {
+				all = append(all, column{name: strings.ToLower(name)})
+			}
+		}
+	}
+	return w.tableOf(all)
 }
 
 // distinctArg matches an aggregate over DISTINCT values of a column.
 var distinctArg = regexp.MustCompile(`(?i)\(\s*DISTINCT\s+([^),]+)`)
 
 // distinct records the pairs of groups and values that aggregates over
-// DISTINCT values hold: DuckDB keeps about every row of their input before
-// it merges the threads' tables, whatever the values' distinct count (16
-// million rows of 200,000 strings held 715 MB).
-func (w *setWalker) distinct(op string, aggs []string, in []column, inRows, groupWidth float64) {
+// DISTINCT values hold: DuckDB groups them as it groups rows (see
+// groupEntries), keeping about every row of their input where the pairs are
+// many (16 million rows of 200,000 strings held 715 MB) and next to nothing
+// where they are few (a count of 1,000 values in 10 groups of 100 million
+// rows held 125 MB); where how many is not known, every row.
+func (w *setWalker) distinct(op string, aggs []string, in, groups []column, inRows float64) {
 	for _, a := range aggs {
 		m := distinctArg.FindStringSubmatch(a)
 		if m == nil {
 			continue
 		}
 		c := w.columns([]string{strings.TrimSpace(m[1])}, in)[0]
-		w.hold(op+" DISTINCT", "distinct", inRows, groupWidth+c.width+hashEntryBytes)
+		entries := inRows
+		if pairs := w.distinctCount(append(slices.Clone(groups), c)); pairs > 0 {
+			entries = groupEntries(inRows, pairs, float64(w.st.threads))
+		}
+		w.hold(op+" DISTINCT", "distinct", entries, width(groups)+c.width+hashEntryBytes)
 	}
+}
+
+// listAgg matches an aggregate that keeps every value of its input, in a
+// list or a string, and its argument.
+var listAgg = regexp.MustCompile(`(?i)^\s*(list|array_agg|string_agg|group_concat|listagg|histogram)\(\s*([^,)]+)`)
+
+// listEntryBytes is what a value an aggregate keeps in a list takes beside
+// itself: its list's segments and their headers. Lists of a hundred
+// million values in ten million groups held 10.6 GB.
+const listEntryBytes = 64
+
+// lists records the values aggregates that keep them hold: every row of
+// their input.
+func (w *setWalker) lists(op string, aggs []string, in []column, inRows float64) {
+	for _, a := range aggs {
+		m := listAgg.FindStringSubmatch(a)
+		if m == nil {
+			continue
+		}
+		c := w.columns([]string{strings.TrimSpace(m[2])}, in)[0]
+		w.hold(op+" LIST", "list", inRows, c.width+listEntryBytes)
+	}
+}
+
+// distinctCount is how many distinct combinations of values cols have, at
+// most: the product of their distinct counts, as statistics or groupings by
+// each before (see learned) give them, or what their bounds allow; zero if
+// one's is not known.
+func (w *setWalker) distinctCount(cols []column) float64 {
+	if len(cols) == 0 {
+		return 0
+	}
+	p := 1.0
+	for _, c := range cols {
+		d := c.distinct
+		if d <= 0 {
+			d = w.st.learned.distinctOf(groupingKey([]column{c}))
+		}
+		if d <= 0 || math.IsInf(d, 1) {
+			d = c.span
+		}
+		if d <= 0 {
+			return 0
+		}
+		p *= d
+		if p > 1e18 {
+			return math.Inf(1)
+		}
+	}
+	return p
 }
 
 // columns resolves the expressions an operator lists: #i is the ith of its
@@ -1024,10 +1417,10 @@ func (w *setWalker) columns(exprs []string, in []column) []column {
 			name = name[k+1:]
 		}
 		if wd, ok := w.st.width[name]; ok {
-			out[i] = column{name: name, width: wd, distinct: w.st.distinct[name]}
+			out[i] = column{name: name, width: wd, distinct: w.st.distinct[name], table: w.st.owner[name], span: w.st.span[name]}
 			continue
 		}
-		out[i] = column{width: planExprWidth}
+		out[i] = column{width: planExprWidth, span: w.timeSpan(e)}
 	}
 	return out
 }
@@ -1038,6 +1431,41 @@ func width(cols []column) float64 {
 		w += max(c.width, planExprWidth/2)
 	}
 	return w
+}
+
+// timeUnits are how many microseconds a date_trunc part spans, and
+// timeField matches date_trunc of a column, and a cast of one to a date.
+var (
+	timeUnits = map[string]float64{"second": 1e6, "minute": 60e6, "hour": 3600e6, "day": 86400e6, "week": 7 * 86400e6,
+		"month": 28 * 86400e6, "quarter": 90 * 86400e6, "year": 365 * 86400e6}
+	timeTrunc = regexp.MustCompile(`(?i)^date_trunc\('(\w+)',\s*"?(\w+)"?\)$`)
+	timeDate  = regexp.MustCompile(`(?i)^CAST\("?(\w+)"? AS DATE\)$`)
+	timePart  = regexp.MustCompile(`(?i)^(hour|dayofweek|isodow|dayofmonth|day|month|quarter)\("?(\w+)"?\)$`)
+)
+
+// timeSpan is how many values an expression that truncates or takes a part
+// of a timestamp column with bounds has, as a dashboard groups its
+// impressions by day: zero if e is not one or the bounds are not known.
+func (w *setWalker) timeSpan(e string) float64 {
+	parts := map[string]float64{"hour": 24, "dayofweek": 7, "isodow": 7, "dayofmonth": 31, "day": 31, "month": 12, "quarter": 4}
+	if m := timePart.FindStringSubmatch(e); m != nil {
+		return parts[strings.ToLower(m[1])]
+	}
+	unit, col := 0.0, ""
+	if m := timeTrunc.FindStringSubmatch(e); m != nil {
+		unit, col = timeUnits[strings.ToLower(m[1])], strings.ToLower(m[2])
+	} else if m := timeDate.FindStringSubmatch(e); m != nil {
+		unit, col = timeUnits["day"], strings.ToLower(m[1])
+	}
+	span := w.st.span[col]
+	if unit <= 0 || span <= 0 {
+		return 0
+	}
+	if !w.st.timestamp[col] {
+		// A date's bounds are days.
+		unit /= 86400e6
+	}
+	return math.Ceil(span/max(unit, 1)) + 1
 }
 
 // product is the product of the columns' distinct counts, zero if any is

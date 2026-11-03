@@ -1,0 +1,1 @@
+SELECT k2, count(DISTINCT id) FROM facts GROUP BY 1;

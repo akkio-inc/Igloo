@@ -1,0 +1,1 @@
+SELECT k3, count(DISTINCT k1) FROM facts GROUP BY 1;

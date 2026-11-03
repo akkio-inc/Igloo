@@ -49,8 +49,8 @@ func TestWorkingSetOf(t *testing.T) {
 		got[p.op] = p
 	}
 	// People filtered: 10 million rows a fifth of them, 2 million, of an id
-	// and a country (8 + 32 bytes) and a join's 32, times 1.5.
-	if p := got["HASH_JOIN"]; p.rows != 2e6 || math.Abs(p.bytes-2e6*72*heldFactors["join"]) > 1 {
+	// and a country (8 + 32 bytes) and a join's 20.
+	if p := got["HASH_JOIN"]; p.rows != 2e6 || math.Abs(p.bytes-2e6*60*heldFactors["join"]) > 1 {
 		t.Errorf("join: %+v", p)
 	}
 	// 100 million events of 8 million people joined to 2 million ids: 25
@@ -150,9 +150,9 @@ func TestPlanShapes(t *testing.T) {
 	if _, ok := WorkingSet(planJSON(t, op("ICEBERG_SCAN", nil, "Projections", "pid")), nil, 24); ok {
 		t.Error("WorkingSet said what a scan of a table it was not given holds")
 	}
-	// One branch: 400 million ids of 32 bytes and a join's 32, times 1.5,
-	// and its view's survey; and the view the common table expression reads.
-	one := 400e6*64*heldFactors["join"] + 18e6*48*heldFactors["join"]
+	// One branch: 400 million ids of 32 bytes and a join's 20, and its
+	// view's survey; and the view the common table expression reads.
+	one := 400e6*52*heldFactors["join"] + 18e6*36*heldFactors["join"]
 	if p.set < one || p.set > 1.2*one {
 		t.Errorf("E1-like: %.1f GB, want about one branch's %.1f GB", p.set/1e9, one/1e9)
 	}
@@ -202,7 +202,7 @@ func TestPlanShapes(t *testing.T) {
 		got[part.op] = part
 	}
 	// An event's id, day and lists, and its member's id.
-	if w := got["WINDOW"]; w.rows != 157e6 || math.Abs(w.bytes-157e6*(32+4+64+64+32+hashEntryBytes)) > 1 {
+	if w := got["WINDOW"]; w.rows != 157e6 || math.Abs(w.bytes-157e6*(32+4+64+64+32)*heldFactors["constant window"]) > 1 {
 		t.Errorf("F3-like window: %+v, want every event, buffered once", w)
 	}
 	if d := got["HASH_GROUP_BY DISTINCT"]; d.rows != 6*unnestValues*157e6 {
@@ -211,7 +211,8 @@ func TestPlanShapes(t *testing.T) {
 	if g := got["HASH_GROUP_BY"]; g.rows > 31.4e6*24 {
 		t.Errorf("F3-like groups: %+v, no more than DuckDB's for each thread", g)
 	}
-	if p.set < 100e9 || p.set > 400e9 {
+	// Within four times what it held and spilled, 106 GB.
+	if p.set < 100e9 || p.set > 4*106e9 {
 		t.Errorf("F3-like: %.0f GB", p.set/1e9)
 	}
 
@@ -826,7 +827,8 @@ func TestPlanResult(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if p.fields != 4e9 || p.sorted < 1e9*24 || p.sorted != p.set {
+	// The sort is the working set, but for what the scan's readers hold.
+	if p.fields != 4e9 || p.sorted < 1e9*24 || p.set-p.sorted > 0.02*p.set {
 		t.Errorf("fields %g, sorted %g of %g", p.fields, p.sorted, p.set)
 	}
 

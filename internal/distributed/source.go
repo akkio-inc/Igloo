@@ -2,6 +2,7 @@ package distributed
 
 import (
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"iter"
@@ -84,7 +85,12 @@ type Iceberg struct {
 
 	mu    sync.Mutex
 	files map[string][]File
-	order []string
+	// bounds are the bounds of each snapshot's columns, as its files' are
+	// (see Table.Bounds), and sizes their sizes (Table.ColumnBytes), by the
+	// same keys as files.
+	bounds map[string]map[string][2]float64
+	sizes  map[string]map[string]int64
+	order  []string
 	// cached counts the files of the snapshots kept.
 	cached int
 	// tables are recently loaded tables, for deciding.
@@ -247,8 +253,10 @@ func (s *Iceberg) Files(ctx context.Context, t *Table) ([]File, error) {
 	key := h.tbl.MetadataLocation() + "#" + strconv.FormatInt(h.snap.SnapshotID, 10)
 	s.mu.Lock()
 	files, ok := s.files[key]
+	bounds, sizes := s.bounds[key], s.sizes[key]
 	s.mu.Unlock()
 	if ok {
+		t.Bounds, t.ColumnBytes = bounds, sizes
 		return files, nil
 	}
 
@@ -258,7 +266,10 @@ func (s *Iceberg) Files(ctx context.Context, t *Table) ([]File, error) {
 	}
 	files = make([]File, 0, len(tasks))
 	bucketed := len(t.Buckets) > 0
+	bounding := newBounder(t.Columns)
 	for _, task := range tasks {
+		bounding.add(task.File.LowerBoundValues(), task.File.UpperBoundValues())
+		bounding.size(task.File.ColumnSizes())
 		if f := strings.ToUpper(string(task.File.FileFormat())); f != "PARQUET" {
 			return nil, unsupported("%s has %s files", t, f)
 		}
@@ -309,19 +320,139 @@ func (s *Iceberg) Files(ctx context.Context, t *Table) ([]File, error) {
 		files = append(files, f)
 	}
 
+	t.Bounds, t.ColumnBytes = bounding.bounds(len(tasks)), bounding.columnBytes(len(tasks))
 	s.mu.Lock()
 	if _, ok := s.files[key]; !ok {
-		s.files[key] = files
+		if s.bounds == nil {
+			s.bounds, s.sizes = map[string]map[string][2]float64{}, map[string]map[string]int64{}
+		}
+		s.files[key], s.bounds[key], s.sizes[key] = files, t.Bounds, t.ColumnBytes
 		s.order = append(s.order, key)
 		s.cached += len(files)
 		for len(s.order) > maxCachedSnapshots || s.cached > maxCachedFiles && len(s.order) > 1 {
 			s.cached -= len(s.files[s.order[0]])
 			delete(s.files, s.order[0])
+			delete(s.bounds, s.order[0])
+			delete(s.sizes, s.order[0])
 			s.order = s.order[1:]
 		}
 	}
 	s.mu.Unlock()
 	return files, nil
+}
+
+// bounder gathers the bounds of a table's columns of integer types, dates
+// and timestamps over its data files: the least of their lower bounds and
+// the most of their upper ones (see Table.Bounds).
+type bounder struct {
+	// kinds are the columns bounded, by field ID: their names, and how their
+	// values are written (Iceberg's single-value serialization).
+	kinds map[int]boundKind
+	lo    map[int]float64
+	hi    map[int]float64
+	// seen counts the files with both bounds of each field.
+	seen map[int]int
+	// names are the top-level columns' names by field ID, and sizes their
+	// compressed bytes over the files, which sized counts.
+	names map[int]string
+	sizes map[int]int64
+	sized map[int]int
+}
+
+type boundKind struct {
+	name string
+	size int
+}
+
+func newBounder(cols []Column) *bounder {
+	b := &bounder{kinds: map[int]boundKind{}, lo: map[int]float64{}, hi: map[int]float64{}, seen: map[int]int{},
+		names: map[int]string{}, sizes: map[int]int64{}, sized: map[int]int{}}
+	for _, c := range cols {
+		if c.ID != 0 {
+			b.names[c.ID] = strings.ToLower(c.Name)
+		}
+		if c.ID == 0 || c.Nested != nil {
+			continue
+		}
+		switch t := strings.ToUpper(c.Type); {
+		case t == "INTEGER", t == "DATE", t == "SMALLINT", t == "TINYINT":
+			b.kinds[c.ID] = boundKind{strings.ToLower(c.Name), 4}
+		case t == "BIGINT", t == "TIMESTAMP", t == "TIMESTAMP WITH TIME ZONE":
+			b.kinds[c.ID] = boundKind{strings.ToLower(c.Name), 8}
+		}
+	}
+	return b
+}
+
+// value decodes a bound of a field of size bytes: a little-endian integer.
+func (b *bounder) value(raw []byte, size int) (float64, bool) {
+	switch {
+	case size == 4 && len(raw) == 4:
+		return float64(int32(binary.LittleEndian.Uint32(raw))), true
+	case size == 8 && len(raw) == 8:
+		return float64(int64(binary.LittleEndian.Uint64(raw))), true
+	}
+	return 0, false
+}
+
+// size takes in a data file's columns' sizes.
+func (b *bounder) size(sizes map[int]int64) {
+	for id := range b.names {
+		if n, ok := sizes[id]; ok {
+			b.sizes[id] += n
+			b.sized[id]++
+		}
+	}
+}
+
+// columnBytes are the sizes of the top-level columns every one of files
+// data files had a size of, by lower-case name; nil if none. A nested
+// column's size is its first field's, which counts it in part.
+func (b *bounder) columnBytes(files int) map[string]int64 {
+	var out map[string]int64
+	for id, name := range b.names {
+		if files == 0 || b.sized[id] != files {
+			continue
+		}
+		if out == nil {
+			out = map[string]int64{}
+		}
+		out[name] = b.sizes[id]
+	}
+	return out
+}
+
+// add takes in a data file's lower and upper bounds.
+func (b *bounder) add(lower, upper map[int][]byte) {
+	for id, k := range b.kinds {
+		lo, okLo := b.value(lower[id], k.size)
+		hi, okHi := b.value(upper[id], k.size)
+		if !okLo || !okHi {
+			continue
+		}
+		if b.seen[id] == 0 {
+			b.lo[id], b.hi[id] = lo, hi
+		} else {
+			b.lo[id], b.hi[id] = min(b.lo[id], lo), max(b.hi[id], hi)
+		}
+		b.seen[id]++
+	}
+}
+
+// bounds are the bounds of the columns every one of files data files had
+// bounds of, by lower-case name; nil if none.
+func (b *bounder) bounds(files int) map[string][2]float64 {
+	var out map[string][2]float64
+	for id, k := range b.kinds {
+		if files == 0 || b.seen[id] != files {
+			continue
+		}
+		if out == nil {
+			out = map[string][2]float64{}
+		}
+		out[k.name] = [2]float64{b.lo[id], b.hi[id]}
+	}
+	return out
 }
 
 // distinctCounts reads the distinct counts ANALYZE keeps in a table's

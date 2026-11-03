@@ -127,6 +127,16 @@ type Table struct {
 	// lower-case name, as ANALYZE keeps them; a column without one is
 	// missing.
 	Distinct map[string]int64
+	// Bounds are the least and most values of its columns of integer types,
+	// dates (as days since 1970) and timestamps (as microseconds), by
+	// lower-case name, as its data files' statistics give them: a column has
+	// no more distinct values than its bounds span.
+	Bounds map[string][2]float64
+	// ColumnBytes are what its columns take in its data files, compressed,
+	// by lower-case name, as its files' statistics give them: what a scan's
+	// readers hold of a row group is about what the columns it reads take
+	// of it (see scanBytes).
+	ColumnBytes map[string]int64
 	// Buckets are the bucket transforms of its partition spec that every
 	// data file of its snapshot was written under (see bucket.go); each
 	// File's Buckets says the file's bucket of each.
