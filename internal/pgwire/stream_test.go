@@ -21,7 +21,6 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 
-	"github.com/akkio-inc/igloo/internal/catalogproxy"
 	"github.com/akkio-inc/igloo/internal/distributed"
 	"github.com/akkio-inc/igloo/internal/prefetch"
 )
@@ -305,8 +304,7 @@ func TestStreamFailureClassified(t *testing.T) {
 	if sess.ranOutOfMemory(context.Background(), err) || isOutOfMemory(err) || distributed.OutOfMemory(err) {
 		t.Error("taken for running out of memory")
 	}
-	if distributed.DataError(err) || distributed.IsUnsupported(err) || prefetch.BlockRace(err) || commitConflict(err) || bitmapsDidNotFit(err) ||
-		catalogproxy.RefusedShared(err.Error()) {
+	if distributed.DataError(err) || distributed.IsUnsupported(err) || prefetch.BlockRace(err) || commitConflict(err) || bitmapsDidNotFit(err) {
 		t.Error("taken for another failure")
 	}
 }

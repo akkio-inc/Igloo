@@ -340,8 +340,8 @@ func (s *Server) implicitView(ctx context.Context, sess *session, source string,
 	if implicit == "" {
 		return nil
 	}
-	// Describing walks the catalog (see catalogRunLock).
-	release := s.holdCatalog(sess)
+	// Describing looks the catalog's tables up (see catalogRunLock).
+	release := s.shareCatalog(sess)
 	defer release()
 	if _, err := describeQuery(ctx, sess, query); err == nil || !implicitCastError(err) {
 		return nil
@@ -385,8 +385,8 @@ func (s *Server) checkViewColumns(ctx context.Context, sess *session, tr *transl
 	if query == "" {
 		return nil
 	}
-	// Describing it walks the catalog (see catalogRunLock).
-	release := s.holdCatalog(sess)
+	// Describing it looks the catalog's tables up (see catalogRunLock).
+	release := s.shareCatalog(sess)
 	cols, err := describeQuery(ctx, sess, query)
 	release()
 	if err != nil || len(cols) == tr.ViewColumns {

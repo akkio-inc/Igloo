@@ -213,7 +213,7 @@ func (s *Server) rerunWithoutBitmaps(ctx context.Context, sess *session, st *sta
 		_ = old.Close()
 		return run()
 	}
-	release := s.holdCatalog(sess)
+	release := s.shareCatalog(sess)
 	err := st.reprepare(ctx, sess.conn)
 	release()
 	if err != nil {

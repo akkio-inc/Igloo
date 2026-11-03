@@ -209,7 +209,7 @@ func (s *Server) copyToCommand(ctx context.Context, sess *session, user auth.Use
 		if q.SimpleQuery {
 			defer sess.release(ps) //nolint:errcheck
 		}
-		relist := s.holdCatalog(sess)
+		relist := s.shareCatalog(sess)
 		err := s.recheck(ctx, sess, st)
 		relist()
 		if err != nil {

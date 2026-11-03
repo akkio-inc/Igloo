@@ -115,11 +115,8 @@ func (s *Server) newTableWrite(ctx context.Context, sess *session, schema, name 
 		return nil, "the table has an Iceberg sort order", nil
 	}
 	fields := tbl.Schema().Fields()
-	var described []columnType
-	if err := s.runBound(sess, nil, func() (err error) {
-		described, err = describeTable(ctx, sess, quoteName([]string{s.catalogName(), schema, name}))
-		return err
-	}); err != nil {
+	described, err := describeTable(ctx, sess, quoteName([]string{s.catalogName(), schema, name}))
+	if err != nil {
 		return nil, "", err
 	}
 	types := make(map[string]string, len(described))
@@ -856,10 +853,7 @@ func (s *Server) insertWriter(ctx context.Context, sess *session, p parsedInsert
 		if err != nil || !strings.EqualFold(db, s.catalogName()) {
 			return nil
 		}
-		if err := s.runBound(sess, nil, func() error {
-			_, err := describeTable(ctx, sess, quoteName([]string{"temp", "main", target.Table}))
-			return err
-		}); err == nil {
+		if _, err := describeTable(ctx, sess, quoteName([]string{"temp", "main", target.Table})); err == nil {
 			return nil
 		}
 	}

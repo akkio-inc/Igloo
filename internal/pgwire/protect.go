@@ -684,8 +684,8 @@ func (s *Server) sensitivity(ctx context.Context, sess *session, snap *policy.Sn
 			return c, false, nil
 		}
 	}
-	// The listing walks the catalog's in-memory set (see policyRewrite).
-	defer s.holdCatalog(sess)()
+	// The listing looks the catalog's tables up (see policyRewrite).
+	defer s.shareCatalog(sess)()
 	rows, err := sess.conn.QueryContext(ctx, `SELECT 'view', database_name, schema_name, view_name, sql
 			FROM system.main.duckdb_views() WHERE NOT internal
 		UNION ALL SELECT 'macro', database_name, schema_name, function_name, coalesce(macro_definition, '')
@@ -1037,19 +1037,17 @@ func (s *Server) policyRewrite(ctx context.Context, sess *session, user auth.Use
 	ddl := t == duckdb.STATEMENT_TYPE_DROP || t == duckdb.STATEMENT_TYPE_ALTER || t == duckdb.STATEMENT_TYPE_CREATE
 	if !ddl && snap.Empty() {
 		// Nothing to apply and nothing to read of the catalog. Holding it
-		// exclusively here, as below, had every query prepared under the
-		// shared lock wait for the others' to end and hold up the next ones:
-		// of 60 s that a dashboard's 136 prepares took, 50 s went here.
+		// exclusively here had every query prepared under the shared lock wait
+		// for the others' to end and hold up the next ones: of 60 s that a
+		// dashboard's 136 prepares took, 50 s went here.
 		return query, g, false, nil
 	}
-	// Applying policies resolves names and runs DESCRIBE, which walk the
-	// catalog's in-memory set; so do the checks of DDL, and listing what
-	// policies concern (see sensitivity). Each holds the exclusive side so
-	// none of it runs while a table is renamed or dropped on this instance
-	// (reentrant; see holdCatalog). A query that names nothing policies
-	// concern, as a dashboard's, needs none of it once the session's
-	// listing is made: holding it for every query, prepared under the
-	// shared lock, queued them all behind each other.
+	// Applying policies resolves names and runs DESCRIBE, which look the
+	// catalog's tables up, and so do listing what policies concern (see
+	// sensitivity) and the checks of DDL: they hold the lock shared, and DDL's
+	// exclusively (reentrant; see holdCatalog). A query that names nothing
+	// policies concern, as a dashboard's, needs none of it once the session's
+	// listing is made.
 	if ddl {
 		defer s.holdCatalog(sess)()
 	}
@@ -1107,7 +1105,7 @@ func (s *Server) policyRewrite(ctx context.Context, sess *session, user auth.Use
 		return query, g, ran, nil
 	}
 	if !ddl {
-		defer s.holdCatalog(sess)()
+		defer s.shareCatalog(sess)()
 	}
 	ran = true
 	privs, err := s.privileges(ctx, sess, user)
@@ -1452,10 +1450,9 @@ func (s *Server) catalogTarget(ctx context.Context, sess *session, parts []strin
 		}
 		return auth.Object{Schema: parts[0], Table: parts[1]}, true, nil
 	case 1:
-		// isTemporary lists with duckdb_tables()/duckdb_views(), which walk
-		// the catalog's in-memory set; hold the exclusive side (reentrant;
-		// see holdCatalog).
-		release := s.holdCatalog(sess)
+		// isTemporary lists with duckdb_tables()/duckdb_views(), which look
+		// the catalog's tables up (see holdCatalog).
+		release := s.shareCatalog(sess)
 		temp, err := isTemporary(ctx, sess.conn, parts[0])
 		release()
 		if err != nil || temp {

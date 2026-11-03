@@ -310,10 +310,7 @@ func (o *overwritePlan) insert(ctx context.Context, dir, query string) (added []
 			_, _ = r.exec(context.WithoutCancel(ctx), "ROLLBACK")
 		}
 	}()
-	err = r.s.runBound(r.sess, nil, func() (err error) {
-		rows, err = r.exec(ctx, "INSERT INTO "+r.qualified+" "+query)
-		return err
-	})
+	rows, err = r.exec(ctx, "INSERT INTO "+r.qualified+" "+query)
 	if err != nil {
 		return nil, nil, nil, 0, err
 	}
@@ -402,7 +399,7 @@ func (o *overwritePlan) copy(ctx context.Context, dir, query string) ([]string, 
 		quoteLiteral(dir) + " (" + strings.Join(opts, ", ") + ")"
 	var paths, empty []string
 	var rows int64
-	err := r.s.runBound(r.sess, nil, func() error {
+	err := func() error {
 		paths, empty, rows = nil, nil, 0
 		res, err := r.sess.conn.QueryContext(ctx, q, nil)
 		if err != nil {
@@ -425,7 +422,7 @@ func (o *overwritePlan) copy(ctx context.Context, dir, query string) ([]string, 
 			}
 			paths, rows = append(paths, path), rows+n
 		}
-	})
+	}()
 	r.measured(q)
 	if err != nil {
 		return nil, 0, err

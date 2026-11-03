@@ -8,9 +8,6 @@ import (
 	"slices"
 	"strings"
 
-	wire "github.com/jeroenrinzema/psql-wire"
-
-	"github.com/akkio-inc/igloo/internal/catalogproxy"
 	"github.com/akkio-inc/igloo/internal/sqllex"
 )
 
@@ -23,37 +20,6 @@ import (
 // (stagedCreate), and of a temporary table, as dbt makes one of an
 // incremental model's new rows (tempCreate). EXECUTE of a statement
 // prepared in SQL holds it only when the statement would (executeHolds).
-
-// runBound runs a statement with run, and runs it again with the session's
-// binds holding the catalog lock exclusively (bindAlone) when the catalog
-// proxy refused a request DuckDB made as it bound the statement to run it.
-// DuckDB binds a statement again as each run starts, holding the lock
-// shared, alongside other sessions' binds; a bind that has to list a
-// schema's tables, as when a table was made or dropped since DuckDB last
-// listed them, or to suggest a name for a missing table, walks
-// DuckDB-Iceberg's set of tables, which is safe only while no other bind
-// replaces entries in it, so the proxy refuses the listing while the lock
-// is held shared (see catalogproxy's shared holds). Preparing such a
-// statement under the shared lock is retried under the exclusive one (see
-// prepareChecked); its runs failed with the refusal. A failed bind runs
-// nothing, sends nothing and, unlike an execution error, leaves a
-// transaction block usable, so binding again exclusively, waiting for the
-// other binds to end, is safe; the run itself holds nothing after its
-// bind, as before.
-// w, if set, is where the statement sends rows: once it has sent some, the
-// run is not repeated.
-func (s *Server) runBound(sess *session, w wire.DataWriter, run func() error) error {
-	refusals := s.engine.SharedRefusals()
-	err := run()
-	if err == nil || w != nil && w.Written() > 0 || s.engine.SharedRefusals() == refusals ||
-		!catalogproxy.RefusedShared(err.Error()) {
-		return err
-	}
-	s.log.Debug("binding a statement again under the exclusive catalog lock", "err", err)
-	sess.bindAlone = true
-	defer func() { sess.bindAlone = false }()
-	return run()
-}
 
 // tempCreate is CREATE [OR REPLACE] TEMP TABLE name AS query, carried out
 // in steps: create the table, empty, holding the catalog lock; fill it with
@@ -111,13 +77,10 @@ func (s *Server) runTempCreate(ctx context.Context, sess *session, c *tempCreate
 		return 0, err
 	}
 	var rows int64
-	err := s.runBound(sess, nil, func() error {
-		res, err := sess.conn.QueryContext(ctx, "INSERT INTO "+into+"\n"+c.query, nil)
-		if err == nil {
-			rows, err = countOf(res)
-		}
-		return err
-	})
+	res, err := sess.conn.QueryContext(ctx, "INSERT INTO "+into+"\n"+c.query, nil)
+	if err == nil {
+		rows, err = countOf(res)
+	}
 	if err != nil {
 		_ = held(context.WithoutCancel(ctx), "DROP TABLE IF EXISTS "+into)
 		return 0, err

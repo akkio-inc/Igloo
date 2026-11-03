@@ -80,11 +80,13 @@ type Engine interface {
 	// path a new one starts with.
 	UseDefaultSchema(ctx context.Context, conn *duckdb.Conn) error
 	// CatalogLock and CatalogShare take the lock that keeps changes to the
-	// structure of the catalog's in-memory set of tables from running
-	// alongside walks and binds of it, exclusively and shared; each returns the
-	// func that releases it. See engine.Engine.CatalogLock.
+	// catalog's tables apart from the steps that look them up, exclusively
+	// and shared; each returns the func that releases it. Respell gives
+	// tables back the names the catalog spells them with before a listing.
+	// See engine.Engine.CatalogLock.
 	CatalogLock() func()
 	CatalogShare() func()
+	Respell()
 	// CatalogShareContext is CatalogShare that gives up when ctx ends, and
 	// CatalogLockedFor is how long the lock has been held exclusively.
 	CatalogShareContext(ctx context.Context) (func(), error)
@@ -111,9 +113,6 @@ type Engine interface {
 	// it returns is called, and ReloadTables loads such tables again, so
 	// that DataVersion goes up if any changed meanwhile.
 	RecordLoads() func() []catalogproxy.Load
-	// SharedRefusals counts DuckDB's catalog requests refused while the
-	// catalog lock was held shared (see sharedprepare.go).
-	SharedRefusals() uint64
 	ReloadTables(ctx context.Context, loads []catalogproxy.Load) error
 	// DistinctCounts returns the distinct counts of the catalog's tables'
 	// columns, by catalog.schema.table as DuckDB names it, lower-cased, and
@@ -971,10 +970,6 @@ type session struct {
 	// outer is the context runCancelable runs the statement's steps under,
 	// which a shed by the memory watch does not end, while it runs.
 	outer context.Context
-	// bindAlone has DuckDB's binds on the session's connection hold the
-	// catalog lock exclusively rather than shared, while a run whose bind
-	// the catalog proxy refused binds again (see runBound).
-	bindAlone bool
 	// held, while set, keeps queries recorded for the history (see
 	// holdRecords).
 	held *[]queryRecord
@@ -1093,10 +1088,6 @@ type session struct {
 	// none), for planning on other goroutines (see sessionEnv.CatalogWaited).
 	catWaited   atomic.Int64
 	catWaitFrom atomic.Int64
-	// sharedPrepare is set while prepareChecked prepares a statement holding
-	// the catalog lock shared, which stops at DuckDB's first failure to
-	// prepare it (see sharedprepare.go).
-	sharedPrepare bool
 
 	// mu guards the fields below, which cancel requests and user changes
 	// reach from other connections.
@@ -1237,19 +1228,13 @@ func (s *Server) openSession(ctx context.Context) (context.Context, error) {
 	}
 	s.sessions.connected(sess, conn)
 	sess.wl.meter, sess.wl.controller = meter, s.workload
-	// Binding a statement looks its tables up in the catalog's in-memory set
-	// and replaces their entries there, and DuckDB binds a statement that
-	// reads the catalog again each time it runs, not only when it is
+	// Binding a statement looks its tables up, and DuckDB binds a statement
+	// that reads the catalog again each time it runs, not only when it is
 	// prepared. Hold the catalog lock shared for every bind on this
-	// connection, so none runs while DDL renames or drops a table or a
-	// listing walks the set (see shareCatalog); running the statement after
-	// that holds nothing more.
-	conn.SetBindHold(func() func() {
-		if sess.bindAlone {
-			return s.holdCatalog(sess)
-		}
-		return s.shareCatalog(sess)
-	})
+	// connection, so none finds a table that DDL is swapping in steps missing
+	// (see shareCatalog); running the statement after that holds nothing
+	// more.
+	conn.SetBindHold(func() func() { return s.shareCatalog(sess) })
 	// A C++ exception that escapes DuckDB in one of this connection's calls
 	// that bind, run or drop a plan, which nothing can catch, ends this
 	// session rather than the process (see parked): the iceberg extension's
@@ -1724,9 +1709,9 @@ func txStatus(ctx context.Context) types.ServerStatus {
 // and clients such as psql look up an OID before listing its columns.
 var listsColumns = regexp.MustCompile(`(?i)\b(pg_attribute|pg_class|information_schema"?\s*\.\s*"?columns|pg_information_schema_columns|duckdb_columns)\b`)
 
-// listsCatalog matches a statement whose run walks the catalog's in-memory
-// set of tables and views and so, unlike a plain data read, holds the
-// catalog lock exclusively while it runs (see catalogRunLock). It covers
+// listsCatalog matches a statement whose run lists the catalog's tables and
+// views and so, unlike a plain data read, holds the catalog lock shared while
+// it runs, not only for its bind (see catalogRunLock). It covers
 // DuckDB's catalog listing functions and the pg_catalog, information_schema
 // and sqlite_master relations BI tools and drivers read, by the names the
 // statement is written with and the names Igloo rewrites them to, and SHOW,
@@ -1739,14 +1724,6 @@ var listsCatalog = regexp.MustCompile(`(?is)(^\s*(SHOW|DESCRIBE|DESC|PRAGMA)\b)|
 	`information_schema|information_schema_tables|information_schema_schemata|information_schema_functions|` +
 	`pg_catalog|pg_class|pg_attribute|pg_namespace|pg_tables|pg_views|pg_matviews|` +
 	`pg_information_schema_columns|pg_description|pg_type|pg_proc)\b`)
-
-// describesRelation matches DESCRIBE (or DESC) of one table or view, by its name:
-// DuckDB binds what it describes, as a query's FROM, and walks nothing, so it holds
-// the catalog lock shared, as any bind, not exclusively, as listsCatalog's
-// statements. A BI tool describes a table before each query it builds on it, and
-// each held up every bind beside it.
-var describesRelation = regexp.MustCompile(`(?is)^\s*(DESCRIBE|DESC)\s+((("([^"]|"")*"|[a-z_][a-z0-9_$]*)\s*\.\s*){0,2}` +
-	`("([^"]|"")*"|[a-z_][a-z0-9_$]*))\s*;?\s*$`)
 
 var deallocateAll = regexp.MustCompile(`(?is)^\s*DEALLOCATE\s+(?:PREPARE\s+)?ALL\s*;?\s*$`)
 
@@ -2472,10 +2449,10 @@ const (
 type catalogHold struct{ mode catalogMode }
 
 // holdCatalog takes the engine's catalog lock exclusively for one step of
-// handling a statement that reaches the catalog's in-memory set of tables
-// (see engine.Engine.CatalogLock and catalogRunLock). shareCatalog takes it
-// shared, for DuckDB binding a statement (the bind hold openSession sets):
-// binds are safe alongside each other, not alongside the rest. Holds are
+// handling a statement that changes the catalog's tables (see
+// engine.Engine.CatalogLock and catalogRunLock). shareCatalog takes it
+// shared, for a step that looks them up: DuckDB binding a statement (the bind
+// hold openSession sets), preparing or rechecking one, a listing. Holds are
 // reentrant per session: the several steps that reach the set while one
 // statement is handled (preparing it, binding it, rechecking it, running it,
 // and the commands that resolve or list catalog objects) each take one
@@ -2656,39 +2633,33 @@ func (s *Server) shareCatalogForLogin(ctx context.Context, sess *session) (func(
 }
 
 // catalogRunLock holds the catalog lock exclusively for a run that changes
-// the catalog or lists it, and not at all for any other run.
+// the catalog, shared for one that lists it, and not at all for any other
+// run (see engine.Engine.CatalogLock).
 //
-// DuckDB-Iceberg's one in-memory set of the catalog's tables is the shared
-// state that is not safe under concurrency (see engine.Engine.CatalogLock).
-// DDL that renames or drops a table removes entries from it without
-// DuckDB-Iceberg's own lock, and a listing walks it while a bind replaces
-// the entries of the tables it names, so the runs that do either take the
-// lock exclusively and run on their own: DDL, by its statement type (create,
+// DDL takes it exclusively, so that what other sessions look up meanwhile
+// finds the catalog before or after it: DDL by its statement type (create,
 // drop, alter, attach, detach, whatever the database: the last statement of
 // several an admin sends may be one, and the Iceberg DDL Igloo recognizes,
-// changesIceberg, is always one), EXECUTE of a statement prepared in SQL
-// that may be any of these (see executeHolds), and listings
-// (information_schema, pg_catalog, duckdb_tables()/views()/columns(), SHOW,
-// DESCRIBE, PRAGMA; see listsCatalog). Preparing and rechecking any
-// statement take it exclusively too, since Igloo's checks list the catalog
-// (see prepareChecked, recheck).
+// changesIceberg, is always one), and EXECUTE of a statement prepared in SQL
+// that may be one (see executeHolds). A listing (information_schema,
+// pg_catalog, duckdb_tables()/views()/columns(), SHOW, DESCRIBE, PRAGMA; see
+// listsCatalog) takes it shared, alongside binds, prepares and other
+// listings, and gives tables back the names the catalog spells them with
+// first (see engine.Engine.Respell). Listings took it exclusively while
+// DuckDB-Iceberg's set of tables could not be walked beside a bind, and a BI
+// tool's schema browser, listing a namespace's tables a second, held up every
+// dashboard's binds.
 //
 // The run of any other statement holds the lock only while DuckDB binds the
 // statement again to run it, which it does each time for a statement that
-// reads the catalog, replacing the entries of the tables it names (see the
-// bind hold openSession sets). Those binds hold it shared: they take
-// DuckDB-Iceberg's own lock, so they run alongside each other, just not
-// alongside DDL, a listing or a prepare.
-//
-// After that bind the run holds nothing: a data read scans the files of the
-// tables it bound, and a write (INSERT, UPDATE, DELETE, MERGE) commits a new
-// snapshot of them — neither changes the set or walks it. Holding nothing
-// lets reads and writes run concurrently and, as importantly, keeps a long
-// run from blocking another session that needs to prepare, list or change
-// the catalog, and a write from blocking a second writer whose commit it
-// must see to retry on a conflict. Statements that do not reach the catalog
-// (SET, transaction control) and sessions with no catalog attached hold
-// nothing either.
+// reads the catalog (see the bind hold openSession sets), shared. After that
+// bind the run holds nothing: a data read scans the files of the tables it
+// bound, and a write (INSERT, UPDATE, DELETE, MERGE) commits a new snapshot of
+// them. Holding nothing lets reads and writes run concurrently and keeps a
+// long run from holding up DDL, and a write from blocking a second writer
+// whose commit it must see to retry on a conflict. Statements that do not
+// reach the catalog (SET, transaction control) and sessions with no catalog
+// attached hold nothing either.
 //
 // CREATE TABLE ... AS of an Iceberg table, which runs outside any
 // transaction block, and of a temporary table are carried out in steps that
@@ -2705,9 +2676,12 @@ func (s *Server) catalogRunLock(sess *session, st *statement) func() {
 	if st.stmtType == duckdb.STATEMENT_TYPE_EXECUTE && !sess.executeHolds(st.query) {
 		return func() {}
 	}
-	lists := st.listsCatalog && !describesRelation.MatchString(st.query)
-	if st.changesIceberg || lists || changesCatalog(st.stmtType) || st.stmtType == duckdb.STATEMENT_TYPE_EXECUTE {
+	if st.changesIceberg || changesCatalog(st.stmtType) || st.stmtType == duckdb.STATEMENT_TYPE_EXECUTE {
 		return s.holdCatalog(sess)
+	}
+	if st.listsCatalog && s.catalogName() != "" {
+		s.engine.Respell()
+		return s.shareCatalog(sess)
 	}
 	return func() {}
 }
@@ -2768,13 +2742,11 @@ func (s *Server) readyStatement(ctx context.Context, sess *session, st *statemen
 	// counts of the tables its prepare loaded.
 	s.registerDistinctCounts(ctx, sess)
 	// Rechecking re-plans with EXPLAIN and may re-apply policies, both of
-	// which read and fill in the catalog's set; release before the run
-	// takes the side it needs (see holdCatalog, catalogRunLock). A
+	// which look tables up: it holds the lock shared, and lets go before the
+	// run takes the side it needs (see holdCatalog, catalogRunLock). A
 	// statement with nothing to check again, as an admin's that reads no
 	// connection while the policies, the catalog and the session's settings
-	// stay as they were, holds nothing here: every run of one would
-	// otherwise wait its turn for the lock with the statements being
-	// prepared.
+	// stay as they were, holds nothing here.
 	deciding := sess.phase("recheck")
 	again, err := s.needsRecheck(ctx, sess, st)
 	deciding()
@@ -2783,7 +2755,7 @@ func (s *Server) readyStatement(ctx context.Context, sess *session, st *statemen
 	}
 	if again {
 		locked := sess.phase("catalog_lock")
-		relist := s.holdCatalog(sess)
+		relist := s.shareCatalog(sess)
 		locked()
 		rechecking := sess.phase("recheck")
 		err := s.recheck(ctx, sess, st)
@@ -2843,20 +2815,12 @@ func (s *Server) rewriteCounting(ctx context.Context, sess *session, user auth.U
 
 // prepareHeld is prepareChecked holding the catalog lock as mode says.
 func (s *Server) prepareHeld(ctx context.Context, sess *session, user auth.User, text string, oids []uint32, mode catalogMode) (st *statement, err error) {
-	// Preparing reads and fills in the catalog's in-memory set of tables:
-	// DuckDB binds the statement (and suggests names for a missing table),
-	// and Igloo resolves names, loads schemas and checks grants the same way,
-	// filling in each table it names on first use. Hold the exclusive side so
-	// no other statement reads the set while this changes it (see
-	// holdCatalog), or the shared side for a query that may be prepared
-	// alongside others (see sharedprepare.go).
+	// Preparing looks the tables the statement names up: DuckDB binds it,
+	// and Igloo resolves names, loads schemas and checks grants the same way
+	// (see sharedprepare.go).
 	defer s.timePhases(ctx, sess, "statement prepared")()
 	locked := sess.phase("catalog_lock")
 	defer s.catalogHold(sess, mode)()
-	if mode == catalogShared {
-		sess.sharedPrepare = true
-		defer func() { sess.sharedPrepare = false }()
-	}
 	locked()
 	// DuckDB plans it with the tables' distinct counts as last loaded.
 	s.registerDistinctCounts(ctx, sess)
@@ -3101,11 +3065,6 @@ func (s *Server) prepareCheckedText(ctx context.Context, sess *session, user aut
 		}
 	}
 	preparing()
-	if err != nil && sess.sharedPrepare {
-		// Prepared again under the exclusive lock, which the steps below
-		// need (see sharedprepare.go).
-		return fail(err)
-	}
 	if err != nil && s.ddl != nil && missingRelation.MatchString(err.Error()) {
 		// Perhaps a view another replica just created, or one this replica
 		// could not make when it last synced, which DuckDB cannot bind (see

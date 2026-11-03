@@ -35,9 +35,8 @@ type Metrics struct {
 	// implicitRetries counts the statements in Snowflake's dialect that
 	// bound only with its implicit conversions (see parseTranslated).
 	implicitRetries prometheus.Counter
-	// prepares counts the queries prepared under the shared catalog lock,
-	// and those prepared again under the exclusive one (see
-	// sharedprepare.go).
+	// prepares counts the statements prepared under the shared catalog lock
+	// (see sharedprepare.go).
 	prepares *prometheus.CounterVec
 	// sortedWrites counts the writes of rows in order sorted a range at a
 	// time (see sortedwrite.go).
@@ -122,7 +121,7 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 		}),
 		prepares: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "igloo_shared_prepares_total",
-			Help: "Queries prepared alongside other statements, under the shared catalog lock (shared), and those that failed to prepare that way, or met a refused catalog listing meanwhile, and were prepared again under the exclusive lock (retried).",
+			Help: "Statements prepared alongside other statements' prepares, binds and listings, under the shared catalog lock (shared).",
 		}, []string{"lock"}),
 		largeSorts: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "igloo_large_sorts_total",

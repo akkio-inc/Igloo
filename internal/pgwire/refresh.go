@@ -1016,15 +1016,9 @@ func (r *refresher) columnNames(ctx context.Context, schema, name string) ([]str
 }
 
 // described returns the names and types of the columns of query's result, as
-// DuckDB binds it, which holds the catalog lock shared (see runBound).
+// DuckDB binds it, which holds the catalog lock shared.
 func (r *refresher) described(ctx context.Context, query string) ([]distributed.Column, error) {
-	var cols []distributed.Column
-	err := r.s.runBound(r.sess, nil, func() error {
-		var err error
-		cols, err = describedColumns(ctx, r.sess.conn, query)
-		return err
-	})
-	return cols, err
+	return describedColumns(ctx, r.sess.conn, query)
 }
 
 // pinAt returns how to read table at its snapshot v: AT (VERSION => v),
@@ -1042,17 +1036,15 @@ func (r *refresher) pinAt(ctx context.Context, table string, v int64) (increment
 // temp makes a temporary view or table, which the refresh drops when it
 // ends: a table empty, and then filled. The session's temporary objects are
 // its own, outside the Iceberg catalog: making one holds the catalog lock only
-// while DuckDB binds its query, as filling it does (see runBound).
+// while DuckDB binds its query, shared, as filling it does.
 func (r *refresher) temp(ctx context.Context, kind, name, query string) error {
 	create := "CREATE OR REPLACE TEMP " + kind + " " + quoteIdent(name) + " AS " + query
 	if kind == "TABLE" {
 		create += "\nWITH NO DATA"
 	}
 	run := func(q string) error {
-		return r.s.runBound(r.sess, nil, func() error {
-			_, err := r.exec(ctx, q)
-			return err
-		})
+		_, err := r.exec(ctx, q)
+		return err
 	}
 	r.sess.temps = true
 	if err := run(create); err != nil {

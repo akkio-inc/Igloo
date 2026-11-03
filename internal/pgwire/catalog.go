@@ -197,13 +197,12 @@ func (s *Server) listConnectionTables(ctx context.Context, sess *session) {
 var remoteSystemSchemas = []string{"information_schema", "pg_catalog", "mysql", "performance_schema", "sys"}
 
 // readConnectionTables lists the tables of the connections catalogs, with
-// their columns, as DuckDB has them. duckdb_columns() walks every attached
-// database's tables, the Iceberg catalog's in-memory set too, whatever the
-// filter, so this holds the catalog lock exclusively (see
-// engine.Engine.CatalogLock); it runs off any session, which holds no lock
-// for it.
+// their columns, as DuckDB has them. duckdb_columns() looks up every attached
+// database's tables, the Iceberg catalog's too, whatever the filter, so this
+// holds the catalog lock shared (see engine.Engine.CatalogLock); it runs off
+// any session, which holds no lock for it.
 func (s *Server) readConnectionTables(ctx context.Context, catalogs map[string]string) ([]catalog.TableMeta, error) {
-	defer s.engine.CatalogLock()()
+	defer s.engine.CatalogShare()()
 	conn, err := s.engine.Connect(ctx)
 	if err != nil {
 		return nil, err

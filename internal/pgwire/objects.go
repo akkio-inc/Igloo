@@ -98,14 +98,10 @@ func (s *Server) names(ctx context.Context, sess *session) (*sessionNames, error
 	n.schema, _ = rows[0][2].(string)
 	n.path = parseSearchPath(setting, n.db)
 	if sess.ddlCount > 0 {
-		// duckdb_tables()/duckdb_views() list every attached database,
-		// walking the catalog's in-memory set; hold the exclusive side so
-		// this does not run while a table is renamed or dropped on this
-		// instance. Reentrant: when this is reached while preparing a
-		// statement the hold is already held (see holdCatalog); when reached
-		// afterwards, recording what a statement read, it takes the hold
-		// itself.
-		release := s.holdCatalog(sess)
+		// duckdb_tables()/duckdb_views() list every attached database, which
+		// looks the catalog's tables up: hold the lock shared (see
+		// holdCatalog).
+		release := s.shareCatalog(sess)
 		temp, err := queryStrings(ctx, sess, `SELECT system.main.lower(table_name) FROM system.main.duckdb_tables() WHERE temporary
 			UNION ALL SELECT system.main.lower(view_name) FROM system.main.duckdb_views() WHERE temporary`)
 		release()
@@ -349,14 +345,12 @@ func (a *analyzer) snapshot(ctx context.Context) *objectSnapshot {
 		return a.snap
 	}
 	// This runs on the analyzer's own connection, off the statement that
-	// queued the work, so it takes the catalog lock itself: listing the
-	// catalog's tables and views walks its in-memory set, which must not
-	// happen while a table is renamed or dropped on this instance (see
-	// engine.Engine.CatalogLock). The catalog lock comes before a.mu (see
-	// package lockorder): a session holding it may wait for a.mu, to record
-	// its statement.
+	// queued the work, so it takes the catalog lock itself, shared, as any
+	// listing does (see engine.Engine.CatalogLock). The catalog lock comes
+	// before a.mu (see package lockorder): a session holding it may wait for
+	// a.mu, to record its statement.
 	a.mu.Unlock()
-	releaseCatalog := a.s.engine.CatalogLock()
+	releaseCatalog := a.s.engine.CatalogShare()
 	a.mu.Lock()
 	if fresh() || a.conn == nil {
 		releaseCatalog()

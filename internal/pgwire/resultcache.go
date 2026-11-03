@@ -351,10 +351,11 @@ func (c *resultCache) has(key resultKey, version uint64) bool {
 	return ok && f.version == version
 }
 
-// Answering before preparing. Preparing a statement holds the catalog lock
-// exclusively (see prepareChecked), so the statements of a dashboard that
-// several charts or viewers ask at once were prepared one at a time, each
-// waiting for those before it, before the cache answered any of them. A
+// Answering before preparing. Preparing a statement held the catalog lock
+// exclusively, so the statements of a dashboard that several charts or
+// viewers ask at once were prepared one at a time, each waiting for those
+// before it, before the cache answered any of them; preparing still costs
+// what DuckDB's prepare does (see prepareChecked). A
 // query whose result the cache keeps is also known by its text
 // (statementKey), when preparing it checks nothing that could come out
 // otherwise the next time: an admin's, with no parameters, no policy on

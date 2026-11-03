@@ -150,9 +150,6 @@ type Proxy struct {
 	lists *listings
 	// names are how the catalog spells its tables' names (see names.go).
 	names *names
-	// sharedHold refuses listings and drops while the catalog lock is
-	// held shared (see holds.go).
-	sharedHold
 	// data goes up whenever a table may have changed (see DataVersion).
 	data dataVersion
 	// pending are the notes of staged creates (see pending.go).
@@ -298,7 +295,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	p.notePrefix(rest)
-	if p.refuseShared(w, r, rest) || p.forgotten(w, r, rest) {
+	if p.forgotten(w, r, rest) {
 		return
 	}
 	switch r.Method {

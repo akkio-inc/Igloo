@@ -19,12 +19,11 @@ import (
 	"github.com/akkio-inc/igloo/internal/icebergtest"
 )
 
-// TestSharedPrepares checks which statements are prepared under the shared
+// TestSharedPrepares checks that statements are prepared under the shared
 // catalog lock: queries, by every role that may read, through either
-// protocol, with their rows; not other statements, nor queries in a
-// transaction. A query naming a table that does not exist has DuckDB's
-// suggestion of similar names refused under the shared lock, and is
-// prepared again under the exclusive one, which gives the suggestion.
+// protocol, with their rows, and DDL, listings and queries in a transaction
+// too; a query naming a table that does not exist gets DuckDB's suggestion of
+// similar names; and IGLOO_SHARED_PREPARES=false prepares each on its own.
 func TestSharedPrepares(t *testing.T) {
 	t.Parallel()
 	vc := newViewCatalog(t)
@@ -36,7 +35,7 @@ func TestSharedPrepares(t *testing.T) {
 	mustExec(t, admin, "CREATE TABLE lake.public.orders AS SELECT i AS id, i % 3 AS region FROM range(10) r(i)")
 	mustExec(t, admin, "CREATE VIEW lake.public.by_region AS SELECT region, count(*) AS n FROM lake.public.orders GROUP BY region")
 	mustExec(t, admin, "CREATE USER rita WITH PASSWORD 'rita-password' ROLE reader")
-	count := func(lock string) float64 { return testutil.ToFloat64(metrics.prepares.WithLabelValues(lock)) }
+	count := func() float64 { return testutil.ToFloat64(metrics.prepares.WithLabelValues("shared")) }
 
 	for _, c := range []struct {
 		name string
@@ -47,29 +46,23 @@ func TestSharedPrepares(t *testing.T) {
 		{"writer", r.dbt(t)},
 		{"reader", connect(t, r.url("rita", "rita-password"), pgx.QueryExecModeSimpleProtocol)},
 	} {
-		shared, refusals := count("shared"), r.eng.SharedRefusals()
+		shared := count()
 		if got := rawTexts(t, c.conn, "SELECT region, n FROM lake.public.by_region ORDER BY region"); !slices.Equal(got, []string{"0|4", "1|3", "2|3"}) {
 			t.Errorf("%s: the view gave %q", c.name, got)
 		}
 		if got := rawTexts(t, c.conn, "WITH o AS (SELECT * FROM orders) SELECT count(*) FROM o"); !slices.Equal(got, []string{"10"}) {
 			t.Errorf("%s: the CTE gave %q", c.name, got)
 		}
-		if n := count("shared") - shared; n != 2 || r.eng.SharedRefusals() != refusals {
-			t.Errorf("%s: %v queries prepared shared, %d refusals, want 2 and none", c.name, n,
-				r.eng.SharedRefusals()-refusals)
+		if n := count() - shared; n != 2 {
+			t.Errorf("%s: %v queries prepared shared, want 2", c.name, n)
 		}
 	}
 
-	retried, refusals := count("retried"), r.eng.SharedRefusals()
 	if _, err := admin.Exec(ctx, "SELECT * FROM lake.public.ordrs"); err == nil || !strings.Contains(err.Error(), `"orders"`) {
 		t.Errorf("a missing table: %v, want DuckDB's suggestion of orders", err)
 	}
-	if count("retried") != retried+1 || r.eng.SharedRefusals() == refusals {
-		t.Errorf("a missing table: %v retried, %d refusals, want 1 and some", count("retried")-retried,
-			r.eng.SharedRefusals()-refusals)
-	}
 
-	shared := count("shared")
+	shared := count()
 	mustExec(t, admin, "INSERT INTO lake.public.orders VALUES (10, 1)")
 	mustExec(t, admin, "BEGIN")
 	if got := rawTexts(t, admin, "SELECT count(*) FROM lake.public.orders"); !slices.Equal(got, []string{"11"}) {
@@ -77,8 +70,9 @@ func TestSharedPrepares(t *testing.T) {
 	}
 	mustExec(t, admin, "COMMIT")
 	rawTexts(t, admin, "SELECT count(*) FROM information_schema.tables")
-	if count("shared") != shared {
-		t.Errorf("%v statements other than queries outside a transaction prepared shared", count("shared")-shared)
+	mustExec(t, admin, "CREATE TABLE lake.public.regions AS SELECT 1 AS region")
+	if n := count() - shared; n < 4 {
+		t.Errorf("%v statements other than queries outside a transaction prepared shared, want 4 or more", n)
 	}
 
 	// IGLOO_SHARED_PREPARES=false.
@@ -115,66 +109,11 @@ func TestQueriesWithoutPoliciesHoldNoExclusiveLock(t *testing.T) {
 	}
 }
 
-// TestSharedHoldRefusesWalks checks the guard shared prepares rely on, in
-// DuckDB itself: while the catalog lock is held shared, a listing of the
-// catalog's tables, a missing table's suggestion of similar names and a
-// drop fail with the catalog proxy's refusal, rather than walk
-// DuckDB-Iceberg's set of tables or erase from it; a table still loads, and
-// the rest go through as usual once the lock is let go of.
-func TestSharedHoldRefusesWalks(t *testing.T) {
-	t.Parallel()
-	vc := newViewCatalog(t)
-	r := vc.replica(t)
-	mustExec(t, r.admin(t, pgx.QueryExecModeSimpleProtocol), "CREATE SCHEMA IF NOT EXISTS lake.public")
-	mustExec(t, r.admin(t, pgx.QueryExecModeSimpleProtocol), "CREATE TABLE lake.public.kept AS SELECT 1 AS n")
-	ctx := context.Background()
-	conn, err := r.eng.Connect(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer conn.Close() //nolint:errcheck
-	exec := func(q string) error {
-		_, err := conn.ExecContext(ctx, q, nil)
-		return err
-	}
-	walks := []string{
-		"SELECT count(*) FROM duckdb_tables() WHERE database_name = 'lake'",
-		"SELECT * FROM lake.public.kep",
-		"DROP TABLE lake.public.kept",
-	}
-
-	release := r.eng.CatalogShare()
-	refusals := r.eng.SharedRefusals()
-	for _, q := range walks {
-		if err := exec(q); err == nil || !strings.Contains(err.Error(), "423") {
-			t.Errorf("%s under the shared lock: %v, want the proxy's refusal", q, err)
-		}
-	}
-	if err := exec("SELECT n FROM lake.public.kept"); err != nil {
-		t.Errorf("loading a table under the shared lock: %v", err)
-	}
-	if n := r.eng.SharedRefusals() - refusals; n < uint64(len(walks)) {
-		t.Errorf("%d refusals, want at least %d", n, len(walks))
-	}
-	release()
-
-	if err := exec(walks[0]); err != nil {
-		t.Errorf("listing: %v", err)
-	}
-	if err := exec(walks[1]); err == nil || !strings.Contains(err.Error(), `"kept"`) {
-		t.Errorf("a missing table: %v, want DuckDB's suggestion of kept", err)
-	}
-	if err := exec(walks[2]); err != nil {
-		t.Errorf("dropping: %v", err)
-	}
-}
-
 // TestListingSubqueriesHoldTheCatalog checks that a query whose listing is a
-// subquery, SELECT ... FROM (SHOW TABLES ...) or (DESCRIBE ...), holds the
-// catalog lock exclusively, as SHOW and DESCRIBE statements do (see
-// listsCatalog), while other holders take its shared side over and over, as
-// other sessions' binds do: it waits its turn, rather than list alongside
-// them and have the listing refused.
+// subquery, SELECT ... FROM (SHOW TABLES ...) or (DESCRIBE ...), lists the
+// catalog as SHOW and DESCRIBE statements do (see listsCatalog), alongside
+// other holders that take the lock shared over and over, as other sessions'
+// binds do.
 func TestListingSubqueriesHoldTheCatalog(t *testing.T) {
 	t.Parallel()
 	vc := newViewCatalog(t)
@@ -240,7 +179,7 @@ func TestSharedPreparesSurviveConcurrentDDL(t *testing.T) {
 // and read the table a writer swaps dbt-style (rename and drop), a table
 // that does not exist, and tables another engine drops behind the replica's
 // back, which may fail but must not crash it; and the background view sync
-// polls. Queries must have been prepared shared, and some prepared again.
+// polls. Queries must have been prepared shared.
 func sharedPrepareStress(t *testing.T) {
 	const builds = 60
 	vc := newViewCatalog(t)
@@ -359,11 +298,11 @@ func sharedPrepareStress(t *testing.T) {
 	for _, f := range failures {
 		t.Errorf("a query over tables that stay put failed: %s", f)
 	}
-	shared, retried := testutil.ToFloat64(metrics.prepares.WithLabelValues("shared")), testutil.ToFloat64(metrics.prepares.WithLabelValues("retried"))
-	if shared == 0 || retried == 0 {
-		t.Errorf("%v queries prepared shared, %v prepared again; want some of each", shared, retried)
+	shared := testutil.ToFloat64(metrics.prepares.WithLabelValues("shared"))
+	if shared == 0 {
+		t.Error("no query was prepared shared")
 	}
-	t.Logf("%v queries prepared shared, %v prepared again, %d catalog requests refused", shared, retried, r.eng.SharedRefusals())
+	t.Logf("%v statements prepared shared", shared)
 	if mart := martTables(t, connect(t, r.url("rita", "rita-password"), pgx.QueryExecModeSimpleProtocol)); !slices.Equal(mart, []string{"mart"}) {
 		t.Errorf("a listing shows %v, want [mart]", mart)
 	}

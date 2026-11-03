@@ -334,11 +334,11 @@ func (r *resolver) load(names []string) error {
 		}
 		return nil
 	}
-	// Listing tables and views walks the catalog's in-memory set of tables,
-	// which takes the catalog lock exclusively (see
-	// engine.Engine.CatalogLock): held already while a statement is
-	// prepared, but not by the commands that resolve names outside one.
-	defer r.s.holdCatalog(r.sess)()
+	// Listing tables and views looks the catalog's tables up, which takes
+	// the catalog lock shared (see engine.Engine.CatalogLock): held already
+	// while a statement is prepared, but not by the commands that resolve
+	// names outside one.
+	defer r.s.shareCatalog(r.sess)()
 	quoted := make([]string, len(missing))
 	for i, n := range missing {
 		quoted[i] = quoteLiteral(n)
@@ -970,7 +970,7 @@ type tableIndex struct {
 // when a table DuckDB loads by name was not in them, so that the checks of
 // a statement that bound a table made elsewhere see it), and after
 // tableIndexTTL. Building it lists the catalog, holding the catalog lock
-// exclusively (see holdCatalog); using it holds nothing. The map returned is
+// shared (see holdCatalog); using it holds nothing. The map returned is
 // never changed.
 func (s *Server) indexedTables(ctx context.Context, sess *session) (map[string][]object, error) {
 	return s.tables.get(ctx, s, sess, `SELECT database_name, schema_name, table_name, false, '', false
@@ -1000,7 +1000,7 @@ func (x *tableIndex) get(ctx context.Context, s *Server, sess *session, query st
 	if m := fresh(); m != nil {
 		return m, nil
 	}
-	defer s.holdCatalog(sess)()
+	defer s.shareCatalog(sess)()
 	if m := fresh(); m != nil {
 		// Another session built it meanwhile.
 		return m, nil

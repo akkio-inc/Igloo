@@ -94,11 +94,10 @@ type statement struct {
 	// loads are the catalog's tables DuckDB loaded as it prepared the
 	// statement: those it reads (see prepareChecked).
 	loads []catalogproxy.Load
-	// listsCatalog says the statement walks the catalog's in-memory set of
-	// tables or views (information_schema, pg_catalog,
-	// duckdb_tables/views/columns, SHOW, DESCRIBE), so it holds the catalog
-	// lock exclusively while it runs rather than only for its bind (see
-	// catalogRunLock).
+	// listsCatalog says the statement lists the catalog's tables or views
+	// (information_schema, pg_catalog, duckdb_tables/views/columns, SHOW,
+	// DESCRIBE), so it holds the catalog lock shared while it runs rather than
+	// only for its bind (see catalogRunLock).
 	listsCatalog bool
 	// unknown says DuckDB could not tell the type of a column of the result
 	// when it prepared the statement.

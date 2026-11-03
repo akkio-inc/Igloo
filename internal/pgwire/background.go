@@ -490,7 +490,7 @@ func (s *Server) sameInBackground(ctx context.Context, sess *session, st *statem
 		// Only DDL makes temporary objects (see names).
 		return true
 	}
-	release := s.holdCatalog(sess)
+	release := s.shareCatalog(sess)
 	defer release()
 	temp, err := queryStrings(ctx, sess, `SELECT system.main.lower(table_name) FROM system.main.duckdb_tables() WHERE temporary AND NOT internal
 		UNION ALL SELECT system.main.lower(view_name) FROM system.main.duckdb_views() WHERE temporary AND NOT internal`)

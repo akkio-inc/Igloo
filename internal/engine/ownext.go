@@ -55,13 +55,14 @@ var (
 )
 
 const (
-	rbFile    = "igloo/rb.duckdb_extension"
-	rbTestEnv = "IGLOO_TEST_RB_EXTENSION"
+	rbFile      = "igloo/rb.duckdb_extension"
+	rbTestEnv   = "IGLOO_TEST_RB_EXTENSION"
+	icebergFile = "igloo/iceberg.duckdb_extension"
 )
 
 var ownExtensions = []ownExtension{
 	{name: "rb", file: rbFile, sha256: &rbSHA256, testEnv: rbTestEnv},
-	{name: "iceberg", file: "igloo/iceberg.duckdb_extension", sha256: &icebergSHA256, testEnv: "IGLOO_TEST_ICEBERG_EXTENSION", pack: true},
+	{name: "iceberg", file: icebergFile, sha256: &icebergSHA256, testEnv: "IGLOO_TEST_ICEBERG_EXTENSION", pack: true},
 }
 
 // extensionFile is an extension file to load, and the hash it must have

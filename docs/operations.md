@@ -471,57 +471,47 @@ measurements behind these numbers.
 
 A replica serves many sessions at once. Reads and writes of table data run
 fully in parallel — each uses DuckDB's threads, and any number run side by
-side — because none of them holds the catalog while it runs. What is
-serialized on each replica is only the short work that reaches the catalog's
-own structure, so that a table is never listed or resolved while it is being
-created, renamed or dropped there:
+side — because none of them holds the catalog while it runs. Igloo builds
+DuckDB's Iceberg extension with patches that keep its in-memory set of the
+catalog's tables safe while sessions look tables up, list them and change
+them at once (`extensions/iceberg`), and attaches the catalog only with that
+build. What a replica serializes is DDL, so that a change made in steps reads
+as one:
 
-- Preparing a statement other than a query (resolving the tables it names
-  and checking it),
-  listing the catalog (`information_schema`, `pg_catalog`,
-  `duckdb_tables()`/`duckdb_views()`, `SHOW`, `DESCRIBE`, `PRAGMA`), and DDL
-  (creating, renaming, dropping or altering a table, view or schema) take the
-  catalog to themselves while they run.
-- Binding a statement again as it starts to run, which DuckDB does on every
-  run of a statement that reads the catalog, shares it with other sessions
-  doing the same, but not with the steps above. So does preparing a query
-  (one `SELECT`, outside a transaction, that calls no catalog function):
-  binds are safe side by side. A query that would list the catalog as it is
-  prepared, as Igloo's checks for some users do and as DuckDB does to
-  suggest similar names for a table that does not exist (one another engine
-  just dropped, say), is refused that listing (the catalog proxy refuses
-  listings, drops and renames while the catalog is shared), and is
-  prepared again on its own. `igloo_shared_prepares_total` counts both;
-  `IGLOO_SHARED_PREPARES=false` prepares every statement on its own.
-- Planning a statement for workers shares the catalog too: the names it
-  resolves and the columns workers read come from indexes of the catalog's
-  tables and views and of the columns DuckDB binds, which the replica builds
-  again, on its own, when the catalog changes.
+- DDL (creating, renaming, dropping or altering a table, view or schema)
+  takes the catalog to itself while it runs.
+- Every step that looks tables up shares it, side by side with the others:
+  preparing a statement (resolving the tables it names and checking it),
+  binding it again as it starts to run, which DuckDB does on every run of a
+  statement that reads the catalog, listing the catalog
+  (`information_schema`, `pg_catalog`, `duckdb_tables()`/`duckdb_views()`,
+  `SHOW`, `DESCRIBE`, `PRAGMA`), and planning a statement for workers. So a
+  statement bound while `CREATE OR REPLACE TABLE ... AS` swaps a table into
+  place finds it before or after the swap, never missing.
+  `IGLOO_SHARED_PREPARES=false` prepares every statement with the catalog to
+  itself.
 - Everything else — reading table data once the statement is bound, and
   `INSERT`, `UPDATE`, `DELETE` and `MERGE` writing and committing a new
   snapshot of the tables bound — holds nothing.
 
-Steps that need the catalog to themselves and wait together take their turns
-one after another, for up to a tenth of a second, before the binds that came
-meanwhile, so a queue of DDL and listings holds binds up once rather than once
-for each.
+DDL statements that wait together take their turns one after another, for up
+to a tenth of a second, before the steps that came meanwhile, so a queue of
+DDL holds them up once rather than once for each.
 
-Opening a session shares the catalog too, as a bind does: it selects the
-catalog's default schema. A login waits at most 30 seconds for a listing or
-DDL that has the catalog to itself, and then fails with SQLSTATE `57P03`,
-saying how long the catalog has been held, rather than waiting with it.
+Opening a session shares the catalog too: it selects the catalog's default
+schema. A login waits at most 30 seconds for DDL that has the catalog to
+itself, and then fails with SQLSTATE `57P03`, saying how long the catalog has
+been held, rather than waiting with it.
 
 `igloo.query_history` records how long each statement waited for the
 catalog as `catalog_wait_ms`, and a statement that has it to itself for a
 second or more is logged when it lets go (`held the catalog lock
 exclusively`), with its session's backend pid and how long it held it.
 
-These serialized steps are brief (preparing or binding a statement, a
-listing, most DDL), and they do not wait for data queries to finish, nor data
-queries for them beyond their bind. So a `dbt` run swapping tables and a BI
-tool browsing schemas take turns with each other and with other sessions'
-statement preparation, for a moment each, while long reads and writes run
-alongside them undisturbed. `CREATE [OR REPLACE] TABLE ... AS` of a catalog
+DDL is brief, and it does not wait for data queries to finish, nor data
+queries for it beyond their bind. So a `dbt` run swapping tables takes the
+catalog for a moment at each swap, while a BI tool browsing schemas,
+dashboards' statements and long reads and writes run alongside it. `CREATE [OR REPLACE] TABLE ... AS` of a catalog
 table, `PARTITIONED BY (...)` before `AS` included, runs in steps for that
 reason: it creates the new table, empty, under a temporary name (with its
 partitioning), fills it with an `INSERT`, which holds nothing, and renames
@@ -531,7 +521,7 @@ block it runs so too, outside the block. `CREATE [OR REPLACE] TEMP TABLE ...
 AS`, as dbt makes one for each incremental model, runs in the same steps.
 `EXECUTE` of a query or a change of rows prepared in SQL holds what the
 statement would, nothing past its bind, and a materialized view's or a
-dynamic table's refresh takes the catalog only to plan and to change it.
+dynamic table's refresh takes the catalog to itself only to change it.
 Other DDL holds the catalog for its whole run, as do `COPY INTO` and
 `CREATE TABLE ... AS` with parameters.
 
@@ -936,8 +926,8 @@ every statement of a user without the reader role. Changes made through
 this replica, and through its Iceberg REST endpoint, apply at once, and
 forget only the listings of the namespaces they change; commits to existing
 tables forget none. A listing in use is asked for again in the background
-before it expires, so walking the catalog, which holds the catalog lock
-alone, never waits for the catalog for each namespace. A table
+before it expires, so a walk of the catalog never waits for the catalog
+for each namespace. A table
 another replica or engine creates or drops is found at once by a query that
 names it, since DuckDB looks up a name its listing lacks; listings
 (`SHOW TABLES`, `information_schema`) show it within 10 seconds.
@@ -1569,7 +1559,7 @@ and the catalog runs its database migrations before it serves. Read
 | SQLSTATE `55P03`, `another statement is generating data with dbgen or dsdgen` | DuckDB's data generators keep their state in the process, and two at once crash it: one statement of a process may call them at a time, and only by `CALL` or in a `SELECT`, not through a macro, view or prepared statement (SQLSTATE `0A000`). Run them in turn. |
 | SQLSTATE `53300` | The replica is at `IGLOO_MAX_CONNECTIONS`. Use a connection pool, raise the limit, or add replicas. |
 | SQLSTATE `58000`, `cannot check this statement: the session's user could not be read from the metadata database for 2m0s` | The replica has not reached the metadata database (`IGLOO_METADATA_DATABASE_URL`) for longer than `IGLOO_ACCESS_MAX_STALENESS`, so it cannot tell whether the user, their grants or the policies changed. Statements run again once it can; check the database and the network to it. |
-| SQLSTATE `57P03`, `cannot open a session: waited 30s for the catalog lock, which a statement listing or changing the catalog has held for ...` | A listing or DDL has had the catalog to itself for that long ([concurrency on a replica](#concurrency-on-a-replica)); logins wait for it no longer. Try again; if it lasts, find the statement among those running in the console and cancel it. |
+| SQLSTATE `57P03`, `cannot open a session: waited 30s for the catalog lock, which a statement listing or changing the catalog has held for ...` | DDL has had the catalog to itself for that long ([concurrency on a replica](#concurrency-on-a-replica)); logins wait for it no longer. Try again; if it lasts, find the statement among those running in the console and cancel it. |
 | Log says `crashed outside Go code, in DuckDB or an extension; exiting`, and the replica restarts | DuckDB crashed on one of its own threads. Igloo exits with status 2 so that Docker or Kubernetes restarts it, rather than keep a session that will never finish; the goroutine dump that follows in the log shows the statements that were running. |
 | Log says `igloo: a C++ exception escaped DuckDB or an extension (...); exiting`, and the replica or worker restarts with status 134 | An exception nothing caught reached C++'s terminate, often while DuckDB cleaned up after running out of memory (the type in parentheses, mangled, says which: `N6duckdb20OutOfMemoryExceptionE`). Igloo exits at once rather than abort, which left workers hung; look at the memory warnings before it, and lower the statements' memory or raise the limit. |
 | Log says `...; parking its statement's thread, whose session ends`, then `a C++ exception escaped DuckDB on a statement's thread, where nothing could catch it` | The same, in a call a session's statement made into DuckDB to bind, run or drop its plan, in either of the replica's DuckDBs. That statement fails and its session ends: a SQL client's connection closes, and a console or Flight SQL request fails with SQLSTATE `XX000`; the thread and its DuckDB connection wait for good, and the server goes on. Past 64 such threads it exits as above. Igloo's own work outside sessions still exits. Look at the memory warnings before it, as above. |
