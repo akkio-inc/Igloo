@@ -327,7 +327,9 @@ func (h *harness) extensionLoads() []string {
 	if len(h.extensions) == 0 {
 		return nil
 	}
-	packOnce.Do(func() { packErr = engine.InstallExtensions(context.Background(), os.Getenv("IGLOO_TEST_EXTENSION_DIR")) })
+	packOnce.Do(func() {
+		packErr = engine.InstallExtensions(context.Background(), os.Getenv("IGLOO_TEST_EXTENSION_DIR"))
+	})
 	if packErr != nil {
 		h.t.Fatalf("installing the extension pack: %v", packErr)
 	}
