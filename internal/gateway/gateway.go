@@ -397,20 +397,31 @@ func (g *Gateway) start(w *wake) {
 }
 
 // waitReady polls Igloo's SQL port until it accepts a connection. Igloo
-// opens it only once it can serve queries.
+// opens it only once it can serve queries. A client waits for the poll that
+// sees it open, so it polls often: a refused connection costs a round trip
+// on the private network. A machine still booting answers nothing, and a
+// connection to it waits out readyDial before the next try.
 func (g *Gateway) waitReady(ctx context.Context) error {
+	dialer := net.Dialer{Timeout: readyDial}
 	for {
-		conn, err := g.dialer.DialContext(ctx, "tcp", g.opts.Backend)
+		conn, err := dialer.DialContext(ctx, "tcp", g.opts.Backend)
 		if err == nil {
 			return conn.Close()
 		}
 		select {
 		case <-ctx.Done():
 			return fmt.Errorf("igloo did not accept connections: %w", err)
-		case <-time.After(500 * time.Millisecond):
+		case <-time.After(readyPoll):
 		}
 	}
 }
+
+// readyPoll is how often waitReady tries Igloo's port, and readyDial how
+// long a try waits for an answer.
+const (
+	readyPoll = 100 * time.Millisecond
+	readyDial = 500 * time.Millisecond
+)
 
 // learnSchedule asks Igloo, when the gateway starts, when scheduled work
 // is next due. If Igloo cannot be asked, it is presumably stopped, and the
