@@ -41,8 +41,8 @@ against a synthetic ad-impressions schema:
 IGLOO_DSN names the Igloo to connect to, as for run.py. Statements carry a
 comment naming the run and the class, `/* mixed RUN CLASS NAME */`, the same
 text each time a dashboard repeats; after the run, queueing time comes from
-`igloo.query_history` (`queued_ms`), and the share of statements that ran on
-workers too.
+`igloo.query_history` (`queued_ms`), and so do the waits for the catalog
+lock (`catalog_wait_ms`) and the share of statements that ran on workers.
 
 **Cost.** The coordinator runs for the whole window: `--coordinator`
 (an instance type in pricing.toml) or `--coordinator-price`, per hour. With
@@ -276,22 +276,28 @@ def summarize(records: list[dict], t0: float, t1: float) -> dict:
 
 def history_summary(rows: list[tuple]) -> dict:
     """Per class and per statement name, from igloo.query_history rows
-    (class, name, queued_ms, duration_ms, workers): queueing percentiles in
-    seconds, how many ran on workers, and busy worker-seconds."""
+    (class, name, queued_ms, duration_ms, workers, catalog_wait_ms):
+    percentiles of queueing and of waiting for the catalog lock in seconds,
+    how many ran on workers, and busy worker-seconds."""
     by: dict[str, list[tuple]] = {}
-    for cls, name, queued, duration, workers in rows:
-        x = (queued or 0, duration or 0, workers or 0)
+    for cls, name, queued, duration, workers, catalog in rows:
+        x = (queued or 0, duration or 0, workers or 0, catalog or 0)
         by.setdefault(cls, []).append(x)
         by.setdefault(f"{cls}.{name}", []).append(x)
     out = {}
     for key, rs in sorted(by.items()):
         q = [x[0] / 1000 for x in rs]
+        c = [x[3] / 1000 for x in rs]
         out[key] = {
             "statements": len(rs),
             "queued_p50": percentile(q, 50),
             "queued_p95": percentile(q, 95),
             "queued_p99": percentile(q, 99),
             "queued_max": max(q),
+            "catalog_wait_p50": percentile(c, 50),
+            "catalog_wait_p95": percentile(c, 95),
+            "catalog_wait_p99": percentile(c, 99),
+            "catalog_wait_max": max(c),
             "on_workers": sum(1 for x in rs if x[2] > 0),
             "worker_busy_seconds": sum(x[1] / 1000 * x[2] for x in rs),
         }
@@ -548,7 +554,7 @@ def run(args, connect, sampler: WorkerSampler | None = None) -> dict:
 
 
 def collect_history(conn, run_id: str, t0: float, t1: float, wait: float = 15.0) -> list[tuple]:
-    """(class, name, queued_ms, duration_ms, workers) of the run's statements
+    """(class, name, queued_ms, duration_ms, workers, catalog_wait_ms) of the run's statements
     that started in the window [t0, t1) (Unix seconds), from the query
     history, which is written in the background."""
     prefix = f"/* mixed {run_id} "
@@ -558,7 +564,7 @@ def collect_history(conn, run_id: str, t0: float, t1: float, wait: float = 15.0)
         last = -1
         while time.time() < deadline:
             cur.execute(
-                "SELECT split_part(query_text, ' ', 4), split_part(query_text, ' ', 5), queued_ms, duration_ms, workers "
+                "SELECT split_part(query_text, ' ', 4), split_part(query_text, ' ', 5), queued_ms, duration_ms, workers, catalog_wait_ms "
                 "FROM igloo.query_history "
                 "WHERE starts_with(query_text, %s) AND epoch(start_time) >= %s AND epoch(start_time) < %s",
                 (prefix, t0, t1),
