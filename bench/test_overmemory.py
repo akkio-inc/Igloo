@@ -24,6 +24,25 @@ class FingerprintTest(unittest.TestCase):
         self.assertNotEqual(overmemory.fingerprint([(1,), (1,)]), overmemory.fingerprint([(1,)]))
 
 
+class TimedTest(unittest.TestCase):
+    def test_a_write_returns_no_rows_and_no_error(self):
+        class Cursor:
+            description = None
+
+            def fetchall(self):
+                raise AssertionError("the last operation didn't produce records")
+
+        class Conn:
+            def execute(self, sql):
+                return Cursor()
+
+            def cancel_safe(self):
+                pass
+
+        rows, _, err = overmemory.timed(Conn(), "CREATE TABLE t AS SELECT 1", 60)
+        self.assertEqual((rows, err), ([], None))
+
+
 class ReportTest(unittest.TestCase):
     def test_lists_mismatches_first(self):
         base = {"suite": "tpcds", "scale": 100, "mode": "on", "label": "on16", "memory_limit": "8.0 GiB", "seconds": 1.0,

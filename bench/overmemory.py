@@ -265,7 +265,8 @@ def timed(conn, sql: str, timeout: float):
     timer.start()
     t = time.perf_counter()
     try:
-        rows, err = conn.execute(sql).fetchall(), None
+        cur = conn.execute(sql)
+        rows, err = (cur.fetchall() if cur.description else []), None   # a write returns no rows
     except Exception as e:
         rows, err = None, str(e).strip().splitlines()[0][:300] if str(e).strip() else type(e).__name__
     finally:
