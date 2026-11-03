@@ -38,13 +38,7 @@ rows one machine returns.
 
 A report that loses a machine with no warning still finishes, with the same
 rows: the statement runs its parts again without that worker. A graceful
-shutdown, such as a Spot notice, costs nothing measurable. Here one of 16
-workers stops about 40 s into a report, at a tenth of the data:
-
-| How the worker stopped | Undisturbed | With it stopped |
-|---|---|---|
-| Powered off, with no warning | 116.6 to 141.1&nbsp;s | 227.9&nbsp;s |
-| Shut down gracefully | 141.1&nbsp;s | 140.8&nbsp;s |
+shutdown, such as a Spot notice, costs nothing measurable.
 
 The workers were `m7gd.2xlarge` (8 vCPUs) and the coordinator an `m7gd.4xlarge`
 (16 vCPUs), on demand in us-east-1. Cost is those machines at list price, $7.69
