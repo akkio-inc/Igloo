@@ -74,7 +74,14 @@ func (s *Stmt) QueryStreamContext(ctx context.Context, nargs []driver.NamedValue
 }
 
 // executeBoundStreaming is executeBound with a streaming pending result.
-func (s *Stmt) executeBoundStreaming(ctx context.Context) (*mapping.Result, error) {
+func (s *Stmt) executeBoundStreaming(ctx context.Context) (res *mapping.Result, err error) {
+	s.conn.guard(func() { res, err = s.executeBoundStreamingGuarded(ctx) })
+	return res, err
+}
+
+// executeBoundStreamingGuarded is executeBoundStreaming within the
+// connection's call guard.
+func (s *Stmt) executeBoundStreamingGuarded(ctx context.Context) (*mapping.Result, error) {
 	var pendingRes mapping.PendingResult
 	release := s.conn.holdBind()
 	pendingState := mapping.PendingPreparedStreaming(*s.preparedStmt, &pendingRes)

@@ -44,6 +44,7 @@ import (
 	"github.com/akkio-inc/igloo/internal/deletefiles"
 	"github.com/akkio-inc/igloo/internal/distributed"
 	"github.com/akkio-inc/igloo/internal/engine"
+	"github.com/akkio-inc/igloo/internal/engine/terminate"
 	"github.com/akkio-inc/igloo/internal/erasure"
 	"github.com/akkio-inc/igloo/internal/federation"
 	"github.com/akkio-inc/igloo/internal/iddomain"
@@ -910,6 +911,8 @@ type session struct {
 	pid, secret int32
 	added       time.Time
 	conn        *duckdb.Conn
+	// left is set once the session has left the server (see leave).
+	left atomic.Bool
 	// memo keeps what the checks of the statement being prepared would
 	// otherwise ask DuckDB more than once; nil outside prepareChecked.
 	memo *checkMemo
@@ -1225,6 +1228,14 @@ func (s *Server) openSession(ctx context.Context) (context.Context, error) {
 		}
 		return s.shareCatalog(sess)
 	})
+	// A C++ exception that escapes DuckDB in one of this connection's calls
+	// that bind, run or drop a plan, which nothing can catch, ends this
+	// session rather than the process (see parked): the iceberg extension's
+	// scan state threw Out of Memory out of its destructor in the optimizer of
+	// a statement bound again at the replica's memory limit, and the process
+	// ended with every session's statement.
+	ended := func(what string) { s.parked(ctx, sess, what) }
+	conn.SetCallGuard(func(call func()) { terminate.Statement(ended, call) })
 	for _, stmt := range sessionCatalogSetup(sess.user.Name, sess.user.Role == auth.RoleAdmin, s.version, s.engine.BitmapsLoaded()) {
 		if _, err := conn.ExecContext(ctx, stmt, nil); err != nil {
 			s.sessions.remove(sess)
@@ -1241,9 +1252,7 @@ func (s *Server) closeSession(ctx context.Context) error {
 	if sess == nil || sess.conn == nil {
 		return nil
 	}
-	s.sessions.remove(sess)
-	s.releaseConn()
-	s.metrics.sessionClosed(string(sess.currentUser().Role))
+	s.leave(sess)
 
 	sess.closeCursors(ctx, true)
 	sess.dropModelResults(s.modelRuntime)
@@ -1253,6 +1262,19 @@ func (s *Server) closeSession(ctx context.Context) error {
 	}
 	errs = append(errs, sess.closeBackgroundConn())
 	return errors.Join(append(errs, sess.wl.meter.Close())...)
+}
+
+// leave takes sess out of the server's sessions and gives back its
+// connection slot, once: when its client's connection closes, or when one of
+// its calls into DuckDB parked its thread (see parked), after which its
+// connection's close may never be handled.
+func (s *Server) leave(sess *session) {
+	if !sess.left.CompareAndSwap(false, true) {
+		return
+	}
+	s.sessions.remove(sess)
+	s.releaseConn()
+	s.metrics.sessionClosed(string(sess.currentUser().Role))
 }
 
 // release closes the DuckDB statement behind ps.
@@ -2424,10 +2446,12 @@ func (s *Server) holdCatalog(sess *session) func() {
 	return s.catalogHold(sess, catalogExclusive)
 }
 
-// parked ends the session whose statement's thread parked, as what escaped
-// DuckDB there says: it lets go of the session's hold on the catalog lock and of
-// what its statement was admitted with, which the thread, waiting for good,
-// would keep from every other session, and closes the client's connection. The
+// parked ends the session one of whose calls into DuckDB parked its thread
+// (see openSession's call guard), as what escaped DuckDB there says: it lets
+// go of the session's hold on the catalog lock and of what its statement was
+// admitted with, which the thread, waiting for good, would keep from every
+// other session, takes the session out of the server's, so the memory watch
+// does not wait on its statement, and closes the client's connection. The
 // thread keeps its DuckDB connection, and what DuckDB held for its statement.
 func (s *Server) parked(ctx context.Context, sess *session, what string) {
 	sess.mu.Lock()
@@ -2437,6 +2461,7 @@ func (s *Server) parked(ctx context.Context, sess *session, what string) {
 	s.log.Error("a C++ exception escaped DuckDB on a statement's thread, where nothing could catch it; the statement and its session end, "+
 		"and its thread and DuckDB connection wait for good", "pid", pid, "user", user, "statement_sha256", hex.EncodeToString(sum[:8]), "what", what)
 	s.unlockCatalog(sess)
+	s.leave(sess)
 	if done := sess.wl.admitted; done != nil {
 		done()
 	}

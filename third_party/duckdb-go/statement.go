@@ -77,7 +77,7 @@ func (s *Stmt) Close() error {
 	}
 
 	s.closed = true
-	mapping.DestroyPrepare(s.preparedStmt)
+	s.conn.guard(func() { mapping.DestroyPrepare(s.preparedStmt) })
 	return nil
 }
 
@@ -581,7 +581,7 @@ func (s *Stmt) ExecContext(ctx context.Context, nargs []driver.NamedValue) (driv
 	}); err != nil {
 		return nil, err
 	}
-	defer mapping.DestroyResult(res)
+	defer s.conn.guard(func() { mapping.DestroyResult(res) })
 
 	ra := int64(mapping.RowsChanged(res))
 	return &result{ra}, nil
@@ -679,7 +679,7 @@ func (s *Stmt) ExecBound(ctx context.Context) (driver.Result, error) {
 	}); err != nil {
 		return nil, err
 	}
-	defer mapping.DestroyResult(res)
+	defer s.conn.guard(func() { mapping.DestroyResult(res) })
 
 	ra := int64(mapping.RowsChanged(res))
 	return &result{ra}, nil
@@ -775,7 +775,13 @@ func interruptRoutine(mainDoneCh, bgDoneCh *chan struct{}, ctx context.Context, 
 	close(*bgDoneCh)
 }
 
-func (s *Stmt) executeBound(ctx context.Context) (*mapping.Result, error) {
+func (s *Stmt) executeBound(ctx context.Context) (res *mapping.Result, err error) {
+	s.conn.guard(func() { res, err = s.executeBoundGuarded(ctx) })
+	return res, err
+}
+
+// executeBoundGuarded is executeBound within the connection's call guard.
+func (s *Stmt) executeBoundGuarded(ctx context.Context) (*mapping.Result, error) {
 	var pendingRes mapping.PendingResult
 	// Phase 1: create pending result. DuckDB binds the statement again here
 	// when it must (see SetBindHold).
