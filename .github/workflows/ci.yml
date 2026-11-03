@@ -29,8 +29,44 @@ env:
   SHELLCHECK_IMAGE: koalaman/shellcheck:v0.11.0@sha256:61862eba1fcf09a484ebcc6feea46f1782532571a34ed51fedf90dd25f925a8d
 
 jobs:
+  # Igloo's build of DuckDB's Iceberg extension (extensions/iceberg), which
+  # the tests and the image use: the Dockerfile's iceberg stage, in a job of
+  # its own because built cold it takes most of an hour. Its cache holds it
+  # until the build script or the patches change.
+  iceberg:
+    name: Iceberg extension (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Build
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          target: iceberg-out
+          platforms: linux/${{ matrix.arch }}
+          outputs: type=local,dest=${{ runner.temp }}/iceberg
+          provenance: false
+          sbom: false
+          cache-from: type=gha,scope=iceberg-${{ matrix.arch }}
+          cache-to: type=gha,scope=iceberg-${{ matrix.arch }},mode=max
+
   go:
     name: Go (${{ matrix.part }})
+    needs: iceberg
     runs-on: ubuntu-latest
     timeout-minutes: 30
     strategy:
@@ -89,6 +125,22 @@ jobs:
           extensions/rb/build.sh "$RUNNER_TEMP/rb"
           echo "IGLOO_TEST_RB_EXTENSION=$RUNNER_TEMP/rb/rb.duckdb_extension" >>"$GITHUB_ENV"
 
+      # The iceberg extension the iceberg job built, from its cache.
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Fetch the iceberg extension
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          target: iceberg-out
+          outputs: type=local,dest=${{ runner.temp }}/iceberg
+          provenance: false
+          sbom: false
+          cache-from: type=gha,scope=iceberg-amd64
+
+      - name: Use the iceberg extension
+        run: echo "IGLOO_TEST_ICEBERG_EXTENSION=$RUNNER_TEMP/iceberg/iceberg.duckdb_extension" >>"$GITHUB_ENV"
+
       # The spatial and sketch tests load the extensions the image ships.
       - name: Install DuckDB extensions
         run: |
@@ -142,6 +194,7 @@ jobs:
 
   image:
     name: Image (${{ matrix.arch }})
+    needs: iceberg
     # Each architecture builds on its own native runner: cross-compiling cgo
     # and DuckDB under QEMU is slow and fragile.
     runs-on: ${{ matrix.runner }}
@@ -174,7 +227,9 @@ jobs:
           push: false
           provenance: false
           sbom: false
-          cache-from: type=gha,scope=image-${{ matrix.arch }}
+          cache-from: |
+            type=gha,scope=image-${{ matrix.arch }}
+            type=gha,scope=iceberg-${{ matrix.arch }}
           cache-to: type=gha,scope=image-${{ matrix.arch }},mode=max
 
       - name: Check that the binary reports its version
@@ -188,7 +243,7 @@ jobs:
 
       # In the runtime image, not only the build stage: its libraries, and
       # the file the binary's hash names.
-      - name: Check that the binary loads its rb extension
+      - name: Check that the binary loads its own extensions
         run: docker run --rm igloo:ci check-extensions
 
   e2e:

@@ -1,5 +1,24 @@
 # syntax=docker/dockerfile:1
 
+# DuckDB's Iceberg extension with Igloo's patches (extensions/iceberg). It has
+# a stage of its own, which only its build script and patches reach, so that
+# changing the rest of Igloo does not build it again; the cache keeps vcpkg's
+# packages and the compiler's work between builds of it.
+FROM debian:bookworm AS iceberg
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      build-essential cmake ninja-build pkg-config autoconf automake autoconf-archive libtool \
+      curl zip unzip tar git rsync python3 perl ca-certificates linux-libc-dev ccache && \
+    rm -rf /var/lib/apt/lists/*
+COPY extensions/iceberg/build.sh /src/extensions/iceberg/
+COPY extensions/iceberg/patches /src/extensions/iceberg/patches
+RUN --mount=type=cache,target=/root/.cache/igloo \
+    /src/extensions/iceberg/build.sh /out/iceberg
+
+# The extension alone, for the tests: docker build --target iceberg-out
+# --output type=local,dest=DIR writes it to DIR.
+FROM scratch AS iceberg-out
+COPY --from=iceberg /out/iceberg /
+
 FROM golang:1.27-bookworm AS build
 WORKDIR /src
 
@@ -14,20 +33,22 @@ COPY . .
 # would otherwise embed, and write out and load at runtime, only to report
 # its version to Snowflake (Igloo turns it off at runtime too).
 # The rb extension (extensions/rb) is built first, in the same step as the
-# binary, which carries the file's SHA-256 and refuses any other file: the
-# two cannot come from different builds.
+# binary, which carries its file's SHA-256, and the iceberg extension's, and
+# refuses any other file: the binary and the files cannot come from
+# different builds.
+COPY --from=iceberg /out/iceberg /out/iceberg
 RUN --mount=type=cache,target=/go/pkg/mod --mount=type=cache,target=/root/.cache/go-build \
     --mount=type=cache,target=/root/.cache/igloo \
     extensions/rb/build.sh /out/rb && \
     go build -tags duckdb_arrow,minicore_disabled -trimpath \
-      -ldflags="-s -w -X main.version=${VERSION} -X github.com/akkio-inc/igloo/internal/engine.rbSHA256=$(cat /out/rb/rb.duckdb_extension.sha256)" \
+      -ldflags="-s -w -X main.version=${VERSION} -X github.com/akkio-inc/igloo/internal/engine.rbSHA256=$(cat /out/rb/rb.duckdb_extension.sha256) -X github.com/akkio-inc/igloo/internal/engine.icebergSHA256=$(cat /out/iceberg/iceberg.duckdb_extension.sha256)" \
       -o /out/igloo ./cmd/igloo
 
 # Bake DuckDB's extensions into the image so the server never downloads code
-# at runtime, then check that this binary loads its rb extension.
+# at runtime, then check that this binary loads its own.
 RUN /out/igloo install-extensions /out/extensions && \
     mkdir -p /out/extensions/igloo /out/tmp /out/cache /out/empty && \
-    cp /out/rb/rb.duckdb_extension /out/extensions/igloo/ && \
+    cp /out/rb/rb.duckdb_extension /out/iceberg/iceberg.duckdb_extension /out/extensions/igloo/ && \
     /out/igloo check-extensions /out/extensions
 
 # distroless/cc has the glibc DuckDB links against, CA certificates for

@@ -1,0 +1,391 @@
+Make the catalog's sets of tables and schemas safe under concurrency.
+
+One set of tables per schema is shared by every connection to the DuckDB.
+Binding a statement replaces a table's entry in it under the set's lock; a
+listing walks it under the lock and reads what it found afterwards; and a
+rename's or drop's commit erased from it without the lock. So an erase beside
+a bind or a walk corrupted the set, and a bind between a listing's walks freed
+entries the listing was still reading (the transaction kept only the latest
+entry of each table): the process segfaulted, or a later listing looped
+forever. And the set's lock was held over each request to the catalog: a
+bind loaded its table, and a listing asked for the schema's tables, under
+it, so the binds of one schema's tables queued behind each other's round
+trips. Now:
+
+- Erases (a drop's or rename's commit) find and erase under the set's lock.
+- A transaction keeps every entry it looked up or listed alive until it ends
+  (IcebergTransaction::KeepAlive, HoldTable), so an entry lives as long as
+  anything holds it, whatever the set does meanwhile.
+- A listing walks a copy of the set taken under the lock.
+- A bind loads its table into an entry of its own without the lock and then
+  puts it in the set under it; a listing asks the catalog for the schema's
+  tables without it and merges them under it, leaving out a name the set
+  erased since it asked, which the catalog may no longer have.
+- A transaction's requests to the catalog, which share its connection's one
+  HTTP client, run one at a time (IcebergTransaction::catalog_requests), and
+  its hold on its tables is under its lock: a listing's scans of several
+  schemas run on DuckDB's threads at once.
+- A rename the catalog committed replaces an entry the set already has under
+  the new name (one a listing of the catalog put there after the commit)
+  rather than fail a rename that happened: the catalog, which refuses a
+  rename onto an existing table, decides.
+- The schema set takes its lock for every access, and keeps a removed schema,
+  whose table set others may still be reading, until the catalog is
+  detached; iceberg_to_ducklake walks copies of both sets.
+
+diff --git a/src/catalog/rest/catalog_entry/schema/iceberg_schema_entry.cpp b/src/catalog/rest/catalog_entry/schema/iceberg_schema_entry.cpp
+index b40f1b613..18a8f83aa 100644
+--- a/src/catalog/rest/catalog_entry/schema/iceberg_schema_entry.cpp
++++ b/src/catalog/rest/catalog_entry/schema/iceberg_schema_entry.cpp
+@@ -107,9 +107,21 @@ void IcebergSchemaEntry::DropEntry(ClientContext &context, DropInfo &info) {
+ 
+ void IcebergSchemaEntry::DropEntry(ClientContext &context, DropInfo &info, bool delete_entry) {
+ 	auto table_name = info.name;
+-	// find if info has a table name, if so look for it in
+-	auto table_info_it = tables.GetEntries().find(table_name);
+-	if (table_info_it == tables.GetEntries().end()) {
++	//! Igloo: find, and erase, under the set's lock, which binds and listings take: an erase without
++	//! it, beside them, corrupted the set. Every transaction that looked the entry up or listed it
++	//! keeps it alive (IcebergTransaction::KeepAlive), so the erase only drops the set's reference.
++	shared_ptr<IcebergTableInformation> table_info;
++	{
++		lock_guard<mutex> guard(tables.GetEntryLock());
++		auto table_info_it = tables.GetEntriesMutable().find(table_name);
++		if (table_info_it != tables.GetEntriesMutable().end()) {
++			table_info = table_info_it->second;
++			if (delete_entry && !info.cascade) {
++				tables.EraseEntry(guard, table_info_it);
++			}
++		}
++	}
++	if (!table_info) {
+ 		if (info.if_not_found == OnEntryNotFound::RETURN_NULL) {
+ 			return;
+ 		}
+@@ -119,12 +131,11 @@ void IcebergSchemaEntry::DropEntry(ClientContext &context, DropInfo &info, bool
+ 		throw NotImplementedException("DROP TABLE <table_name> CASCADE is not supported for Iceberg tables currently");
+ 	}
+ 	if (delete_entry) {
+-		// Remove the entry from the catalog
+-		tables.GetEntriesMutable().erase(table_name);
++		// Removed from the catalog above
+ 	} else {
+ 		// Add the table to the transaction's deleted_tables
+ 		auto &transaction = IcebergTransaction::Get(context, catalog).Cast<IcebergTransaction>();
+-		auto &table_info = table_info_it->second;
++		transaction.KeepAlive(table_info);
+ 		auto &table = transaction.DeleteTable(*table_info);
+ 		//! FIXME: what?
+ 		// must init schema versions after copy. Schema versions have a pointer to IcebergTableInformation
+diff --git a/src/catalog/rest/iceberg_schema_set.cpp b/src/catalog/rest/iceberg_schema_set.cpp
+index 2fc117279..8956ced03 100644
+--- a/src/catalog/rest/iceberg_schema_set.cpp
++++ b/src/catalog/rest/iceberg_schema_set.cpp
+@@ -89,15 +89,31 @@ void IcebergSchemaSet::Scan(ClientContext &context, const std::function<void(Cat
+ }
+ 
+ void IcebergSchemaSet::AddEntry(const string &name, unique_ptr<IcebergSchemaEntry> entry) {
++	lock_guard<mutex> l(entry_lock);
+ 	entries.insert(make_pair(name, std::move(entry)));
+ }
+ 
+ void IcebergSchemaSet::RemoveEntry(const string &name) {
+ 	lock_guard<mutex> l(entry_lock);
+-	entries.erase(name);
++	auto entry_it = entries.find(name);
++	if (entry_it == entries.end()) {
++		return;
++	}
++	removed.push_back(std::move(entry_it->second));
++	entries.erase(entry_it);
++}
++
++vector<optional_ptr<CatalogEntry>> IcebergSchemaSet::GetEntriesSnapshot() {
++	lock_guard<mutex> l(entry_lock);
++	vector<optional_ptr<CatalogEntry>> result;
++	for (auto &entry : entries) {
++		result.push_back(entry.second.get());
++	}
++	return result;
+ }
+ 
+ CatalogEntry &IcebergSchemaSet::GetEntry(const string &name) {
++	lock_guard<mutex> l(entry_lock);
+ 	auto entry_it = entries.find(name);
+ 	if (entry_it == entries.end()) {
+ 		throw CatalogException("Schema '%s' does not exist", name);
+diff --git a/src/catalog/rest/iceberg_table_set.cpp b/src/catalog/rest/iceberg_table_set.cpp
+index 45974f877..5992c49cc 100644
+--- a/src/catalog/rest/iceberg_table_set.cpp
++++ b/src/catalog/rest/iceberg_table_set.cpp
+@@ -78,16 +78,24 @@ bool IcebergTableSet::FillEntry(ClientContext &context, IcebergTableInformation
+ }
+ 
+ void IcebergTableSet::Scan(ClientContext &context, const std::function<void(CatalogEntry &)> &callback) {
++	//! Igloo: the catalog's list of tables is asked for before taking the lock (see LoadEntries).
++	LoadEntries(context);
+ 	lock_guard<mutex> lock(entry_lock);
+ 	auto &iceberg_transaction = IcebergTransaction::Get(context, catalog);
+-	LoadEntries(context);
+ 	case_insensitive_set_t non_iceberg_tables;
+ 	auto schema_component = IRCPathComponent::NamespaceComponent(schema.namespace_items);
+ 	auto table_namespace = schema_component.encoded;
++	//! Igloo: the entries as they are now, each kept alive by the transaction for as long as it runs,
++	//! as the listing reads them after this returns.
++	vector<shared_ptr<IcebergTableInformation>> listed;
++	listed.reserve(entries.size());
+ 	for (auto &entry : entries) {
+-		auto &table_info = *entry.second;
++		listed.push_back(entry.second);
++	}
++	for (auto &entry_ptr : listed) {
++		auto &table_info = *entry_ptr;
+ 		auto table_key = table_info.GetTableKey();
+-		iceberg_transaction.tables[table_key] = entry.second;
++		iceberg_transaction.HoldTable(table_key, entry_ptr);
+ 
+ 		if (!table_info.schema_versions.empty()) {
+ 			// The table has already been resolved (e.g. via DESCRIBE or a scan), so its full schema -
+@@ -144,16 +152,38 @@ mutex &IcebergTableSet::GetEntryLock() {
+ 	return entry_lock;
+ }
+ 
++void IcebergTableSet::EraseEntry(lock_guard<mutex> &guard,
++                                 case_insensitive_map_t<shared_ptr<IcebergTableInformation>>::iterator it) {
++	erased_at[it->first] = ++erase_count;
++	entries.erase(it);
++}
++
+ void IcebergTableSet::LoadEntries(ClientContext &context) {
+ 	auto &iceberg_transaction = IcebergTransaction::Get(context, catalog);
++	//! Igloo: ask the catalog without the set's lock, which every bind and listing of the schema
++	//! takes, so they do not queue behind the request, and one of the transaction's requests at a time
++	//! (see IcebergTransaction::catalog_requests); then merge under the set's lock. A name the set
++	//! erased since the request was made (a drop or rename committed meanwhile) may be one the catalog
++	//! no longer has, so the list does not put it back.
++	lock_guard<mutex> requests(iceberg_transaction.catalog_requests);
+ 	bool schema_listed =
+ 	    iceberg_transaction.listed_schemas.find(schema.name) != iceberg_transaction.listed_schemas.end();
+ 	if (schema_listed) {
+ 		return;
+ 	}
+ 	auto &ic_catalog = catalog.Cast<IcebergCatalog>();
++	idx_t asked_after;
++	{
++		lock_guard<mutex> l(entry_lock);
++		asked_after = erase_count;
++	}
+ 	auto tables = IRCAPI::GetTables(context, ic_catalog, schema);
++	lock_guard<mutex> l(entry_lock);
+ 	for (auto &table : tables) {
++		auto erased = erased_at.find(table.name);
++		if (erased != erased_at.end() && erased->second > asked_after) {
++			continue;
++		}
+ 		entries.emplace(table.name, make_shared_ptr<IcebergTableInformation>(ic_catalog, schema, table.name));
+ 	}
+ 	iceberg_transaction.listed_schemas.insert(schema.name);
+@@ -298,41 +328,52 @@ IcebergTableInformation &IcebergTableSet::CreateNewEntry(ClientContext &context,
+ }
+ 
+ optional_ptr<CatalogEntry> IcebergTableSet::GetEntry(ClientContext &context, const EntryLookupInfo &lookup) {
+-	lock_guard<mutex> l(entry_lock);
+ 	auto &ic_catalog = catalog.Cast<IcebergCatalog>();
+ 	auto &iceberg_transaction = IcebergTransaction::Get(context, catalog);
+ 	const auto &table_name = lookup.GetEntryName();
+ 	// first check transaction entries
+ 	const auto table_key = IcebergTableInformation::GetTableKey(schema.namespace_items, table_name);
+-	auto latest_state = iceberg_transaction.GetLatestTableState(table_key);
+-
+ 	auto at = lookup.GetAtClause();
+-	if (latest_state) {
+-		if (!latest_state->IsAlive()) {
+-			// If table has been deleted or is missing within the transaction, return null
+-			return nullptr;
++	{
++		lock_guard<mutex> l(entry_lock);
++		auto latest_state = iceberg_transaction.GetLatestTableState(table_key);
++		if (latest_state) {
++			if (!latest_state->IsAlive()) {
++				// If table has been deleted or is missing within the transaction, return null
++				return nullptr;
++			}
++			auto &table_info = latest_state->GetInfo();
++			return table_info.GetSchemaVersion(context, at);
+ 		}
+-		auto &table_info = latest_state->GetInfo();
+-		return table_info.GetSchemaVersion(context, at);
+ 	}
+ 
+-	//! Preserve the old version in case our replacement fails
+-	shared_ptr<IcebergTableInformation> old_version;
+-	auto new_version =
+-	    CreateEntryInternal(l, table_name, IcebergTableInformation(ic_catalog, schema, table_name), old_version);
++	//! Igloo: load the table from the catalog into an entry of this bind's own, without the set's
++	//! lock, which every bind and listing of the schema takes: under it, binds queued behind each
++	//! other's requests to the catalog. The entry then replaces the set's under the lock; a bind
++	//! that loaded the table a moment before keeps the entry it loaded.
++	auto new_version = make_shared_ptr<IcebergTableInformation>(ic_catalog, schema, table_name);
+ 	auto &table_info = *new_version;
+-	if (!FillEntry(context, table_info)) {
+-		if (old_version) {
+-			entries[table_name] = std::move(old_version);
+-		} else {
+-			entries.erase(table_name);
+-		}
++	bool exists;
++	{
++		lock_guard<mutex> requests(iceberg_transaction.catalog_requests);
++		exists = FillEntry(context, table_info);
++	}
++	if (!exists) {
+ 		//! The table doesn't exist in the catalog
+ 		iceberg_transaction.SetLatestTableState(table_key, IcebergTableStatus::MISSING);
+ 		return nullptr;
+ 	}
+ 
+-	iceberg_transaction.tables[table_key] = new_version;
++	lock_guard<mutex> l(entry_lock);
++	shared_ptr<IcebergTableInformation> old_version;
++	auto it = entries.find(table_name);
++	if (it != entries.end()) {
++		old_version = std::move(it->second);
++		it->second = new_version;
++	} else {
++		entries.emplace(table_name, new_version);
++	}
++	iceberg_transaction.HoldTable(table_key, new_version);
+ 	auto ret = table_info.GetSchemaVersion(context, at);
+ 	if (!ret) {
+ 		return nullptr;
+diff --git a/src/catalog/rest/transaction/iceberg_transaction.cpp b/src/catalog/rest/transaction/iceberg_transaction.cpp
+index 4d740dd5a..3f333ac9c 100644
+--- a/src/catalog/rest/transaction/iceberg_transaction.cpp
++++ b/src/catalog/rest/transaction/iceberg_transaction.cpp
+@@ -574,10 +574,11 @@ void IcebergTransaction::DoTableRename(IcebergTransactionRenameUpdate &rename_up
+ 
+ 	lock_guard<mutex> guard(schema.tables.GetEntryLock());
+ 	shared_ptr<IcebergTableInformation> old_version;
++	//! Igloo: the catalog has committed the rename, and refuses one onto a table that exists, so the
++	//! table is now new_name's. An entry the set has under that name already is from a listing of
++	//! the catalog that ran after the commit, before this: replace it, rather than fail a rename
++	//! that happened. Transactions that hold the old entry keep it alive.
+ 	schema.tables.CreateEntryInternal(guard, new_name, std::move(rename_update.new_table), old_version);
+-	if (old_version) {
+-		throw TransactionException("Table %s was already created by a different transaction!", new_name);
+-	}
+ }
+ 
+ void IcebergTransaction::DoTableDeletes(IcebergTransactionDeleteUpdate &delete_update, ClientContext &context) {
+diff --git a/src/function/ducklake/iceberg_to_ducklake.cpp b/src/function/ducklake/iceberg_to_ducklake.cpp
+index c62cda871..81e7e30cc 100644
+--- a/src/function/ducklake/iceberg_to_ducklake.cpp
++++ b/src/function/ducklake/iceberg_to_ducklake.cpp
+@@ -843,13 +843,23 @@ static unique_ptr<FunctionData> IcebergToDuckLakeBind(ClientContext &context, Ta
+ 	}
+ 
+ 	schema_set.LoadEntries(context);
+-	for (auto &it : schema_set.GetEntries()) {
+-		auto &schema_entry = it.second->Cast<IcebergSchemaEntry>();
++	for (auto &schema_ptr : schema_set.GetEntriesSnapshot()) {
++		auto &schema_entry = schema_ptr->Cast<IcebergSchemaEntry>();
+ 		auto &tables = schema_entry.tables;
+ 		tables.LoadEntries(context);
+-		for (auto &it : tables.GetEntriesMutable()) {
+-			auto &table = it.second;
+-			tables.FillEntry(context, *table);
++		//! Igloo: a copy of the set, taken under its lock.
++		vector<shared_ptr<IcebergTableInformation>> table_entries;
++		{
++			lock_guard<mutex> guard(tables.GetEntryLock());
++			for (auto &entry : tables.GetEntriesMutable()) {
++				table_entries.push_back(entry.second);
++			}
++		}
++		for (auto &table : table_entries) {
++			{
++				lock_guard<mutex> guard(tables.GetEntryLock());
++				tables.FillEntry(context, *table);
++			}
+ 			ret->AddTable(*table, context, options);
+ 		}
+ 	}
+diff --git a/src/include/catalog/rest/iceberg_schema_set.hpp b/src/include/catalog/rest/iceberg_schema_set.hpp
+index 2a7643772..c5ab6f9bd 100644
+--- a/src/include/catalog/rest/iceberg_schema_set.hpp
++++ b/src/include/catalog/rest/iceberg_schema_set.hpp
+@@ -21,6 +21,8 @@ public:
+ 	void AddEntry(const string &name, unique_ptr<IcebergSchemaEntry> entry);
+ 	void RemoveEntry(const string &name);
+ 	CatalogEntry &GetEntry(const string &name);
++	//! Igloo: the entries as they are now, taken under the set's lock.
++	vector<optional_ptr<CatalogEntry>> GetEntriesSnapshot();
+ 
+ protected:
+ 	optional_ptr<CatalogEntry> CreateEntryInternal(ClientContext &context, unique_ptr<CatalogEntry> entry);
+@@ -30,6 +32,9 @@ public:
+ 
+ private:
+ 	case_insensitive_map_t<unique_ptr<CatalogEntry>> entries;
++	//! Igloo: the entries RemoveEntry took out of the set. Other connections' bound statements and
++	//! listings refer to them and to their table sets, so they stay until the catalog is detached.
++	vector<unique_ptr<CatalogEntry>> removed;
+ 	mutex entry_lock;
+ };
+ 
+diff --git a/src/include/catalog/rest/iceberg_table_set.hpp b/src/include/catalog/rest/iceberg_table_set.hpp
+index 610c3a782..86ad2c5fb 100644
+--- a/src/include/catalog/rest/iceberg_table_set.hpp
++++ b/src/include/catalog/rest/iceberg_table_set.hpp
+@@ -27,6 +27,8 @@ public:
+ 	const case_insensitive_map_t<shared_ptr<IcebergTableInformation>> &GetEntries();
+ 	case_insensitive_map_t<shared_ptr<IcebergTableInformation>> &GetEntriesMutable();
+ 	mutex &GetEntryLock();
++	//! Igloo: erases the entry it points at, under the lock guard holds (see LoadEntries).
++	void EraseEntry(lock_guard<mutex> &guard, case_insensitive_map_t<shared_ptr<IcebergTableInformation>>::iterator it);
+ 
+ public:
+ 	void LoadEntries(ClientContext &context);
+@@ -41,6 +43,10 @@ public:
+ private:
+ 	case_insensitive_map_t<shared_ptr<IcebergTableInformation>> entries;
+ 	mutex entry_lock;
++	//! Igloo: how many erases the set has had, and the count as of each name's latest, so that a list
++	//! of the catalog's tables asked for before an erase does not put the name back (see LoadEntries).
++	idx_t erase_count = 0;
++	case_insensitive_map_t<idx_t> erased_at;
+ };
+ 
+ } // namespace duckdb
+diff --git a/src/include/catalog/rest/transaction/iceberg_transaction.hpp b/src/include/catalog/rest/transaction/iceberg_transaction.hpp
+index 87f98489f..ddd7eebf3 100644
+--- a/src/include/catalog/rest/transaction/iceberg_transaction.hpp
++++ b/src/include/catalog/rest/transaction/iceberg_transaction.hpp
+@@ -108,6 +108,27 @@ private:
+ public:
+ 	//! Tables referenced by this transaction that have to stay alive for the duration of the transaction.
+ 	case_insensitive_map_t<shared_ptr<IcebergTableInformation>> tables;
++	//! Igloo: every entry of the catalog's table sets this transaction looked up or listed, kept alive
++	//! until it ends. A listing's results and a bound statement refer into the entries, which another
++	//! connection's bind replaces in the set, and a drop or rename erases, meanwhile.
++	unordered_map<IcebergTableInformation *, shared_ptr<IcebergTableInformation>> seen_tables;
++	void KeepAlive(const shared_ptr<IcebergTableInformation> &table) {
++		lock_guard<mutex> guard(lock);
++		if (table) {
++			seen_tables.emplace(table.get(), table);
++		}
++	}
++	//! Igloo: tables[key] = table, kept alive (see KeepAlive), under the transaction's lock: a listing's
++	//! scans of several schemas run on DuckDB's threads at once.
++	void HoldTable(const string &key, const shared_ptr<IcebergTableInformation> &table) {
++		lock_guard<mutex> guard(lock);
++		tables[key] = table;
++		seen_tables.emplace(table.get(), table);
++	}
++	//! Igloo: held over each of the transaction's requests to the catalog, which go through its
++	//! connection's one HTTP client: a listing's scans of several schemas, run on DuckDB's threads at
++	//! once, each asked the catalog for their tables on it at the same time.
++	mutex catalog_requests;
+ 	vector<unique_ptr<IcebergTransactionUpdate>> transaction_updates;
+ 	//! The latest state of a table (either points into 'transaction_updates' or 'tables')
+ 	case_insensitive_map_t<IcebergTransactionTableState> current_table_data;

@@ -2493,6 +2493,35 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
 
 ### Fixed
 
+- Igloo builds DuckDB's Iceberg extension itself (`extensions/iceberg`):
+  DuckDB-Iceberg at the commit DuckDB 1.5.6 ships, with Igloo's patches,
+  loaded as the rb extension is, checked against the SHA-256 the image
+  build recorded. The patches fix two ways the official extension ended
+  the process:
+  - An Iceberg scan torn down after one of its manifest-reading tasks ran
+    out of memory threw that error again from a destructor, and C++ ended
+    the process with every session on it. The statement now fails with the
+    error, and the process goes on.
+  - The extension's in-memory set of a schema's tables, which every
+    connection shares, was erased from without its lock when a drop or
+    rename committed. A bind could also free entries a listing was still
+    reading. Either segfaulted the process or left a later listing looping
+    forever, and Igloo had to serialize listings and DDL against every bind
+    with its catalog lock. The set is now safe on its own. Erases take its
+    lock, an entry lives as long as any transaction holds it, and listings
+    walk a copy. In a stress test of the extension alone (24 connections
+    binding, listing, renaming, dropping and swapping tables dbt's way for
+    10 minutes against a catalog 25 ms away, in two schemas), the official
+    extension segfaulted 3 times in 3 runs, within 3 to 66 s; the patched
+    one ran 50,000 statements with no crash, also under AddressSanitizer.
+  - Binds no longer queue behind each other's requests to the catalog.
+    The extension held the set's lock while it loaded a table or listed a
+    schema, so a schema's binds took turns one round trip each. They now
+    load side by side, up to 18 at once in the stress test, and bind 5.4
+    times as fast.
+  - A rename whose commit had landed no longer fails with "already created
+    by a different transaction" when a listing saw the new name first.
+
 - The coordinator merges workers' sorted rows on several cores and copies
   them into DuckDB a column at a time: rows of a table sorted on workers
   took longer to reach the client than one machine's own sort of them.

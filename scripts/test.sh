@@ -2,8 +2,9 @@
 # Runs the Go tests in a container, with a throwaway PostgreSQL for the
 # tests that need one, a throwaway MySQL that the tests of connections to
 # other databases read alongside it, DuckDB's extensions (kept in the volume
-# igloo-duckdb-extensions) and Igloo's rb extension (igloo-rb-extension) for
-# the tests that use them. Only Docker is required.
+# igloo-duckdb-extensions) and Igloo's own rb and iceberg extensions
+# (igloo-rb-extension, igloo-iceberg-extension) for the tests that use them.
+# Only Docker is required.
 #
 #   scripts/test.sh [go test args...]
 set -euo pipefail
@@ -45,12 +46,17 @@ docker run -d --name "$name-mysql" --network "$name" -e MYSQL_ROOT_PASSWORD=test
 ready "$name-db" docker exec "$name-db" pg_isready -U postgres
 
 mounts=(-v "$root":/src -v igloo-go-mod:/go/pkg/mod -v igloo-go-build:/root/.cache/go-build -v igloo-duckdb-extensions:/ext
-  -v igloo-rb-extension:/rb)
+  -v igloo-rb-extension:/rb -v igloo-iceberg-extension:/iceberg)
 # Downloads only what the volume does not have yet.
 docker run --rm "${mounts[@]}" -w /src "$go_image" go run -tags duckdb_arrow ./cmd/igloo install-extensions /ext
 # Igloo's own rb extension, which the engine tests load (seconds; DuckDB's
 # headers stay in the volume).
 docker run --rm "${mounts[@]}" -e RB_CACHE=/rb/cache -w /src "$go_image" extensions/rb/build.sh /rb
+# Igloo's build of DuckDB's iceberg extension, which the tests attach catalogs
+# with: the Dockerfile's iceberg stage (most of an hour the first time;
+# Docker's build cache keeps it until extensions/iceberg's build changes).
+docker build -q --target iceberg -t igloo-iceberg-build "$root" >/dev/null
+docker run --rm -v igloo-iceberg-extension:/iceberg igloo-iceberg-build cp /out/iceberg/iceberg.duckdb_extension /iceberg/
 
 # MySQL first starts without networking to initialize; wait for TCP.
 ready "$name-mysql" docker exec "$name-mysql" mysql -h127.0.0.1 -uroot -ptest -e 'SELECT 1' igloo_test
@@ -67,4 +73,5 @@ docker run --rm ${cpus[@]+"${cpus[@]}"} --network "$name" \
   -e IGLOO_TEST_MYSQL_URL="mysql://root:test@$name-mysql:3306/igloo_test" \
   -e IGLOO_TEST_EXTENSION_DIR=/ext \
   -e IGLOO_TEST_RB_EXTENSION=/rb/rb.duckdb_extension \
+  -e IGLOO_TEST_ICEBERG_EXTENSION=/iceberg/iceberg.duckdb_extension \
   "${mounts[@]}" -w /src "$go_image" go test -tags duckdb_arrow "${@:-./...}"

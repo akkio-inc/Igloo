@@ -108,9 +108,10 @@ type Engine struct {
 	catShared atomic.Int64
 	// releaseTempDir lets go of the spill directory; see claimTempDir.
 	releaseTempDir func()
-	// bitmaps says the rb extension is loaded (see loadRB).
-	bitmaps bool
-	log     *slog.Logger
+	// bitmaps says the rb extension is loaded, and icebergOwn Igloo's build
+	// of the iceberg extension (see loadOwn).
+	bitmaps, icebergOwn bool
+	log                 *slog.Logger
 	// cfg is what it was opened with, and isBackground says it is the
 	// second DuckDB of a process, for heavy statements (see background.go);
 	// bg is that one, opened at its first use, and the rest its upkeep.
@@ -156,7 +157,7 @@ func Open(ctx context.Context, cfg config.Config, log *slog.Logger, opts ...Opti
 		opt(&o)
 	}
 	release := claimTempDir(cfg.DuckDB.TempDir, log)
-	connector, err := duckdb.NewConnector(rbDSN(cfg.DuckDB.Path, rbToLoad(cfg)), nil)
+	connector, err := duckdb.NewConnector(unsignedDSN(cfg.DuckDB.Path, ownToLoad(cfg)), nil)
 	if err != nil {
 		release()
 		return nil, fmt.Errorf("open duckdb: %w", err)
@@ -738,9 +739,11 @@ func (e *Engine) setup(ctx context.Context, cfg config.Config, log *slog.Logger,
 	if err := configure(cfg, serverThreadsPerCore, exec, query); err != nil {
 		return err
 	}
-	if e.bitmaps, err = loadRB(cfg, log, exec, query); err != nil {
+	own, err := loadOwn(cfg, log, exec, query)
+	if err != nil {
 		return err
 	}
+	e.bitmaps, e.icebergOwn = own["rb"], own["iceberg"]
 	if e.local, err = queryString(ctx, conn, "SELECT current_database()"); err != nil {
 		return fmt.Errorf("read database name: %w", err)
 	}

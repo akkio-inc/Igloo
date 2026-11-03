@@ -18,7 +18,7 @@ import (
 // since a worker reads only the data files its tasks name.
 func OpenWorker(ctx context.Context, cfg config.Config, log *slog.Logger) (*Engine, error) {
 	release := claimTempDir(cfg.DuckDB.TempDir, log)
-	connector, err := duckdb.NewConnector(rbDSN(cfg.DuckDB.Path, rbToLoad(cfg)), nil)
+	connector, err := duckdb.NewConnector(unsignedDSN(cfg.DuckDB.Path, ownToLoad(cfg)), nil)
 	if err != nil {
 		release()
 		return nil, fmt.Errorf("open duckdb: %w", err)
@@ -57,9 +57,11 @@ func (e *Engine) setupWorker(ctx context.Context, cfg config.Config, log *slog.L
 	if err := configure(cfg, workerThreadsPerCore, exec, query); err != nil {
 		return err
 	}
-	if e.bitmaps, err = loadRB(cfg, log, exec, query); err != nil {
+	own, err := loadOwn(cfg, log, exec, query)
+	if err != nil {
 		return err
 	}
+	e.bitmaps, e.icebergOwn = own["rb"], own["iceberg"]
 	if e.local, err = queryString(ctx, conn, "SELECT current_database()"); err != nil {
 		return fmt.Errorf("read database name: %w", err)
 	}

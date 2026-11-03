@@ -117,7 +117,7 @@ func TestRBFileCacheRoundTrip(t *testing.T) {
 		t.Skip("IGLOO_TEST_EXTENSION_DIR not set")
 	}
 	ctx := context.Background()
-	connector, err := duckdb.NewConnector(rbDSN("", &rbExtension{path: rb}), nil)
+	connector, err := duckdb.NewConnector(unsignedDSN("", []extensionFile{{name: "rb", path: rb}}), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
