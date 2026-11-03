@@ -148,11 +148,7 @@ func (srv *Session) consumeSingleCommand(ctx context.Context, reader *buffer.Rea
 	srv.wg.Add(1)
 	srv.closingMu.RUnlock()
 	srv.logger.Debug("<- incoming command", slog.Int("length", length), slog.String("type", t.String()))
-	if srv.commandWrap != nil {
-		err = srv.commandWrap(ctx, func() error { return srv.handleCommand(ctx, conn, t, reader, writer) })
-	} else {
-		err = srv.handleCommand(ctx, conn, t, reader, writer)
-	}
+	err = srv.handleCommand(ctx, conn, t, reader, writer)
 	srv.wg.Done()
 	if errors.Is(err, io.EOF) {
 		return nil

@@ -57,10 +57,5 @@ otherwise unchanged except for these patches:
   a CopyInResponse for as many columns as the table it fills, as a
   statement that returns no rows describes none.
 
-- `igloo_wrap.go` and `command.go`, `consumeSingleCommand`: `CommandWrapper`
-  runs each command a client sends through a function of Igloo's, which runs
-  it on a thread of its own, so that a C++ exception escaping DuckDB there
-  ends the session rather than the process.
-
 Drop this copy and the `replace` directive once a psql-wire release includes
 equivalent fixes.

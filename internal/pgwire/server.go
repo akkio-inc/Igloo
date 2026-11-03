@@ -44,7 +44,6 @@ import (
 	"github.com/akkio-inc/igloo/internal/deletefiles"
 	"github.com/akkio-inc/igloo/internal/distributed"
 	"github.com/akkio-inc/igloo/internal/engine"
-	"github.com/akkio-inc/igloo/internal/engine/terminate"
 	"github.com/akkio-inc/igloo/internal/erasure"
 	"github.com/akkio-inc/igloo/internal/federation"
 	"github.com/akkio-inc/igloo/internal/iddomain"
@@ -856,7 +855,6 @@ func New(engine Engine, opts Options, log *slog.Logger) (*Server, error) {
 		wire.BackendKeyData(s.backendKeyData),
 		wire.CancelRequest(s.cancelRequest),
 		wire.SessionMiddleware(s.openSession),
-		wire.CommandWrapper(s.statementThread),
 		wire.CloseConn(s.closeSession),
 		wire.Statements(newStatementCache),
 		wire.Portals(newPortalCache),
@@ -2424,22 +2422,6 @@ type catalogHold struct{ mode catalogMode }
 // to guard, so they do nothing.
 func (s *Server) holdCatalog(sess *session) func() {
 	return s.catalogHold(sess, catalogExclusive)
-}
-
-// statementThread runs run, a session's command, on a thread of its own (see
-// terminate.Statement), from which a C++ exception that escapes DuckDB, which
-// nothing can catch, parks the thread rather than end the process: the iceberg
-// extension's scan state threw Out of Memory out of its destructor in the
-// optimizer of a statement bound again at the replica's memory limit, and the
-// process ended with every session's statement.
-func (s *Server) statementThread(ctx context.Context, run func() error) error {
-	sess := sessionFrom(ctx)
-	if sess == nil {
-		return run()
-	}
-	var err error
-	terminate.Statement(func(what string) { s.parked(ctx, sess, what) }, func() { err = run() })
-	return err
 }
 
 // parked ends the session whose statement's thread parked, as what escaped
