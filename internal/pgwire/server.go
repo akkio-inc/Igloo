@@ -1709,6 +1709,14 @@ var listsCatalog = regexp.MustCompile(`(?is)(^\s*(SHOW|DESCRIBE|DESC|PRAGMA)\b)|
 	`pg_catalog|pg_class|pg_attribute|pg_namespace|pg_tables|pg_views|pg_matviews|` +
 	`pg_information_schema_columns|pg_description|pg_type|pg_proc)\b`)
 
+// describesRelation matches DESCRIBE (or DESC) of one table or view, by its name:
+// DuckDB binds what it describes, as a query's FROM, and walks nothing, so it holds
+// the catalog lock shared, as any bind, not exclusively, as listsCatalog's
+// statements. A BI tool describes a table before each query it builds on it, and
+// each held up every bind beside it.
+var describesRelation = regexp.MustCompile(`(?is)^\s*(DESCRIBE|DESC)\s+((("([^"]|"")*"|[a-z_][a-z0-9_$]*)\s*\.\s*){0,2}` +
+	`("([^"]|"")*"|[a-z_][a-z0-9_$]*))\s*;?\s*$`)
+
 var deallocateAll = regexp.MustCompile(`(?is)^\s*DEALLOCATE\s+(?:PREPARE\s+)?ALL\s*;?\s*$`)
 
 var showPasswordEncryption = regexp.MustCompile(`(?is)^\s*SHOW\s+password_encryption\s*;?\s*$`)
@@ -2645,7 +2653,8 @@ func (s *Server) catalogRunLock(sess *session, st *statement) func() {
 	if st.stmtType == duckdb.STATEMENT_TYPE_EXECUTE && !sess.executeHolds(st.query) {
 		return func() {}
 	}
-	if st.changesIceberg || st.listsCatalog || changesCatalog(st.stmtType) || st.stmtType == duckdb.STATEMENT_TYPE_EXECUTE {
+	lists := st.listsCatalog && !describesRelation.MatchString(st.query)
+	if st.changesIceberg || lists || changesCatalog(st.stmtType) || st.stmtType == duckdb.STATEMENT_TYPE_EXECUTE {
 		return s.holdCatalog(sess)
 	}
 	return func() {}

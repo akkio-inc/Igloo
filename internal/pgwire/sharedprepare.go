@@ -53,7 +53,14 @@ func (s *Server) sharedPrepare(sess *session, user auth.User, text string) bool 
 	if slices.ContainsFunc(sess.catHolds, func(h *catalogHold) bool { return h.mode == catalogExclusive }) {
 		return false
 	}
-	if len(sqllex.Split(text)) != 1 || !startsQuery(text) && !cteQuery(text) {
+	if len(sqllex.Split(text)) != 1 {
+		return false
+	}
+	if describesRelation.MatchString(text) {
+		// A bind, as a query's (see describesRelation).
+		return true
+	}
+	if !startsQuery(text) && !cteQuery(text) {
 		return false
 	}
 	return !listsCatalog.MatchString(text) && !listsColumns.MatchString(text) && !readsMetadata.MatchString(text) &&
