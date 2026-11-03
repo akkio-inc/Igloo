@@ -27,6 +27,10 @@ against a synthetic ad-impressions schema:
   one after another with their result cache off, as an analyst's session
   beside the dashboards. With `--dashboard-users 0 --elt-streams 0`, what
   they take alone.
+- **Listings.** `--listing-streams` sessions, each browsing the catalog
+  one listing after another, as a BI tool's schema browser does: the
+  schema's tables, their columns, a table's description and its columns
+  from `pg_catalog`, a second apart.
 - **Probes.** `--probes` runs one statement a second of each kind in
   `PROBES`, their result cache off, to tell where a dashboard waits: `ping`
   takes Igloo's path and no DuckDB task, `cpu` only DuckDB's threads, and
@@ -184,6 +188,16 @@ HEAVY = {
     "first_touch": "SELECT c.channel, avg(n) AS impressions_after_first FROM (SELECT i.campaign_id, row_number() OVER "
     "(PARTITION BY i.device_id ORDER BY i.ts, i.campaign_id) AS n FROM {s}.impressions i) t JOIN {s}.campaigns c "
     "ON c.campaign_id = t.campaign_id GROUP BY 1 ORDER BY 1",
+}
+
+# What a BI tool's schema browser lists, one after another.
+LISTINGS = {
+    "tables": "SELECT table_name, table_type FROM information_schema.tables WHERE table_schema = '{s}' ORDER BY 1",
+    "columns": "SELECT table_name, column_name, data_type FROM information_schema.columns WHERE table_schema = '{s}' "
+    "ORDER BY table_name, ordinal_position",
+    "describe": "DESCRIBE {s}.daily_delivery",
+    "attributes": "SELECT a.attname FROM pg_catalog.pg_attribute a JOIN pg_catalog.pg_class c ON c.oid = a.attrelid "
+    "WHERE c.relname = 'campaigns' AND a.attnum > 0",
 }
 
 # Where a statement waits: see the module's doc.
@@ -454,6 +468,23 @@ def probe_session(name: str, args, connect, rec: Recorder, until: float):
         conn.close()
 
 
+def listing_session(k: int, args, connect, rec: Recorder, until: float):
+    """Browses the catalog, one listing of LISTINGS after another, a second
+    apart, until the window ends."""
+    conn = connect("listing")
+    names = sorted(LISTINGS)
+    try:
+        i = k
+        while time.time() < until:
+            name = names[i % len(names)]
+            i += 1
+            text = f"/* mixed {args.run_id} listing {name} */ " + LISTINGS[name].format(s=args.schema)
+            run_one(conn, text, rec, "listing", name)
+            time.sleep(1)
+    finally:
+        conn.close()
+
+
 class ELT:
     """Runs the ELT jobs on their schedules with streams sessions. A job
     still running when it is due again is skipped."""
@@ -534,6 +565,8 @@ def run(args, connect, sampler: WorkerSampler | None = None) -> dict:
         threads += [threading.Thread(target=elt.stream, args=(k,), daemon=True) for k in range(args.elt_streams)]
     threads += [threading.Thread(target=heavy_session, args=(k, args, connect, rec, until), daemon=True)
                 for k in range(args.heavy_sessions)]
+    threads += [threading.Thread(target=listing_session, args=(k, args, connect, rec, until), daemon=True)
+                for k in range(args.listing_streams)]
     if args.probes:
         threads += [threading.Thread(target=probe_session, args=(name, args, connect, rec, until), daemon=True) for name in sorted(PROBES)]
     if sampler:
@@ -591,7 +624,7 @@ def report(res: dict, hist: list[tuple], args, coord_price: float, worker_price:
         "label": args.label,
         "config": {k: getattr(args, k) for k in ("schema", "rows", "batch_rows", "duration", "warmup", "dashboard_users",
                                                   "tile_concurrency", "think", "param_pool", "elt_streams", "elt_every",
-                                                  "elt_jobs", "heavy_sessions", "probes", "seed", "coordinator", "worker",
+                                                  "elt_jobs", "heavy_sessions", "listing_streams", "probes", "seed", "coordinator", "worker",
                                                   "spot_factor")},
         "window_seconds": round(window, 1),
         "classes": summarize(res["records"], res["t0"], res["t1"]),
@@ -644,6 +677,7 @@ def parse(argv=None):
     r.add_argument("--elt-jobs", default=",".join(ELT_JOBS))
     r.add_argument("--batch-rows", type=int, default=200_000, help="impressions each ingest appends")
     r.add_argument("--heavy-sessions", type=int, default=0, help="sessions running long reports one after another")
+    r.add_argument("--listing-streams", type=int, default=0, help="sessions browsing the catalog, as a BI tool's schema browser")
     r.add_argument("--probes", action="store_true", help="run a probe of each kind in PROBES once a second")
     r.add_argument("--seed", type=int, default=1)
     r.add_argument("--metrics-url", help="Igloo's /metrics, to bill workers for the seconds they ran")
