@@ -699,9 +699,9 @@ if [ "${got:-0}" -ge 1 ]; then pass "and runs on workers"; else fail "a compacte
 check_distributed "a compacted table with nested columns" nested_compacted "$nested_query"
 
 echo "policies"
-# Workers read table files and could not apply masking or row access
-# policies: a statement over a protected table runs on one replica and
-# returns what the policies let through, however it aggregates.
+# A statement over a protected table runs on workers, which read the table
+# through the subquery the policies' rewrite wrote, and returns what the
+# policies let through, however it aggregates.
 {
   echo "CREATE TABLE contacts AS SELECT c_custkey AS id, c_name AS name, c_nationkey AS nation FROM customer;"
   echo "CREATE MASKING POLICY hide_name AS (val VARCHAR) RETURNS VARCHAR -> '***';"
@@ -713,8 +713,8 @@ got="$(psql_admin -c "SET distributed_execution = 'on'" \
   -c "/* masked */ SELECT count(DISTINCT name), min(name), max(name), max(nation) FROM contacts" | grep -v '^SET$')"
 if [ "$got" = "1|***|***|4" ]; then pass "a protected table returns what its policies let through"; else fail "protected table: [$got]"; fi
 sleep 2
-expect "and runs on one replica" "0" \
-  "SELECT workers FROM igloo.query_history WHERE query_text LIKE '/* masked */%' ORDER BY start_time DESC LIMIT 1"
+got="$(psql_admin -c "SELECT workers FROM igloo.query_history WHERE query_text LIKE '/* masked */%' ORDER BY start_time DESC LIMIT 1")"
+if [ "${got:-0}" -ge 1 ]; then pass "and runs on workers"; else fail "a protected table ran on $got workers"; fi
 
 echo "worker endpoint"
 if docker run --rm --network "$network" curlimages/curl:8.22.0 -sk --max-time 10 "https://worker:7433/v1/status" >/dev/null 2>&1; then
