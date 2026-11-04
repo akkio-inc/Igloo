@@ -176,7 +176,7 @@ func TestAgreement(t *testing.T) {
 				WHERE o_orderkey IN (SELECT l_orderkey FROM lineitem8 GROUP BY l_orderkey HAVING sum(l_quantity) > 200)
 				GROUP BY o_orderkey, o_totalprice ORDER BY o_totalprice DESC, o_orderkey LIMIT 100`,
 			"counts that do not divide": `SELECT count(*), sum(l_quantity) FROM orders12 JOIN lineitem8 ON o_orderkey = l_orderkey`,
-			"lines of no order": `SELECT count(*), count(o_orderkey), sum(l_quantity) FROM lines4 LEFT JOIN orders16 ON l_orderkey = o_orderkey`,
+			"lines of no order":         `SELECT count(*), count(o_orderkey), sum(l_quantity) FROM lines4 LEFT JOIN orders16 ON l_orderkey = o_orderkey`,
 			"distinct orders a day": `SELECT o_orderdate, count(DISTINCT l_orderkey) AS n FROM orders16 JOIN lineitem8 ON o_orderkey = l_orderkey
 				GROUP BY o_orderdate ORDER BY o_orderdate`,
 		}
