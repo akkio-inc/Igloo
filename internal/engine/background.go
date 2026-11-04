@@ -7,10 +7,7 @@ import (
 	"log/slog"
 	"path/filepath"
 	"runtime"
-	"strconv"
 	"time"
-
-	"github.com/duckdb/duckdb-go/v2"
 
 	"github.com/akkio-inc/igloo/internal/config"
 	"github.com/akkio-inc/igloo/internal/memlimit"
@@ -268,23 +265,16 @@ func (e *Engine) balance(ctx context.Context) {
 	// next statement until the first reads: a session's reports one after another
 	// read the same files, and one of 24 s took 50 s starting with nothing.
 	if e.bgUsers.Load() > 0 || !reading {
-		query := queryMemory
+		mainAll, mainHeld, err := e.held(ctx)
+		if err != nil {
+			return
+		}
 		if reading {
-			query = queryAllMemory
+			mainHeld = mainAll
 		}
-		mainHeld, err := e.held(ctx, query)
+		bgHeld, _, err := bg.held(ctx)
 		if err != nil {
 			return
-		}
-		bgHeld, err := bg.held(ctx, queryAllMemory)
-		if err != nil {
-			return
-		}
-		mainAll := mainHeld
-		if !reading {
-			if mainAll, err = e.held(ctx, queryAllMemory); err != nil {
-				return
-			}
 		}
 		// Up at once, and down slowly: the limits should not follow what
 		// the allocator hands back and takes again.
@@ -371,19 +361,3 @@ func abs64(n int64) int64 {
 	return n
 }
 
-// queryAllMemory reads what DuckDB holds, caches included.
-const queryAllMemory = `SELECT coalesce(sum(memory_usage_bytes), 0)::VARCHAR FROM system.main.duckdb_memory()`
-
-// held reads what DuckDB holds, by query.
-func (e *Engine) held(ctx context.Context, query string) (int64, error) {
-	c, err := e.connector.Connect(ctx)
-	if err != nil {
-		return 0, err
-	}
-	defer c.Close() //nolint:errcheck
-	v, err := queryString(ctx, c.(*duckdb.Conn), query)
-	if err != nil {
-		return 0, err
-	}
-	return strconv.ParseInt(v, 10, 64)
-}

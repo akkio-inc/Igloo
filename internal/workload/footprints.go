@@ -327,13 +327,23 @@ func (f *footprints) of(shape string) *footprint {
 }
 
 // FootprintOf is what Observe learns of a run that allocated allocated over
-// its whole run and was seen holding at most peak, if sampled: heldShare of
-// what it allocated, or what it was seen holding if more, since a run
-// allocates at least what it holds at once.
-func FootprintOf(allocated, peak int64, sampled bool) int64 {
+// its whole run and was seen holding what seen says: heldShare of what it
+// allocated, or what it was seen holding if more, since a run allocates at
+// least what it holds at once; and never more than its DuckDB held in all for
+// the statements running in it while it ran, where a sample says so. A run that
+// allocates and frees again and again holds far less than two thirds of what it
+// allocated: a dashboard's query at ten times its data allocated 82 GB and its
+// DuckDB held at most 35 GB while it ran. Reserving 54.5 GB, more than the
+// replica's 49 GB, it waited each time for every statement that reserved memory
+// to end, and the 8 to 10 that came after it waited until it ended, while one
+// statement ran on 16 cores.
+func FootprintOf(allocated int64, seen Seen) int64 {
 	held := int64(heldShare * float64(allocated))
-	if sampled {
-		held = max(held, min(peak, allocated))
+	if seen.Sampled {
+		held = max(held, min(seen.Peak, allocated))
+		if seen.Most > 0 {
+			held = min(held, seen.Most)
+		}
 	}
 	return max(held, 0)
 }

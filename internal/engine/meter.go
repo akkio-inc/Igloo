@@ -23,7 +23,7 @@ import (
 // back. DuckDB 1.5's profiler reports peak memory only for the whole
 // process since it started, so the history has the memory a statement
 // allocated over its run, and the most it was seen holding as the workload
-// controller samples DuckDB's memory (see QueryMemory); and it does not
+// controller samples DuckDB's memory (see HeldMemory); and it does not
 // count bytes written to object storage, so the history has no bytes
 // written.
 
@@ -176,32 +176,54 @@ type oneConn struct{ conn *duckdb.Conn }
 func (c oneConn) Connect(context.Context) (driver.Conn, error) { return c.conn, nil }
 func (c oneConn) Driver() driver.Driver                        { return &duckdb.Driver{} }
 
-// queryMemory is the memory DuckDB's buffer manager holds for the
-// statements running now: their hash tables, sorts, windows, materialized
-// rows and file readers, not the tables, metadata and caches it keeps from
-// one statement to the next.
-const queryMemory = `SELECT coalesce(sum(memory_usage_bytes), 0)::VARCHAR FROM system.main.duckdb_memory()
-	WHERE tag IN ('HASH_TABLE', 'ORDER_BY', 'WINDOW', 'COLUMN_DATA', 'ALLOCATOR', 'OVERFLOW_STRINGS',
-		'PARQUET_READER', 'CSV_READER', 'TRANSACTION')`
+// Held is what each of the process's DuckDBs holds now, the first and then the
+// second (see background.go), which holds nothing while it is not open: All,
+// caches included, and Query, what the statements running in it hold, their
+// hash tables, sorts, windows, materialized rows and file readers, not the
+// tables, metadata and caches it keeps from one statement to the next.
+type Held struct {
+	All, Query [2]int64
+}
 
-// QueryMemory opens a connection of its own and returns read, which reads
-// over it the memory DuckDB holds for the statements running now, for
-// workload.Controller.SampleMemory, one call at a time; closeConn closes
-// the connection. A read takes well under 10 ms while statements run.
-func (e *Engine) QueryMemory(ctx context.Context) (read func(context.Context) (int64, error), closeConn func() error, err error) {
-	c, err := e.connector.Connect(ctx)
-	if err != nil {
-		return nil, nil, err
-	}
-	conn := c.(*duckdb.Conn)
-	read = func(ctx context.Context) (int64, error) {
-		v, err := queryString(ctx, conn, queryMemory)
+// heldMemory reads what a DuckDB holds in all, then for its statements.
+const heldMemory = `SELECT coalesce(sum(memory_usage_bytes), 0)::VARCHAR || ' ' || coalesce(sum(memory_usage_bytes)
+	FILTER (WHERE tag IN ('HASH_TABLE', 'ORDER_BY', 'WINDOW', 'COLUMN_DATA', 'ALLOCATOR', 'OVERFLOW_STRINGS',
+		'PARQUET_READER', 'CSV_READER', 'TRANSACTION')), 0)::VARCHAR FROM system.main.duckdb_memory()`
+
+// held reads what this DuckDB holds in all and for its statements, over a
+// connection it keeps for that, one read at a time: a read takes well under
+// 10 ms while statements run, and the workload controller reads ten times a
+// second.
+func (e *Engine) held(ctx context.Context) (all, query int64, err error) {
+	e.heldMu.Lock()
+	defer e.heldMu.Unlock()
+	if e.heldConn == nil {
+		c, err := e.connector.Connect(ctx)
 		if err != nil {
-			return 0, err
+			return 0, 0, err
 		}
-		return strconv.ParseInt(v, 10, 64)
+		e.heldConn = c.(*duckdb.Conn)
 	}
-	return read, conn.Close, nil
+	v, err := queryString(ctx, e.heldConn, heldMemory)
+	if err != nil {
+		e.heldConn.Close() //nolint:errcheck
+		e.heldConn = nil
+		return 0, 0, err
+	}
+	_, err = fmt.Sscan(v, &all, &query)
+	return all, query, err
+}
+
+// closeHeld closes the connection held reads over.
+func (e *Engine) closeHeld() error {
+	e.heldMu.Lock()
+	defer e.heldMu.Unlock()
+	if e.heldConn == nil {
+		return nil
+	}
+	err := e.heldConn.Close()
+	e.heldConn = nil
+	return err
 }
 
 // SetMemoryLimit changes DuckDB's memory limit to n bytes, which it then
@@ -217,25 +239,28 @@ func (e *Engine) SetMemoryLimit(ctx context.Context, n int64) error {
 	return e.setLimit(ctx, n)
 }
 
-// HeldMemory is what DuckDB holds, caches included, with the second DuckDB's
-// beside it if that is open: what memlimit.Adapt lowers their limit from.
-func (e *Engine) HeldMemory(ctx context.Context) (int64, bool) {
-	n, err := e.held(ctx, queryAllMemory)
-	if err != nil {
-		return 0, false
+// HeldMemory reads what both DuckDBs hold (see Held); ok is false if a read
+// failed. memlimit.Adapt lowers their limit from what they hold in all, and the
+// workload controller charges what each holds for its statements to those
+// running in it (see workload.Controller.SampleMemory).
+func (e *Engine) HeldMemory(ctx context.Context) (h Held, ok bool) {
+	var err error
+	if h.All[0], h.Query[0], err = e.held(ctx); err != nil {
+		return Held{}, false
 	}
 	e.bgMu.Lock()
 	bg := e.bg
 	e.bgMu.Unlock()
 	if bg != nil {
-		m, err := bg.held(ctx, queryAllMemory)
-		if err != nil {
-			return 0, false
+		if h.All[1], h.Query[1], err = bg.held(ctx); err != nil {
+			return Held{}, false
 		}
-		n += m
 	}
-	return n, true
+	return h, true
 }
+
+// Sum is what both hold in all.
+func (h Held) Sum() int64 { return h.All[0] + h.All[1] }
 
 // setLimit sets DuckDB's memory limit, to n bytes.
 func (e *Engine) setLimit(ctx context.Context, n int64) error {

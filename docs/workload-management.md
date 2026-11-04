@@ -316,7 +316,10 @@ time, so statements with no history keep their arrival order. A short statement
 therefore goes before a long one that came just before it, and a long one before
 a short one that comes after it would have ended, so nothing starves. A shape
 that took under a second of CPU in one of those runs does not wait at all: it
-neither counts against the replica's limit nor reserves memory. A statement of a
+neither counts against the replica's limit nor reserves memory. A long one, of
+five seconds or more alone, waits while another long one runs, as two of them use
+most of the cores and beside each other neither ends sooner than one after the
+other would; shorter statements keep starting beside it. A statement of a
 shape not seen yet, of which nothing is known, has what it will hold estimated
 before it starts, as auto mode estimates it for this replica, from DuckDB's plan of
 it and the tables it reads (see [when](distributed-execution.md#when)). One the
@@ -371,9 +374,15 @@ not of one statement. A statement alone holds at its most between two
 fifths and all of what it allocated, and that holds whatever runs beside
 it, so a run's footprint is two thirds of what it allocated, or what the
 replica saw it hold if that is more: every 100 ms the replica reads what
-DuckDB holds for running statements (their hash tables, sorts and the like,
-not its caches) and shares it among them by what they reserved, which is
-exact only for a statement alone. A shape's footprint is the median of its
+each of its two DuckDBs holds for the statements running in it (their hash
+tables, sorts and the like, not its caches) and shares it among them by what
+they reserved, which is exact only for a statement alone. A run's footprint
+is never more than the most its DuckDB held for them all while it ran: a
+statement that allocates and frees again and again holds far less than two
+thirds of what it allocated, as a dashboard's query that allocated 82 GB
+held at most 35 GB. The [query history](sql.md#query-history) keeps a run's
+footprint as its peak, which [auto mode](distributed-execution.md) places the
+statement by when it runs again. A shape's footprint is the median of its
 latest eight runs, and the runs of the same text with the same literals, if there
 are any, go before those of its shape, here and in [the line](#the-line). With none,
 a statement goes by the most any run of its shape held and took, since its literals

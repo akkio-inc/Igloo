@@ -136,6 +136,10 @@ type Engine struct {
 	// fgHeld, if set, says statements wait in line with none running in the
 	// first (see WatchForeground).
 	fgHeld atomic.Pointer[func() bool]
+	// heldConn is the connection held reads what it holds over, heldMu its
+	// lock (see HeldMemory).
+	heldMu   sync.Mutex
+	heldConn *duckdb.Conn
 	// bgOver is what the process holds past what the two DuckDBs hold (see
 	// balance).
 	bgOver atomic.Int64
@@ -684,7 +688,7 @@ func (e *Engine) Close() error {
 	}
 	e.stopCache()
 	e.parser.close()
-	err = errors.Join(err, e.connector.Close())
+	err = errors.Join(err, e.closeHeld(), e.connector.Close())
 	if e.proxy != nil {
 		err = errors.Join(err, e.proxy.Close())
 	}

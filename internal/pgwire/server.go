@@ -2349,10 +2349,19 @@ func (s *Server) preparedQuery(ctx context.Context, sess *session, user auth.Use
 		// A run planned to no rows says nothing of others of its shape (see
 		// workload.ReadNothing).
 		measured := used != nil && !workload.ReadNothing(used.BytesRead, used.CPUTime)
-		peak, sampled := sess.wl.peak, sess.wl.sampled
+		// What it held at its most, as far as the replica can tell (see
+		// workload.FootprintOf): what the next statement like it reserves, what
+		// auto mode places it by, and what the history keeps as its peak.
+		seen, peak := sess.wl.seen, sess.wl.seen.Peak
+		var held int64
+		if used != nil {
+			held = workload.FootprintOf(used.MemoryAllocated, seen)
+			if seen.Sampled && err == nil {
+				peak = held
+			}
+		}
 		if measured && tr != nil && tr.flattenKey != "" {
-			s.workload.ObserveForm(tr.flattenKey, tr.flattenLists, used.CPUTime,
-				workload.FootprintOf(used.MemoryAllocated, peak, sampled), time.Since(start)-sess.wl.queued)
+			s.workload.ObserveForm(tr.flattenKey, tr.flattenLists, used.CPUTime, held, time.Since(start)-sess.wl.queued)
 		}
 		if used != nil && parts.workers == 0 && s.heavy != nil && (measured || !s.heavy.known(shape)) {
 			// Which of this replica's DuckDBs the next like it runs in.
@@ -2368,13 +2377,13 @@ func (s *Server) preparedQuery(ctx context.Context, sess *session, user auth.Use
 		case measured:
 			// What it held here, for the next statement like it, and the next the same.
 			for _, key := range []string{shape, exact} {
-				s.workload.Observe(key, workload.FootprintOf(used.MemoryAllocated, peak, sampled))
+				s.workload.Observe(key, held)
 				s.workload.ObserveCost(key, used.CPUTime)
 			}
 			s.workload.ObserveTook(shape, time.Since(start)-sess.wl.queued)
 		case used != nil:
 			s.workload.ObserveEmpty(exact)
-		case err != nil && sampled:
+		case err != nil && seen.Sampled:
 			// It ended before its end, holding at least that much, or, if it
 			// ran a while, all the memory: it may have held any of what the
 			// statements beside it were charged with.
@@ -2383,9 +2392,6 @@ func (s *Server) preparedQuery(ctx context.Context, sess *session, user auth.Use
 			}
 			s.workload.ObserveUnfinished(shape, peak)
 			s.workload.ObserveUnfinished(exact, peak)
-		}
-		if !sampled {
-			peak = 0
 		}
 		queued := sess.wl.queued
 		s.metrics.query(start, err)

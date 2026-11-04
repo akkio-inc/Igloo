@@ -145,20 +145,16 @@ func TestMeter(t *testing.T) {
 	if meter.Last("SELECT * FROM no_such_table") != nil {
 		t.Error("a failed statement was measured")
 	}
-	// What DuckDB holds for running statements, over a connection of its
-	// own (see workload.Controller.SampleMemory).
-	read, closeRead, err := e.QueryMemory(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if held, err := read(ctx); err != nil || held < 0 {
-		t.Errorf("query memory %d, %v", held, err)
-	}
-	if err := closeRead(); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := read(ctx); err == nil {
-		t.Error("read query memory after closing its connection")
+	// What DuckDB holds, in all and for running statements, over a connection
+	// of its own, and again once that is closed; no second DuckDB is open.
+	for range 2 {
+		h, ok := e.HeldMemory(ctx)
+		if !ok || h.Query[0] < 0 || h.All[0] < h.Query[0] || h.All[1] != 0 || h.Query[1] != 0 {
+			t.Errorf("held %+v (%v)", h, ok)
+		}
+		if err := e.closeHeld(); err != nil {
+			t.Fatal(err)
+		}
 	}
 	limit := e.MemoryLimit(ctx)
 	if limit <= 0 {

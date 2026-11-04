@@ -106,7 +106,10 @@ func serveWorker() error {
 	if plan.Total > 0 {
 		go memlimit.Watch(ctx, plan.Total, w.ShedMemory)
 		go memlimit.Adapt(ctx, plan.Total, plan.DuckDB, func(n int64) error { return eng.SetMemoryLimit(ctx, n) },
-			func() (int64, bool) { return eng.HeldMemory(ctx) }, log)
+			func() (int64, bool) {
+				h, ok := eng.HeldMemory(ctx)
+				return h.Sum(), ok
+			}, log)
 		log.Info("memory watch is on", "cancels_below", memlimit.Format(memlimit.Low(plan.Total)),
 			"spills_more_below", memlimit.Format(memlimit.High(plan.Total)))
 	}
@@ -307,6 +310,16 @@ type footprints interface {
 	ObserveOnWorkers(key string)
 }
 
+// heldOf is what a statement in the history held at once, its peak where a
+// sample fell within its run, which is its footprint (see audit.Query.Peak), or
+// else two thirds of what it allocated.
+func heldOf(q audit.Query) int64 {
+	if q.Peak > 0 {
+		return q.Peak
+	}
+	return workload.FootprintOf(q.Resources.MemoryAllocated, workload.Seen{})
+}
+
 // longUnmeasured is how long a run that ended early must have run, without
 // a peak in the history, to be taken for one that needed all its memory.
 const longUnmeasured = 10 * time.Second
@@ -364,7 +377,7 @@ func seedHistory(ctx context.Context, seed func([]distributed.Run), fp footprint
 			empty := q.Resources != nil && workload.ReadNothing(q.Resources.BytesRead, q.Resources.CPUTime)
 			if q.FlattenKey != "" && q.Outcome == audit.OutcomeOK && q.Resources != nil && q.Workers == 0 && !empty {
 				forms = append(forms, form{q.FlattenKey, q.FlattenLists, q.Resources.CPUTime,
-					workload.FootprintOf(q.Resources.MemoryAllocated, q.Peak, q.Peak > 0), q.Duration - q.Queued})
+					heldOf(q), q.Duration - q.Queued})
 			}
 			switch {
 			case q.PlanKey == "":
@@ -394,7 +407,7 @@ func seedHistory(ctx context.Context, seed func([]distributed.Run), fp footprint
 			early := q.Outcome == audit.OutcomeCanceled || q.SQLState == "53200"
 			switch {
 			case q.Outcome == audit.OutcomeOK && q.Resources != nil:
-				fs = append(fs, footprint{q.Shape, workload.FootprintOf(q.Resources.MemoryAllocated, q.Peak, q.Peak > 0), false, q.Resources.CPUTime, empty,
+				fs = append(fs, footprint{q.Shape, heldOf(q), false, q.Resources.CPUTime, empty,
 					q.Duration - q.Queued, q.Exact, false})
 			case early && q.Peak > 0:
 				fs = append(fs, footprint{q.Shape, q.Peak, true, -1, false, 0, q.Exact, false})

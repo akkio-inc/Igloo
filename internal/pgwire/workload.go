@@ -77,11 +77,9 @@ type workloadState struct {
 	// admitted gives back what the running statement was admitted with, for
 	// a statement whose thread parked (see Server.statementThread); nil for none.
 	admitted func()
-	// peak is the most memory the latest statement was seen holding while
-	// it ran, and sampled says a sample fell within its run (see
+	// seen is what the latest statement was seen holding while it ran (see
 	// workload.Controller.SampleMemory).
-	peak    int64
-	sampled bool
+	seen workload.Seen
 	// meter reads what each statement used; nil without one.
 	meter *engine.Meter
 	// backgroundUsed is what the latest statement used, if it ran in the
@@ -225,11 +223,11 @@ func (sess *session) admit(ctx context.Context) (release, leave func(), err erro
 	}
 	done, waited, err := sess.wl.controller.Admit(ctx, l)
 	sess.wl.queued = waited
-	sess.wl.peak, sess.wl.sampled = 0, false
+	sess.wl.seen = workload.Seen{}
 	if err == nil {
 		sess.wl.elsewhere, sess.wl.admitted = elsewhere, func() { done() }
 		return func() {
-			sess.wl.peak, sess.wl.sampled = done()
+			sess.wl.seen = done()
 			sess.wl.elsewhere, sess.wl.admitted = nil, nil
 		}, func() { done() }, nil
 	}

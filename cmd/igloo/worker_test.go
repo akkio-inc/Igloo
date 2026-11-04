@@ -40,9 +40,10 @@ func TestSeedHistory(t *testing.T) {
 			Memory: 14 * gb},
 		{ID: "7", Start: now.Add(-40 * time.Second), Outcome: audit.OutcomeOK, Duration: time.Second, Shape: "d", Resources: used(gb)},
 		{ID: "8", Start: now.Add(-30 * time.Second), PlanKey: "m", Outcome: audit.OutcomeError, SQLState: "53200", Duration: time.Hour},
-		// e peaked under what it allocated; f's second run was cancelled
-		// holding less than its first, and g's held more; h was cancelled
-		// after a minute, before peaks were kept, and i after a second.
+		// e held, its peak, far less than two thirds of what it allocated;
+		// f's second run was cancelled holding less than its first, and g's
+		// held more; h was cancelled after a minute, before peaks were kept,
+		// and i after a second.
 		{ID: "9", Start: now.Add(-29 * time.Second), Outcome: audit.OutcomeOK, Duration: time.Minute, Shape: "e", Resources: used(84 * gb),
 			Peak: 12 * gb, Memory: 22 * gb},
 		{ID: "10", Start: now.Add(-28 * time.Second), Outcome: audit.OutcomeOK, Duration: time.Minute, Shape: "f", Resources: used(9 * gb),
@@ -72,8 +73,7 @@ func TestSeedHistory(t *testing.T) {
 	// a's runs on this replica's memory, 21 GB within a quarter of 22, the
 	// lower of two; not b's, which failed, c's, on 14 GB, d's, which does not say,
 	// nor i's, cancelled after a second.
-	wantHeld := map[string]int64{"a": workload.FootprintOf(2*gb, 0, false), "e": workload.FootprintOf(84*gb, 12*gb, true), "f": 8 * gb,
-		"g": 10 * gb, "h": 22 * gb}
+	wantHeld := map[string]int64{"a": workload.FootprintOf(2*gb, workload.Seen{}), "e": 12 * gb, "f": 8 * gb, "g": 10 * gb, "h": 22 * gb}
 	for _, shape := range []string{"a", "b", "c", "d", "e", "f", "g", "h", "i"} {
 		got, ok := footprints.Footprint(shape)
 		if w, learned := wantHeld[shape]; ok != learned || got != w {
@@ -146,7 +146,7 @@ func TestSeedHistory(t *testing.T) {
 	// Without a coordinator, footprints all the same.
 	footprints = workload.NewController(22 * gb)
 	seedHistory(context.Background(), nil, footprints, 22*gb, store, slog.New(slog.NewTextHandler(io.Discard, nil)))
-	if got, _ := footprints.Footprint("a"); got != workload.FootprintOf(2*gb, 0, false) {
+	if got, _ := footprints.Footprint("a"); got != workload.FootprintOf(2*gb, workload.Seen{}) {
 		t.Errorf("without a coordinator, a's seeded footprint %d", got)
 	}
 }

@@ -53,12 +53,13 @@ type Controller struct {
 	running  map[string]int
 	// replicaRunning counts the counted statements running.
 	replicaRunning int
-	// apartRunning counts the statements running in the second DuckDB.
-	apartRunning int
-	queue        []*waiter
-	// active are the statements running under the controller's limits,
-	// whose peaks SampleMemory keeps.
-	active map[*waiter]struct{}
+	// longRunning counts the long statements running (see longAlone).
+	longRunning int
+	queue []*waiter
+	// active are the statements running under the controller's limits in the
+	// first DuckDB, and apart those running in the second, whose peaks
+	// SampleMemory keeps.
+	active, apart map[*waiter]struct{}
 	// unseen are those of them nothing was known of when they started.
 	unseen map[*waiter]struct{}
 	// patience is how long a statement nothing is known of waits while none
@@ -83,6 +84,8 @@ type waiter struct {
 	memory int64
 	// counted says it counts against the replica's limit.
 	counted bool
+	// long says it takes the replica's cores for long (see longAlone).
+	long bool
 	// unseen says nothing is known of what it holds, so that it waits while
 	// the memory is nearly full (see full).
 	unseen bool
@@ -100,10 +103,17 @@ type waiter struct {
 	// admitted is set, under the controller's lock, once the statement
 	// holds its slot and reservation.
 	admitted bool
-	// peak is the most memory it was seen holding while it ran, and
-	// sampled says a sample fell within its run (see SampleMemory).
-	peak    int64
-	sampled bool
+	// seen is what it was seen holding while it ran (see SampleMemory).
+	seen Seen
+}
+
+// Seen is what a statement was seen holding while it ran, as SampleMemory read
+// what its DuckDB held for the statements running in it: Peak, the most of its
+// share of that; Most, the most of all of it, more than which it cannot have
+// held; and Sampled, whether a sample fell within its run.
+type Seen struct {
+	Peak, Most int64
+	Sampled    bool
 }
 
 // NewController enforces limits against budget bytes of query memory.
@@ -112,6 +122,7 @@ func NewController(budget int64) *Controller {
 		budget:  budget,
 		running: make(map[string]int),
 		active:  make(map[*waiter]struct{}),
+		apart:   make(map[*waiter]struct{}),
 		unseen:  make(map[*waiter]struct{}),
 
 		patience: unseenPatience,
@@ -147,16 +158,17 @@ func (c *Controller) Metrics() []prometheus.Collector {
 
 // Admit waits until a statement under l may start, or ctx ends, in which
 // case it returns ctx's error. The statement must call release when it
-// ends, which returns the most memory it was seen holding, peak, if a
-// sample fell within its run, sampled (see SampleMemory). waited is how
-// long it was held back.
-func (c *Controller) Admit(ctx context.Context, l Limits) (release func() (peak int64, sampled bool), waited time.Duration, err error) {
-	unlimited := func() (int64, bool) { return 0, false }
-	if c == nil || !l.Limited() && !(l.Counted && c.replicaMax > 0) && !l.Unseen {
+// ends, which returns what it was seen holding (see SampleMemory). waited is
+// how long it was held back.
+func (c *Controller) Admit(ctx context.Context, l Limits) (release func() Seen, waited time.Duration, err error) {
+	unlimited := func() Seen { return Seen{} }
+	long := l.Counted && l.Expect >= longAlone
+	if c == nil || !l.Limited() && !(l.Counted && c.replicaMax > 0) && !l.Unseen && !long {
 		return unlimited, 0, nil
 	}
-	w := &waiter{slots: l.Slots, memory: c.reservation(l.Memory), estimated: l.Estimated, counted: l.Counted && c.replicaMax > 0, unseen: l.Unseen, apart: l.Apart, ready: make(chan struct{})}
-	if w.slots.Max == 0 && w.memory == 0 && !w.counted && !w.unseen {
+	w := &waiter{slots: l.Slots, memory: c.reservation(l.Memory), estimated: l.Estimated, counted: l.Counted && c.replicaMax > 0, long: long,
+		unseen: l.Unseen, apart: l.Apart, ready: make(chan struct{})}
+	if w.slots.Max == 0 && w.memory == 0 && !w.counted && !w.unseen && !w.long {
 		return unlimited, 0, nil
 	}
 	w.due = time.Now().Add(l.Expect)
@@ -191,9 +203,11 @@ func (c *Controller) Admit(ctx context.Context, l Limits) (release func() (peak 
 		*l.Elsewhere = func() { c.elsewhere(w) }
 	}
 	var once sync.Once
-	return func() (int64, bool) {
+	return func() Seen {
 		once.Do(func() { c.release(w) })
-		return w.peak, w.sampled
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		return w.seen
 	}, waited, nil
 }
 
@@ -216,7 +230,12 @@ func (c *Controller) elsewhere(w *waiter) {
 		c.replicaRunning--
 		w.counted = false
 	}
+	if w.long {
+		c.longRunning--
+		w.long = false
+	}
 	delete(c.active, w)
+	delete(c.apart, w)
 	c.turn(w)
 	c.notLate(w)
 	c.admit()
@@ -295,24 +314,27 @@ func (c *Controller) admit() {
 		}
 	}
 	blocked := map[string]bool{}
-	memoryBlocked, replicaBlocked := false, false
+	memoryBlocked, replicaBlocked, longBlocked := false, false, false
 	kept := c.queue[:0]
 	for _, w := range c.queue {
 		slotsFree := w.slots.Max == 0 || !blocked[w.slots.Key] && c.running[w.slots.Key] < w.slots.Max
 		memoryFree := w.memory == 0 && !(w.unseen && !w.late && c.full()) || w.memory > 0 && !memoryBlocked && c.reserved+w.memory <= c.budget && c.heldLeaves(w.memory)
 		replicaFree := !w.counted || !replicaBlocked && c.replicaRunning < c.replicaMax
-		if slotsFree && memoryFree && replicaFree {
+		coresFree := !w.long || !longBlocked && c.longRunning == 0
+		if slotsFree && memoryFree && replicaFree && coresFree {
 			if w.slots.Max > 0 {
 				c.running[w.slots.Key]++
 			}
 			if w.counted {
 				c.replicaRunning++
 			}
+			if w.long {
+				c.longRunning++
+			}
 			c.reserved += w.memory
 			if w.apart {
-				c.apartRunning++
+				c.apart[w] = struct{}{}
 			} else {
-				// What SampleMemory reads is the first DuckDB's.
 				c.active[w] = struct{}{}
 			}
 			if w.unseen {
@@ -329,11 +351,15 @@ func (c *Controller) admit() {
 			continue
 		}
 		// Later statements with the same slots wait behind this one
-		// whatever it waits for; others reserving memory only if it waits
-		// for memory, and other counted ones only if it waits for the
-		// replica's limit, not when it waits for its slots alone.
+		// whatever it waits for, and so do later long ones behind a long one;
+		// others reserving memory only if it waits for memory, and other
+		// counted ones only if it waits for the replica's limit, not when it
+		// waits for its slots alone.
 		if w.slots.Max > 0 {
 			blocked[w.slots.Key] = true
+		}
+		if w.long {
+			longBlocked = true
 		}
 		if !memoryFree && w.memory > 0 {
 			memoryBlocked = true
@@ -443,7 +469,7 @@ func (c *Controller) HeldBehindSecond() bool {
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return c.apartRunning > 0 && len(c.active) == 0 && len(c.queue) > 0
+	return len(c.apart) > 0 && len(c.active) == 0 && len(c.queue) > 0
 }
 
 func (c *Controller) remove(w *waiter) {
@@ -469,13 +495,27 @@ func (c *Controller) release(w *waiter) {
 	if w.counted {
 		c.replicaRunning--
 	}
-	c.reserved -= w.memory
-	if w.apart {
-		c.apartRunning--
+	if w.long {
+		c.longRunning--
 	}
+	c.reserved -= w.memory
 	delete(c.active, w)
+	delete(c.apart, w)
 	c.admit()
 }
+
+// longAlone is how long a statement takes alone, its CPU time over the replica's
+// cores (see Limits.Expect), to be long. Such statements use most of the cores
+// for seconds on end: two beside each other each get about half, and neither
+// ends sooner than one after the other would. So a long statement waits while
+// another runs, in their order, and the others keep starting. Two of a
+// dashboard's statements at ten times its data, of 15 s and 9 s alone on 16
+// cores, held 20 to 30 GB each: once what they reserved said so, they started
+// beside each other and beside the dashboard's other statements, and took 57 to
+// 63 s and 45 to 57 s rather than 22 and 36 to 44 one after the other. Of a
+// heavier dashboard's 324 statements, the 47 of 5 s or more used 10 to 16 of
+// the 16 cores while they ran.
+const longAlone = 5 * time.Second
 
 // Running reports how many statements counting against key run now.
 func (c *Controller) Running(key string) int {

@@ -482,14 +482,12 @@ func serve() error {
 	limits.EstimateFromHistory(cfg.StatementReservations)
 	limits.WeighCosts(runtime.GOMAXPROCS(0), workload.LightCPU)
 	reg.MustRegister(limits.Metrics()...)
-	// What statements hold at once, for their reservations (see
-	// workload.Controller.SampleMemory).
-	if read, closeRead, err := eng.QueryMemory(ctx); err != nil {
-		log.Warn("statements' peak memory is not sampled; reservations come from what they allocated", "err", err)
-	} else {
-		defer closeRead() //nolint:errcheck
-		go limits.SampleMemory(ctx, peakSampleEvery, read)
-	}
+	// What statements hold at once, in each DuckDB, for their reservations
+	// (see workload.Controller.SampleMemory).
+	go limits.SampleMemory(ctx, peakSampleEvery, func(ctx context.Context) ([2]int64, bool) {
+		h, ok := eng.HeldMemory(ctx)
+		return h.Query, ok
+	})
 	if historyStore != nil {
 		var seed func([]distributed.Run)
 		if dist != nil {
@@ -580,7 +578,10 @@ func serve() error {
 	if memory.Total > 0 {
 		go memlimit.Watch(ctx, memory.Total, srv.ShedMemory)
 		go memlimit.Adapt(ctx, memory.Total, memory.DuckDB, func(n int64) error { return eng.SetMemoryLimit(ctx, n) },
-			func() (int64, bool) { return eng.HeldMemory(ctx) }, log)
+			func() (int64, bool) {
+				h, ok := eng.HeldMemory(ctx)
+				return h.Sum(), ok
+			}, log)
 		log.Info("memory watch is on", "cancels_below", memlimit.Format(memlimit.Low(memory.Total)),
 			"spills_more_below", memlimit.Format(memlimit.High(memory.Total)))
 	}

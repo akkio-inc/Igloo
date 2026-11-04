@@ -83,8 +83,9 @@ type queryRecord struct {
 	exact string
 	// form is what its FLATTENs took, if they could take either.
 	form statementForm
-	// peak is the most memory it was seen holding, if sampled (see
-	// workload.Controller.SampleMemory); zero otherwise.
+	// peak is the most memory it held at once, as far as the replica could
+	// tell, if a sample fell within its run (see workload.FootprintOf); zero
+	// otherwise.
 	peak int64
 	// ai is what its AI functions did, if it called any.
 	ai *ai.Spend
