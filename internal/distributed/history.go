@@ -75,6 +75,10 @@ type runs struct {
 	planSorted float64
 	planJoins  float64
 	planRows   float64
+	// peak is the most it held at its peak in its runs to their end on
+	// this replica, short of the share of memory at which it may have
+	// spilled (see ObservePeak); zero if none. It stands for planSet.
+	peak float64
 	// localMemory, distMemory and largeMemory are the memory its runs had:
 	// the replica's limit on one machine, the smallest worker's on workers,
 	// the large worker's on it; zero when not known. Runs under other
@@ -224,6 +228,9 @@ type Run struct {
 	// Memory is the memory it ran with (see RunMemory); a run that does not
 	// say is not taken.
 	Memory int64
+	// Peak is the most it held, as its replica sampled it, of a run to its
+	// end on one machine (see ObservePeak); zero if not known.
+	Peak int64
 }
 
 // alike reports whether two machines' memory, a and b, are close enough,
@@ -420,6 +427,9 @@ func (co *Coordinator) Seed(rs []Run) {
 			co.observeOutOfMemory(r.Key, r.Memory)
 		case r.Duration > 0:
 			co.history.observe(r.Key, r.Workers, r.Large, r.Duration.Seconds(), r.Memory)
+			if r.Workers == 0 && !r.Large && alike(r.Memory, co.opts.MemoryBytes) {
+				co.ObservePeak(r.Key, r.Peak)
+			}
 		}
 	}
 }

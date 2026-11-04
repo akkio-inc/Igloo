@@ -626,6 +626,10 @@ func (co *Coordinator) planOn(ctx context.Context, query string, env Env, mode M
 			})
 		}
 		x.planSet, x.planParts, x.planned = p.set*co.memory.scale(), p.parts, ok
+		if ok && r.peak > 0 {
+			// What it held here before, measured (see ObservePeak).
+			x.planSet = r.peak
+		}
 		x.planBytes, x.planWork, x.planKeeps = p.bytes, p.work, p.keeps
 		x.planFields, x.planSorted, x.planJoins, x.planRows = p.fields, p.sorted*co.memory.scale(), p.joins, p.rows
 	}

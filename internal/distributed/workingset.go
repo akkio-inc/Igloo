@@ -369,10 +369,13 @@ func (m *memoryScale) scale() float64 {
 
 // ObservePeak records that a statement whose plan key is key held peak
 // bytes at its peak on this replica, where it ran to its end, as its
-// replica's sampling of DuckDB's memory saw it: DuckDB's plans' working
-// sets are corrected by such peaks against what they estimated (see
-// memoryScale). A peak at the memory limit's share may be one spilled,
-// and says less than it held.
+// replica's sampling of DuckDB's memory saw it. It is its working set when
+// it runs again, the most of its runs so, rather than its plan's estimate:
+// of statements run alone again and again, every run's peak was within
+// twice what the next held, where plans are for 80% of them on a first run.
+// DuckDB's plans' other working sets are corrected by such peaks against
+// what they estimated (see memoryScale). A peak at the memory limit's share
+// may be one spilled, and says less than it held.
 func (co *Coordinator) ObservePeak(key string, peak int64) {
 	if key == "" || peak <= 0 || co.opts.MemoryBytes > 0 && float64(peak) >= memoryShare*float64(co.opts.MemoryBytes) {
 		return
@@ -380,6 +383,7 @@ func (co *Coordinator) ObservePeak(key string, peak int64) {
 	if r, ok := co.history.get(key); ok && r.planSet > 0 {
 		co.memory.observe(r.planSet, float64(peak))
 	}
+	co.history.update(key, func(r *runs) { r.peak = max(r.peak, float64(peak)) })
 }
 
 // heldPart is what one operator of a plan holds, for EXPLAIN DISTRIBUTED.

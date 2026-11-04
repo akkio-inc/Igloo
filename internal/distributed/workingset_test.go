@@ -323,6 +323,41 @@ func TestMemoryScale(t *testing.T) {
 	}
 }
 
+// TestRepeatPlacedByItsPeak checks that a statement that ran to its end on
+// the replica is placed, run again, by the most it held then, not by its
+// plan's estimate; and not by a peak at the memory's share, which may be
+// one spilled.
+func TestRepeatPlacedByItsPeak(t *testing.T) {
+	h := newHarness(t, 0.01, 3, 2)
+	h.co.opts.MemoryBytes = 4 << 30
+	for _, name := range []string{"orders", "lineitem"} {
+		h.tables[name].Bytes = 1 << 34
+	}
+	q := `SELECT o_orderpriority, count(*) FROM orders JOIN lineitem ON l_orderkey = o_orderkey GROUP BY 1 ORDER BY 1`
+	env := harnessEnv{h}
+	set := func() (string, float64) {
+		t.Helper()
+		plan, d, err := h.co.plan(context.Background(), q, env, ModeAuto, false, nil)
+		if err != nil || d == nil {
+			t.Fatalf("plan: %v", err)
+		}
+		return plan.Key, d.e.local.set
+	}
+	key, first := set()
+	if first <= 0 {
+		t.Fatalf("no working set by the plan: %g", first)
+	}
+	h.co.ObservePeak(key, int64(0.9*memoryShare*float64(h.co.opts.MemoryBytes))+1<<30)
+	if _, again := set(); again != first {
+		t.Errorf("after a peak at the memory's share: %g, want the plan's %g", again, first)
+	}
+	h.co.ObservePeak(key, 300<<20)
+	h.co.ObservePeak(key, 200<<20)
+	if _, again := set(); again != 300<<20 {
+		t.Errorf("run again: %g, want the most it held, %d", again, 300<<20)
+	}
+}
+
 // TestGroupEntries checks what groupings hold against what DuckDB was seen to
 // hold, on 16 threads.
 func TestGroupEntries(t *testing.T) {

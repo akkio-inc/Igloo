@@ -776,7 +776,10 @@ many groups a grouping's keys made of how many rows, how many rows a join of
 two columns made of its inputs', and what share of a table a scan with the
 same filters kept, their constants aside. A statement grouping 400 million
 rows by a key of 500 strings was estimated at 32 GB; after another grouping
-by the same key ran, at 0.4 GB.
+by the same key ran, at 0.4 GB. A statement that ran to its end on the
+replica before, without reaching the share of its memory at which it may
+have spilled, is placed by the most it held then, as the replica sampled
+it, not by its plan.
 
 **How many workers.** Igloo weighs the statement on 1, 2, 4 and so on of
 the workers, up to `IGLOO_WORKER_MAX`, and on the workers running now, each

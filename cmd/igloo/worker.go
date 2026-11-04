@@ -370,7 +370,7 @@ func seedHistory(ctx context.Context, seed func([]distributed.Run), fp footprint
 			case q.PlanKey == "":
 			case q.Outcome == audit.OutcomeOK:
 				rs = append(rs, distributed.Run{Key: q.PlanKey, Workers: q.Workers, Large: distributed.OnLarge(q.Placement), Duration: q.Duration,
-					Memory: q.Memory})
+					Memory: q.Memory, Peak: q.Peak})
 			case q.Workers > 0 && q.Outcome == audit.OutcomeError:
 				// It failed on workers, as when one ran out of memory.
 				rs = append(rs, distributed.Run{Key: q.PlanKey, Workers: q.Workers, Large: distributed.OnLarge(q.Placement), Duration: q.Duration,
