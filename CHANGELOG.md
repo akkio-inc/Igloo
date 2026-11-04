@@ -2515,7 +2515,9 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   more memory than the replica has, on any number of threads, and 2 ran out
   as they were prepared, which now waits too. A statement runs again only
   before it sent a row, outside a transaction block, and when it changes
-  nothing until it commits.
+  nothing until it commits. One that runs out alone on one thread fails
+  with what happened and what would let it finish: a higher memory limit,
+  or workers, when its session turned distributed execution off.
 
 - A replica no longer cancels its first statements for memory while it reads back,
   after a start, the parts of files DuckDB held. The read-back took a new buffer for

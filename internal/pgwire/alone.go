@@ -3,11 +3,16 @@ package pgwire
 import (
 	"context"
 	"errors"
+	"fmt"
 	"math"
 	"strconv"
 	"time"
 
 	"github.com/duckdb/duckdb-go/v2"
+	"github.com/jeroenrinzema/psql-wire/codes"
+	pgerror "github.com/jeroenrinzema/psql-wire/errors"
+
+	"github.com/akkio-inc/igloo/internal/distributed"
 )
 
 // A statement that runs out of memory runs again rather than fail, first
@@ -107,7 +112,7 @@ func (sess *session) runAgainAlone(outer, ctx context.Context, alone *runAlone, 
 			}
 		}
 		if threads /= 2; threads < 1 {
-			return more.cause
+			return sess.outOfMemoryAlone(more.cause)
 		}
 		restore, ok := sess.setThreads(again, threads)
 		if !ok {
@@ -158,4 +163,22 @@ func (sess *session) setThreads(ctx context.Context, n int) (restore func(), ok 
 			r()
 		}
 	}, len(restores) > 0
+}
+
+// outOfMemoryAlone is the error of a statement that ran out of memory, cause,
+// running alone on one thread: it says so, and what would let it finish, which
+// are the operator's choices and the session's to make.
+func (sess *session) outOfMemoryAlone(cause error) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	limit, err := settingValue(ctx, sess.conn, "memory_limit")
+	if err != nil {
+		limit = "its"
+	}
+	finish := "a higher memory limit (IGLOO_MEMORY_LIMIT)"
+	if sess.mode() == distributed.ModeOff {
+		finish += ", or on workers with distributed_execution 'auto' or 'on' (it is 'off')"
+	}
+	return pgerror.WithCode(fmt.Errorf("this statement ran out of memory running alone, on one thread, under DuckDB's memory limit of %s; it would finish with %s: %w",
+		limit, finish, cause), codes.OutOfMemory)
 }

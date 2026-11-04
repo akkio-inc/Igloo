@@ -121,6 +121,22 @@ func TestOutOfMemoryRunsAgainAlone(t *testing.T) {
 		t.Errorf("threads are %d after, not the %d they were", after, was)
 	}
 
+	// Out of memory even alone on one thread: the error says so, and what would
+	// let it finish.
+	cs.srv.failLocal = func(_ context.Context, st *statement) error {
+		if strings.Contains(st.query, "never_marker") {
+			return oom
+		}
+		return nil
+	}
+	never := cs.testServer.admin(t, pgx.QueryExecModeSimpleProtocol)
+	mustExec(t, never, "SET distributed_execution = 'off'")
+	_, err = never.Exec(ctx, "SELECT 10 AS never_marker")
+	if pgCode(err) != "53200" || !strings.Contains(err.Error(), "ran out of memory running alone, on one thread") ||
+		!strings.Contains(err.Error(), "IGLOO_MEMORY_LIMIT") || !strings.Contains(err.Error(), "distributed_execution") {
+		t.Errorf("out of memory alone on one thread: %v", err)
+	}
+
 	reset()
 	cs.srv.failLocal = func(_ context.Context, st *statement) error {
 		if strings.Contains(st.query, "block_marker") {
