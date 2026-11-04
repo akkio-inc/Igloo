@@ -811,7 +811,8 @@ func TestLatestVersionOfAnAudience(t *testing.T) {
 	x := features{bytes: 7e9, exchanged: 83e9, held: 7e9, rows: 5.75e9, levels: 5, stages: 9, planned: true, planSet: p.set, planBytes: p.bytes, planWork: p.work,
 		planKeeps: p.keeps, planJoins: p.joins}
 	e := x.estimate(machine{cores: 16, threads: 16, memory: 44e9}, fleet{cores: 16, threads: 16, running: 16, most: 16, memory: 26 << 30})
-	if !e.memory || e.onWorkers > e.oneMachine {
+	// Its first run goes to workers by its time, which its operators give.
+	if e.onWorkers > e.oneMachine {
 		t.Fatalf("one machine %.0f s, short of memory %v; workers %.0f s", e.oneMachine, e.memory, e.onWorkers)
 	}
 	if workers, explore, reason := choose(e, runs{}, false, DefaultThreshold, time.Now()); !workers || explore {

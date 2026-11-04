@@ -146,6 +146,32 @@ func TestChoose(t *testing.T) {
 	}
 }
 
+// TestPlannedMemory checks that a statement whose working set by DuckDB's
+// plan fits the replica is not short of memory by what its stages exchange:
+// F5-like at ten times the data, whose stages read 30.7 GB for exchanges,
+// held 19 to 20 GB as its plan said (15.3 GB), and ran in 23.5 s on a
+// replica of 44 GB beside dashboards, where 4 workers took 166.5 s.
+func TestPlannedMemory(t *testing.T) {
+	replica := machine{cores: 16, threads: 24, memory: 44e9}
+	f5 := features{bytes: 736851919, exchanged: 30700362940, held: 736851919, rows: 1.5187e9, levels: 7, stages: 13,
+		planned: true, planSet: 15.3e9, planBytes: 736851822, planWork: 14 * 16}
+	e := f5.estimate(replica, benchWorkers)
+	e.others = 4
+	if workers, _, reason := choose(e, runs{}, false, DefaultThreshold, time.Now()); workers || e.memory {
+		t.Errorf("F5-like beside four: workers %v, short of memory %v (%s)", workers, e.memory, reason)
+	}
+	// Its plan over the replica's share: short of memory, as before.
+	f5.planSet = 40e9
+	if e := f5.estimate(replica, benchWorkers); !e.memory || !e.spills {
+		t.Errorf("held at 40 GB: short of memory %v, spills %v", e.memory, e.spills)
+	}
+	// Without a plan, by what its stages exchange.
+	f5.planned = false
+	if e := f5.estimate(replica, benchWorkers); !e.memory {
+		t.Error("without a plan: not short of memory")
+	}
+}
+
 // TestDirectReads checks that what stages that write no exchange read counts
 // apart (features.direct), and that workers read it at one machine's cold rate
 // a core, not workerReadShare of it: on 16 workers of 8 cores and 12 threads

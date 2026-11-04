@@ -649,7 +649,10 @@ the replica would take longer than `IGLOO_WORKER_THRESHOLD` (a minute), or
 would run short of memory, and the workers are estimated to be at least
 1.5 times faster. Short of memory by what it exchanges, workers need only be
 no slower: a report estimated at 52 s, what it reads, took 174 s by way of the
-guard, and 68 to 87 s on workers. A working set four or more times the
+guard, and 68 to 87 s on workers. Where DuckDB's plan says what it holds,
+it is short of memory only if that is over the replica's room too: a report
+whose stages read 30.7 GB for exchanges held 19 to 20 GB, as its plan said,
+and ran in 23.5 s on the replica, where 4 workers took 166.5 s. A working set four or more times the
 replica's room runs on workers whatever they are estimated to take, as long as
 there are workers.
 
