@@ -492,6 +492,8 @@ type Server struct {
 	// stateRowGroupBytes is about how many bytes of a refresh state's rows a
 	// row group of its files holds (see refresher.sizeRowGroups).
 	stateRowGroupBytes int64
+	// captured is when captureOutOfMemory last logged, in Unix nanoseconds.
+	captured atomic.Int64
 	// stuck lets the client of a statement that does not stop once
 	// canceled go (see watchStuck).
 	stuck *stuckWatch
@@ -1115,6 +1117,8 @@ type session struct {
 	// because Igloo exits (see exitForMemory).
 	statement string
 	started   time.Time
+	// reserved is the memory the running statement reserved as it started.
+	reserved int64
 	// runShape is the running statement's shape, inBackground says it runs in the
 	// second DuckDB, and elsewhere on workers, for the statements beside it (see
 	// besideIsHeavy and othersRunning).
@@ -1634,7 +1638,7 @@ func (sess *session) runCancelable(ctx context.Context, query string, fn func(co
 
 	defer func() {
 		sess.mu.Lock()
-		sess.running, sess.statement, sess.started, sess.queued = nil, "", time.Time{}, false
+		sess.running, sess.statement, sess.started, sess.queued, sess.reserved = nil, "", time.Time{}, false, 0
 		sess.runShape, sess.elsewhere = "", false
 		sess.mu.Unlock()
 		cancel()
@@ -1658,7 +1662,7 @@ func (sess *session) runCancelable(ctx context.Context, query string, fn func(co
 	}
 	defer release()
 	sess.mu.Lock()
-	sess.started, sess.queued = time.Now(), false
+	sess.started, sess.queued, sess.reserved = time.Now(), false, sess.wl.reserved
 	sess.mu.Unlock()
 	if timeout := sess.statementTimeout(); timeout > 0 {
 		var cancelRun context.CancelFunc
@@ -2408,6 +2412,7 @@ func (s *Server) preparedQuery(ctx context.Context, sess *session, user auth.Use
 					// below, rather than on workers with bitmaps.
 					return err
 				}
+				s.captureOutOfMemory(sess, err)
 				if err != nil && s.mayMoveAfterOutOfMemory(sess, &parts) && tw.Written() == 0 && outer.Err() == nil && sess.ranOutOfMemory(ctx, err) {
 					return s.afterOutOfMemory(outer, ctx, sess, st, args, tw, &parts, err)
 				}

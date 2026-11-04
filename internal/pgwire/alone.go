@@ -116,6 +116,7 @@ func (s *Server) againAlone(sess *session, err error) error {
 func (s *Server) rerunsAlone(sess *session, fn func(context.Context) error) func(context.Context) error {
 	return func(ctx context.Context) error {
 		err := fn(ctx)
+		s.captureOutOfMemory(sess, err)
 		if sess.outer.Err() == nil && sess.outOfMemoryHere(err) {
 			return s.againAlone(sess, err)
 		}

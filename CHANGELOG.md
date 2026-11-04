@@ -2658,6 +2658,12 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   rewrites it, and its inserts are sized the same. DuckDB puts a vector of rows,
   up to 2,048, in each row group it writes, so rows past 4 KB make larger ones.
 
+- A statement that runs out of DuckDB's memory has Igloo log what held it:
+  DuckDB's limit and its memory by tag, what the workload controller reserved
+  and last saw held, and the five running statements that reserved the most.
+  DuckDB's error says only what the statement failed to get. Statements that
+  run out within 10 s of each other share one line.
+
 - A replica no longer cancels its first statements for memory while it reads back,
   after a start, the parts of files DuckDB held. The read-back took a new buffer for
   each request, which Go's heap kept after it ended, until Go's next collection;

@@ -193,6 +193,24 @@ func (c *Controller) Budget() int64 {
 	return c.budget
 }
 
+// Memory is what the controller knows of the memory now: what the running
+// statements reserved, what DuckDB last held for them in all as
+// SampleMemory read it, how many run, and how many wait.
+type Memory struct {
+	Reserved, Held   int64
+	Running, Waiting int
+}
+
+// Memory returns what the controller knows of the memory now.
+func (c *Controller) Memory() Memory {
+	if c == nil {
+		return Memory{}
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return Memory{Reserved: c.reserved, Held: c.held, Running: len(c.active), Waiting: len(c.queue)}
+}
+
 // Admit waits until a statement under l may start, or ctx ends, in which
 // case it returns ctx's error. The statement must call release when it
 // ends, which returns the most memory it was seen holding, peak, if a
