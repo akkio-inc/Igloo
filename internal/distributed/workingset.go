@@ -59,8 +59,7 @@ import (
 //
 // The plan also says what one machine reads (each table's columns that
 // its scans project, once: the read cache serves them again) and the
-// rows its hash tables take in, at hashMissRate a core where a table is
-// larger than the caches (see planEstimate).
+// core-seconds its operators take, by their rows (see operatorWork).
 
 // Explainer is an Env whose session plans a query as DuckDB would run it
 // on this replica: Explain returns DuckDB's EXPLAIN (FORMAT JSON) of query,
@@ -83,13 +82,6 @@ const (
 	// planExprWidth is the width of a column the plan names by an
 	// expression rather than a table's column.
 	planExprWidth = 8
-	// hashMissRate is how many rows a core puts into or looks up in a hash
-	// table larger than cacheBytes, a memory access each, where one that
-	// fits the caches takes rowRate: 16 joins of 400 million rows to 400
-	// million and 17 to 18 million took 2,166 core-seconds on one machine,
-	// about 1e7 rows a core-second.
-	hashMissRate = 1e7
-	cacheBytes   = 64 << 20
 	// smallSource is the most rows a side of a cross product without
 	// tables of its own may have for the product to count every pair.
 	smallSource = 1024
@@ -407,7 +399,7 @@ func workingSetOf(plan string, st planStats) (float64, []heldPart, error) {
 // what it reads of tables cold, each table's columns its scans project
 // once, a hundredth of them for a table every scan of which is filtered
 // by a constant (zero where no scan's table is known); work the
-// core-seconds its hash tables take, joins' and aggregates'.
+// core-seconds its operators take (see operatorWork).
 type planEstimate struct {
 	set   float64
 	parts []heldPart
@@ -526,7 +518,7 @@ type setWalker struct {
 	unknown string
 	// ctes are the rows of the plan's common table expressions, by index,
 	// for their scans; scans what each scan of a table reads; work the
-	// core-seconds hash tables take (see planEstimate).
+	// core-seconds its operators take (see operatorWork).
 	ctes  map[string]cte
 	scans []scanRead
 	work  float64
@@ -537,6 +529,21 @@ type setWalker struct {
 	// filterIn are the columns of the input of the filter being estimated
 	// (see valuesShare).
 	filterIn []column
+	// delim is the correlated subquery the walk is in (see delimScope).
+	delim delimScope
+}
+
+// delimScope is a delim join's correlated subquery, as its DELIM_SCAN and
+// UNNEST see it: the rows of the join's input, which its DELIM_SCAN makes at
+// most, their distinct values, and how many of their columns the join takes
+// the subquery's rows back by. A FLATTEN of a row's object, as a report's
+// profile of an audience writes it, unnests a list of the row's own columns,
+// which the plan does not list: as many values as the columns it joins by.
+// DuckDB took each DELIM_SCAN of such a report for every row of the largest
+// table it read, 282 million, where it made 189,000.
+type delimScope struct {
+	rows float64
+	cols int
 }
 
 // cte is a common table expression's rows and columns, for its scans.
@@ -579,13 +586,113 @@ func (w *setWalker) bytes() int64 {
 	return total
 }
 
-// hashRate is how many rows a core puts into or looks up in a hash table
-// of bytes: rowRate where it fits the caches, hashMissRate otherwise.
-func hashRate(bytes float64) float64 {
-	if bytes > cacheBytes {
-		return hashMissRate
+// What a row costs DuckDB's operators, in seconds of a thread, fitted to the
+// time each operator of the estimate corpus's statements took in their runs'
+// profiles, by the rows it and its inputs made (bench/estimates.py keeps
+// each operator's seconds): a scan's row, and each byte of the row it hands
+// on; a hash join's row probed, row built on and row made; a delim join's row
+// of input; an aggregate's row in and group made, and its row in again for
+// each aggregate over distinct values or over all of a group's (median,
+// list); a window's or a sort's row times log2 of their rows where it
+// orders, and a window's row where it does not; an UNNEST's row made, of a
+// list the statement writes, as FLATTEN of a row's object does, or of one a
+// column holds; and a filter's row in. A statement's operators took 0.86 of
+// its run's time on its machine's cores (operatorShare), at the median of
+// those of a second or more.
+//
+// Hash tables' rows alone, the estimate before, missed what made reports
+// long: a report's profile of an audience, FLATTENing its people's objects
+// of 6 to 20 columns, spent 19 of its 90 s in UNNEST, at 1.9 µs a row, 17
+// in scans of tables of 7 to 45 columns, and 26 building on 80 million
+// rows, and was estimated at a third of it; the corpus's report that unnests
+// three values of each of 14 million orders took 16 s and was estimated at
+// 1.3. Over the operators of half a second or more, by their rows in the
+// runs, the costs put 76 hash joins of 106, 71 aggregates of 126, 13 windows
+// of 21, 13 unnests of 15 and 76 scans of 222 within twice what they took;
+// over whole statements whose operators took 2 s or more, 100 of 157.
+const (
+	scanRowCost       = 20e-9
+	scanByteCost      = 0.62e-9
+	joinProbeCost     = 41e-9
+	joinBuildCost     = 120e-9
+	joinOutCost       = 56e-9
+	delimInCost       = 140e-9
+	aggregateInCost   = 31e-9
+	aggregateOutCost  = 240e-9
+	distinctInCost    = 120e-9
+	holisticInCost    = 190e-9
+	orderedRowCost    = 22e-9
+	windowRowCost     = 100e-9
+	writtenUnnestCost = 1.2e-6
+	storedUnnestCost  = 5e-9
+	filterInCost      = 6.4e-9
+	operatorShare     = 0.86
+)
+
+// holistic matches an aggregate over all of a group's values, which it keeps.
+var holistic = regexp.MustCompile(`(?i)\b(list|array_agg|string_agg|median|quantile\w*|mode|approx_quantile|histogram)\(`)
+
+// operatorWork is the core-seconds an operator n takes, by the rows its
+// children made, in, and it made, out, as made of columns cols; flattens says
+// it is within a delim join's subquery that unnests a row's own columns (see
+// delimScope).
+func operatorWork(n *planNode, in []rowsEstimate, out rowsEstimate, cols []column, flattens bool) float64 {
+	name := strings.ToUpper(n.Name)
+	var all float64
+	for _, r := range in {
+		all += r.ours
 	}
-	return rowRate
+	ordered := func(rows float64) float64 { return rows * math.Log2(max(rows, 2)) * orderedRowCost }
+	var cost float64
+	switch {
+	case len(in) == 0 && (name == "ICEBERG_SCAN" || name == "TABLE_SCAN" || name == "SEQ_SCAN" || strings.HasPrefix(name, "READ_")):
+		cost = out.ours * (scanRowCost + scanByteCost*width(cols))
+	case strings.HasSuffix(name, "DELIM_JOIN") && len(in) > 0:
+		cost = in[0].ours * delimInCost
+	case strings.Contains(name, "JOIN") && len(in) >= 2:
+		cost = in[0].ours*joinProbeCost + in[len(in)-1].ours*joinBuildCost + out.ours*joinOutCost
+	case strings.HasSuffix(name, "GROUP_BY"), name == "UNGROUPED_AGGREGATE":
+		cost = all * aggregateInCost
+		if name != "UNGROUPED_AGGREGATE" {
+			cost += out.ours * aggregateOutCost
+		}
+		for _, a := range n.strs("Aggregates") {
+			if strings.Contains(strings.ToUpper(a), "DISTINCT") {
+				cost += all * distinctInCost
+			}
+			if holistic.MatchString(a) {
+				cost += all * holisticInCost
+			}
+		}
+	case name == "WINDOW":
+		p := strings.ToUpper(strings.Join(n.strs("Projections"), " "))
+		if strings.Contains(p, "PARTITION BY") || strings.Contains(p, "ORDER BY") {
+			cost = ordered(all)
+		} else {
+			cost = all * windowRowCost
+		}
+	case name == "ORDER_BY":
+		cost = ordered(all)
+	case name == "UNNEST", name == "INOUT_FUNCTION" && unnestFunction(n):
+		if _, written := writtenValues(n); written || flattens {
+			cost = out.ours * writtenUnnestCost
+		} else {
+			cost = out.ours * storedUnnestCost
+		}
+	case name == "FILTER":
+		cost = all * filterInCost
+	}
+	return cost / operatorShare
+}
+
+// notDistinct is how many of conds compare columns IS NOT DISTINCT FROM, as a
+// delim join takes its subquery's rows back by its input's columns.
+func notDistinct(conds []string) int {
+	n := 0
+	for _, c := range conds {
+		n += strings.Count(strings.ToUpper(c), "IS NOT DISTINCT FROM")
+	}
+	return n
 }
 
 // column is a column an operator outputs: its name if it is one, its
@@ -624,12 +731,13 @@ func (in rowsEstimate) scaled(d float64) float64 {
 // statistics), its rows are taken to be the product of its inputs' over
 // the larger distinct count of each pair of keys, and the operators above
 // it are corrected by as much.
-func (w *setWalker) walk(n *planNode) (rowsEstimate, []column) {
+func (w *setWalker) walk(n *planNode) (made rowsEstimate, madeCols []column) {
 	name := strings.ToUpper(n.Name)
 	var rows []rowsEstimate
 	var outs [][]column
 	// Where each child's parts and scans begin, and end, the last.
 	parts, scans := []int{len(w.parts)}, []int{len(w.scans)}
+	outer := w.delim
 	for i, c := range n.Children {
 		r, o := w.walk(c)
 		rows, outs = append(rows, r), append(outs, o)
@@ -637,7 +745,13 @@ func (w *setWalker) walk(n *planNode) (rowsEstimate, []column) {
 		if name == "CTE" && i == 0 {
 			w.ctes[strings.Join(n.strs("Table Index"), "")] = cte{r, o}
 		}
+		if strings.HasSuffix(name, "DELIM_JOIN") && i == 0 {
+			// Its subquery's, after its input (see delimScope).
+			w.delim = delimScope{rows: r.ours, cols: notDistinct(n.strs("Conditions"))}
+		}
 	}
+	w.delim = outer
+	defer func() { w.work += operatorWork(n, rows, made, madeCols, w.delim.cols > 0) }()
 	if name == "UNION" && len(rows) > 1 {
 		w.largestBranch(parts)
 	}
@@ -685,6 +799,10 @@ func (w *setWalker) walk(n *planNode) (rowsEstimate, []column) {
 		return est, nil
 	case strings.Contains(name, "SCAN"), strings.HasPrefix(name, "READ_"):
 		cols := w.columns(n.strs("Projections"), nil)
+		if name == "DELIM_SCAN" && w.delim.rows > 0 {
+			// No more than its delim join's input (see delimScope).
+			est.ours = min(est.ours, w.delim.rows)
+		}
 		if len(n.Children) > 0 || name == "DUMMY_SCAN" || strings.HasPrefix(name, "CTE") || strings.HasPrefix(name, "DELIM") {
 			return est, limitDistinct(cols, est.ours)
 		}
@@ -774,7 +892,7 @@ func (w *setWalker) walk(n *planNode) (rowsEstimate, []column) {
 		}
 		fan := 1.0
 		if u := findUnnest(n.Children[1]); u != nil {
-			fan = listValues(u)
+			fan = listValues(u, notDistinct(n.strs("Conditions")))
 		}
 		est.ours, est.kept = lhs.ours*fan, lhs.kept
 		_, sub := child(1)
@@ -786,9 +904,6 @@ func (w *setWalker) walk(n *planNode) (rowsEstimate, []column) {
 		build, buildCols := child(len(rows) - 1)
 		entry := min(width(buildCols), maxBuildWidth) + joinEntryBytes
 		w.hold(name, "join", build.ours, entry)
-		if strings.Contains(name, "HASH") {
-			w.work += (in.ours + build.ours) / hashRate(build.ours*entry)
-		}
 		var all []column
 		for _, o := range outs {
 			all = append(all, o...)
@@ -840,7 +955,6 @@ func (w *setWalker) walk(n *planNode) (rowsEstimate, []column) {
 		w.hold(name, "group", entries, entry)
 		w.distinct(name, aggs, inCols, groups, in.ours)
 		w.lists(name, aggs, inCols, in.ours)
-		w.work += in.ours / hashRate(entries*entry)
 		if computedKeys(groups) {
 			// Keys it computes, as a report's dimensions and their values:
 			// rows above it are few, whatever it holds on its way to them
@@ -852,10 +966,8 @@ func (w *setWalker) walk(n *planNode) (rowsEstimate, []column) {
 		w.distinct(name, n.strs("Aggregates"), inCols, nil, in.ours)
 		return rowsEstimate{duck: 1, ours: 1, kept: 1}, make([]column, len(n.strs("Aggregates")))
 	case name == "UNNEST", name == "INOUT_FUNCTION" && unnestFunction(n):
-		// As many rows as its lists have values: a list the statement writes,
-		// of the row's own values, has as many as it names; any other, which
-		// nothing here knows, unnestValues.
-		est.ours *= listValues(n)
+		// As many rows as its lists have values (see listValues).
+		est.ours *= listValues(n, w.delim.cols)
 		return est, limitDistinct(inCols, est.ours)
 	case name == "ORDER_BY" || name == "WINDOW":
 		est = in
@@ -1569,11 +1681,27 @@ func findUnnest(n *planNode) *planNode {
 	return nil
 }
 
-// listValues is how many rows an UNNEST makes of a row: as many as the
-// list it unnests has, where the statement writes it, as a report's
-// FLATTEN of its row's own values does (list_value(a, b, c) makes three);
-// unnestValues otherwise.
-func listValues(n *planNode) float64 {
+// listValues is how many rows an UNNEST, n, makes of a row: as many as the
+// list it unnests has, where the statement writes it (see writtenValues);
+// within a delim join's subquery that takes its rows back by delimCols of
+// its input's columns, as a FLATTEN of a row's object of as many columns
+// does, as many as those (see delimScope); unnestValues otherwise. A
+// report's four FLATTENs of people's objects made 6, 8.2, 20 and 19.2 rows of
+// each, and took 6, 12, 20 and 26 of their columns back.
+func listValues(n *planNode, delimCols int) float64 {
+	if k, ok := writtenValues(n); ok {
+		return k
+	}
+	if delimCols > 0 {
+		return float64(delimCols)
+	}
+	return unnestValues
+}
+
+// writtenValues is how many values the list an UNNEST, n, unnests has where
+// the statement writes it, as a report's FLATTEN of its row's own values
+// does (list_value(a, b, c) makes three); ok is false otherwise.
+func writtenValues(n *planNode) (values float64, ok bool) {
 	var exprs []string
 	for _, c := range n.Children {
 		exprs = append(exprs, c.strs("Projections")...)
@@ -1581,10 +1709,10 @@ func listValues(n *planNode) float64 {
 	exprs = append(exprs, n.strs("Projections")...)
 	for _, e := range exprs {
 		if k := listArgs(e); k > 0 {
-			return float64(k)
+			return float64(k), true
 		}
 	}
-	return unnestValues
+	return 0, false
 }
 
 // listArgs is how many values a list_value(...) expression at the start of

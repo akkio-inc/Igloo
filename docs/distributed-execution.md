@@ -613,9 +613,15 @@ joins much. Where DuckDB's plan says (see spilling, below), the replica's
 reading is what its scans project, each table's columns once, rather than
 what the parts name, which for a part reading a view's every column was
 77 GB of a table of 470 columns where the replica read 9.6 GB; and its
-time is no less than its hash tables take, at 10 million rows a second per
-core for a table larger than the processor's caches, as 16 joins of 400
-million rows to 400 million took 2,166 core-seconds. Workers also take
+time is no less than its operators take of its cores, by the rows the plan
+says each makes and takes in, at costs fitted to DuckDB's profiles of the
+estimate corpus: a scan's row and byte, a hash join's row probed, built on
+and made, an aggregate's row and group and its distinct and median-like
+aggregates, a sort's or window's rows times their logarithm, and an
+UNNEST's row, a microsecond and more where the statement writes the list,
+as FLATTEN of a row's object does. Of the corpus's statements that took 2 s
+or more alone, it puts 58% within twice what they took on a first run,
+where hash tables' rows alone put 8%. Workers also take
 about 8 seconds to start a statement and 5 for each level of its stages
 (stages that read what another wrote wait for it; those of one level run
 at once), plus the time to start workers that are stopped. Against the

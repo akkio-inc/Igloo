@@ -191,12 +191,13 @@ def tpcds_load(cur, schema: str, scale: float, scratch: pathlib.Path) -> None:
 
 def operators(profile: dict) -> list[dict]:
     """A profile's operators, as the plan's tree: each operator's name, the
-    rows it made and DuckDB's estimate of them, and its children, from below
-    the EXPLAIN_ANALYZE operator at its root."""
+    rows it made and DuckDB's estimate of them, the seconds its threads spent
+    in it, and its children, from below the EXPLAIN_ANALYZE operator at its
+    root."""
 
     def node(n: dict) -> dict:
         est = (n.get("extra_info") or {}).get("Estimated Cardinality")
-        out = {"name": n.get("operator_name"), "rows": n.get("operator_cardinality")}
+        out = {"name": n.get("operator_name"), "rows": n.get("operator_cardinality"), "seconds": n.get("operator_timing")}
         if est is not None:
             out["est"] = float(str(est).lstrip("~"))
         kids = [node(c) for c in n.get("children", [])]

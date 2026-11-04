@@ -66,7 +66,7 @@ type runs struct {
 	// before the correction by statements' peaks (see workingSet), kept so
 	// that the plan is not read again for it, and to correct the estimates
 	// by its peak (see ObservePeak); planBytes and planWork are what the
-	// plan said one machine reads and its hash tables take (planEstimate).
+	// plan said one machine reads and its operators take (planEstimate).
 	planSet    float64
 	planBytes  int64
 	planWork   float64

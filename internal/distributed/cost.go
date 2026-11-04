@@ -306,7 +306,7 @@ type features struct {
 	// where planned says the session could plan it, and planParts what each
 	// of its operators holds (see workingSetOf); planBytes is what one
 	// machine reads of tables by the plan, zero where it does not say, and
-	// planWork the core-seconds its hash tables take (see planEstimate).
+	// planWork the core-seconds its operators take (see operatorWork).
 	planSet   float64
 	planned   bool
 	planParts []heldPart
@@ -777,7 +777,7 @@ func (x features) estimate(m machine, f fleet) estimate {
 	// What it reads, or what it computes over the rows, whichever takes
 	// longer: a report that reads 2 GB of a table but joins its 400 million
 	// rows to themselves 16 times is no 1-second statement. By the plan,
-	// its hash tables' rows, at hashMissRate where they outgrow the caches.
+	// what its operators take of the cores (see operatorWork).
 	e.oneMachine = max(e.oneMachine, e.rows/(cores*rowRate), x.planWork/cores)
 	// Short of memory, it takes longer, spilling, as much as its working
 	// set is over its share of memory (see spillOn): heldFactor times what

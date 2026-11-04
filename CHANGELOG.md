@@ -591,6 +591,17 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
 
 ### Distributed execution
 
+- Auto mode estimates a statement's time on one machine by what each of its
+  operators takes, not by its hash tables' rows alone: scans by their rows and
+  width, joins by the rows probed, built on and made, aggregates by their rows,
+  groups and distinct or median-like aggregates, sorts and windows by their rows'
+  order, and UNNEST by the rows it makes, a microsecond and more each where the
+  statement writes the list, as FLATTEN of a row's object does. Of the estimate
+  corpus's statements that took 2 s or more alone, 58% are now estimated within
+  twice what they took on a first run, where 8% were; a report's profile of an
+  audience, which FLATTENs people's objects and took 7 s alone, is estimated at
+  3.7 s, where it was at 1.9.
+
 - Auto mode no longer gives up planning a statement for workers while its session
   waits for the catalog lock. A refresh beside a fleet's dashboards took the lock
   alone 12 times for up to 13 s, and 275 dashboard statements counted that wait

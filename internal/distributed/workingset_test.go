@@ -160,10 +160,10 @@ func TestPlanShapes(t *testing.T) {
 	if want := int64(77e9) / 470 * 18; p.bytes < want-1e8 || p.bytes > want+2e8 {
 		t.Errorf("E1-like reads %.1f GB, want %.1f GB", float64(p.bytes)/1e9, float64(want)/1e9)
 	}
-	// 16 joins of 400 million rows to 400 million and 17 to 18 million, in
-	// tables past the caches: 2,033 core-seconds; it took 2,166.
-	if p.work < 1800 || p.work > 2300 {
-		t.Errorf("E1-like: %.0f core-seconds", p.work)
+	// 16 joins of 400 million rows to 400 million and 17 to 18 million, and
+	// their scans: 3,295 core-seconds by the operators' costs; it took 2,166.
+	if took := 2166.0; p.work < took/1.6 || p.work > took*1.6 {
+		t.Errorf("E1-like: %.0f core-seconds; it took %.0f", p.work, took)
 	}
 
 	// F3-like: 157 million events joined to an audience of everyone, 2

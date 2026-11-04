@@ -464,6 +464,75 @@ func TestEstimateCorpus(t *testing.T) {
 // worstShown is how many of the statements furthest off the test logs.
 const worstShown = 30
 
+// corpusCores are the cores of the machine bench/estimates.py ran the
+// corpus's statements on, each alone: 16 (an m7g.4xlarge).
+const corpusCores = 16
+
+// TestTimeCorpus replays the estimate of what one machine's operators take
+// (operatorWork) over the corpus, as on each statement's first run, against
+// the seconds it took alone, of all and of those that took 2 s or more,
+// which are the ones whose time decides where they run.
+func TestTimeCorpus(t *testing.T) {
+	stmts, tables := corpus(t)
+	var all, long estimateErrors
+	type miss struct {
+		name     string
+		est, ran float64
+	}
+	var misses []miss
+	for _, s := range stmts {
+		if s.Seconds <= 0 || s.Error != "" {
+			continue
+		}
+		p, err := estimateOf(s, tables, nil, false)
+		if err != nil {
+			continue
+		}
+		est := p.work / corpusCores
+		// Under a twentieth of a second, both are noise.
+		r := max(est, 0.05) / max(s.Seconds, 0.05)
+		all.add(r)
+		if s.Seconds >= 2 {
+			long.add(r)
+			misses = append(misses, miss{fmt.Sprintf("%s %g %s", s.Suite, s.Scale, s.Name), est, s.Seconds})
+		}
+	}
+	t.Logf("all:          %s", all)
+	t.Logf("2 s or more:  %s", long)
+	sort.Slice(misses, func(i, j int) bool { return misses[i].est/misses[i].ran < misses[j].est/misses[j].ran })
+	for _, m := range misses[:min(len(misses), 8)] {
+		t.Logf("  %7.2f s estimated, %7.2f s run  %s", m.est, m.ran, m.name)
+	}
+	if os.Getenv("IGLOO_ESTIMATE_CORPUS") != "" {
+		return
+	}
+	for _, c := range []struct {
+		label string
+		e     estimateErrors
+		floor struct {
+			within float64
+			short  int
+		}
+	}{{"all", all, timeFloors["all"]}, {"2 s or more", long, timeFloors["long"]}} {
+		if within, short := c.e.shares(); within < c.floor.within || short > c.floor.short {
+			t.Errorf("%s: %.0f%% within twice what they took, %d more than four times short; want at least %.0f%% and at most %d",
+				c.label, 100*within, short, 100*c.floor.within, c.floor.short)
+		}
+	}
+}
+
+// timeFloors are what TestTimeCorpus accepts: what the estimate does now,
+// so that a change that does worse fails. Hash tables' rows alone, before
+// operatorWork, put 47% of all within twice, 97 more than four times short,
+// and of those of 2 s or more 8%, 18 short.
+var timeFloors = map[string]struct {
+	within float64
+	short  int
+}{
+	"all":  {0.68, 15},
+	"long": {0.55, 5},
+}
+
 // estimateFloors are the least share of the corpus's statements estimated
 // within twice what they held, and the most more than four times short,
 // that TestEstimateCorpus accepts of each mode: what the estimate does
