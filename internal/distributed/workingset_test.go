@@ -815,6 +815,69 @@ func TestPlanKeeps(t *testing.T) {
 	}
 }
 
+// TestFilterShares checks what filters are taken to keep (see filtered):
+// near all of a table for filters that a column is set, not empty or
+// recent, which DuckDB takes for a fifth; ranges of one column together;
+// an OR as its branches; DuckDB's own estimate for an equality of a column
+// nothing here knows; and of a join to a filtered dimension, the share of
+// the keys the facts have that the filter keeps.
+func TestFilterShares(t *testing.T) {
+	people := &Table{Name: "people", Rows: 1e7, Bytes: 1e9, Columns: []Column{{Name: "id", Type: "VARCHAR"}, {Name: "segment", Type: "VARCHAR"},
+		{Name: "born", Type: "INTEGER"}, {Name: "seen", Type: "TIMESTAMP"}, {Name: "kind", Type: "INTEGER"}, {Name: "city", Type: "VARCHAR"}},
+		Bounds:   map[string][2]float64{"born": {1900, 2099}, "seen": {0, 864e9}},
+		Distinct: map[string]int64{"kind": 10, "city": 50}}
+	st := newPlanStats([]*Stage{{Inputs: []Input{{Table: people}}}}, 16)
+	scan := func(card string, filters ...string) map[string]any {
+		extra := []any{"Projections", []string{"id", "segment", "born", "seen", "kind", "city"}, "Estimated Cardinality", card}
+		if len(filters) > 0 {
+			extra = append(extra, "Filters", filters)
+		}
+		return op("ICEBERG_SCAN", nil, extra...)
+	}
+	for _, c := range []struct {
+		name string
+		plan map[string]any
+		want float64
+	}{
+		{"set, not empty, seen in the last nine of ten days",
+			scan("2000000", "(NOT (id IS NULL))", "segment != ''", "seen>='1970-01-02 00:00:00'::TIMESTAMP"), 0.9},
+		{"born 1999 to 2001", scan("2000000", "born>=1999", "born<=2001"), 3.0 / 200},
+		{"a kind or a city", scan("2000000", "((kind = 1) OR (city = 'x'))"), 0.1 + 0.02},
+		{"optional", scan("2000000", "optional: kind IN (1, 2)"), 1},
+		{"a segment", scan("3300", "segment='a'"), 3300 / 1e7},
+		{"a segment, set", scan("660", "segment='a'", "(NOT (id IS NULL))"), 3300 / 1e7},
+		{"seen in a filter", op("FILTER", []map[string]any{scan("10000000")}, "Expression", "(seen >= '1970-01-02 00:00:00'::TIMESTAMP)",
+			"Estimated Cardinality", "2000000"), 0.9},
+	} {
+		p, err := planOf(planJSON(t, c.plan), st)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := p.rows / 1e7; math.Abs(got-c.want) > c.want/100 {
+			t.Errorf("%s: keeps %g, want %g", c.name, got, c.want)
+		}
+	}
+
+	// Two centuries of days, of which a year is kept, joined to five years
+	// of sales: a fifth of them, which DuckDB took for 500,000.
+	days := &Table{Name: "days", Rows: 73049, Bytes: 1e6, Columns: []Column{{Name: "day_key", Type: "INTEGER"}, {Name: "year", Type: "INTEGER"}},
+		Bounds: map[string][2]float64{"day_key": {0, 73048}, "year": {1900, 2099}}}
+	sales := &Table{Name: "sales", Rows: 1e8, Bytes: 1e9, Columns: []Column{{Name: "sold", Type: "INTEGER"}, {Name: "amount", Type: "BIGINT"}},
+		Bounds: map[string][2]float64{"sold": {36500, 38325}}}
+	st = newPlanStats([]*Stage{{Inputs: []Input{{Table: days}, {Table: sales}}}}, 16)
+	join := op("HASH_JOIN", []map[string]any{
+		op("ICEBERG_SCAN", nil, "Projections", []string{"sold", "amount"}, "Estimated Cardinality", "100000000"),
+		op("ICEBERG_SCAN", nil, "Projections", []string{"day_key"}, "Filters", "year=2001", "Estimated Cardinality", "14610")},
+		"Join Type", "INNER", "Conditions", "sold = day_key", "Estimated Cardinality", "500000")
+	p, err := planOf(planJSON(t, join), st)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.rows < 1.9e7 || p.rows > 2.1e7 {
+		t.Errorf("a year of five years' sales: %g rows", p.rows)
+	}
+}
+
 // TestPlanResult checks the fields of a plan's result, which a read sends
 // its client, and what its largest sort holds.
 func TestPlanResult(t *testing.T) {

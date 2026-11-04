@@ -2,6 +2,7 @@ package distributed
 
 import (
 	"bufio"
+	"cmp"
 	"compress/gzip"
 	"encoding/json"
 	"fmt"
@@ -101,10 +102,13 @@ func withActualRows(s corpusStatement) (json.RawMessage, bool) {
 // as ANALYZE would keep them, by table (see corpus).
 var analyzedCounts = map[*Table]map[string]int64{}
 
-// corpus reads the corpus's statements, with each one's tables.
+// corpus reads the corpus's statements, with each one's tables: those of
+// testdata/estimates, or of the directory IGLOO_ESTIMATE_CORPUS names, as
+// for statements kept out of the corpus to check it against.
 func corpus(t *testing.T) ([]corpusStatement, map[string]*Table) {
 	t.Helper()
-	files, err := filepath.Glob(filepath.Join("testdata", "estimates", "*.jsonl.gz"))
+	dir := cmp.Or(os.Getenv("IGLOO_ESTIMATE_CORPUS"), filepath.Join("testdata", "estimates"))
+	files, err := filepath.Glob(filepath.Join(dir, "*.jsonl.gz"))
 	if err != nil || len(files) == 0 {
 		t.Fatalf("no corpus: %v", err)
 	}
@@ -139,7 +143,11 @@ func corpus(t *testing.T) ([]corpusStatement, map[string]*Table) {
 					// manifests keep; and its distinct counts, as ANALYZE keeps
 					// them, for estimates of analyzed tables (see analyzed).
 					tb.Bounds = ct.Bounds
-					analyzedCounts[tb] = ct.Distinct
+					if strings.HasSuffix(ct.Suite, "+analyzed") {
+						tb.Distinct = ct.Distinct
+					} else {
+						analyzedCounts[tb] = ct.Distinct
+					}
 					continue
 				}
 				tb := &Table{Schema: strings.ReplaceAll(corpusKey(ct.Suite, ct.Scale, ""), "/", "_"), Name: ct.Name, Rows: ct.Rows, Bytes: ct.Bytes,
@@ -182,9 +190,9 @@ func corpusKey(suite string, scale float64, name string) string {
 
 // estimateOf replays the working-set estimate of a corpus statement, with
 // what l learned before, if not nil.
-func estimateOf(s corpusStatement, tables map[string]*Table, l *learned) (planEstimate, error) {
+func estimateOf(s corpusStatement, tables map[string]*Table, l *learned, exact bool) (planEstimate, error) {
 	st := corpusStats(s, tables)
-	st.learned = l
+	st.learned, st.exact = l, exact
 	return planOf(string(s.Plan), st)
 }
 
@@ -347,7 +355,7 @@ func TestEstimateCorpus(t *testing.T) {
 				}
 				s.Plan = plan
 			}
-			p, err := estimateOf(s, tables, l)
+			p, err := estimateOf(s, tables, l, mode == "actual")
 			if l != nil {
 				learnFrom(orig, tables, l)
 			}
@@ -391,7 +399,7 @@ func TestEstimateCorpus(t *testing.T) {
 		slices.SortFunc(worsts, func(a, b worst) int {
 			return int(math.Copysign(1, math.Abs(math.Log(b.ratio))-math.Abs(math.Log(a.ratio))))
 		})
-		if floor, ok := estimateFloors[mode]; ok {
+		if floor, ok := estimateFloors[mode]; ok && os.Getenv("IGLOO_ESTIMATE_CORPUS") == "" {
 			if within, short := all.shares(); within < floor.within || short > floor.short {
 				t.Errorf("%s: %.0f%% within twice what they held, %d more than four times short; want at least %.0f%% and at most %d",
 					label, 100*within, short, 100*floor.within, floor.short)
@@ -443,8 +451,8 @@ var estimateFloors = map[string]struct {
 	within float64
 	short  int
 }{
-	"first":    {0.66, 2},
-	"learning": {0.66, 2},
+	"first":    {0.68, 0},
+	"learning": {0.66, 1},
 	"actual":   {0.85, 2},
 }
 

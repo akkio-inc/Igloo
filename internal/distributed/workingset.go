@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 )
 
 // A statement's working set on one machine, from DuckDB's own plan of it:
@@ -82,9 +83,6 @@ const (
 	// planExprWidth is the width of a column the plan names by an
 	// expression rather than a table's column.
 	planExprWidth = 8
-	// filterShare is the share of a scan's rows a filter keeps, where
-	// DuckDB gives the scan no estimate of its own.
-	filterShare = 0.2
 	// hashMissRate is how many rows a core puts into or looks up in a hash
 	// table larger than cacheBytes, a memory access each, where one that
 	// fits the caches takes rowRate: 16 joins of 400 million rows to 400
@@ -165,13 +163,20 @@ type planStats struct {
 	owner     map[string]string
 	span      map[string]float64
 	timestamp map[string]bool
-	tables    []*Table
-	threads   int
+	// bounds are the columns' bounds, as span is of them; date the columns
+	// that are dates.
+	bounds  map[string][2]float64
+	date    map[string]bool
+	tables  []*Table
+	threads int
 	// learned are the rows operators made before (see learned), if any;
 	// with observe, the plan's estimates are the rows its operators made in
 	// a run, and walking it teaches learned.
 	learned *learned
 	observe bool
+	// exact says the plan's estimates are the rows its operators made, as
+	// when observing: they are taken as they are.
+	exact bool
 }
 
 // newPlanStats collects the columns of a plan's tables, for a machine of
@@ -194,7 +199,7 @@ func newPlanStats(stages []*Stage, threads int) planStats {
 // threads.
 func tableStats(tables []*Table, threads int) planStats {
 	st := planStats{width: map[string]float64{}, distinct: map[string]float64{}, owner: map[string]string{}, span: map[string]float64{},
-		timestamp: map[string]bool{}, tables: tables, threads: max(threads, 1)}
+		timestamp: map[string]bool{}, bounds: map[string][2]float64{}, date: map[string]bool{}, tables: tables, threads: max(threads, 1)}
 	owners := map[string]map[string]bool{}
 	for _, t := range tables {
 		for _, c := range t.Columns {
@@ -206,9 +211,16 @@ func tableStats(tables []*Table, threads int) planStats {
 			st.width[name] = max(st.width[name], memoryBytes(c.Type))
 			if b, ok := t.Bounds[name]; ok && b[1] >= b[0] {
 				st.span[name] = max(st.span[name], b[1]-b[0]+1)
+				if old, seen := st.bounds[name]; seen {
+					b = [2]float64{min(old[0], b[0]), max(old[1], b[1])}
+				}
+				st.bounds[name] = b
 			}
-			if strings.HasPrefix(strings.ToUpper(c.Type), "TIMESTAMP") {
+			switch typ := strings.ToUpper(c.Type); {
+			case strings.HasPrefix(typ, "TIMESTAMP"):
 				st.timestamp[name] = true
+			case typ == "DATE":
+				st.date[name] = true
 			}
 			if n := t.Distinct[name]; n > 0 {
 				st.distinct[name] = max(st.distinct[name], float64(n))
@@ -518,6 +530,9 @@ type setWalker struct {
 	scanned float64
 	// scanHeld is what its largest scan's readers hold (see scanBytes).
 	scanHeld float64
+	// filterIn are the columns of the input of the filter being estimated
+	// (see valuesShare).
+	filterIn []column
 }
 
 // cte is a common table expression's rows and columns, for its scans.
@@ -675,11 +690,17 @@ func (w *setWalker) walk(n *planNode) (rowsEstimate, []column) {
 		// estimates not at all for an Iceberg scan.
 		t := w.scanTable(cols, n.strs("Filters"))
 		switch {
+		case t != nil && t.Rows > 0 && len(n.strs("Filters")) > 0 && !w.st.exact && !w.st.observe:
+			// The share of the table its filters keep, by what they compare
+			// (see filtered), not DuckDB's fifth a filter.
+			w.filterIn = cols
+			est.ours = max(w.filtered(n.strs("Filters"), float64(t.Rows), card, ok), 1)
+			w.filterIn = nil
+			if !ok {
+				est.duck = est.ours
+			}
 		case t != nil && t.Rows > 0 && (!ok || card > float64(t.Rows)):
 			est.ours = float64(t.Rows)
-			if len(n.strs("Filters")) > 0 {
-				est.ours *= filterShare
-			}
 			if !ok {
 				est.duck = est.ours
 			}
@@ -712,7 +733,23 @@ func (w *setWalker) walk(n *planNode) (rowsEstimate, []column) {
 				est.kept = min(1, est.ours/float64(t.Rows))
 			}
 		}
-		return est, limitDistinct(cols, est.ours)
+		return est, limitDistinct(fixValues(cols, n.strs("Filters")), est.ours)
+	case name == "FILTER" && len(rows) == 1 && len(n.strs("Expression")) > 0 && !w.st.exact && !w.st.observe:
+		// What its expression keeps of its input (see filtered), where
+		// DuckDB takes a fifth of it for each filter it cannot estimate: a
+		// common table expression of every person filtered by when each was
+		// last seen, which kept 9.3 million of 10, was taken for 400,000.
+		w.filterIn = inCols
+		est.ours = max(w.filtered(n.strs("Expression"), in.ours, in.scaled(card), ok), min(in.ours, 1))
+		w.filterIn = nil
+		if in.ours > 0 {
+			est.kept = in.kept * min(est.ours/in.ours, 1)
+		}
+		kept := fixValues(inCols, n.strs("Expression"))
+		if p := n.strs("Projections"); len(p) > 0 {
+			return est, limitDistinct(w.columns(p, kept), est.ours)
+		}
+		return est, limitDistinct(kept, est.ours)
 	case name == "PROJECTION" || name == "FILTER" && len(n.strs("Projections")) > 0:
 		return est, limitDistinct(w.columns(n.strs("Projections"), inCols), est.ours)
 	case strings.HasSuffix(name, "DELIM_JOIN") && len(rows) == 3:
@@ -963,16 +1000,28 @@ func (w *setWalker) joinRows(n *planNode, rows []rowsEstimate, outs [][]column, 
 		if exact, found := w.distinctJoin(conds, rows, outs); found {
 			return exact, kept
 		}
-		fact, dim := l, r
+		fact, dim, side := l, r, 0
 		if r.ours > l.ours {
-			fact, dim = r, l
+			fact, dim, side = r, l, 1
 		}
-		capped := max(min(scaled, fact.ours), fact.ours*dim.kept)
+		// The other side's filters keep of the keys the side with more has,
+		// not of all of its own: a filter of two centuries of dates that
+		// keeps a year, joined to five years of sales, keeps a fifth of
+		// them, not a two-hundredth. So the share they keep is taken of the
+		// keys' bounds the side with more has, where both sides' are known.
+		dimKept := dim.kept
+		pairs := joinPairs(conds, outs)
+		for _, p := range pairs {
+			if f, d := p[side], p[1-side]; f.span > 0 && d.span > f.span {
+				dimKept *= d.span / f.span
+			}
+		}
+		capped := max(min(scaled, fact.ours), fact.ours*min(dimKept, 1))
 		// No fewer than its keys' bounds make of its inputs' rows: keys of at
 		// most span values, drawn apart, make l*r/span rows or more, as five
 		// memberships of each person, joined to each person's events, made
 		// five rows of each event.
-		if span := joinSpan(joinPairs(conds, outs)); span > 0 {
+		if span := joinSpan(pairs); span > 0 {
 			capped = max(capped, l.ours*r.ours/span)
 		}
 		return capped, kept
@@ -1138,6 +1187,362 @@ func constantWindow(projections []string) bool {
 		}
 	}
 	return len(projections) > 0
+}
+
+// What a filter keeps of its input: the product of what each of its
+// conjuncts keeps. DuckDB takes each filter it has no statistics for to keep
+// a fifth, and its products ran far short: filters that a column is set, or
+// not empty, or not one value keep nearly every row, and the scans of a
+// dashboard burst's audiences and attributes, filtered so, were taken for a
+// twentieth of what they read. So a conjunct keeps:
+//   - all of its rows, as IS NOT NULL, != and <>;
+//   - a twentieth, as IS NULL;
+//   - for the ranges of a column with bounds (an integer, a date, a
+//     timestamp), taken together, the share of the bounds they leave;
+//   - for equality with a constant, one over the column's distinct count,
+//     or else over the values its bounds allow, for an integer or a date;
+//     for IN, as many times that as its list has values;
+//   - for an OR, what its branches keep, together, as many as there are;
+//   - half, for anything else, as LIKE or a function's result;
+//   - as DuckDB estimates it, for equality or a range of a column of which
+//     the statement's tables tell neither: DuckDB may know more (Igloo hands
+//     it ANALYZE's distinct counts), and took an audience of 3.3 million of
+//     412 million memberships for one million where a fifth would be 82
+//     million.
+//
+// A scan's optional filters, the values a filter above it compares, as
+// DuckDB pushes them down to skip what it can, keep all its rows: the filter
+// above does the keeping.
+const (
+	nullShare    = 0.05
+	equalShare   = 0.2
+	unknownShare = 0.5
+)
+
+// filtered is the rows a filter of exprs, its conjuncts or lists of them,
+// keeps of in rows, of which DuckDB estimated it keeps duck, if ok: a
+// fifth, for all of its conjuncts but equalities, and the rest for its
+// equalities. What DuckDB estimates stands for the conjuncts this does not.
+func (w *setWalker) filtered(exprs []string, in, duck float64, ok bool) float64 {
+	var conj []string
+	for _, e := range exprs {
+		if !strings.HasPrefix(e, "optional: ") {
+			conj = append(conj, filterConjuncts(e)...)
+		}
+	}
+	f := w.conjunction(conj)
+	switch {
+	case !f.deferred:
+		return in * f.share
+	case !ok:
+		return in * f.share * equalShare
+	case f.others && !f.deferredOther:
+		// DuckDB's fifth is for the conjuncts estimated here.
+		duck /= equalShare
+	}
+	return min(duck, in) * f.share
+}
+
+// filter is what conjuncts keep together (see filtered): share, of the
+// conjuncts estimated here; deferred says one is left to DuckDB's estimate,
+// and deferredOther that one of those is not an equality; others that one
+// estimated here is not an equality.
+type filter struct {
+	share                           float64
+	deferred, deferredOther, others bool
+}
+
+// conjunction is what conjuncts keep together.
+func (w *setWalker) conjunction(conj []string) filter {
+	f := filter{share: 1}
+	ranges := map[string][2]float64{}
+	for _, c := range conj {
+		if col, side, v, ok := w.rangeOf(c); ok {
+			r, seen := ranges[col]
+			if !seen {
+				r = w.st.bounds[col]
+			}
+			if side == 0 {
+				r[0] = max(r[0], v)
+			} else {
+				r[1] = min(r[1], v)
+			}
+			ranges[col], f.others = r, true
+			continue
+		}
+		share, equal, known := w.conjunctShare(c)
+		switch {
+		case !known:
+			f.deferred = true
+			f.deferredOther = f.deferredOther || !equal
+		case equal:
+			f.share *= share
+		default:
+			f.share, f.others = f.share*share, true
+		}
+	}
+	for col, r := range ranges {
+		b := w.st.bounds[col]
+		f.share *= min(max(w.spanOf(col, r)/w.spanOf(col, b), 0), 1)
+	}
+	return f
+}
+
+// rangeOf is a conjunct comparing a column with bounds to a constant: the
+// column, the side of the column's values it leaves (0 those at least v, 1
+// those at most v) and v, in the units of its bounds.
+func (w *setWalker) rangeOf(c string) (col string, side int, v float64, ok bool) {
+	m := rangeCompare.FindStringSubmatch(c)
+	if m == nil {
+		return "", 0, 0, false
+	}
+	col = strings.ToLower(m[1])
+	if b, known := w.st.bounds[col]; !known || b[1] <= b[0] {
+		return "", 0, 0, false
+	}
+	v, ok = w.constant(col, strings.TrimSpace(m[3]))
+	if !ok {
+		return "", 0, 0, false
+	}
+	step := 0.0
+	if w.discrete(col) {
+		step = 1
+	}
+	switch m[2] {
+	case ">":
+		return col, 0, v + step, true
+	case ">=":
+		return col, 0, v, true
+	case "<":
+		return col, 1, v - step, true
+	}
+	return col, 1, v, true
+}
+
+// discrete says column col's values are whole steps of its bounds: an
+// integer's or a date's, not a timestamp's or a fraction's.
+func (w *setWalker) discrete(col string) bool {
+	b := w.st.bounds[col]
+	return !w.st.timestamp[col] && b[0] == math.Trunc(b[0]) && b[1] == math.Trunc(b[1])
+}
+
+// spanOf is how many values of column col lie from r[0] to r[1]: as many
+// as whole steps, both ends counted, for a discrete column.
+func (w *setWalker) spanOf(col string, r [2]float64) float64 {
+	if w.discrete(col) {
+		return r[1] - r[0] + 1
+	}
+	return r[1] - r[0]
+}
+
+// fixValues is cols with the distinct counts of those that conjuncts of
+// exprs, a filter's, hold to constants no more than those constants.
+func fixValues(cols []column, exprs []string) []column {
+	out := slices.Clone(cols)
+	for _, e := range exprs {
+		if strings.HasPrefix(e, "optional: ") {
+			continue
+		}
+		for _, c := range filterConjuncts(e) {
+			col, k, ok := fixedValues(c)
+			if !ok {
+				continue
+			}
+			for i := range out {
+				if out[i].name == col && (out[i].distinct <= 0 || out[i].distinct > k) {
+					out[i].distinct = k
+				}
+			}
+		}
+	}
+	return out
+}
+
+// fixedValues is the column a conjunct holds to constants, and how many:
+// as equality, IN or an OR of those of one column.
+func fixedValues(c string) (col string, k float64, ok bool) {
+	c = unwrap(strings.TrimSpace(c))
+	if branches := splitTop(c, " OR "); len(branches) > 1 {
+		for _, b := range branches {
+			bc, bk, bok := fixedValues(b)
+			if !bok || (col != "" && bc != col) {
+				return "", 0, false
+			}
+			col, k = bc, k+bk
+		}
+		return col, k, true
+	}
+	if m := inList.FindStringSubmatch(c); m != nil {
+		return strings.ToLower(m[1]), float64(len(splitTop(m[2], ", "))), true
+	}
+	if m := equalCompare.FindStringSubmatch(c); m != nil && !strings.ContainsAny(m[2], "(") {
+		return strings.ToLower(m[1]), 1, true
+	}
+	return "", 0, false
+}
+
+// filterConjuncts splits e at its top-level ANDs, outer parentheses removed.
+func filterConjuncts(e string) []string {
+	e = unwrap(strings.TrimSpace(e))
+	var out []string
+	depth, start, quote := 0, 0, false
+	for i := 0; i < len(e); i++ {
+		switch c := e[i]; {
+		case c == '\'':
+			quote = !quote
+		case quote:
+		case c == '(':
+			depth++
+		case c == ')':
+			depth--
+		case depth == 0 && strings.HasPrefix(e[i:], " AND "):
+			out = append(out, unwrap(strings.TrimSpace(e[start:i])))
+			start = i + len(" AND ")
+		}
+	}
+	return append(out, unwrap(strings.TrimSpace(e[start:])))
+}
+
+// unwrap removes parentheses around the whole of e.
+func unwrap(e string) string {
+	for len(e) > 1 && e[0] == '(' && e[len(e)-1] == ')' {
+		depth, whole := 0, true
+		for i := 0; i < len(e)-1; i++ {
+			if e[i] == '(' {
+				depth++
+			} else if e[i] == ')' {
+				depth--
+			}
+			if depth == 0 {
+				whole = false
+				break
+			}
+		}
+		if !whole {
+			break
+		}
+		e = strings.TrimSpace(e[1 : len(e)-1])
+	}
+	return e
+}
+
+var (
+	rangeCompare = regexp.MustCompile(`^"?([A-Za-z_][A-Za-z0-9_]*)"?\s*(>=|<=|>|<)\s*(.+)$`)
+	equalCompare = regexp.MustCompile(`^"?([A-Za-z_][A-Za-z0-9_]*)"?\s*=\s*(.+)$`)
+	inList       = regexp.MustCompile(`(?i)^"?([A-Za-z_][A-Za-z0-9_]*)"?\s+IN\s*\((.*)\)$`)
+	dateLiteral  = regexp.MustCompile(`^'(\d{4}-\d{2}-\d{2})(?:[ T](\d{2}:\d{2}:\d{2}(?:\.\d+)?))?'(?:::\w+(?: WITH TIME ZONE)?)?$`)
+)
+
+// conjunctShare is what one conjunct of a filter keeps (see filtered);
+// equal says it is an equality with constants, and known that this knows
+// what it keeps.
+func (w *setWalker) conjunctShare(c string) (share float64, equal, known bool) {
+	upper := strings.ToUpper(c)
+	switch {
+	case strings.HasPrefix(upper, "NOT ") && strings.HasSuffix(upper, "IS NULL)"), strings.HasSuffix(upper, " IS NOT NULL"):
+		return 1, false, true
+	case strings.HasSuffix(upper, " IS NULL"):
+		return nullShare, false, true
+	case strings.Contains(c, "!=") || strings.Contains(c, "<>") || strings.Contains(upper, " NOT IN "):
+		return 1, false, true
+	}
+	if branches := splitTop(c, " OR "); len(branches) > 1 {
+		// Its branches' shares, summed: DuckDB takes an OR of the values a
+		// store's city or a household's size may have for a fifth, which
+		// keep a tenth or a quarter.
+		sum := 0.0
+		for _, b := range branches {
+			f := w.conjunction(filterConjuncts(b))
+			if f.deferred {
+				f.share *= equalShare
+			}
+			sum += f.share
+		}
+		return min(sum, 1), false, true
+	}
+	if rangeCompare.MatchString(c) {
+		return 0, false, false
+	}
+	if m := inList.FindStringSubmatch(c); m != nil {
+		share, known := w.valuesShare(strings.ToLower(m[1]), float64(len(splitTop(m[2], ", "))))
+		return share, true, known
+	}
+	if m := equalCompare.FindStringSubmatch(c); m != nil && !strings.ContainsAny(m[2], "(") {
+		share, known := w.valuesShare(strings.ToLower(m[1]), 1)
+		return share, true, known
+	}
+	return unknownShare, false, true
+}
+
+// valuesShare is what equality of column col with one of k constants
+// keeps: k over its distinct count, where known, or else over the values
+// its bounds allow, for a discrete column (a year, a month, a date), which
+// has no more. Its count is the filter's input's where that has it: a
+// scan of dates DuckDB filtered to three years for the filter above it,
+// one year and two months of the others, keeps that filter a third of its
+// rows, not a two-hundredth of them.
+func (w *setWalker) valuesShare(col string, k float64) (float64, bool) {
+	for _, c := range w.filterIn {
+		if c.name == col && c.distinct > 0 {
+			return min(k/c.distinct, 1), true
+		}
+	}
+	if d := w.st.distinct[col]; d > 0 {
+		return min(k/d, 1), true
+	}
+	if b, ok := w.st.bounds[col]; ok && b[1] > b[0] && w.discrete(col) {
+		return min(k/w.spanOf(col, b), 1), true
+	}
+	return 0, false
+}
+
+// constant is value, a constant compared to col, in the units of col's
+// bounds: a number as it is, a date as days since 1970, a timestamp as
+// microseconds.
+func (w *setWalker) constant(col, value string) (float64, bool) {
+	if f, err := strconv.ParseFloat(strings.Trim(value, "'"), 64); err == nil {
+		return f, true
+	}
+	m := dateLiteral.FindStringSubmatch(value)
+	if m == nil {
+		return 0, false
+	}
+	layout, text := "2006-01-02", m[1]
+	if m[2] != "" {
+		layout, text = "2006-01-02 15:04:05", m[1]+" "+m[2]
+	}
+	at, err := time.Parse(layout, text)
+	if err != nil {
+		return 0, false
+	}
+	switch {
+	case w.st.timestamp[col]:
+		return float64(at.UnixMicro()), true
+	case w.st.date[col]:
+		return math.Floor(float64(at.Unix()) / 86400), true
+	}
+	return 0, false
+}
+
+// splitTop splits e at sep where sep is outside parentheses and quotes.
+func splitTop(e, sep string) []string {
+	var out []string
+	depth, start, quote := 0, 0, false
+	for i := 0; i < len(e); i++ {
+		switch c := e[i]; {
+		case c == '\'':
+			quote = !quote
+		case quote:
+		case c == '(':
+			depth++
+		case c == ')':
+			depth--
+		case depth == 0 && strings.HasPrefix(e[i:], sep):
+			out = append(out, e[start:i])
+			start = i + len(sep)
+		}
+	}
+	return append(out, e[start:])
 }
 
 // unnestFunction says a table in-out function is UNNEST, as DuckDB plans
