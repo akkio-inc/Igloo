@@ -361,12 +361,12 @@ func (e *writeEnv) local(t *testing.T, query string) string {
 	return strings.Join(texts(t, e.admin, query), "\n")
 }
 
-// TestFullRefreshOnWorkers checks that a full refresh of a view that later
-// refreshes go on from runs its partial aggregates on workers under auto mode,
-// as a read of them would, and that the next refresh, after a write, goes on
-// from the state they leave: for a view of sums, and for one counting distinct
-// values, which keeps them in bitmaps. Each has its query's rows, and runs on
-// workers in the background (see distributed.WithBackground).
+// TestFullRefreshOnWorkers checks where refreshes run under auto mode, as reads
+// of their queries would. A view of sums that later refreshes go on from runs
+// its full refresh's partial aggregates on workers, and the next refresh, after
+// a write, goes on from the state they leave. A view counting distinct values,
+// whose state would keep them in bitmaps merged here, runs its query whole on
+// workers each time, and keeps no state. Each has its query's rows.
 func TestFullRefreshOnWorkers(t *testing.T) {
 	t.Parallel()
 	rb := os.Getenv("IGLOO_TEST_RB_EXTENSION")
@@ -388,19 +388,25 @@ func TestFullRefreshOnWorkers(t *testing.T) {
 			t.Errorf("%s, %s:\n%s\nwant:\n%s", what, view, got, want)
 		}
 	}
-	for _, step := range []struct{ what, action string }{
-		{"the first refresh", actionFull},
-		{"the refresh after a write", actionIncremental},
+	for _, step := range []struct{ what, sums, reach string }{
+		{"the first refresh", actionFull, actionFull},
+		{"the refresh after a write", actionIncremental, actionFull},
 	} {
-		for view, query := range map[string]string{"sums_mv": sums, "reach_mv": reach} {
-			mustExec(t, admin, "REFRESH MATERIALIZED VIEW "+view)
-			action, detail, _, reason := viewRefresh(t, admin, "public."+view)
-			ranOn := strings.Contains(detail, "its query ran on")
-			if action != step.action || reason != "" || action == actionFull && !ranOn || ranOn && !strings.Contains(detail, "in the background") {
-				t.Errorf("%s of %s: %s: %s (%s)", step.what, view, action, detail, reason)
-			}
-			same(step.what, view, query)
+		mustExec(t, admin, "REFRESH MATERIALIZED VIEW sums_mv")
+		mustExec(t, admin, "REFRESH MATERIALIZED VIEW reach_mv")
+		onWorkers := func(detail string) bool {
+			return strings.Contains(detail, "its query ran on") && strings.Contains(detail, "in the background")
 		}
+		action, detail, _, reason := viewRefresh(t, admin, "public.sums_mv")
+		if action != step.sums || reason != "" || action == actionFull && !onWorkers(detail) {
+			t.Errorf("%s of the sums: %s: %s (%s)", step.what, action, detail, reason)
+		}
+		action, detail, _, reason = viewRefresh(t, admin, "public.reach_mv")
+		if action != step.reach || reason != bitmapsOnWorkers || !onWorkers(detail) {
+			t.Errorf("%s of the reach: %s: %s (%s)", step.what, action, detail, reason)
+		}
+		same(step.what, "sums_mv", sums)
+		same(step.what, "reach_mv", reach)
 		mustExec(t, admin, "INSERT INTO src SELECT i, i % 7, i * 2, 'more', TIMESTAMP '2026-02-01' FROM range(40000, 40100) AS r(i)")
 	}
 }

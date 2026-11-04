@@ -2667,16 +2667,17 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   groups' partial aggregates on the replica. The log says where each of a
   refresh's queries ran, and the history where its query did.
 
-- A view counting distinct values refreshes incrementally in seconds. Its
-  state, a bitmap of each group's values, was written as one row group of
-  every group's bitmap, as DuckDB puts a vector of rows, up to 2,048, in each
-  at least: for the
-  reach of a billion impressions by advertiser and channel, 800 bitmaps and
-  2 GB, which took more than 1 GB at once to read back. Beside dashboards that
-  memory was not there, and refreshes failed and ran again for 180 to 283 s.
-  The state is now written in row groups of about 8 MB. Alone, a refresh after
-  8 million new impressions takes 8 to 9 s, and writes 267 row groups of up
-  to 9 MB.
+- A view counting distinct values refreshes in full, its query on workers,
+  wherever auto mode would run that query there, and keeps no bitmaps; it goes
+  on incrementally, from a bitmap of each group's values, only where workers
+  would not run it. Beside a mixed load on 16 workers, full refreshes of the
+  reach of 1.5 billion impressions by advertiser and channel took 41 to 140 s,
+  with the dashboards at their best rate; incremental ones on the replica took
+  64 to 385 s and cost the dashboards 13 to 36% of theirs. Where it goes on
+  incrementally, its state is written in row groups of about 8 MB, not one row
+  group of every group's bitmap, as DuckDB puts a vector of rows, up to 2,048,
+  in each at least: 800 bitmaps, 2 GB, took more than 1 GB at once to read
+  back. Alone, such a refresh after 8 million new impressions takes 8 to 9 s.
 
 - A refresh writes a state of bitmaps in a few files, rather than a file for
   each 8 MB row group, each a request of its own to object storage. Writing
