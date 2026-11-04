@@ -389,7 +389,8 @@ new delete files name.
 | Filters and projections of a table, or of inner joins of tables | Incremental | Full |
 | Outer joins (`LEFT`, `RIGHT`, `FULL`) | Incremental while the tables the join fills with NULLs are unchanged | Full |
 | `GROUP BY` (or `SELECT DISTINCT`, or aggregates of all rows) with `count(*)`, `count(x)`, `sum(x)` of integers and decimals, and `avg(x)` of integers | Incremental | Incremental |
-| ... and also `min(x)`, `max(x)`, or `count(DISTINCT x)` of integers | Incremental | Full |
+| ... and also `min(x)` or `max(x)` | Incremental | Full |
+| ... and also `count(DISTINCT x)` of integers | Full, its query on workers, where auto mode would run it there; incremental otherwise | Full |
 | `UNION` of such filters, projections and joins | Incremental | Incremental |
 
 What these read may be a `WITH` clause (not recursive), a subquery in `FROM` or
@@ -404,9 +405,18 @@ is that aggregate.
   ΔA⋈B' + A⋈ΔB). A dimension table that changes reads the fact table it
   joins whole, as a full refresh would. A `UNION ALL` gains what each of its
   branches does, each change read through its branch alone.
+- **Distinct counts.** A view with `count(DISTINCT x)` refreshes in full,
+  its query on workers, whenever auto mode would run that query there, and
+  keeps no state; `refresh_mode_reason` says so. The reach of 1.5 billion
+  impressions by advertiser and channel refreshes so on 16 workers in 41 to
+  140 s, beside dashboards. It goes on incrementally, from a bitmap of each
+  group's values, where workers would not run the query (none are
+  configured, or auto mode keeps it on the replica), and with
+  `REFRESH_MODE = INCREMENTAL`.
 - **Aggregates.** An aggregating view keeps each group's partial
-  aggregates (counts, sums, minimums, maximums, and `count(DISTINCT x)`'s
-  values in a roaring bitmap) in a table of Igloo's own schema
+  aggregates (counts, sums, minimums, maximums, and, where it goes on
+  incrementally, `count(DISTINCT x)`'s values in a roaring bitmap, written in
+  row groups of about 8 MB) in a table of Igloo's own schema
   `igloo_refresh`, which no user's statement reads or writes, admins'
   included. A refresh aggregates the changed rows, merges them into the
   state, and writes the groups that changed; rows deleted are subtracted
@@ -421,8 +431,8 @@ is that aggregate.
   result equals a full refresh's to the bit. So sums and averages of
   floating-point values (`DOUBLE`, `FLOAT`), whose results depend on the
   order the values are added in, and averages of decimals, refresh in
-  full; `count(DISTINCT x)` needs integers from 0 to 4,294,967,295 and the
-  `rb` extension, which Igloo's image has.
+  full; `count(DISTINCT x)` kept incrementally needs integers from 0 to
+  4,294,967,295 and the `rb` extension, which Igloo's image has.
 - **Full refreshes** run the query over every row of its tables, and
   rebuild the state. They write the view's rows as new files, which one
   commit puts in its table in place of every file it had, so a full
@@ -506,10 +516,12 @@ CREATE DYNAMIC TABLE marts.daily_spend TARGET_LAG = '1 hour' WAREHOUSE = transfo
   its first refresh to fill. `SUSPEND` stops its schedule and `RESUME`
   starts it again; `ALTER ... REFRESH` refreshes it now.
 - **`REFRESH_MODE`**: `AUTO` (the default) refreshes incrementally when
-  the query's shape allows it, as for materialized views; `FULL` always
-  runs the query over every row; `INCREMENTAL` refuses, when the table is
-  created, a query that cannot be refreshed incrementally, with the
-  reason.
+  the query's shape allows it, as for materialized views, and a
+  `count(DISTINCT x)` in full on workers where auto mode would run its query
+  there (see [distinct counts](#incremental-refresh)); `FULL` always runs the
+  query over every row; `INCREMENTAL` refuses, when the table is created, a
+  query that cannot be refreshed incrementally, with the reason, and keeps a
+  `count(DISTINCT x)` incremental.
 - **`WAREHOUSE` is accepted and ignored**, with a notice: Igloo has no
   warehouses, and a refresh runs on the replica that holds its job.
   `COMMENT` and `DATA_RETENTION_TIME_IN_DAYS` are ignored with a notice

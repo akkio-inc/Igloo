@@ -351,10 +351,9 @@ partitioned by the groups so that each worker computes whole groups;
 aggregates over `DISTINCT` values of unrelated
 expressions in one `SELECT` (`count(DISTINCT a), count(DISTINCT b)`),
 window functions over rows but those of the next section, a large table read again in a correlated
-subquery expression of another shape (`NOT IN`, whose rows depend on whether
-any of its subquery's is `NULL`; a correlation with no equal columns, or by
-anything but equal columns in a scalar subquery or an `OR` of `EXISTS`;
-a scalar subquery of another aggregate, or that gives a value over no rows),
+subquery expression that is not one of the joins above (`NOT IN`, whose rows
+depend on whether any of its subquery's is `NULL`, or a correlation with no
+equal columns),
 subqueries in `GROUP BY`, samples of a number of rows,
 large tables joined on different keys in one `SELECT`, statements that call user-defined macros
 or session functions (`getvariable`, `current_setting`), tables with
@@ -658,9 +657,12 @@ estimate corpus: a scan's row and byte, a hash join's row probed, built on
 and made, an aggregate's row and group and its distinct and median-like
 aggregates, a sort's or window's rows times their logarithm, and an
 UNNEST's row, a microsecond and more where the statement writes the list,
-as FLATTEN of a row's object does. Of the corpus's statements that took 2 s
-or more alone, it puts 58% within twice what they took on a first run,
-where hash tables' rows alone put 8%. Workers also take
+as FLATTEN of a row's object does. Over the corpus's 450 statements, it
+puts 70% within twice what they took on a first run and 14 more than four
+times short, where hash tables' rows alone put 47% and 97; of the 26 that
+took 2 s or more alone, 58% and 5, where they put 8% and 18. On the
+holdout (see below), 59% and 41 of all, and 48% and 6 of the 31 of 2 s or
+more. Workers also take
 about 8 seconds to start a statement and 5 for each level of its stages
 (stages that read what another wrote wait for it; those of one level run
 at once), plus the time to start workers that are stopped. Against the
@@ -749,10 +751,15 @@ does, where DuckDB keeps every row, unless its scan is filtered so already,
 as one audience's rows of a lookup are, which DuckDB counted; where that
 row is the most value of a column over a table, unfiltered, it keeps no
 more than the rows of the row groups that hold the most value, read from
-the footers of the few files whose Iceberg bounds reach it (a lookup of
-1.41 billion rows had 189,400 of its latest version, in row groups of
-384,204, where a third of its rows by the versions' distinct count took a
-report for 191 GB, ten times what it held; it is now taken for 15 GB); one group by
+the footers of the files whose Iceberg bounds reach it, up to 16, once a
+snapshot and only when such a join is estimated (a lookup of 1.41 billion
+rows had 189,400 of its latest version, in 2 files of 19.7 million rows
+and row groups of 384,204, where a third of its rows by the versions'
+distinct count took a report for 191 GB, ten times what it held; it is
+now taken for 15 GB; at a hundred times the data, the version is in 8 of
+1,483 files, 76.3 million rows, and row groups of 2.05 million); integer
+columns stored as `DECIMAL(p,0)`, as a Snowflake `NUMBER` arrives, have
+bounds as integer columns do; one group by
 DuckDB's estimate of keys nothing knows is not one row; a `TOP_N` keeps what
 it says; a cross product with a small source of
 its own, as `FLATTEN` over a list of objects becomes, makes a row for each
@@ -808,9 +815,16 @@ plan of each, the rows each operator made, and the peak of what DuckDB held
 for it, sampled every few milliseconds; `TestEstimateCorpus` replays the
 estimate over them (`internal/distributed/testdata/estimates`) and fails if
 it gets worse. Over 450 statements, the estimate on a first run is within
-twice what they held for 67% of them, and more than four times short for 2,
-where it was 50% and 43; with DuckDB's estimates of each operator's rows
-replaced by the rows it made, 86% and 2, where it was 49% and 67. What it
+twice what they held for 69% of them, and more than four times short for
+none, where it was 50% and 43; with their tables analyzed, 80% and 1; as
+they run again, having learned from their own runs, 78% and 1; and with
+DuckDB's estimates of each operator's rows replaced by the rows it made,
+86% and 2, where it was 49% and 67. A holdout, a second capture of the same
+statements with their tables analyzed, which the costs were not fitted on,
+puts 80% within twice on a first run and as they run again, 4 more than
+four times short, and 82% and 4 by the rows made. Two captures of a
+statement agree within twice on what it held 93% of the time, and on how
+long it took 88%: no estimate can do much better than that. What it
 counts besides each operator's rows: what a scan's readers hold, about three
 times the part of a row group the columns it reads take, compressed, on each
 thread (Iceberg's manifests give the columns' sizes), which held 100 to 300
@@ -820,7 +834,7 @@ or `LATERAL` subquery's join, which materializes its input whole and, as
 list has values; aggregates that keep their values (`list`, `string_agg`);
 and distinct aggregates sized by their pairs of groups and values where
 their distinct counts are known. The bounds Iceberg's manifests keep of
-columns of integer types, dates and timestamps bound how many distinct
+columns of integer types (`DECIMAL(p,0)` among them), dates and timestamps bound how many distinct
 values they have, and so how many groups a grouping by them makes
 (`date_trunc` and casts of timestamps to dates included), and how many rows a
 join of them makes at least. And what operators made in statements that ran
@@ -948,7 +962,10 @@ So a statement that took 127 s on 16 workers, estimated at 89, is taken
 to need 153 s on 8, and one that then took 112 s on 8 runs on 8 next. A
 TPC-DS statement of seven levels at a hundred times the data that took 4.8
 s on 16 workers stays there: scaled whole by its run over its estimate,
-8 workers looked as fast for less, and took 14.7 s. A statement that
+8 workers looked as fast for less, and took 14.7 s. Carried over so, two
+reports' runs on 16 workers at ten times the data predict their runs on
+8, 4, 2 and 1 within a factor of 1.18 at the root mean square of the
+logarithms, where scaling the whole estimate was within 1.25. A statement that
 failed on a number of workers, or on the large worker, in the last day (a
 worker out of memory, a read that failed) is taken to need one and a half
 times as long as it ran there before it failed, so that other ways weigh
@@ -1065,7 +1082,9 @@ it printed of each part, and logs `planned a statement` with its time,
 stages, descriptions, other lookups in the session and its wait for the
 catalog lock when it takes a second or more. A lookup in the session that
 takes a quarter of a second or more logs `a lookup in the session took long`
-with what each of its steps took.
+with what each of its steps took. A table's metadata, which planning reads,
+loads again in the background as soon as a commit changes the table, so the
+statements after a commit find it loaded rather than wait for it.
 
 Stages that do not read each other's rows run side by side, and the
 coordinator sends a statement's tasks to a worker as it has room for them,
@@ -1075,16 +1094,19 @@ earlier statements; others, each worker in turn), and goes there when that
 worker has room; a worker with room that
 no waiting task goes to first takes the task that has waited longest. A slow
 or busy worker so runs fewer of a stage's tasks, and the others more, rather
-than hold up the stage until it has run a share as large as theirs. A worker
+than hold up the stage until it has run a share as large as theirs: a report
+on 16 workers took 573.9 s at the median against 677.7 s, and 626.2 s against
+1,048.1 s with one worker at half speed. A worker
 runs as many tasks at once as it has slots, and gives the next free ones to
 a task that runs again what a lost worker held, then to the statement that
 has started the fewest tasks there, so that a short statement gets past a
 long one's, and among those, to the first task to come.
 
 Statements in the background give way to the others on each worker: the
-refreshes of materialized views and dynamic tables, pipes' loads, and
-statements whose shape held the workers 5 seconds or more and 8 times as long
-as the other statements there, in each of its latest runs (see [heavy statements beside short
+refreshes of materialized views and dynamic tables, pipes' loads, and, when
+`IGLOO_HEAVY_IN_BACKGROUND` is set, statements whose shape held the
+workers 5 seconds or more and 8 times as long as the other statements there,
+in each of its latest runs (see [heavy statements beside short
 ones](workload-management.md#heavy-statements-beside-short-ones)). Their tasks
 get a quarter of a worker's slots before other tasks, rounded down, and one
 before them whenever none of theirs has started there for 10 seconds, so that
@@ -1092,7 +1114,10 @@ dashboards that keep the workers busy slow them and never stop them; more only
 once no other statement's task has run or waited there for 2 seconds. Beside a full
 refresh on 16 workers that took them for 40 to 140 s at a time, dashboards'
 statements on workers took 9.7 s at the median and 42 s at the 95th percentile,
-against 6.6 and 23 s while none ran. `placement` in the history ends with `in
+against 6.6 and 23 s while none ran. On two workers beside back-to-back full
+refreshes, once the refreshes gave way, dashboards ran twice the statements,
+at 11.4 s at the median and 101 s at the 95th percentile against 47.8 and
+544 s, and each refresh took 701 s against 719 s. `placement` in the history ends with `in
 the background` for them.
 
 ## Same results as one machine
@@ -1878,9 +1903,9 @@ several instance types and zones, so that capacity one lacks another has.
 - The large inputs of one `SELECT` are partitioned by one key. Large tables
   joined on different keys need a step each: a common table expression or
   subquery per key. A large table read again in a correlated subquery
-  expression that is not the join it means (`NOT IN`, a correlation by
-  anything but equal columns) runs on one machine; written as a join to a
-  common table expression, it runs distributed. Give the machines that run
+  expression that is not one of the joins it can mean (`NOT IN`, a
+  correlation with no equal columns) runs on one machine; written as a join
+  to a common table expression, it runs distributed. Give the machines that run
   such statements a lot of memory and fast spill disk.
 - `ROLLUP`, `CUBE` and `GROUPING SETS` run on workers up to the finest groups
   of their sets, and the coordinator, or in a subquery or common table
