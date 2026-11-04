@@ -659,9 +659,11 @@ func (b *bounder) topRows(files int) map[string]int64 {
 
 // footerFilesMost is how many files' footers a column's latest rows are
 // counted from (see latestRows), and footerReadLimit how long reading them
-// may take; with more, or longer, the files' rows stand.
+// may take; with more, or longer, the files' rows stand. The lookup of
+// 14.1 billion rows at a hundred times the data has its latest version in 8
+// of its 1,483 files, 76.3 million rows, and in row groups of 2.05 million.
 const (
-	footerFilesMost = 4
+	footerFilesMost = 16
 	footerReadLimit = 10 * time.Second
 )
 
