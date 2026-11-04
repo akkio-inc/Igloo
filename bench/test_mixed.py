@@ -193,6 +193,23 @@ class SQLTest(unittest.TestCase):
 
 
 class RunTest(unittest.TestCase):
+    def test_window_starts_after_the_users_log_in(self):
+        log, lock = [], threading.Lock()
+        args = mixed.parse(["run", "--duration", "0.4", "--warmup", "0", "--dashboard-users", "3", "--tile-concurrency", "2",
+                            "--think", "0.05", "--elt-streams", "0", "--rows", "1000", "--run-id", "t2"])
+
+        def connect(cls):
+            if cls == "dashboard":
+                time.sleep(0.3)  # a slow login, as under load
+            return FakeConn(log, lock, delay=0.01)
+
+        res = mixed.run(args, connect)
+        self.assertGreaterEqual(res["login_seconds"], 0.3)
+        first = min(r["start"] for r in res["records"] if r["class"] == "dashboard")
+        self.assertLess(first - res["t0"], 0.2)  # the first tile runs as the window opens
+        out = mixed.report(res, [], args, 1.0, 1.0, None)
+        self.assertGreaterEqual(out["login_seconds"], 0.3)
+
     def test_short_run(self):
         log, lock = [], threading.Lock()
         args = mixed.parse(["run", "--duration", "0.6", "--warmup", "0", "--dashboard-users", "2", "--tile-concurrency", "2",

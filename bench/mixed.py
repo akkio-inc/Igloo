@@ -395,11 +395,11 @@ class WorkerSampler(threading.Thread):
 # --- Running ----------------------------------------------------------------
 
 
-def dashboard_user(uid: int, args, connect, rec: Recorder, until: float, seed: int):
-    """One BI user: opens dashboards with think time between, each
-    dashboard's tiles at once."""
+def dashboard_user(uid: int, args, conns: list, rec: Recorder, until: float, seed: int):
+    """One BI user, on its own connections (opened before the window
+    starts): opens dashboards with think time between, each dashboard's
+    tiles at once."""
     rng = random.Random(seed * 1000 + uid)
-    conns = [connect("dashboard") for _ in range(args.tile_concurrency)]
     names = sorted(DASHBOARDS)
     try:
         while time.time() < until:
@@ -556,9 +556,16 @@ def run(args, connect, sampler: WorkerSampler | None = None) -> dict:
         if "ingest" in args.elt_jobs.split(",") and args.elt_streams:
             cur.execute(f"SELECT coalesce(max(batch_id), 0) FROM {args.schema}.impressions")
             first_batch = int(cur.fetchone()[0])
+    # Every BI user logs in before the clock starts: logins slow under load
+    # (43 s in one window), and a window that counted them would measure fewer
+    # dashboards a minute than the replica served.
+    began = time.time()
+    conns = connect_all(connect, "dashboard", args.dashboard_users * args.tile_concurrency)
+    logins = time.time() - began
     start = time.time()
     t0, until = start + args.warmup, start + args.warmup + args.duration
-    threads = [threading.Thread(target=dashboard_user, args=(u, args, connect, rec, until, args.seed), daemon=True)
+    k = args.tile_concurrency
+    threads = [threading.Thread(target=dashboard_user, args=(u, args, conns[u * k:(u + 1) * k], rec, until, args.seed), daemon=True)
                for u in range(args.dashboard_users)]
     elt = ELT(args, connect, rec, until, first_batch) if args.elt_streams else None
     if elt:
@@ -583,7 +590,31 @@ def run(args, connect, sampler: WorkerSampler | None = None) -> dict:
     if sampler:
         sampler.stop.set()
         sampler.join()
-    return {"records": rec.records, "t0": t0, "t1": t1, "end": end, "skipped": elt.skipped if elt else {}}
+    return {"records": rec.records, "t0": t0, "t1": t1, "end": end, "skipped": elt.skipped if elt else {},
+            "login_seconds": logins}
+
+
+def connect_all(connect, cls: str, n: int) -> list:
+    """n connections of class cls, opened at once; the first error raised."""
+    conns, errs = [None] * n, []
+
+    def one(i):
+        try:
+            conns[i] = connect(cls)
+        except Exception as e:  # raised below, once every attempt is done
+            errs.append(e)
+
+    ths = [threading.Thread(target=one, args=(i,)) for i in range(n)]
+    for th in ths:
+        th.start()
+    for th in ths:
+        th.join()
+    if errs:
+        for c in conns:
+            if c is not None:
+                c.close()
+        raise errs[0]
+    return conns
 
 
 def collect_history(conn, run_id: str, t0: float, t1: float, wait: float = 15.0) -> list[tuple]:
@@ -627,6 +658,7 @@ def report(res: dict, hist: list[tuple], args, coord_price: float, worker_price:
                                                   "elt_jobs", "heavy_sessions", "listing_streams", "probes", "seed", "coordinator", "worker",
                                                   "spot_factor")},
         "window_seconds": round(window, 1),
+        "login_seconds": round(res.get("login_seconds", 0), 1),
         "classes": summarize(res["records"], res["t0"], res["t1"]),
         "history": hs,
         "elt_skipped": res["skipped"],
@@ -638,7 +670,7 @@ def report(res: dict, hist: list[tuple], args, coord_price: float, worker_price:
 
 
 def print_report(out: dict):
-    print(f"\nrun {out['run_id']} {out['label']}: {out['window_seconds']:.0f} s window")
+    print(f"\nrun {out['run_id']} {out['label']}: {out['window_seconds']:.0f} s window, after the users' logins took {out.get('login_seconds', 0):.1f} s")
     print(f"{'class':<34} {'stmts':>6} {'err':>4} {'/min':>8} {'p50 s':>8} {'p95 s':>8} {'p99 s':>8} {'queue p95':>9} {'on wkrs':>7}")
     for key, v in out["classes"].items():
         h = out["history"].get(key, {})
