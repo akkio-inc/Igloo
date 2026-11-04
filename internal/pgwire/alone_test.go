@@ -61,6 +61,11 @@ func TestOutOfMemoryRunsAgainAlone(t *testing.T) {
 	var holderDone sync.WaitGroup
 	t.Cleanup(func() { holderDone.Wait() })
 	t.Cleanup(otherEnds)
+	// Seen once, the statement starts beside the other, rather than wait in
+	// line behind it for up to a minute as one nothing is known of does.
+	if n := count(t, cs.admin, "SELECT 7 AS beside_marker"); n != 7 {
+		t.Fatalf("got %d", n)
+	}
 	cs.srv.failLocal = func(ctx context.Context, st *statement) error {
 		switch {
 		case strings.Contains(st.query, "holder_marker"):
@@ -154,5 +159,79 @@ func TestOutOfMemoryRunsAgainAlone(t *testing.T) {
 	}
 	if n, _ := seen(); n != 1 {
 		t.Errorf("in a transaction block it ran %d times, want 1", n)
+	}
+}
+
+// TestOutOfMemoryRefreshRunsAgainAlone checks that a job's refresh of a
+// dynamic table that runs out of memory beside another statement runs again
+// once the other statement's reservation ends, rather than fail, and that the
+// table then has the rows of its query.
+func TestOutOfMemoryRefreshRunsAgainAlone(t *testing.T) {
+	t.Parallel()
+	ctl := workload.NewController(1 << 30)
+	env := startRefreshServer(t, func(o *Options) { o.Workload = ctl })
+	admin := env.admin
+	ctx := context.Background()
+	mustExec(t, admin, "CREATE TABLE spend (g VARCHAR, x INTEGER)")
+	mustExec(t, admin, "INSERT INTO spend SELECT 'g' || (i % 4), i FROM range(1000) AS r(i)")
+	mustExec(t, admin, "CREATE DYNAMIC TABLE spend_full TARGET_LAG = DOWNSTREAM WAREHOUSE = wh REFRESH_MODE = FULL AS "+
+		"SELECT g, sum(x) AS sx FROM spend GROUP BY g")
+	mustExec(t, admin, "INSERT INTO spend VALUES ('g9', 1)")
+
+	// Another statement runs, and holds some of the memory.
+	other, _, err := ctl.Admit(ctx, workload.Limits{Memory: 100 << 20})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var mu sync.Mutex
+	var fills int
+	var otherEnded, secondFill time.Time
+	otherEnds := sync.OnceFunc(func() {
+		mu.Lock()
+		otherEnded = time.Now()
+		mu.Unlock()
+		other()
+	})
+	t.Cleanup(otherEnds)
+	env.srv.failFill = func(context.Context, string) error {
+		mu.Lock()
+		defer mu.Unlock()
+		if fills++; fills > 1 {
+			secondFill = time.Now()
+			return nil
+		}
+		go func() {
+			time.Sleep(200 * time.Millisecond)
+			otherEnds()
+		}()
+		return &duckdb.Error{Type: duckdb.ErrorTypeOutOfMemory, Msg: "Out of Memory Error: could not allocate block of size 2.3 GiB (43.4 GiB/44.2 GiB used)"}
+	}
+	t.Cleanup(func() { env.srv.failFill = nil })
+	mustExec(t, admin, "ALTER DYNAMIC TABLE spend_full REFRESH")
+	env.srv.failFill = nil
+	mu.Lock()
+	if fills != 2 {
+		t.Errorf("the refresh filled the table %d times, want twice", fills)
+	}
+	if otherEnded.IsZero() || secondFill.Before(otherEnded) {
+		t.Error("the refresh ran again before the other statement's reservation ended")
+	}
+	mu.Unlock()
+	if n := count(t, admin, "SELECT count(*) FROM spend_full"); n != 5 {
+		t.Errorf("%d groups after the refresh, want 5", n)
+	}
+}
+
+// TestKeepPeak checks that a statement that ran again keeps the larger of its
+// runs' sampled peaks.
+func TestKeepPeak(t *testing.T) {
+	t.Parallel()
+	var w workloadState
+	w.keepPeak(0, false)
+	w.keepPeak(5<<30, true)
+	w.keepPeak(1<<30, true)
+	w.keepPeak(9<<30, false)
+	if w.peak != 5<<30 || !w.sampled {
+		t.Errorf("peak %d, sampled %v; want the failed run's 5 GiB", w.peak, w.sampled)
 	}
 }

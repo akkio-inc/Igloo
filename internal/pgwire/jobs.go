@@ -1132,14 +1132,14 @@ func (s *Server) RunJob(ctx context.Context, j tasks.Job) (int64, error) {
 		}
 		start := time.Now()
 		var loads []tasks.Load
-		// COPY INTO reaches the catalog's in-memory set (see
-		// copyIntoStatement); hold the exclusive side.
-		releaseCatalog := s.holdCatalog(sess)
-		err = sess.runCancelable(ctx, j.Statement, func(ctx context.Context) error {
+		err = sess.runCancelable(ctx, j.Statement, s.rerunsAlone(sess, func(ctx context.Context) error {
+			// COPY INTO reaches the catalog's in-memory set (see
+			// copyIntoStatement); hold the exclusive side as it runs, and not
+			// as it waits for memory (see rerunsAlone).
+			defer s.holdCatalog(sess)()
 			loads, _, err = s.copyInto(ctx, sess, owner, cp, j.Name)
 			return err
-		})
-		releaseCatalog()
+		}))
 		if err == nil && len(loads) == 0 {
 			return 0, tasks.ErrIdle
 		}
@@ -1192,11 +1192,11 @@ func (s *Server) RunJob(ctx context.Context, j tasks.Job) (int64, error) {
 		// sampled, and the dashboards beside it ran out of memory.
 		shape, exact := s.workloadShape(ctx, sess, text), s.workloadExact(sess, text)
 		sess.wl.counted, sess.wl.shape, sess.wl.exact = true, shape, exact
-		err := sess.runCancelable(ctx, text, func(ctx context.Context) error {
+		err := sess.runCancelable(ctx, text, s.rerunsAlone(sess, func(ctx context.Context) error {
 			var err error
 			res, err = s.refreshView(ctx, sess, owner, j)
 			return err
-		})
+		}))
 		sess.wl.counted, sess.wl.shape, sess.wl.exact = false, "", ""
 		rows := res.rows
 		if err != nil {

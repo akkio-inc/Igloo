@@ -571,7 +571,8 @@ type Server struct {
 	// memory here.
 	failLocal func(ctx context.Context, st *statement) error
 	// failFill, if set, runs before a fill's query runs on this replica
-	// (see fillOn), and fails it with its error.
+	// (see fillOn), and fails it with its error; query is empty for a fill
+	// no worker could run.
 	failFill func(ctx context.Context, query string) error
 	// writesRunning holds the notes' keys of this replica's statements whose
 	// workers write a table's files (see tableWrite).
@@ -2318,13 +2319,7 @@ func (s *Server) preparedQuery(ctx context.Context, sess *session, user auth.Use
 					err = s.rerunWithoutBitmaps(ctx, sess, st, err, runOnce)
 				}
 				if outer.Err() == nil && sess.mayRunAlone(st, err, tw.Written() > 0) {
-					others := s.othersRunning(sess)
-					how := "running it again once it can run alone"
-					if sess.alone || others == 0 {
-						how = "running it again on fewer threads"
-					}
-					s.log.Warn("a statement ran out of memory; "+how, "user", sess.currentUser().Name, "pid", sess.pid, "err", err)
-					return &runAlone{cause: err, alone: others == 0}
+					return s.againAlone(sess, err)
 				}
 				return err
 			}

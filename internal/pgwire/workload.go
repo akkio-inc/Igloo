@@ -78,8 +78,8 @@ type workloadState struct {
 	// a statement whose thread parked (see Server.statementThread); nil for none.
 	admitted func()
 	// peak is the most memory the latest statement was seen holding while
-	// it ran, and sampled says a sample fell within its run (see
-	// workload.Controller.SampleMemory).
+	// it ran, in any of its runs (see keepPeak), and sampled says a sample
+	// fell within one (see workload.Controller.SampleMemory).
 	peak    int64
 	sampled bool
 	// meter reads what each statement used; nil without one.
@@ -91,6 +91,16 @@ type workloadState struct {
 	ranInBackground bool
 	// controller holds statements back for their limits.
 	controller *workload.Controller
+}
+
+// keepPeak keeps peak, a run's sampled peak if sampled, if it is the most a
+// run of the statement held: a statement that ran out of memory and ran
+// again alone (see runAgainAlone) reserves for the larger of its runs, so
+// that one that failed big and finished small reserves for the big one.
+func (w *workloadState) keepPeak(peak int64, sampled bool) {
+	if sampled && (!w.sampled || peak > w.peak) {
+		w.peak, w.sampled = peak, true
+	}
 }
 
 // queryTag is the tag the session's statements run under.
@@ -229,7 +239,7 @@ func (sess *session) admit(ctx context.Context) (release, leave func(), err erro
 	if err == nil {
 		sess.wl.elsewhere, sess.wl.admitted = elsewhere, func() { done() }
 		return func() {
-			sess.wl.peak, sess.wl.sampled = done()
+			sess.wl.keepPeak(done())
 			sess.wl.elsewhere, sess.wl.admitted = nil, nil
 		}, func() { done() }, nil
 	}

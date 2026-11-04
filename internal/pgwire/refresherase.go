@@ -252,9 +252,10 @@ func (s *Server) rebuildView(ctx context.Context, j tasks.Job) error {
 		}
 	}
 	start := time.Now()
-	err = sess.runCancelable(ctx, create, func(ctx context.Context) error {
+	// CREATE OR REPLACE TABLE ... AS: run again, it replaces the table as once.
+	err = sess.runCancelable(ctx, create, s.rerunsAlone(sess, func(ctx context.Context) error {
 		return s.execDDL(ctx, sess, owner, create)
-	})
+	}))
 	s.recordQuery(sess, queryRecord{text: create, start: start, err: err, rows: -1,
 		written: []auth.Object{{Schema: schema, Table: table}}, stmtType: duckdb.STATEMENT_TYPE_CREATE})
 	if err != nil {

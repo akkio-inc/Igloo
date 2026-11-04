@@ -53,7 +53,7 @@ func (r *runAlone) Unwrap() error { return r.cause }
 // mayRunAlone says whether st, whose run ended with err, sent the client rows
 // if sent, ran out of memory and may run again (see above).
 func (sess *session) mayRunAlone(st *statement, err error, sent bool) bool {
-	if err == nil || sent || sess.inTx || st.ai || st.changesIceberg || st.staged != nil {
+	if err == nil || sent || st.ai || st.changesIceberg || st.staged != nil {
 		return false
 	}
 	switch st.stmtType {
@@ -62,14 +62,54 @@ func (sess *session) mayRunAlone(st *statement, err error, sent bool) bool {
 	default:
 		return false
 	}
-	// DuckDB's own error, and not the memory watch's cancel (ShedMemory), which
-	// is for the process's memory: running the statement again would use it up
-	// again.
+	return sess.outOfMemoryHere(err)
+}
+
+// outOfMemoryHere says err is DuckDB's Out of Memory error, outside a
+// transaction block, and not the memory watch's cancel (ShedMemory), which is
+// for the process's memory: running the statement again would use it up
+// again.
+func (sess *session) outOfMemoryHere(err error) bool {
+	if err == nil || sess.inTx {
+		return false
+	}
 	sess.mu.Lock()
 	shed := sess.shed
 	sess.mu.Unlock()
 	var de *duckdb.Error
 	return !shed && errors.As(err, &de) && de.Type == duckdb.ErrorTypeOutOfMemory
+}
+
+// againAlone is what a run that ran out of memory with err, and may run
+// again, returns to runCancelable.
+func (s *Server) againAlone(sess *session, err error) error {
+	others := s.othersRunning(sess)
+	how := "running it again once it can run alone"
+	if sess.alone || others == 0 {
+		how = "running it again on fewer threads"
+	}
+	s.log.Warn("a statement ran out of memory; "+how, "user", sess.currentUser().Name, "pid", sess.pid, "job", sess.job, "err", err)
+	return &runAlone{cause: err, alone: others == 0}
+}
+
+// rerunsAlone has fn, run under runCancelable, run again alone, then on fewer
+// threads, when it runs out of memory, as a client's statement does: a job's
+// work that, failed, leaves nothing that a run from its start trips on, and
+// that holds no lock while it is not running, which the statements it waits
+// for may need. A refresh of a materialized view or a dynamic table writes in
+// one transaction at its end, makes its temporary tables again and goes in
+// full if its table moved, so that running it again is its next scheduled
+// refresh, sooner; 9 of 11 refreshes beside a mixed load had failed, out of
+// memory at 43.4 of 44.2 GiB. A pipe's COPY INTO that runs out of memory
+// loads none of its files and gives back its claim on them.
+func (s *Server) rerunsAlone(sess *session, fn func(context.Context) error) func(context.Context) error {
+	return func(ctx context.Context) error {
+		err := fn(ctx)
+		if sess.outer.Err() == nil && sess.outOfMemoryHere(err) {
+			return s.againAlone(sess, err)
+		}
+		return err
+	}
 }
 
 // runAgainAlone runs fn, the statement whose run under ctx returned alone,
@@ -87,7 +127,8 @@ func (sess *session) runAgainAlone(outer, ctx context.Context, alone *runAlone, 
 	if err != nil {
 		return alone.cause
 	}
-	defer done()
+	// Its history keeps the larger of what its runs held.
+	defer func() { sess.wl.keepPeak(done()) }()
 	// What a park lets go of (see Server.parked).
 	sess.wl.admitted = func() { done() }
 	defer func() { sess.wl.admitted = nil }()

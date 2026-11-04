@@ -75,20 +75,23 @@ func (s *Server) fillSource(ctx context.Context, sess *session, st *statement, q
 // histories.
 func (s *Server) fillOn(f *stagedFill, src *statement, here func(context.Context) (int64, error),
 	from func(ctx context.Context, source string) (int64, error)) (rows int64, parts distParts, again bool, err error) {
-	if src == nil {
-		rows, err = here(f.ctx)
-		return rows, parts, err != nil && f.again(err), err
-	}
-	defer src.close() //nolint:errcheck
 	if fail := s.failFill; fail != nil {
-		run := here
+		run, query := here, ""
+		if src != nil {
+			query = src.query
+		}
 		here = func(ctx context.Context) (int64, error) {
-			if err := fail(ctx, src.query); err != nil {
+			if err := fail(ctx, query); err != nil {
 				return 0, err
 			}
 			return run(ctx)
 		}
 	}
+	if src == nil {
+		rows, err = here(f.ctx)
+		return rows, parts, err != nil && f.again(err), err
+	}
+	defer src.close() //nolint:errcheck
 	sess, user := f.sess, f.sess.currentUser()
 	n, p, done, err := s.fillOnWorkers(f.ctx, sess, src, sessionMode(sess, user), from)
 	if done {

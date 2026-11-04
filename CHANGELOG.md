@@ -2519,6 +2519,17 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   with what happened and what would let it finish: a higher memory limit,
   or workers, when its session turned distributed execution off.
 
+- Refreshes of materialized views and dynamic tables, and COPY INTO, a
+  pipe's or a client's, run again alone when they run out of memory, as a
+  client's statement does, rather than fail. Beside a mixed load on a
+  replica of 44.2 GiB, 9 of 11 refreshes had failed, out of memory at
+  43.4 GiB, and none ran again. A failed refresh leaves nothing a run from
+  its start trips on, and a COPY INTO that runs out loads none of its files.
+  COPY INTO now holds the catalog's lock only while it runs, not while it
+  waits its turn. A statement that ran again keeps the larger of its runs'
+  peaks for the next like it, so one that failed big and finished small
+  reserves for the big one. Tasks and alerts had this already.
+
 - A replica no longer cancels its first statements for memory while it reads back,
   after a start, the parts of files DuckDB held. The read-back took a new buffer for
   each request, which Go's heap kept after it ended, until Go's next collection;
