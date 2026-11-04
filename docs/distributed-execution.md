@@ -328,10 +328,9 @@ partitioned by the groups so that each worker computes whole groups;
 aggregates over `DISTINCT` values of unrelated
 expressions in one `SELECT` (`count(DISTINCT a), count(DISTINCT b)`),
 window functions over rows but those of the next section, a large table read again in a correlated
-subquery expression of another shape (`NOT IN`, whose rows depend on whether
-any of its subquery's is `NULL`; a correlation with no equal columns, or by
-anything but equal columns in a scalar subquery or an `OR` of `EXISTS`;
-a scalar subquery of another aggregate, or that gives a value over no rows),
+subquery expression that is not one of the joins above (`NOT IN`, whose rows
+depend on whether any of its subquery's is `NULL`, or a correlation with no
+equal columns),
 subqueries in `GROUP BY`, samples of a number of rows,
 large tables joined on different keys in one `SELECT`, statements that call user-defined macros
 or session functions (`getvariable`, `current_setting`), tables with
@@ -1042,7 +1041,9 @@ it printed of each part, and logs `planned a statement` with its time,
 stages, descriptions, other lookups in the session and its wait for the
 catalog lock when it takes a second or more. A lookup in the session that
 takes a quarter of a second or more logs `a lookup in the session took long`
-with what each of its steps took.
+with what each of its steps took. A table's metadata, which planning reads,
+loads again in the background as soon as a commit changes the table, so the
+statements after a commit find it loaded rather than wait for it.
 
 Stages that do not read each other's rows run side by side, and the
 coordinator sends a statement's tasks to a worker as it has room for them,
@@ -1052,16 +1053,19 @@ earlier statements; others, each worker in turn), and goes there when that
 worker has room; a worker with room that
 no waiting task goes to first takes the task that has waited longest. A slow
 or busy worker so runs fewer of a stage's tasks, and the others more, rather
-than hold up the stage until it has run a share as large as theirs. A worker
+than hold up the stage until it has run a share as large as theirs: a report
+on 16 workers took 573.9 s at the median against 677.7 s, and 626.2 s against
+1,048.1 s with one worker at half speed. A worker
 runs as many tasks at once as it has slots, and gives the next free ones to
 a task that runs again what a lost worker held, then to the statement that
 has started the fewest tasks there, so that a short statement gets past a
 long one's, and among those, to the first task to come.
 
 Statements in the background give way to the others on each worker: the
-refreshes of materialized views and dynamic tables, pipes' loads, and
-statements whose shape held the workers 5 seconds or more and 8 times as long
-as the other statements there, in each of its latest runs (see [heavy statements beside short
+refreshes of materialized views and dynamic tables, pipes' loads, and, with
+`IGLOO_HEAVY_IN_BACKGROUND` (on by default), statements whose shape held the
+workers 5 seconds or more and 8 times as long as the other statements there,
+in each of its latest runs (see [heavy statements beside short
 ones](workload-management.md#heavy-statements-beside-short-ones)). Their tasks
 get a quarter of a worker's slots before other tasks, rounded down, and one
 before them whenever none of theirs has started there for 10 seconds, so that
@@ -1069,7 +1073,10 @@ dashboards that keep the workers busy slow them and never stop them; more only
 once no other statement's task has run or waited there for 2 seconds. Beside a full
 refresh on 16 workers that took them for 40 to 140 s at a time, dashboards'
 statements on workers took 9.7 s at the median and 42 s at the 95th percentile,
-against 6.6 and 23 s while none ran. `placement` in the history ends with `in
+against 6.6 and 23 s while none ran. On two workers beside back-to-back full
+refreshes, once the refreshes gave way, dashboards ran twice the statements,
+at 11.4 s at the median and 101 s at the 95th percentile against 47.8 and
+544 s, and each refresh took 701 s against 719 s. `placement` in the history ends with `in
 the background` for them.
 
 ## Same results as one machine
@@ -1855,9 +1862,9 @@ several instance types and zones, so that capacity one lacks another has.
 - The large inputs of one `SELECT` are partitioned by one key. Large tables
   joined on different keys need a step each: a common table expression or
   subquery per key. A large table read again in a correlated subquery
-  expression that is not the join it means (`NOT IN`, a correlation by
-  anything but equal columns) runs on one machine; written as a join to a
-  common table expression, it runs distributed. Give the machines that run
+  expression that is not one of the joins it can mean (`NOT IN`, a
+  correlation with no equal columns) runs on one machine; written as a join
+  to a common table expression, it runs distributed. Give the machines that run
   such statements a lot of memory and fast spill disk.
 - `ROLLUP`, `CUBE` and `GROUPING SETS` run on workers up to the finest groups
   of their sets, and the coordinator, or in a subquery or common table
