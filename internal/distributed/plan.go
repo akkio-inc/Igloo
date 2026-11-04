@@ -237,6 +237,9 @@ type Plan struct {
 	// streamMerged says the session reads a merge of sorted rows as a
 	// stream (see StreamMerged).
 	streamMerged bool
+	// pruned counts the union branches left out of it, which a filter around
+	// them rejects (see pruneBranches).
+	pruned int
 }
 
 // StreamMerged has Execute leave a merge of the sorted rows a statement
@@ -456,7 +459,7 @@ func (pl *planner) plan(stmt node) (*Plan, error) {
 	q := clone(stmt).(node)
 	pl.gov = pl.newGovernance(q)
 	pl.dropOrders(q)
-	pl.pruneBranches(q)
+	pruned := pl.pruneBranches(q)
 	pl.markTopK(q)
 	out, err := pl.query(q, true, nil)
 	if err != nil {
@@ -520,7 +523,7 @@ func (pl *planner) plan(stmt node) (*Plan, error) {
 		keys[x.ID] = k
 	}
 	return &Plan{Stages: pl.stages, final: out, pins: pins, local: pl.reasons, uncertain: written(pl.uncertain, pl.stages), relKeys: keys,
-		versions: pl.versions, buckets: slices.Compact(slices.Clone(pl.bucketNotes))}, nil
+		versions: pl.versions, buckets: slices.Compact(slices.Clone(pl.bucketNotes)), pruned: pruned}, nil
 }
 
 // pinReads finds the tables the coordinator reads itself, in final, that

@@ -26,14 +26,17 @@ import (
 // stays where it was, and rows it rejects are all that go.
 
 // pruneBranches drops the branches of unions in stmt that the filters around
-// them leave nothing of (see the top of this file).
-func (pl *planner) pruneBranches(stmt node) {
+// them leave nothing of (see the top of this file), and returns how many.
+func (pl *planner) pruneBranches(stmt node) int {
 	b := &brancher{pl: pl}
 	b.query(stmt, nil)
+	return b.dropped
 }
 
 type brancher struct {
 	pl *planner
+	// dropped counts the branches left out.
+	dropped int
 }
 
 // query visits the filters of query node q and of the queries in it.
@@ -136,17 +139,18 @@ func (b *brancher) restrict(q node, at int, pred node, scope cteScope) bool {
 		if branches == nil {
 			return false
 		}
-		var keep []node
-		for _, br := range branches {
-			if !b.restrict(br, at, pred, scope) {
-				keep = append(keep, br)
+		keep := make([]bool, len(branches))
+		kept := 0
+		for i, br := range branches {
+			if keep[i] = !b.restrict(br, at, pred, scope); keep[i] {
+				kept++
 			}
 		}
-		if len(keep) == 0 {
+		if kept == 0 {
 			return true
 		}
-		if len(keep) < len(branches) {
-			b.rebuild(q, keep, scope)
+		if kept < len(branches) && b.rebuild(q, branches, keep, scope) {
+			b.dropped += len(branches) - kept
 		}
 		return false
 	case "SELECT_NODE":
@@ -385,22 +389,36 @@ func unionBranches(q node, setop string, all any) []node {
 	return append(left, right...)
 }
 
-// rebuild makes q, a union, the union of keep, some of its branches: the first
-// of them casts its columns to q's types, under q's names, so that q's
-// columns stay as they were. q stays as it was if it cannot be described, or
-// the first branch left is no plain SELECT of as many columns.
-func (b *brancher) rebuild(q node, keep []node, scope cteScope) {
+// rebuild makes q, a union of branches (see unionBranches), the union of
+// those keep says, some of them: the first casts its columns to q's types,
+// under q's names, so that q's columns stay as they were, and the one branch
+// left of a UNION that is not ALL keeps its rows distinct. The unions left
+// nest as they did, as DuckDB parses them: a tree of another shape does not
+// print as itself. q stays as it was, and rebuild returns false, if it cannot
+// be described, or the first branch left is no plain SELECT of as many
+// columns, or the one left of such a UNION has modifiers.
+func (b *brancher) rebuild(q node, branches []node, keep []bool, scope cteScope) bool {
 	cols, err := b.pl.describe(q, scope)
-	first := keep[0]
+	at := slices.Index(keep, true)
+	first := branches[at]
 	items := list(first, "select_list")
 	if err != nil || str(first["type"]) != "SELECT_NODE" || len(items) != len(cols) || hasClass(items, "STAR") {
-		return
+		return false
+	}
+	var distinct any
+	if q["setop_all"] != true && !slices.Contains(keep[at+1:], true) {
+		// A UNION's rows are distinct, the one branch left's too.
+		d, err := b.pl.p.parse("SELECT DISTINCT 1")
+		if err != nil || len(list(first, "modifiers")) > 0 {
+			return false
+		}
+		distinct = clone(d["modifiers"])
 	}
 	cast := make([]any, len(items))
 	for i, it := range items {
 		e, err := b.pl.p.expr("CAST(__igloo_x AS " + cols[i].Type + ")")
 		if err != nil {
-			return
+			return false
 		}
 		v := clone(it).(node)
 		v["alias"] = ""
@@ -412,14 +430,34 @@ func (b *brancher) rebuild(q node, keep []node, scope cteScope) {
 		}).(node), cols[i].Name)
 	}
 	first["select_list"] = cast
-	// Each union of the tree as q is, but for its sides.
-	shape := maps.Clone(q)
-	tree := first
-	for _, br := range keep[1:] {
-		u := maps.Clone(shape)
-		u["left"], u["right"] = tree, br
-		tree = u
+	if distinct != nil {
+		first["modifiers"] = distinct
 	}
+	// The branches in the order unionBranches found them, each union of them
+	// with both sides left as it was, one with one side left as that side.
+	next := 0
+	var kept func(n node) node
+	kept = func(n node) node {
+		if str(n["type"]) != "SET_OPERATION_NODE" {
+			next++
+			if keep[next-1] {
+				return n
+			}
+			return nil
+		}
+		l, r := kept(child(n, "left")), kept(child(n, "right"))
+		switch {
+		case l == nil:
+			return r
+		case r == nil:
+			return l
+		}
+		n["left"], n["right"] = l, r
+		return n
+	}
+	// q may be the tree itself.
+	tree := maps.Clone(kept(q))
 	clear(q)
 	maps.Copy(q, tree)
+	return true
 }

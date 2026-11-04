@@ -38,13 +38,15 @@ func TestPrunedBranches(t *testing.T) {
 	}
 	for _, c := range []struct {
 		name, query string
-		// read are the tables the plan reads of lineitem and part.
+		// lineitem and part say whether the plan reads them, and pruned is how
+		// many branches it leaves out.
 		lineitem, part bool
+		pruned         int
 	}{
-		{"one section kept", report("upper(t0.section) IN ('PARTS')", "PARTITION BY section", false), false, true},
-		{"two sections kept", report("upper(t0.section) IN ('PARTS', 'LINE ITEMS')", "PARTITION BY section", false), true, true},
-		{"a window over every section", report("upper(t0.section) IN ('PARTS')", "", false), true, true},
-		{"a section read twice", report("upper(t0.section) IN ('PARTS')", "PARTITION BY section", true), true, true},
+		{"one section kept", report("upper(t0.section) IN ('PARTS')", "PARTITION BY section", false), false, true, 2},
+		{"two sections kept", report("upper(t0.section) IN ('PARTS', 'LINE ITEMS')", "PARTITION BY section", false), true, true, 1},
+		{"a window over every section", report("upper(t0.section) IN ('PARTS')", "", false), true, true, 0},
+		{"a section read twice", report("upper(t0.section) IN ('PARTS')", "PARTITION BY section", true), true, true, 0},
 	} {
 		want, _, err := h.query(t.Context(), c.query)
 		if err != nil {
@@ -57,8 +59,8 @@ func TestPrunedBranches(t *testing.T) {
 		if msg := compareRows(want, got, false); msg != "" {
 			t.Errorf("%s: %s\n%s", c.name, msg, plan.describe())
 		}
-		if reads(plan, "lineitem") != c.lineitem || reads(plan, "part") != c.part {
-			t.Errorf("%s: reads lineitem %v, part %v\n%s", c.name, reads(plan, "lineitem"), reads(plan, "part"), plan.describe())
+		if reads(plan, "lineitem") != c.lineitem || reads(plan, "part") != c.part || plan.pruned != c.pruned {
+			t.Errorf("%s: reads lineitem %v, part %v; left out %d branches\n%s", c.name, reads(plan, "lineitem"), reads(plan, "part"), plan.pruned, plan.describe())
 		}
 	}
 }
