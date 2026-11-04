@@ -435,6 +435,45 @@ func TestPlanKey(t *testing.T) {
 	}
 }
 
+// TestReplicaRetry replays a dashboard tile's day-by-day statement under a
+// fleet's load: 9 s on workers, then seven copies at once on the replica
+// beside 24 to 29 other statements, which took 12 to 34 s there. It stayed
+// on workers for the window at a median of 7.8 s, where another window ran
+// it on the replica at 5.7 s. Two minutes on, it is tried on the replica
+// once, whose run of 3 s replaces the burst's, and it stays there.
+func TestReplicaRetry(t *testing.T) {
+	h := newHistory()
+	t0 := time.Date(2026, 11, 4, 15, 37, 0, 0, time.UTC)
+	h.observeAt("by_day", 16, false, 14, 0, t0.Add(20*time.Second))
+	h.observeAt("by_day", 16, false, 4, 0, t0.Add(60*time.Second))
+	for i, s := range []float64{12, 24, 30, 34, 34, 30, 25} {
+		h.observeAt("by_day", 0, false, s, 0, t0.Add(80*time.Second+time.Duration(i)*time.Second))
+	}
+	e := estimate{oneMachine: 138, onWorkers: 32, workers: 16, others: 26}
+	decide := func(at time.Time) (bool, bool, string) {
+		r, ok := h.get("by_day")
+		return choose(e, r, ok, DefaultThreshold, at)
+	}
+	if workers, _, why := decide(t0.Add(100 * time.Second)); !workers {
+		t.Errorf("right after the burst here: one machine (%s)", why)
+	}
+	retry := t0.Add(86*time.Second + replicaRetryAfter)
+	workers, explore, why := decide(retry)
+	if workers || !explore || !strings.Contains(why, "trying one machine again") {
+		t.Errorf("two minutes on: workers %v, trying %v (%s)", workers, explore, why)
+	}
+	// As the coordinator records the try: the next ones stay on workers.
+	h.update("by_day", func(r *runs) { r.explored = retry })
+	if workers, _, why := decide(retry.Add(time.Second)); !workers {
+		t.Errorf("a second try at once: %s", why)
+	}
+	// Its run of 3 s replaces the burst's, and it stays on the replica.
+	h.observeAt("by_day", 0, false, 3, 0, retry.Add(5*time.Second))
+	if workers, _, why := decide(retry.Add(6 * time.Second)); workers || !strings.Contains(why, "it ran in 3 s on one machine") {
+		t.Errorf("after 3 s here: workers %v (%s)", workers, why)
+	}
+}
+
 // TestHistory checks the runs a history keeps: the last run weighs as much
 // as the earlier ones, and the keys used longest ago go first.
 func TestHistory(t *testing.T) {
