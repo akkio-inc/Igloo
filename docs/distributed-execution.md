@@ -22,7 +22,7 @@ the choices behind it and the measurements.
                                                     object storage (S3, GCS, ADLS)
 ```
 
-## Heavy reports finish in 12 minutes or less, on up to 19 billion rows
+## Heavy reports finish in under 10 minutes, on up to 19 billion rows
 
 Two heavy reports ran on synthetic tables that total about 25 billion rows, in
 Amazon S3. Both join, unnest and compute window aggregates. Igloo chose by
@@ -30,8 +30,8 @@ itself to run them on its 16 workers.
 
 | Rows in the tables it reads | Time | Cost |
 |---|---|---|
-| About 19 billion | 492&nbsp;s | $1.05 |
-| About 4 billion | 712&nbsp;s | $1.52 |
+| About 19 billion | 461&nbsp;s | $0.98 |
+| About 4 billion | 573&ndash;594&nbsp;s | $1.22&ndash;1.27 |
 
 Reruns returned the same rows. At a tenth of the data, both reports return the
 rows one machine returns.
@@ -1049,7 +1049,7 @@ workers' error. One that auto mode ran on the [large
 worker](#a-large-worker) runs on the other workers instead, as a statement
 forced onto them does: at a hundred times the data, a report of 250 GB
 whose large worker failed ran on the coordinator, spilled 167 GB and was
-killed after 9 minutes, where 16 workers take 712 s. Workers stay
+killed after 9 minutes, where 16 workers take under 600 s. Workers stay
 up while a statement that ran tasks on them runs on the coordinator, and
 count as idle from when it ends. An error in the data itself, such as a failed cast
 or a division by zero, is the statement's error, as it would be on one
@@ -1501,7 +1501,7 @@ where the small workers cannot run it: the spill curve holds for most
 reports but runs far short for some, and at a hundred times the data a
 report whose working set was 5.3 times the large worker's room, estimated
 at 217 s there, spilling 2.5 times as long, ran past 1,800 s there, where
-16 workers run it in 712 s (at ten times the data it spilled 11 times as
+16 workers run it in under 600 s (at ten times the data it spilled 11 times as
 long on one machine). The small workers share a working set over their
 partitions instead. Auto mode runs a statement there when
 that estimate is within a fifth of the fastest way and the cheapest of
