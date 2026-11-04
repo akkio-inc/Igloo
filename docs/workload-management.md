@@ -220,15 +220,16 @@ others run beside it, rather than three times it (see [beside other
 statements](distributed-execution.md#when)). `IGLOO_WORKER_THRESHOLD`
 sets how long a statement must take for workers to be worth it.
 
-Without workers, nothing needs setting either, on Linux. DuckDB runs every
-statement on one pool of threads, and a thread stays with a statement's
-pipeline until that ends, so beside one session's long reports a dashboard's
-statement had little more than its own thread. The operating system can
-prefer one thread to another, though, so a heavy statement runs in a second
-DuckDB of the replica's process, opened at the first heavy statement, whose
-threads give way to the first's (a nice value of 10). Alone it takes about
-what it takes in the first; beside others it gets the cores they leave idle,
-and about a tenth of those they use.
+Without workers, on Linux, a task's heavy statements give way to clients'
+with nothing set, and `IGLOO_HEAVY_IN_BACKGROUND=true` has clients' heavy
+statements give way too. DuckDB runs every statement on one pool of threads,
+and a thread stays with a statement's pipeline until that ends, so beside one
+session's long reports a dashboard's statement had little more than its own
+thread. The operating system can prefer one thread to another, though, so a
+heavy statement runs in a second DuckDB of the replica's process, opened at
+the first heavy statement, whose threads give way to the first's (a nice value
+of 10). Alone it takes about what it takes in the first; beside others it gets
+the cores they leave idle, and about a tenth of those they use.
 
 Measured on 12 cores with `bench/mixed.py`, its statements' results not cached,
 beside one session's reports:
@@ -241,6 +242,14 @@ beside one session's reports:
 Those dashboards use all the cores they can have, and the longest report over a
 billion rows took 567 s beside them where it took 436 s in one DuckDB, with the
 dashboards at a fifth of the statements, and 267 s to 294 s alone in either.
+
+That is what standalone reports beside dashboards want, and what a
+dashboard's own heavy statements do not: at ten times its data on 16 cores, a
+dashboard's FLATTEN statement took 22 s alone in the first DuckDB and 57 to 78
+s in the second beside the dashboard's other statements, and the dashboard
+waited for it. So a client's heavy statements stay in the first unless
+`IGLOO_HEAVY_IN_BACKGROUND` is `true`; set it where long reports run beside
+dashboards on a replica without workers.
 
 The two share the memory limit. A heavy statement alone may use it all, the
 first's caches giving way to it. While the first reads tables it keeps what
@@ -278,7 +287,8 @@ first. `placement` in the history says which reads ran there, and
 the first while most of what runs there or waits to is of some size itself, known to take
 5 seconds of all the cores alone or having run for a while, since there is
 nothing short for it to give way to.
-`IGLOO_HEAVY_IN_BACKGROUND=false` runs everything in the first. Without
+With `IGLOO_HEAVY_IN_BACKGROUND=false`, the default, only tasks' heavy
+statements run in the second. Without
 workers, the replica's limit below and roles' limits hold back heavy
 statements beyond that. On workers, a statement is heavy by how long its shape
 held them against the other statements there, and its tasks give way to theirs

@@ -622,9 +622,8 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   quarter of a worker's slots before other tasks, and one whenever none of its tasks
   has started there for 10 seconds, so that it always finishes, and more only once
   no other statement's task has run or waited there for 2 seconds.
-  Materialized views' and dynamic tables' refreshes and pipes run so, and with
-  `IGLOO_HEAVY_IN_BACKGROUND` statements whose shape held the workers 8 times as
-  long as the others there. Their `placement` ends with `in the background`.
+  Materialized views' and dynamic tables' refreshes and pipes run so, and
+  statements whose shape held the workers 8 times as long as the others there. Their `placement` ends with `in the background`.
 - TPC-DS q09, q10, q16, q32, q35, q69, q92 and q94 run on workers, where they stayed on
   one machine. A scalar subquery in the columns of a statement that does not group, one
   aggregate of all the rows of a large table, is a relation of one row that the workers
@@ -2011,6 +2010,17 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
 
 ### Performance and cost
 
+- A dashboard's own heavy statements stay in the first DuckDB. With nothing set,
+  only tasks' heavy statements run in the second DuckDB, whose threads give way
+  to the first's, and clients' do only with `IGLOO_HEAVY_IN_BACKGROUND=true`,
+  no longer the default. In the second DuckDB, beside the dashboard's other
+  statements, a dashboard's FLATTEN statement at ten times its data took 57 to
+  78 s, against 22 s in the first, and the dashboard waited for it. Its 96
+  queries took 2 to 9% less time on 8 cores and 22 GB, and 3% less on 16
+  cores. Set it where long reports run beside dashboards on a replica without
+  workers (see [heavy statements beside short
+  ones](docs/workload-management.md#heavy-statements-beside-short-ones)).
+
 - Three or more common table expressions of one statement that group the same
   rows the same way, as reports count one join several ways, are grouped once, in
   a common table expression marked `MATERIALIZED` that each reads (see [SQL](docs/sql.md)):
@@ -2018,16 +2028,16 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   reports of six such took 480 to 488 CPU-seconds rather than 781 to 898 at ten
   times its data on 8 cores and 22 GB, and its 324 queries 1,684 s rather than 1,808.
 
-- With no workers, a replica runs statements known to be heavy (their shape last
-  used 5 seconds of all its cores) in a second DuckDB of its process, whose
-  threads give way to the first's, and a read not yet known to be heavy starts
-  again there when it runs long beside others. Beside one analyst's long reports
-  a dashboard's statement had little more than its own thread. Over a billion
-  rows on 12 cores dashboards take 3.0 s at the median and 8.1 s at p95 beside them,
-  47 statements a minute, as they do alone, where they took 13.7 s, 74 s and 10 a
-  minute. Nothing needs setting, and
-  `IGLOO_HEAVY_IN_BACKGROUND=false` runs everything in the first (see [heavy
-  statements beside short ones](docs/workload-management.md#heavy-statements-beside-short-ones)).
+- With no workers, a replica runs tasks' statements known to be heavy (their shape
+  last used 5 seconds of all its cores) in a second DuckDB of its process, whose
+  threads give way to the first's, and with `IGLOO_HEAVY_IN_BACKGROUND=true`
+  clients' too, where a read not yet known to be heavy starts again there when it
+  runs long beside others. Beside one analyst's long reports a dashboard's
+  statement had little more than its own thread. Over a billion rows on 12 cores,
+  with the setting on, dashboards take 3.0 s at the median and 8.1 s at p95 beside
+  them, 47 statements a minute, as they do alone, where they took 13.7 s, 74 s and
+  10 a minute (see [heavy statements beside short
+  ones](docs/workload-management.md#heavy-statements-beside-short-ones)).
 - The result cache sends a dashboard's repeated queries again more often:
   it compares statements without their comments and spacing, which BI
   tools vary per run; shares a result between users when no policy
