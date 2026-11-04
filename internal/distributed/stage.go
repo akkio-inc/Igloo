@@ -297,12 +297,11 @@ type execution struct {
 	// stage, by ID.
 	used   map[string]bool
 	usedBy map[int]map[string]bool
-	// started are its stages, finished those that ended and levels their levels
-	// (see toEnd), by ID; lost the workers it went on without, as they took their
-	// exchanges with them; see repair.go, which repairing keeps to one at a time.
+	// started are its stages, and finished those that ended, by ID; lost the
+	// workers it went on without, as they took their exchanges with them; see
+	// repair.go, which repairing keeps to one at a time.
 	started   []*Stage
 	finished  map[int]bool
-	levels    map[int]int
 	lost      map[string]bool
 	repairing sync.Mutex
 	// holders are the workers watched for the exchange files they hold of the run,
@@ -357,10 +356,6 @@ func (e *execution) run(ctx context.Context, stages []*Stage) error {
 func (e *execution) start(ctx context.Context, stages []*Stage) (wait func() error) {
 	e.mu.Lock()
 	e.started = append(e.started, stages...)
-	if e.levels == nil {
-		e.levels = map[int]int{}
-	}
-	maps.Copy(e.levels, toEnd(stages))
 	if e.watching == nil {
 		e.watching, e.stopWatch = context.WithCancel(ctx)
 	}
@@ -608,10 +603,7 @@ func (e *execution) stage(ctx context.Context, s *Stage) error {
 		groups = e.groups(s)
 		tasks = len(groups)
 	}
-	e.mu.Lock()
-	level := e.levels[s.ID]
-	e.mu.Unlock()
-	e.co.log.Debug("running a stage", "query", e.qid, "stage", s.String(), "tasks", tasks, "partitions", e.parts, "level", level)
+	e.co.log.Debug("running a stage", "query", e.qid, "stage", s.String(), "tasks", tasks, "partitions", e.parts)
 
 	// What every task reads in full, and its bytes: as it is when a task is
 	// made, as a worker's files may have been written again by then, by this run
@@ -742,7 +734,7 @@ func (e *execution) stage(ctx context.Context, s *Stage) error {
 				task.Views = append(task.Views, whole[in.View])
 			}
 		}
-		task.round, task.Level = round, level
+		task.round = round
 		idx := strconv.Itoa(p.index())
 		if writes {
 			task.SQL = writeSQL(s, e.target)

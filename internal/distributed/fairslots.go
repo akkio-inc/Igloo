@@ -19,13 +19,6 @@ import (
 // tasks at once: one of 128 tasks puts 8 or 9 on each of 15 workers. With one of
 // 16 workers powered off during a report, the tasks it had held took 44 and 45 s
 // to run again.
-//
-// Among a statement's own tasks, those of stages further from its end go first
-// (taskRequest.Level): stages of branches that run side by side share the slots,
-// and in arrival order a report's longest branch, four stages deep, waited 55 s
-// on every worker behind three branches of three whose stages were sent before
-// its own, and 7 s in a run where its stage was sent before two of theirs; the
-// report took 594 s and 573 s.
 type fairSlots struct {
 	mu   sync.Mutex
 	free int64
@@ -43,19 +36,12 @@ type slotQuery struct {
 	tasks   int
 }
 
-// slotOrder is where a task goes among those waiting: first, before every task
-// that is not; then by its statement's fairness; then, before tasks of lower
-// level, its stage's level.
-type slotOrder struct {
-	first bool
-	level int
-}
-
 // slotWaiter is a task waiting for its slots.
 type slotWaiter struct {
 	query *slotQuery
 	n     int64
-	order slotOrder
+	// first says it goes before every task that does not.
+	first bool
 	ready chan struct{}
 }
 
@@ -64,7 +50,8 @@ func newFairSlots(n int64) *fairSlots {
 }
 
 // acquire waits for n slots for a task of query, or until ctx ends.
-func (f *fairSlots) acquire(ctx context.Context, query string, n int64, order slotOrder) error {
+// first, if set, puts it before every waiting task that is not.
+func (f *fairSlots) acquire(ctx context.Context, query string, n int64, first bool) error {
 	f.mu.Lock()
 	q := f.queries[query]
 	if q == nil {
@@ -72,7 +59,7 @@ func (f *fairSlots) acquire(ctx context.Context, query string, n int64, order sl
 		f.queries[query] = q
 	}
 	q.tasks++
-	w := &slotWaiter{query: q, n: n, order: order, ready: make(chan struct{})}
+	w := &slotWaiter{query: q, n: n, first: first, ready: make(chan struct{})}
 	f.waiting = append(f.waiting, w)
 	f.next()
 	f.mu.Unlock()
@@ -126,15 +113,11 @@ func (f *fairSlots) next() {
 		for i, w := range f.waiting {
 			p := f.waiting[pick]
 			switch {
-			case w.order.first != p.order.first:
-				if w.order.first {
+			case w.first != p.first:
+				if w.first {
 					pick = i
 				}
-			case w.query.started != p.query.started:
-				if w.query.started < p.query.started {
-					pick = i
-				}
-			case w.order.level > p.order.level:
+			case w.query.started < p.query.started:
 				pick = i
 			}
 		}

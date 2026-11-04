@@ -62,10 +62,6 @@ type taskRequest struct {
 	// wait for: it takes the worker's next free slots before any other task
 	// (see fairSlots).
 	Repair bool `json:"repair,omitempty"`
-	// Level is how many stages lead from the task's stage to its statement's
-	// end, its own included: a worker runs a statement's tasks of higher levels
-	// first (see fairSlots).
-	Level int `json:"level,omitempty"`
 	// Columns, if set, rename the result's columns positionally.
 	Columns []string `json:"columns,omitempty"`
 	// Shuffle, if set, makes the task write its result to this directory

@@ -340,36 +340,3 @@ func TestPrintKeepsTexts(t *testing.T) {
 		t.Errorf("past maxPrinted, kept %d texts, the last among them: %v", len(p.printed), kept)
 	}
 }
-
-// TestToEnd checks stages' levels in a plan of a chain of stages: 1 for a stage
-// whose rows no stage reads, otherwise one more than the highest level of the
-// stages that read them, the highest of all as long as the plan's longest chain.
-func TestToEnd(t *testing.T) {
-	h := householdHarness(t)
-	for _, name := range []string{"households", "people"} {
-		h.tables[name].Bytes = 2 << 40
-	}
-	plan, _, err := h.co.plan(t.Context(), longReport(4), harnessEnv{h}, ModeOn, true, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	got := toEnd(plan.Stages)
-	most := 0
-	for _, s := range plan.Stages {
-		want := 1
-		for _, r := range plan.Stages {
-			for _, in := range r.Inputs {
-				if s.Out != nil && in.Exchange != nil && in.Exchange.ID == s.Out.ID {
-					want = max(want, got[r.ID]+1)
-				}
-			}
-		}
-		if got[s.ID] != want {
-			t.Errorf("stage %d: level %d, want %d\n%s", s.ID, got[s.ID], want, plan.describe())
-		}
-		most = max(most, got[s.ID])
-	}
-	if most != levels(plan.Stages) || most < 4 {
-		t.Errorf("highest level %d, longest chain %d", most, levels(plan.Stages))
-	}
-}

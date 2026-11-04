@@ -1009,9 +1009,8 @@ A stage sends all of its tasks to the workers at once, and stages that do not
 read each other's rows run side by side. A worker runs as many tasks at once
 as it has slots, and gives the next free ones to a task that runs again what
 a lost worker held, then to the statement that has started the fewest tasks
-there, so that a short statement gets past a long one's, and among a
-statement's own tasks, to those of the stages that the most stages follow,
-which keeps its longest chain of stages going.
+there, so that a short statement gets past a long one's, and among those,
+to the first task to come.
 
 ## Same results as one machine
 
