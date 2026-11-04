@@ -24,10 +24,9 @@ import (
 // engine's filecache.go), and the memory watch canceled a report 0.4 s
 // later, before the next step. Below what it holds, DuckDB drops those
 // ranges first. A worker reads nothing back, and what its DuckDB holds is
-// its tasks' work, which it needs: lowered from that rather than from the
-// limit, a fleet's workers took a report's shuffles and aggregates 30 to 60 s
-// longer each, at a hundred times the data. So a worker lowers it from the
-// limit.
+// its tasks' work, which it needs: lowered from that, a shortfall would cut
+// a shuffle's memory deeper than the shortfall. So a worker lowers it from
+// the limit.
 
 // High is the memory left, of total, below which Adapt lowers DuckDB's
 // memory limit: an eighth of it, at least 512 MiB, twice Low, so that it
