@@ -748,13 +748,12 @@ does, where DuckDB keeps every row, unless its scan is filtered so already,
 as one audience's rows of a lookup are, which DuckDB counted; where that
 row is the most value of a column over a table, unfiltered, it keeps no
 more than the rows of the row groups that hold the most value, read from
-the footers of the files whose Iceberg bounds reach it, up to 16, once a
+the footers of the files whose Iceberg bounds reach it, up to 4, once a
 snapshot and only when such a join is estimated (a lookup of 1.41 billion
 rows had 189,400 of its latest version, in 2 files of 19.7 million rows
 and row groups of 384,204, where a third of its rows by the versions'
 distinct count took a report for 191 GB, ten times what it held; it is
-now taken for 15 GB; at a hundred times the data, the version is in 8 of
-1,483 files, 76.3 million rows, and row groups of 2.05 million); integer
+now taken for 15 GB); integer
 columns stored as `DECIMAL(p,0)`, as a Snowflake `NUMBER` arrives, have
 bounds as integer columns do; one group by
 DuckDB's estimate of keys nothing knows is not one row; a `TOP_N` keeps what
