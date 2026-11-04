@@ -326,7 +326,8 @@ func TestEstimateCorpus(t *testing.T) {
 	// mode: "first" estimates each statement as on its first run, with
 	// nothing learned; "analyzed" so, its tables analyzed (with distinct
 	// counts); "learning" as the corpus's statements run in turn, each
-	// learning from those before it; "actual" with each operator's actual
+	// learning from those before it; "repeat" as it runs again, having
+	// learned from its own run only; "actual" with each operator's actual
 	// rows.
 	report := func(label, mode string) ([]worst, estimateErrors) {
 		if mode == "analyzed" {
@@ -348,6 +349,10 @@ func TestEstimateCorpus(t *testing.T) {
 		}
 		for _, s := range stmts {
 			orig := s
+			if mode == "repeat" {
+				l = newLearned()
+				learnFrom(orig, tables, l)
+			}
 			if mode == "actual" {
 				plan, ok := withActualRows(s)
 				if !ok {
@@ -356,7 +361,7 @@ func TestEstimateCorpus(t *testing.T) {
 				s.Plan = plan
 			}
 			p, err := estimateOf(s, tables, l, mode == "actual")
-			if l != nil {
+			if l != nil && mode == "learning" {
 				learnFrom(orig, tables, l)
 			}
 			if err != nil {
@@ -407,9 +412,17 @@ func TestEstimateCorpus(t *testing.T) {
 		}
 		return worsts, all
 	}
-	worsts, _ := report("estimated on a first run", "first")
+	worsts, first := report("estimated on a first run", "first")
 	report("estimated on a first run, the tables analyzed", "analyzed")
 	learning, _ := report("estimated after what the statements before it made", "learning")
+	repeat, again := report("estimated as it runs again", "repeat")
+	// What statements' own runs taught leaves no fewer of them within twice
+	// what they held. One of them may land further off where what its
+	// operators hold is itself off, its rows put right.
+	w1, _ := first.shares()
+	if w2, _ := again.shares(); w2 < w1 && os.Getenv("IGLOO_ESTIMATE_CORPUS") == "" {
+		t.Errorf("run again, %.0f%% within twice what they held; on a first run %.0f%%", 100*w2, 100*w1)
+	}
 	actual, _ := report("with each operator's actual rows", "actual")
 	byName, learnt := map[string]worst{}, map[string]worst{}
 	for _, w := range actual {
@@ -432,6 +445,14 @@ func TestEstimateCorpus(t *testing.T) {
 		}
 		t.Logf("learning %6.2fx  estimated %6.0f MB, held %6.0f MB  %s: %s", w.ratio, w.est/1e6, w.peak/1e6, w.name, w.detail)
 	}
+	for i, w := range repeat {
+		if i == worstShown {
+			break
+		}
+		a := byName[w.name]
+		t.Logf("repeat %6.2fx (%6.2fx by actual rows)  estimated %6.0f MB, held %6.0f MB  %s: %s | by actual rows: %s",
+			w.ratio, a.ratio, w.est/1e6, w.peak/1e6, w.name, w.detail, a.detail)
+	}
 	for i, w := range actual {
 		if i == worstShown {
 			break
@@ -452,7 +473,8 @@ var estimateFloors = map[string]struct {
 	short  int
 }{
 	"first":    {0.68, 0},
-	"learning": {0.66, 1},
+	"learning": {0.70, 1},
+	"repeat":   {0.76, 1},
 	"actual":   {0.85, 2},
 }
 

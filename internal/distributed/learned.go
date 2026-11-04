@@ -35,8 +35,8 @@ type learned struct {
 
 // joinSeen is what a join made: d is the larger distinct count of its keys,
 // as l*r/out of its inputs' rows and its own come to; fan is how many rows it
-// made for each of its larger input's.
-type joinSeen struct{ d, fan float64 }
+// made for each of its larger input's; small and large its inputs' rows.
+type joinSeen struct{ d, fan, small, large float64 }
 
 // OperatorRows are the rows each operator of a completed statement made,
 // as DuckDB's profiler counted them: its operator's name, as DuckDB's plan
@@ -239,7 +239,7 @@ func (l *learned) observeJoin(key string, left, right, out float64) {
 	if l == nil || key == "" || left <= 0 || right <= 0 || out <= 0 {
 		return
 	}
-	seen := joinSeen{d: left * right / out, fan: out / max(left, right)}
+	seen := joinSeen{d: left * right / out, fan: out / max(left, right), small: min(left, right), large: max(left, right)}
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if old, ok := l.joins[key]; ok || len(l.joins) < maxLearned {
@@ -253,6 +253,13 @@ func (l *learned) observeJoin(key string, left, right, out float64) {
 // their values were drawn apart from each other, but no more for each of
 // its larger input's rows than it made before, as estimates of its inputs
 // may be far off and their product further; ok is false if nothing was.
+//
+// Only of inputs within joinNear of those it was learned of: the rows a join
+// read, as DuckDB's filters from the other side's keys leave them, may be a
+// few hundredths of a table taken whole here, and the product of the two
+// took TPC-DS's joins of sales to customers to 35 million rows where they
+// made 18,000. Learned so, the corpus's statements run again were within
+// twice what they held 70% of the time, against 81% without.
 func (l *learned) joinFor(key string, left, right float64) (float64, bool) {
 	if l == nil || key == "" {
 		return 0, false
@@ -260,10 +267,19 @@ func (l *learned) joinFor(key string, left, right float64) (float64, bool) {
 	l.mu.Lock()
 	seen, ok := l.joins[key]
 	l.mu.Unlock()
-	if !ok || seen.d <= 0 {
+	if !ok || seen.d <= 0 || !near(min(left, right), seen.small) || !near(max(left, right), seen.large) {
 		return 0, false
 	}
 	return max(min(left*right/seen.d, max(left, right)*max(seen.fan, 1)), 1), true
+}
+
+// joinNear is how many times more or fewer rows than a join was learned of
+// its inputs may be for what was learned to stand (see joinFor).
+const joinNear = 4
+
+// near says rows estimated are within joinNear of rows seen.
+func near(estimated, seen float64) bool {
+	return estimated <= seen*joinNear && seen <= estimated*joinNear
 }
 
 // observeScan learns that a scan by key kept share of its table's rows.
