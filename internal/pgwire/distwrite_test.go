@@ -361,12 +361,12 @@ func (e *writeEnv) local(t *testing.T, query string) string {
 	return strings.Join(texts(t, e.admin, query), "\n")
 }
 
-// TestFullRefreshOnWorkers checks that a full refresh of a view that later
-// refreshes go on from, which keeps each group's distinct values in bitmaps,
-// runs its partial aggregates on workers under auto mode, as a read of them
-// would, and that the view has its query's rows; and that the next refresh,
-// after a write, goes on from them, which only the state the full refresh
-// keeps of them allows.
+// TestFullRefreshOnWorkers checks where refreshes run under auto mode, as reads
+// of their queries would. A view of sums that later refreshes go on from runs
+// its full refresh's partial aggregates on workers, and the next refresh, after
+// a write, goes on from the state they leave. A view counting distinct values,
+// whose state would keep them in bitmaps merged here, runs its query whole on
+// workers each time, and keeps no state. Each has its query's rows.
 func TestFullRefreshOnWorkers(t *testing.T) {
 	t.Parallel()
 	rb := os.Getenv("IGLOO_TEST_RB_EXTENSION")
@@ -378,23 +378,33 @@ func TestFullRefreshOnWorkers(t *testing.T) {
 	}
 	env := startWriteServerOn(t, writeWorkers{cores: 8, memory: 4 << 30, claim: 300 << 20, rb: rb}, nil)
 	admin := env.admin
-	mv := "SELECT g, count(DISTINCT id) AS d, count(*) AS n, sum(x) AS s FROM lake.public.src GROUP BY g"
-	mustExec(t, admin, "CREATE MATERIALIZED VIEW reach_mv AS "+mv)
-	mustExec(t, admin, "REFRESH MATERIALIZED VIEW reach_mv")
-	action, detail, _, reason := viewRefresh(t, admin, "public.reach_mv")
-	if action != actionFull || reason != "" || !strings.Contains(detail, "its query ran on") {
-		t.Errorf("the first refresh: %s: %s (%s)", action, detail, reason)
+	sums := "SELECT g, count(*) AS n, sum(x) AS s FROM lake.public.src GROUP BY g"
+	reach := "SELECT g, count(DISTINCT id) AS d, count(*) AS n, sum(x) AS s FROM lake.public.src GROUP BY g"
+	mustExec(t, admin, "CREATE MATERIALIZED VIEW sums_mv AS "+sums)
+	mustExec(t, admin, "CREATE MATERIALIZED VIEW reach_mv AS "+reach)
+	same := func(what, view, query string) {
+		t.Helper()
+		if got, want := env.local(t, "SELECT * FROM "+view+" ORDER BY ALL"), env.local(t, query+" ORDER BY ALL"); got != want {
+			t.Errorf("%s, %s:\n%s\nwant:\n%s", what, view, got, want)
+		}
 	}
-	if got, want := env.local(t, "SELECT * FROM reach_mv ORDER BY ALL"), env.local(t, mv+" ORDER BY ALL"); got != want {
-		t.Errorf("after the full refresh:\n%s\nwant:\n%s", got, want)
-	}
-	mustExec(t, admin, "INSERT INTO src SELECT i, i % 7, i * 2, 'more', TIMESTAMP '2026-02-01' FROM range(40000, 40100) AS r(i)")
-	mustExec(t, admin, "REFRESH MATERIALIZED VIEW reach_mv")
-	if action, detail, _, _ := viewRefresh(t, admin, "public.reach_mv"); action != actionIncremental {
-		t.Errorf("the refresh after a write: %s: %s", action, detail)
-	}
-	if got, want := env.local(t, "SELECT * FROM reach_mv ORDER BY ALL"), env.local(t, mv+" ORDER BY ALL"); got != want {
-		t.Errorf("after the incremental refresh:\n%s\nwant:\n%s", got, want)
+	for _, step := range []struct{ what, sums, reach string }{
+		{"the first refresh", actionFull, actionFull},
+		{"the refresh after a write", actionIncremental, actionFull},
+	} {
+		mustExec(t, admin, "REFRESH MATERIALIZED VIEW sums_mv")
+		mustExec(t, admin, "REFRESH MATERIALIZED VIEW reach_mv")
+		action, detail, _, reason := viewRefresh(t, admin, "public.sums_mv")
+		if action != step.sums || reason != "" || action == actionFull && !strings.Contains(detail, "its query ran on") {
+			t.Errorf("%s of the sums: %s: %s (%s)", step.what, action, detail, reason)
+		}
+		action, detail, _, reason = viewRefresh(t, admin, "public.reach_mv")
+		if action != step.reach || reason != bitmapsOnWorkers || !strings.Contains(detail, "its query ran on") {
+			t.Errorf("%s of the reach: %s: %s (%s)", step.what, action, detail, reason)
+		}
+		same(step.what, "sums_mv", sums)
+		same(step.what, "reach_mv", reach)
+		mustExec(t, admin, "INSERT INTO src SELECT i, i % 7, i * 2, 'more', TIMESTAMP '2026-02-01' FROM range(40000, 40100) AS r(i)")
 	}
 }
 

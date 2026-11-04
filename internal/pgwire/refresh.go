@@ -196,6 +196,9 @@ type refresher struct {
 	// what that took, for the history.
 	placement string
 	parts     distParts
+	// stateless says it refreshes in full and keeps no state, though it could
+	// (see bitmapsOnWorkers).
+	stateless bool
 }
 
 // rebuild replaces the view's rows with its query's, the query on workers
@@ -313,6 +316,10 @@ func (r *refresher) run(ctx context.Context) (refreshResult, error) {
 	if r.st.Mode == refreshFull {
 		why = "its REFRESH_MODE is FULL"
 	}
+	if why == "" && r.st.Mode != refreshIncremental && r.bitmapsOnWorkers(ctx) {
+		why, r.stateless = bitmapsOnWorkers, true
+		r.st.Incremental, r.st.Reason = false, why
+	}
 	if why == "" {
 		why = r.baseline(ctx)
 	}
@@ -324,6 +331,31 @@ func (r *refresher) run(ctx context.Context) (refreshResult, error) {
 		why = reason
 	}
 	return r.full(ctx, why)
+}
+
+// bitmapsOnWorkers is why a view counting distinct values is refreshed in
+// full, its query on workers (see refresher.bitmapsOnWorkers).
+const bitmapsOnWorkers = "it counts distinct values, and workers run its query whole faster than this replica merges its bitmaps"
+
+// bitmapsOnWorkers says the view counts distinct values, which an incremental
+// refresh keeps in bitmaps and merges on this replica, and auto mode would run
+// its query on workers. Going on from 800 groups' bitmaps of distinct devices,
+// a billion impressions' reach took 180 to 283 s here, 13 to 55 CPU-minutes,
+// beside dashboards whose tiles count the same distinct devices on workers in
+// 2 to 12 s; refreshed in full, its query runs on workers and keeps no state.
+func (r *refresher) bitmapsOnWorkers(ctx context.Context) bool {
+	if r.plan == nil || !r.plan.Grouped || !r.plan.Bitmaps() || r.s.dist == nil {
+		return false
+	}
+	src := r.s.fillSource(ctx, r.sess, &statement{access: r.access, guard: r.guard}, r.query)
+	if src == nil {
+		return false
+	}
+	defer src.close() //nolint:errcheck
+	user := r.sess.currentUser()
+	env := &sessionEnv{s: r.s, sess: r.sess, user: user, st: src}
+	_, err := r.s.dist.Plan(ctx, src.query, env, sessionMode(r.sess, user))
+	return err == nil
 }
 
 // planQuery plans the query, and loads its tables' current snapshots. It
@@ -832,7 +864,7 @@ func (r *refresher) full(ctx context.Context, why string) (refreshResult, error)
 		detail = fmt.Sprintf("ran the query over every row (%d rows, %d bytes of files): %s", rows, bytes, why)
 	}
 	p := r.plan
-	if p == nil || p.Reason != "" || r.snaps == nil || r.st.Mode == refreshFull {
+	if p == nil || p.Reason != "" || r.snaps == nil || r.st.Mode == refreshFull || r.stateless {
 		// Nothing to go on from: the query as it is, and no state.
 		rows, err := r.rebuild(ctx)
 		if err != nil {
@@ -1161,7 +1193,7 @@ func (r *refresher) write(ctx context.Context, stmts ...string) (int64, error) {
 func (r *refresher) done(ctx context.Context, res refreshResult) (refreshResult, string, error) {
 	st := &r.st
 	st.Action, st.Detail, st.DataTimestamp = res.action, res.detail, time.Now().UTC()
-	if r.snaps != nil && r.plan != nil && r.plan.Reason == "" && st.Unkeepable != r.digest && st.Mode != refreshFull {
+	if r.snaps != nil && r.plan != nil && r.plan.Reason == "" && st.Unkeepable != r.digest && st.Mode != refreshFull && !r.stateless {
 		st.Query, st.Sources = r.digest, r.snaps
 		if snap, err := r.snapshot(ctx, r.schema, r.table); err == nil {
 			st.Table = snap

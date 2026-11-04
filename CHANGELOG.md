@@ -2557,12 +2557,16 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   peaks for the next like it, so one that failed big and finished small
   reserves for the big one. Tasks and alerts had this already.
 
-- A full refresh of a view that later refreshes go on from runs its query on
-  workers where auto mode would run a read of it there. It computed its
-  groups' partial aggregates on the replica: a count of distinct devices over
-  a billion impressions took 137 to 257 s there, beside the dashboards, that
-  workers count in 2 to 12 s. The log says where each of a refresh's queries
-  ran, and the history where its query did.
+- Refreshes run their queries on workers where auto mode would run reads of
+  them there. A full refresh of a view that later refreshes go on from
+  computed its groups' partial aggregates on the replica. A view counting
+  distinct values went on from bitmaps of them, merged on the replica: the
+  reach of a billion impressions by advertiser and channel took 180 to 283 s
+  there, 13 to 55 CPU-minutes, each refresh, beside dashboards whose tiles
+  count the same on workers in 2 to 12 s. Such a view is now refreshed in
+  full, its query on workers, and keeps no bitmaps, as long as auto mode
+  would run that query there. The log says where each of a refresh's
+  queries ran, and the history where its query did.
 
 - A replica no longer cancels its first statements for memory while it reads back,
   after a start, the parts of files DuckDB held. The read-back took a new buffer for
