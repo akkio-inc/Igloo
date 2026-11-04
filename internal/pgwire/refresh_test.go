@@ -16,12 +16,14 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
+	"github.com/akkio-inc/igloo/internal/audit"
 	"github.com/akkio-inc/igloo/internal/catalog"
 	"github.com/akkio-inc/igloo/internal/config"
 	"github.com/akkio-inc/igloo/internal/ddl"
 	"github.com/akkio-inc/igloo/internal/engine"
 	"github.com/akkio-inc/igloo/internal/icebergtest"
 	"github.com/akkio-inc/igloo/internal/tasks"
+	"github.com/akkio-inc/igloo/internal/workload"
 )
 
 // refreshEnv is a server on an Iceberg catalog, with the scheduler's store
@@ -388,6 +390,69 @@ func TestRefreshFallsBack(t *testing.T) {
 // by position, where a full refresh would apply every deletion in its
 // scan; and that a small delete from a table that holds many deletions,
 // which both would apply, refreshes in full.
+// TestRefreshWaitsItsTurn checks that a materialized view's refresh waits
+// behind the replica's limit of statements at once as a statement does, and
+// is sampled as it runs: its history row has its shape, for what it holds to
+// be reserved next time. Its refreshes, 5 GB each, ran unannounced beside a
+// burst of dashboards, which then ran out of memory.
+func TestRefreshWaitsItsTurn(t *testing.T) {
+	t.Parallel()
+	ctl := workload.NewController(1 << 30)
+	ctl.LimitReplica(1)
+	history := audit.NewMemoryStore(1000, 1000)
+	env := startRefreshServer(t, func(o *Options) {
+		o.Workload = ctl
+		o.Audit = audit.New(history, audit.Options{}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	})
+	admin := env.admin
+	mustExec(t, admin, "CREATE TABLE spend (g VARCHAR, x INTEGER)")
+	mustExec(t, admin, "INSERT INTO spend SELECT 'g' || (i % 4), i FROM range(1000) AS r(i)")
+	mustExec(t, admin, "CREATE MATERIALIZED VIEW spend_sums AS SELECT g, sum(x) AS sx FROM spend GROUP BY g")
+	mustExec(t, admin, "INSERT INTO spend VALUES ('g9', 1)")
+
+	// Another statement runs, the one the replica lets run at once.
+	release, _, err := ctl.Admit(context.Background(), workload.Limits{Counted: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		_, err := admin.Exec(context.Background(), "REFRESH MATERIALIZED VIEW spend_sums")
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		release()
+		t.Fatalf("the refresh ran beside a statement the replica's limit holds it behind: %v", err)
+	case <-time.After(500 * time.Millisecond):
+	}
+	release()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("the refresh did not start once the other statement ended")
+	}
+	if n := count(t, admin, "SELECT count(*) FROM spend_sums"); n != 5 {
+		t.Errorf("%d groups after the refresh, want 5", n)
+	}
+	qs, err := history.Queries(context.Background(), audit.Viewer{All: true}, audit.Page{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, q := range qs {
+		if strings.HasPrefix(q.Text, `REFRESH MATERIALIZED VIEW "public"."spend_sums"`) {
+			if q.Shape == "" || q.Queued < 100*time.Millisecond {
+				t.Errorf("the refresh's history: shape %q, queued %s", q.Shape, q.Queued)
+			}
+			return
+		}
+	}
+	t.Error("no refresh in the history")
+}
+
 func TestRefreshCost(t *testing.T) {
 	t.Parallel()
 	env := startRefreshServer(t)

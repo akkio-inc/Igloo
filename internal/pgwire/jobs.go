@@ -21,6 +21,7 @@ import (
 	"github.com/akkio-inc/igloo/internal/schedule"
 	"github.com/akkio-inc/igloo/internal/sqllex"
 	"github.com/akkio-inc/igloo/internal/tasks"
+	"github.com/akkio-inc/igloo/internal/workload"
 )
 
 // Tasks, pipes, materialized views, dynamic tables and alerts. DuckDB has
@@ -1184,17 +1185,39 @@ func (s *Server) RunJob(ctx context.Context, j tasks.Job) (int64, error) {
 		if j.Kind == tasks.KindDynamicTable {
 			text = "ALTER DYNAMIC TABLE " + quoteName([]string{schema, table}) + " REFRESH"
 		}
+		// It waits its turn, reserves what its refreshes held, and is
+		// sampled as it runs, as a statement is: it is one, CREATE OR REPLACE
+		// TABLE ... AS of the view's query. A refresh of a view of a billion
+		// rows allocated 5.1 GiB every minute, which nothing reserved or
+		// sampled, and the dashboards beside it ran out of memory.
+		shape, exact := s.workloadShape(ctx, sess, text), s.workloadExact(sess, text)
+		sess.wl.counted, sess.wl.shape, sess.wl.exact = true, shape, exact
 		err := sess.runCancelable(ctx, text, func(ctx context.Context) error {
 			var err error
 			res, err = s.refreshView(ctx, sess, owner, j)
 			return err
 		})
+		sess.wl.counted, sess.wl.shape, sess.wl.exact = false, "", ""
 		rows := res.rows
 		if err != nil {
 			rows = -1
 		}
 		used := res.used
-		s.recordQuery(sess, queryRecord{text: text, used: &used,
+		peak, sampled := sess.wl.peak, sess.wl.sampled
+		switch {
+		case err == nil && !workload.ReadNothing(used.BytesRead, used.CPUTime):
+			for _, key := range []string{shape, exact} {
+				s.workload.Observe(key, workload.FootprintOf(used.MemoryAllocated, peak, sampled))
+				s.workload.ObserveCost(key, used.CPUTime)
+			}
+		case err != nil && sampled:
+			s.workload.ObserveUnfinished(shape, peak)
+			s.workload.ObserveUnfinished(exact, peak)
+		}
+		if !sampled {
+			peak = 0
+		}
+		s.recordQuery(sess, queryRecord{text: text, used: &used, peak: peak, shape: shape, exact: exact, queued: sess.wl.queued,
 			start: start, err: err, rows: rows, written: []auth.Object{{Schema: schema, Table: table}}, policies: res.policies,
 			analyze:  s.rewrite(ctx, sess, owner, "CREATE OR REPLACE TABLE "+quoteName([]string{s.catalogName(), schema, table})+" AS "+j.Statement),
 			stmtType: duckdb.STATEMENT_TYPE_CREATE})
