@@ -1055,6 +1055,21 @@ a task that runs again what a lost worker held, then to the statement that
 has started the fewest tasks there, so that a short statement gets past a
 long one's, and among those, to the first task to come.
 
+Statements in the background give way to the others on each worker: the
+refreshes of materialized views and dynamic tables, pipes' loads, and, with
+`IGLOO_HEAVY_IN_BACKGROUND`, statements whose shape held the workers 5 seconds
+or more and 8 times as long as the other statements there, in each of its
+latest runs (see [heavy statements beside short
+ones](workload-management.md#heavy-statements-beside-short-ones)). Their tasks
+get a quarter of a worker's slots before other tasks, rounded down, and one
+before them whenever none of theirs has started there for 10 seconds, so that
+dashboards that keep the workers busy slow them and never stop them; more only
+once no other statement's task has run or waited there for 2 seconds. Beside a full
+refresh on 16 workers that took them for 40 to 140 s at a time, dashboards'
+statements on workers took 9.7 s at the median and 42 s at the 95th percentile,
+against 6.6 and 23 s while none ran. `placement` in the history ends with `in
+the background` for them.
+
 ## Same results as one machine
 
 Workers run the same DuckDB as the coordinator, on the same snapshot of

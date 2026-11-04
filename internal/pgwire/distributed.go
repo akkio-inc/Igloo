@@ -313,6 +313,10 @@ func (s *Server) startDistributed(ctx context.Context, sess *session, user auth.
 		plan.StreamMerged()
 	}
 	sess.onWorkers()
+	if s.heavyOnWorkers != nil && sess.wl.shape != "" && s.heavyOnWorkers.heavy(sess.wl.shape) {
+		// Heavy beside the others there: its tasks give way to theirs.
+		ctx = distributed.WithBackground(ctx)
+	}
 	ex, err := s.dist.Execute(ctx, plan, settings)
 	if err != nil {
 		// Released now if the statement is done; otherwise once it has run
@@ -451,7 +455,11 @@ func (s *Server) startDistributed(ctx context.Context, sess *session, user auth.
 		s.log.Warn("workers could not run a statement; running it here", "user", user.Name, "err", err)
 		return nil, parts, false, nil
 	}
-	parts = distParts{workers: ex.Workers, large: ex.Large, placement: plan.Placement(), stages: ex.Stages, exchanges: ex.Exchanges, key: plan.Key}
+	placement := plan.Placement()
+	if distributed.InBackground(ctx) {
+		placement += "; in the background, giving way to other statements on the workers"
+	}
+	parts = distParts{workers: ex.Workers, large: ex.Large, placement: placement, stages: ex.Stages, exchanges: ex.Exchanges, key: plan.Key}
 	return &distRun{ex: ex, parts: parts, end: func() { ex.Close(); release() }}, parts, true, nil
 }
 

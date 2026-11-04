@@ -62,6 +62,9 @@ type taskRequest struct {
 	// wait for: it takes the worker's next free slots before any other task
 	// (see fairSlots).
 	Repair bool `json:"repair,omitempty"`
+	// Background says the statement runs in the background: its tasks take the
+	// worker's slots after other statements' (see fairSlots and WithBackground).
+	Background bool `json:"background,omitempty"`
 	// Columns, if set, rename the result's columns positionally.
 	Columns []string `json:"columns,omitempty"`
 	// Sorted says the task sorts its rows, which the coordinator merges in

@@ -54,6 +54,11 @@ import (
 // until they timed out, the two DuckDBs each spilling what the other wanted, and
 // those moved there threw away what they had done.
 //
+// On workers, a statement is heavy by how long statements of its shape held
+// them, against the other statements there, as heavyHistory measures CPU here
+// (see Server.heavyOnWorkers): its tasks give way to the others' on each worker
+// (see distributed.WithBackground), as refreshes' and pipes' loads do.
+//
 // A write of the catalog's tables known to be heavy (INSERT, UPDATE, DELETE,
 // MERGE and the fill of CREATE TABLE ... AS) runs there too, under the same
 // conditions and through its own proxy, with the same guard. It commits as a
@@ -142,8 +147,13 @@ func (r *shapeRuns) sorted() []time.Duration {
 }
 
 func newHeavyHistory() *heavyHistory {
-	return &heavyHistory{shapes: map[string]*shapeRuns{}, cpu: heavySeconds * time.Second * time.Duration(runtime.GOMAXPROCS(0)),
-		factor: heavyFactor, after: heavySeconds * time.Second, now: time.Now}
+	return newHeavyHistoryOf(heavySeconds * time.Second * time.Duration(runtime.GOMAXPROCS(0)))
+}
+
+// newHeavyHistoryOf returns a heavyHistory whose statements are heavy from cpu
+// of what it measures at the least.
+func newHeavyHistoryOf(cpu time.Duration) *heavyHistory {
+	return &heavyHistory{shapes: map[string]*shapeRuns{}, cpu: cpu, factor: heavyFactor, after: heavySeconds * time.Second, now: time.Now}
 }
 
 // line is how much CPU makes shape heavy: at least h.cpu, and heavyFactor times

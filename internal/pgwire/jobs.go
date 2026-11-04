@@ -17,6 +17,7 @@ import (
 
 	"github.com/akkio-inc/igloo/internal/auth"
 	"github.com/akkio-inc/igloo/internal/config"
+	"github.com/akkio-inc/igloo/internal/distributed"
 	"github.com/akkio-inc/igloo/internal/erasure"
 	"github.com/akkio-inc/igloo/internal/schedule"
 	"github.com/akkio-inc/igloo/internal/sqllex"
@@ -1086,6 +1087,12 @@ func (s *Server) RunJob(ctx context.Context, j tasks.Job) (int64, error) {
 	}
 	if j.Kind == tasks.KindAlert {
 		return s.runAlert(ctx, j)
+	}
+	switch j.Kind {
+	case tasks.KindMaterializedView, tasks.KindDynamicTable, tasks.KindPipe:
+		// A refresh or a pipe's load runs in the background: on workers, its
+		// tasks give way to sessions' statements' (see distributed.WithBackground).
+		ctx = distributed.WithBackground(ctx)
 	}
 	if err := s.stillDue(ctx, j); err != nil {
 		return -1, err
