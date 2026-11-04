@@ -309,6 +309,40 @@ using all of its cores.
   `memory is nearly gone with no statement running` with the session,
   user and statement hash of the statement it canceled last. A statement
   that stops when canceled, and lets DuckDB stop, never leads to either.
+- **A statement that runs out of DuckDB's memory** (`Out of Memory Error`)
+  runs again rather than fail, if it has sent no row and is outside a
+  transaction block: queries, `INSERT`, `UPDATE`, `DELETE` and `MERGE`,
+  refreshes of materialized views and dynamic tables, and `COPY INTO` from
+  pipes and clients. DuckDB has one memory pool and fails whichever
+  statement asks for memory the others hold. In turn:
+  1. In auto mode, it runs on workers where they may run it (see
+     [distributed execution](distributed-execution.md)); the log says `a
+     statement ran out of memory on this replica; trying it on workers`.
+  2. On the replica, it waits for a reservation of what it held and the block
+     it failed to get, and runs again beside the others (`... running it again
+     beside others once what it held and the block it failed to get are
+     free`), unless that is three quarters of the memory or more.
+  3. Then alone (`... running it again alone`). One statement at a time waits
+     to run alone, and holds nobody back while it waits: statements that fit
+     keep starting beside it. Another that comes to this step fails at once,
+     and so does the one waiting if the replica has no moment free of others
+     within 5 minutes.
+  4. Alone, on half the threads each time, down to one (`a statement ran out
+     of memory alone; running it again on fewer threads`): some of DuckDB's
+     operators hold memory for each thread that they cannot spill.
+
+  A statement that still runs out fails with SQLSTATE `53200`
+  (`out_of_memory`), saying how it last ran: alone on one thread, beside
+  others while another waited to run alone, or beside others with no moment
+  free to run alone.
+- **What held the memory.** When a statement runs out of DuckDB's memory,
+  Igloo logs `a statement ran out of DuckDB's memory; what held it`. The line
+  has DuckDB's `limit`, the memory it `used` and `spilled`, `by_tag` as
+  `duckdb_memory()` counts it, what the workload controller has `reserved`
+  and saw held at its last sample (`held_at_last_sample`), the statements
+  running and waiting, and the five running statements that reserved the
+  most, with how long each ran. Statements that run out within 10 seconds of
+  each other share one line.
 - **Memory that comes back.** Igloo fixes glibc's `mmap` threshold at 128 KiB,
   so that DuckDB's buffers go back to the system when freed, rather than stay
   in the allocator's arenas: after a sort that returned its rows, a process
@@ -1045,6 +1079,7 @@ Igloo's metrics, besides the standard Go and process metrics:
 | `igloo_report_ctes_recognized_total` | | Common table expressions of reports that `IGLOO_REPORT_REWRITE` answered through the report API ([reports as written](media-analytics.md#reports-as-written)) |
 | `igloo_report_rewrite_fallbacks_total` | | Statements whose recognized reports failed to prepare and were prepared as written instead |
 | `igloo_bitmap_index_statements_total` | | Statements prepared whose counts of distinct members in SQL read [bitmap indexes](sql.md#bitmap-indexes) instead of the tables (report API calls count in `igloo_report_calls_total`) |
+| `igloo_log_lines_dropped_total` | | Log lines dropped because stderr, or what reads it, did not keep up. Logging never holds a statement up: Igloo holds up to 4 MiB of lines, drops the rest, and says so in a warning at most once a minute (see `IGLOO_LOG_LEVEL` in [configuration](configuration.md)) |
 | `igloo_memory_exits_total` | | Times Igloo exited because a statement it canceled for running out of memory did not stop, or DuckDB went on with its work after it did, and memory was nearly gone (see [sizing](#sizing)) |
 | `igloo_snowflake_implicit_conversions_total` | | Statements in [Snowflake's dialect](snowflake-sql.md#implicit-conversions) that DuckDB could bind only with Snowflake's implicit conversions, which Igloo then made |
 | `igloo_sorted_writes_total` | | Writes of rows in order too large to sort at once within `IGLOO_SORT_SPILL_BUDGET`, which Igloo sorted [a range of the order at a time](sql.md#writing-rows-in-order) |
