@@ -35,6 +35,8 @@ type unsortedTable struct {
 	keys, nullEvery int
 	// rowGroups is the rows of a row group of its files, if not DuckDB's.
 	rowGroups int
+	// wide, if set, makes each payload that many MD5s in hex, 32 bytes each.
+	wide int
 }
 
 func (u unsortedTable) schema() *iceberg.Schema {
@@ -57,6 +59,10 @@ func (u unsortedTable) write(t testing.TB, db *sql.DB, dir string, first, count 
 	if u.nullEvery > 0 {
 		key = fmt.Sprintf("CASE WHEN i %% %d = 0 THEN NULL ELSE %s END", u.nullEvery, key)
 	}
+	payload := "'payload-' || md5(i::VARCHAR) || '-' || md5((i + 1)::VARCHAR)"
+	if u.wide > 0 {
+		payload = fmt.Sprintf("array_to_string(list_transform(range(%d), lambda j: md5((i * %d + j)::VARCHAR)), '')", u.wide, u.wide)
+	}
 	var paths []string
 	for f := first; f < first+count; f++ {
 		path := filepath.Join(dir, fmt.Sprintf("duckdb-%03d.parquet", f))
@@ -64,9 +70,8 @@ func (u unsortedTable) write(t testing.TB, db *sql.DB, dir string, first, count 
 		if u.rowGroups > 0 {
 			options += fmt.Sprintf(", ROW_GROUP_SIZE %d", u.rowGroups)
 		}
-		stmt := fmt.Sprintf(`COPY (SELECT i AS id, %s AS audience, CAST(i %% 3 AS INTEGER) AS ver,
-			'payload-' || md5(i::VARCHAR) || '-' || md5((i + 1)::VARCHAR) AS payload
-			FROM range(%d, %d) t(i) ORDER BY random()) TO '%s' (%s)`, key, f*u.rows, (f+1)*u.rows, path, options)
+		stmt := fmt.Sprintf(`COPY (SELECT i AS id, %s AS audience, CAST(i %% 3 AS INTEGER) AS ver, %s AS payload
+			FROM range(%d, %d) t(i) ORDER BY random()) TO '%s' (%s)`, key, payload, f*u.rows, (f+1)*u.rows, path, options)
 		if _, err := db.Exec(stmt); err != nil {
 			t.Fatal(err)
 		}

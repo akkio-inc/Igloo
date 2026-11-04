@@ -327,8 +327,8 @@ func (r *refresher) run(ctx context.Context) (refreshResult, error) {
 }
 
 // stateRowGroupBytes is about how many bytes of a state's bitmaps each of its
-// files' row groups holds (see slices).
-const stateRowGroupBytes = 8 << 20
+// files' row groups holds (see slices), as many as of Igloo's other files.
+const stateRowGroupBytes = distributed.RowGroupBytes
 
 // slices returns the ranges of rowid of rel, a temporary table of state rows
 // about to be written, to write them in: about stateRowGroupBytes of their

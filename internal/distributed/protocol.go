@@ -64,6 +64,9 @@ type taskRequest struct {
 	Repair bool `json:"repair,omitempty"`
 	// Columns, if set, rename the result's columns positionally.
 	Columns []string `json:"columns,omitempty"`
+	// Sorted says the task sorts its rows, which the coordinator merges in
+	// that order (see merge.go): the file of its result keeps it.
+	Sorted bool `json:"sorted,omitempty"`
 	// Shuffle, if set, makes the task write its result to this directory
 	// in object storage, partitioned by its __b column, instead of sending
 	// it back; the response lists the files. Partitions is how many

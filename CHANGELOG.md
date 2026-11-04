@@ -2646,6 +2646,18 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   8 million new impressions takes 8 to 9 s, and writes 267 row groups of up
   to 9 MB.
 
+- Igloo's other Parquet files keep their row groups near 8 MB too, and tables of
+  wide rows get fewer rows a row group. A task's result was written in DuckDB's
+  row groups of 122,880 rows, 250 MB for rows of 2 KB; it is now cut
+  at 8 MB where its rows have no order to keep. Sorted results, a large sort's
+  runs and a sorted write's ranges, which DuckDB bounds by rows only, take as
+  many rows as their width makes 8 MB, and a merge's file ends a row group at
+  8 MB. Tables aim at 16 MiB a row group, as before, now also where rows are
+  wider than 137 bytes, which stayed at 122,880 rows: a table of 2 KB rows in
+  one row group of 40 MB gets row groups of up to 16 MiB once maintenance
+  rewrites it, and its inserts are sized the same. DuckDB puts a vector of rows,
+  up to 2,048, in each row group it writes, so rows past 4 KB make larger ones.
+
 - A replica no longer cancels its first statements for memory while it reads back,
   after a start, the parts of files DuckDB held. The read-back took a new buffer for
   each request, which Go's heap kept after it ended, until Go's next collection;

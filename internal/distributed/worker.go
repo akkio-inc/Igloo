@@ -833,17 +833,41 @@ func (w *Worker) run(ctx context.Context, req *taskRequest) (string, *taskResult
 			sel[i] = "CAST(" + quoteIdent(c.Name) + " AS " + t + ") AS " + quoteIdent(c.Name)
 		}
 	}
+	// Row groups of about RowGroupBytes: by their bytes where the rows have
+	// no order to keep, which DuckDB bounds only then, and otherwise by as
+	// many rows as their types make that many bytes.
+	opts := "FORMAT parquet, ROW_GROUP_SIZE_BYTES " + strconv.Itoa(RowGroupBytes)
+	if req.Sorted {
+		opts = "FORMAT parquet, ROW_GROUP_SIZE " + strconv.FormatInt(RowGroupRows(rowWidth(cols)), 10)
+	} else if _, err := conn.ExecContext(ctx, "SET SESSION preserve_insertion_order = false", nil); err != nil {
+		return "", nil, err
+	}
 	var b [16]byte
 	_, _ = rand.Read(b[:])
 	path := filepath.Join(w.opts.TempDir, hex.EncodeToString(b[:])+".parquet")
 	res, err := conn.ExecContext(ctx, "COPY (SELECT "+strings.Join(sel, ", ")+" FROM ("+query+")) TO "+
-		quoteLiteral(path)+" (FORMAT parquet)", nil)
+		quoteLiteral(path)+" ("+opts+")", nil)
 	if err != nil {
 		_ = os.Remove(path)
 		return "", nil, err
 	}
 	rows, _ := res.RowsAffected()
 	return path, &taskResult{Columns: cols, Rows: rows}, nil
+}
+
+// RowGroupBytes is about how many bytes of rows, as DuckDB holds them, a row
+// group of a file Igloo writes for itself holds at most: a task's result, a
+// sort's runs, a refresh's state. A reader holds a row group's column at
+// once, which, at DuckDB's 122,880 rows a group, rows of bitmaps of 2.5 MB
+// took to 2 GB. DuckDB puts a vector of rows, up to 2,048, in a row group
+// whatever it is asked, so rows wider than 4 KB take more.
+const RowGroupBytes = 8 << 20
+
+// RowGroupRows is how many rows of width bytes make a row group of
+// RowGroupBytes, up to DuckDB's 122,880: for writes that keep their rows'
+// order, where DuckDB bounds a row group by its rows only.
+func RowGroupRows(width int64) int64 {
+	return min(max(RowGroupBytes/max(width, 1), 1), 122_880)
 }
 
 // shuffleRowGroup is how many rows a shuffle task writes to a row group.

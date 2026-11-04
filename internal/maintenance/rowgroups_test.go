@@ -3,6 +3,7 @@ package maintenance
 import (
 	"context"
 	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/apache/iceberg-go"
@@ -163,6 +164,71 @@ func TestSplitRowGroups(t *testing.T) {
 	before := cat.tbl.CurrentSnapshot().SnapshotID
 	if got, err := m.splitRowGroups(ctx, cat.tbl, quiet); err != nil || got.CurrentSnapshot().SnapshotID != before {
 		t.Errorf("a table of 8 files of 100,000 rows was rewritten: %v", err)
+	}
+}
+
+// TestWideRowGroups checks that a table of wide rows, of 2 KiB payloads,
+// written in one row group of 40 MB as DuckDB's 122,880 rows make it, gets
+// row groups of about filerewrite.TargetRowGroupBytes: for its inserts, and
+// for its rows as they are, which a pass rewrites.
+func TestWideRowGroups(t *testing.T) {
+	db := openDuckDB(t)
+	ctx := context.Background()
+	m := New(nil, t.TempDir()+"/", Options{Memory: 1 << 30, Threads: 4}, quiet)
+	u := unsortedTable{files: 1, rows: 20_000, keys: 500, wide: 64}
+	cat := u.table(t, db, t.TempDir(), table.UnsortedSortOrder)
+	tx := cat.tbl.NewTransaction()
+	if err := tx.SetProperties(iceberg.Properties{rowGroupsProperty: "auto"}); err != nil {
+		t.Fatal(err)
+	}
+	tbl, err := tx.Commit(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cat.tbl = tbl
+	largest := func(tbl *table.Table) (groups int, rows, bytes int64, files []string) {
+		t.Helper()
+		tasks, err := tbl.Scan().PlanFiles(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, task := range tasks {
+			files = append(files, task.File.FilePath())
+		}
+		err = db.QueryRow(`SELECT count(*), max(n), max(b) FROM (SELECT file_name, row_group_id, max(row_group_num_rows) AS n,
+			sum(total_compressed_size) AS b FROM parquet_metadata(['`+strings.Join(files, "', '")+`']) GROUP BY ALL)`).Scan(&groups, &rows, &bytes)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return groups, rows, bytes, files
+	}
+	groups, rows, bytes, files := largest(cat.tbl)
+	if groups != 1 || bytes < filerewrite.TargetRowGroupBytes {
+		t.Fatalf("the table to split: %d row groups, the largest of %d bytes", groups, bytes)
+	}
+	before := u.digest(t, db, files)
+
+	if err := m.sizeRowGroups(ctx, cat.tbl, quiet); err != nil {
+		t.Fatal(err)
+	}
+	size, records, err := tableBytes(ctx, cat.tbl)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := filerewrite.TargetRows(size, records)
+	if got := cat.tbl.Properties()[duckDBRowGroups]; got != strconv.FormatInt(want, 10) || want >= 10_000 {
+		t.Errorf("inserts write row groups of %q rows; want %d, fewer than 10,000", got, want)
+	}
+	committed, err := m.splitRowGroups(ctx, cat.tbl, quiet)
+	if err != nil {
+		t.Fatal(err)
+	}
+	groups, rows, bytes, files = largest(committed)
+	if groups < 2 || rows > want || bytes > filerewrite.TargetRowGroupBytes+filerewrite.TargetRowGroupBytes/8 {
+		t.Errorf("after the split: %d row groups, the largest of %d rows and %d bytes", groups, rows, bytes)
+	}
+	if after := u.digest(t, db, files); after != before {
+		t.Errorf("the rows changed: %s, were %s", after, before)
 	}
 }
 
