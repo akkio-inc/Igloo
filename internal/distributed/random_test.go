@@ -546,8 +546,10 @@ func (g *gen) query() string {
 	case 14:
 		return g.siblings()
 	case 8:
-		// Subqueries in WHERE.
-		q := "SELECT f.h, count(*), sum(f.v) FROM f WHERE " + g.subqueryPred("f")
+		// Subqueries in WHERE, of f alone or joined to others, as TPC-DS q69's
+		// customers are to their addresses (see innerItem).
+		from := g.pick("f", "f", "f JOIN dim ON f.k = dim.k", "f CROSS JOIN (SELECT DISTINCT w FROM dim WHERE w < 3) AS d")
+		q := "SELECT f.h, count(*), sum(f.v) FROM " + from + " WHERE " + g.subqueryPred("f")
 		if g.chance(0.5) {
 			q += " AND " + g.pred("f")
 		}

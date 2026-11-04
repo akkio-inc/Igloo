@@ -132,6 +132,12 @@ func (sc *scope) addOuterJoin(ref node, rd *reads, conds []node, us, rs [3]int) 
 		return nil, nil
 	}
 	left, markLeft := item([2]int{us[0], rs[0]}, [2]int{us[1], rs[1]})
+	if left == nil && str(ref["join_type"]) == "ANTI" {
+		// An anti join of items joined to each other keeps each of their rows
+		// by the item its condition reads: that one read by partition, every
+		// row they make is in its key's partition alone (see existsJoin).
+		left, markLeft = keyItem(conds, rd.uses[us[0]:us[1]], rd.rels[rs[0]:rs[1]], sc)
+	}
 	right, markRight := item([2]int{us[1], rs[1]}, [2]int{us[2], rs[2]})
 	if left == nil || right == nil {
 		return
@@ -144,6 +150,35 @@ func (sc *scope) addOuterJoin(ref node, rd *reads, conds []node, us, rs [3]int) 
 	if oj.nullable(right) {
 		markRight()
 	}
+}
+
+// keyItem returns the item of sc, among the tables uses and relations rels of
+// a join's left side, whose columns the left of every one of conds, equalities
+// of a column of the left side to one of the right, reads; and the func that
+// marks it a side of the join. It returns nil if the conditions read more than
+// one item, or one of none of them.
+func keyItem(conds []node, uses []*tableUse, rels []*relUse, sc *scope) (*fromItem, func()) {
+	name := ""
+	for _, c := range conds {
+		l := child(c, "left")
+		parts := columnNames(l)
+		if str(c["class"]) != "COMPARISON" || str(c["type"]) != "COMPARE_EQUAL" || str(l["class"]) != "COLUMN_REF" || len(parts) != 2 ||
+			name != "" && !strings.EqualFold(name, parts[0]) {
+			return nil, nil
+		}
+		name = strings.ToLower(parts[0])
+	}
+	for _, u := range uses {
+		if u.scope == sc && u.item != nil && u.item.name == name {
+			return u.item, func() {}
+		}
+	}
+	for _, r := range rels {
+		if r.sc == sc && r.item != nil && r.item.name == name {
+			return r.item, func() {}
+		}
+	}
+	return nil, nil
 }
 
 // outerPairs reads by partition the other side of each outer join of the

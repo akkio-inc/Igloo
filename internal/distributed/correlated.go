@@ -220,6 +220,49 @@ func (pl *planner) joinOn(sel node, kind, alias string, sub node, names []any, c
 	return right, nil
 }
 
+// innerItem reports whether the columns outer are all qualified by the name of
+// one table or subquery of FROM clause from, which inner and cross joins only
+// join to the others.
+func innerItem(from node, outer []node) bool {
+	name := ""
+	for _, e := range outer {
+		parts := columnNames(e)
+		if len(parts) != 2 || name != "" && !strings.EqualFold(name, parts[0]) {
+			return false
+		}
+		name = parts[0]
+	}
+	found := 0
+	var visit func(n node) bool
+	visit = func(n node) bool {
+		switch str(n["type"]) {
+		case "JOIN":
+			jt, rt := str(n["join_type"]), str(n["ref_type"])
+			switch {
+			case rt != "REGULAR" && rt != "CROSS":
+				return false
+			case jt == "SEMI" || jt == "ANTI":
+				// Another EXISTS made a join: its rows are its left side's.
+				return visit(child(n, "left"))
+			case jt != "INNER":
+				return false
+			}
+			return visit(child(n, "left")) && visit(child(n, "right"))
+		case "BASE_TABLE", "SUBQUERY":
+			alias := str(n["alias"])
+			if alias == "" {
+				alias = str(n["table_name"])
+			}
+			if strings.EqualFold(alias, name) {
+				found++
+			}
+			return true
+		}
+		return false
+	}
+	return visit(from) && found == 1
+}
+
 // keyColumns are the names of a correlated subquery's keys as a join reads them.
 func keyColumns(n int) []any {
 	names := make([]any, n)
@@ -252,13 +295,15 @@ func (pl *planner) existsJoin(sel, cond node, ctes cteScope) (bool, error) {
 	if q == nil {
 		return false, nil
 	}
-	if t := str(child(sel, "from_table")["type"]); negated && t != "BASE_TABLE" && t != "SUBQUERY" {
-		// The left of an anti join read by partition must be partitioned too,
-		// which it can tell only of one item (see addOuterJoin).
-		return false, nil
-	}
 	c := pl.correlationOf(q, ctes)
 	if c == nil || !pl.readsOuter(sel, c, ctes) {
+		return false, nil
+	}
+	if t := str(child(sel, "from_table")["type"]); negated && t != "BASE_TABLE" && t != "SUBQUERY" && !innerItem(child(sel, "from_table"), c.outer) {
+		// The left of an anti join read by partition must be partitioned too:
+		// one item, or the item of an inner join's that its key is a column of
+		// (see addOuterJoin), as TPC-DS q69's customers, joined to their
+		// addresses and demographics, are kept by their key.
 		return false, nil
 	}
 	sub := clone(q).(node)

@@ -35,3 +35,32 @@ func TestAnyExists(t *testing.T) {
 		}
 	}
 }
+
+// TestNotExistsOverJoins runs TPC-DS q69, which keeps the customers, joined to
+// their addresses and demographics, who bought in stores but neither on the web
+// nor from the catalog, on workers, with the sales tables too large for every
+// worker to read: its NOT EXISTS are anti joins by the customer's key, the
+// customers read by partition (see innerItem), and the rows are one machine's.
+func TestNotExistsOverJoins(t *testing.T) {
+	h := newTPCDSHarness(t, 0.01, 4, 3)
+	for _, name := range []string{"store_sales", "web_sales", "catalog_sales"} {
+		h.tables[name].Bytes = 1 << 36
+	}
+	h.tables["customer"].Bytes = 1 << 33
+	rows, _, err := h.query(context.Background(), "SELECT query FROM tpcds_queries() WHERE query_nr = 69")
+	if err != nil || len(rows) != 1 {
+		t.Fatal(err)
+	}
+	q := rows[0][0].(string)
+	want, _, err := h.query(t.Context(), q)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, _, plan, _, err := h.run(t.Context(), q, ModeOn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if msg := compareRows(want, got, hasOrderBy(q)); msg != "" {
+		t.Errorf("%s\n%s", msg, plan.describe())
+	}
+}
