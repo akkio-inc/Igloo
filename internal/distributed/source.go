@@ -4,16 +4,22 @@ import (
 	"context"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"iter"
+	"math/big"
 	"reflect"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/apache/arrow-go/v18/parquet/metadata"
 	"github.com/apache/iceberg-go"
+	icebergio "github.com/apache/iceberg-go/io"
 	"github.com/apache/iceberg-go/table"
 
 	"github.com/akkio-inc/igloo/internal/catalog"
@@ -85,12 +91,10 @@ type Iceberg struct {
 
 	mu    sync.Mutex
 	files map[string][]File
-	// bounds are the bounds of each snapshot's columns, as its files' are
-	// (see Table.Bounds), and sizes their sizes (Table.ColumnBytes), by the
-	// same keys as files.
-	bounds map[string]map[string][2]float64
-	sizes  map[string]map[string]int64
-	order  []string
+	// stats are what each snapshot's files' statistics give its columns
+	// (see fileStats), by the same keys as files.
+	stats map[string]fileStats
+	order []string
 	// cached counts the files of the snapshots kept.
 	cached int
 	// tables are recently loaded tables, for deciding, and loading the loads
@@ -338,10 +342,10 @@ func (s *Iceberg) Files(ctx context.Context, t *Table) ([]File, error) {
 	key := h.tbl.MetadataLocation() + "#" + strconv.FormatInt(h.snap.SnapshotID, 10)
 	s.mu.Lock()
 	files, ok := s.files[key]
-	bounds, sizes := s.bounds[key], s.sizes[key]
+	st := s.stats[key]
 	s.mu.Unlock()
 	if ok {
-		t.Bounds, t.ColumnBytes = bounds, sizes
+		st.set(t)
 		return files, nil
 	}
 
@@ -353,7 +357,7 @@ func (s *Iceberg) Files(ctx context.Context, t *Table) ([]File, error) {
 	bucketed := len(t.Buckets) > 0
 	bounding := newBounder(t.Columns)
 	for _, task := range tasks {
-		bounding.add(task.File.LowerBoundValues(), task.File.UpperBoundValues())
+		bounding.add(task.File.LowerBoundValues(), task.File.UpperBoundValues(), task.File.Count())
 		bounding.size(task.File.ColumnSizes())
 		if f := strings.ToUpper(string(task.File.FileFormat())); f != "PARQUET" {
 			return nil, unsupported("%s has %s files", t, f)
@@ -405,20 +409,30 @@ func (s *Iceberg) Files(ctx context.Context, t *Table) ([]File, error) {
 		files = append(files, f)
 	}
 
-	t.Bounds, t.ColumnBytes = bounding.bounds(len(tasks)), bounding.columnBytes(len(tasks))
+	st = fileStats{bounds: bounding.bounds(len(tasks)), sizes: bounding.columnBytes(len(tasks)), top: bounding.topRows(len(tasks))}
+	if len(st.top) > 0 {
+		// Read when a statement asks, with a context of its own: the
+		// snapshot's stats outlive this call.
+		tbl := h.tbl
+		st.latest = bounding.latestRows(files, func() (icebergio.IO, context.CancelFunc, error) {
+			ctx, cancel := context.WithTimeout(context.Background(), footerReadLimit)
+			fsys, err := tbl.FS(ctx)
+			return fsys, cancel, err
+		})
+	}
+	st.set(t)
 	s.mu.Lock()
 	if _, ok := s.files[key]; !ok {
-		if s.bounds == nil {
-			s.bounds, s.sizes = map[string]map[string][2]float64{}, map[string]map[string]int64{}
+		if s.stats == nil {
+			s.stats = map[string]fileStats{}
 		}
-		s.files[key], s.bounds[key], s.sizes[key] = files, t.Bounds, t.ColumnBytes
+		s.files[key], s.stats[key] = files, st
 		s.order = append(s.order, key)
 		s.cached += len(files)
 		for len(s.order) > maxCachedSnapshots || s.cached > maxCachedFiles && len(s.order) > 1 {
 			s.cached -= len(s.files[s.order[0]])
 			delete(s.files, s.order[0])
-			delete(s.bounds, s.order[0])
-			delete(s.sizes, s.order[0])
+			delete(s.stats, s.order[0])
 			s.order = s.order[1:]
 		}
 	}
@@ -426,15 +440,35 @@ func (s *Iceberg) Files(ctx context.Context, t *Table) ([]File, error) {
 	return files, nil
 }
 
+// fileStats are what a snapshot's data files' statistics give its columns:
+// their bounds (Table.Bounds), sizes (Table.ColumnBytes) and the rows of
+// the files that hold their most values (Table.TopRows).
+type fileStats struct {
+	bounds map[string][2]float64
+	sizes  map[string]int64
+	top    map[string]int64
+	latest func(col string) (int64, bool)
+}
+
+func (f fileStats) set(t *Table) {
+	t.Bounds, t.ColumnBytes, t.TopRows, t.latestRows = f.bounds, f.sizes, f.top, f.latest
+}
+
 // bounder gathers the bounds of a table's columns of integer types, dates
 // and timestamps over its data files: the least of their lower bounds and
-// the most of their upper ones (see Table.Bounds).
+// the most of their upper ones (see Table.Bounds), and the rows of the
+// files whose upper bound is that most (Table.TopRows).
 type bounder struct {
 	// kinds are the columns bounded, by field ID: their names, and how their
 	// values are written (Iceberg's single-value serialization).
 	kinds map[int]boundKind
 	lo    map[int]float64
 	hi    map[int]float64
+	top   map[int]int64
+	// topFiles are the files, in the order added, whose upper bound of each
+	// field is its most; files counts those added.
+	topFiles map[int][]int
+	files    int
 	// seen counts the files with both bounds of each field.
 	seen map[int]int
 	// names are the top-level columns' names by field ID, and sizes their
@@ -450,7 +484,7 @@ type boundKind struct {
 }
 
 func newBounder(cols []Column) *bounder {
-	b := &bounder{kinds: map[int]boundKind{}, lo: map[int]float64{}, hi: map[int]float64{}, seen: map[int]int{},
+	b := &bounder{kinds: map[int]boundKind{}, lo: map[int]float64{}, hi: map[int]float64{}, top: map[int]int64{}, topFiles: map[int][]int{}, seen: map[int]int{},
 		names: map[int]string{}, sizes: map[int]int64{}, sized: map[int]int{}}
 	for _, c := range cols {
 		if c.ID != 0 {
@@ -464,20 +498,50 @@ func newBounder(cols []Column) *bounder {
 			b.kinds[c.ID] = boundKind{strings.ToLower(c.Name), 4}
 		case t == "BIGINT", t == "TIMESTAMP", t == "TIMESTAMP WITH TIME ZONE":
 			b.kinds[c.ID] = boundKind{strings.ToLower(c.Name), 8}
+		case wholeDecimal.MatchString(t):
+			b.kinds[c.ID] = boundKind{strings.ToLower(c.Name), decimalBound}
 		}
 	}
 	return b
 }
 
-// value decodes a bound of a field of size bytes: a little-endian integer.
+// wholeDecimal matches a decimal type of no fractional digits, as a
+// Snowflake NUMBER of integers arrives: its values are integers as an
+// integer type's are.
+var wholeDecimal = regexp.MustCompile(`^DECIMAL\(\d+,\s*0\)$`)
+
+// decimalBound is the size of a decimal's bound, which Iceberg writes as its
+// unscaled value in big-endian two's complement, in as few bytes as it
+// takes.
+const decimalBound = -1
+
+// value decodes a bound of a field of size bytes: a little-endian integer,
+// or a decimal's unscaled value (decimalBound).
 func (b *bounder) value(raw []byte, size int) (float64, bool) {
 	switch {
 	case size == 4 && len(raw) == 4:
 		return float64(int32(binary.LittleEndian.Uint32(raw))), true
 	case size == 8 && len(raw) == 8:
 		return float64(int64(binary.LittleEndian.Uint64(raw))), true
+	case size == decimalBound:
+		return bigEndianInt(raw)
 	}
 	return 0, false
+}
+
+// bigEndianInt decodes a two's complement integer of 1 to 16 big-endian
+// bytes, as Iceberg's bounds and Parquet's statistics write a decimal's
+// unscaled value.
+func bigEndianInt(raw []byte) (float64, bool) {
+	if len(raw) == 0 || len(raw) > 16 {
+		return 0, false
+	}
+	v := new(big.Int).SetBytes(raw)
+	if raw[0]&0x80 != 0 {
+		v.Sub(v, new(big.Int).Lsh(big.NewInt(1), uint(8*len(raw))))
+	}
+	f, _ := v.Float64()
+	return f, true
 }
 
 // size takes in a data file's columns' sizes.
@@ -507,13 +571,19 @@ func (b *bounder) columnBytes(files int) map[string]int64 {
 	return out
 }
 
-// add takes in a data file's lower and upper bounds.
-func (b *bounder) add(lower, upper map[int][]byte) {
+// add takes in the next data file's lower and upper bounds, and its rows.
+func (b *bounder) add(lower, upper map[int][]byte, rows int64) {
 	for id, k := range b.kinds {
 		lo, okLo := b.value(lower[id], k.size)
 		hi, okHi := b.value(upper[id], k.size)
 		if !okLo || !okHi {
 			continue
+		}
+		switch {
+		case b.seen[id] == 0 || hi > b.hi[id]:
+			b.top[id], b.topFiles[id] = rows, []int{b.files}
+		case hi == b.hi[id]:
+			b.top[id], b.topFiles[id] = b.top[id]+rows, append(b.topFiles[id], b.files)
 		}
 		if b.seen[id] == 0 {
 			b.lo[id], b.hi[id] = lo, hi
@@ -522,6 +592,165 @@ func (b *bounder) add(lower, upper map[int][]byte) {
 		}
 		b.seen[id]++
 	}
+	b.files++
+}
+
+// topRows are the rows of the files whose upper bound of a column is its
+// most, of the columns every one of files data files had bounds of, by
+// lower-case name; nil if none.
+func (b *bounder) topRows(files int) map[string]int64 {
+	var out map[string]int64
+	for id, k := range b.kinds {
+		if files == 0 || b.seen[id] != files {
+			continue
+		}
+		if out == nil {
+			out = map[string]int64{}
+		}
+		out[k.name] = b.top[id]
+	}
+	return out
+}
+
+// footerFilesMost is how many files' footers a column's latest rows are
+// counted from (see latestRows), and footerReadLimit how long reading them
+// may take; with more, or longer, the files' rows stand.
+const (
+	footerFilesMost = 4
+	footerReadLimit = 10 * time.Second
+)
+
+// latestRows returns what Table.LatestRows does for a table of files, which
+// b took in, read through fs when first asked for a column: the rows of the
+// row groups of the files that hold the column's most value whose most
+// value it is, by the files' Parquet footers. A lookup's versions written
+// in turn sit in row groups of their own where its files hold several: a
+// lookup of 1.41 billion rows over versions 0 to 2, whose 2 files that hold
+// version 2 have 19.7 million rows, has 384,204 in their row groups that
+// hold it, and 189,400 of version 2. Where more than footerFilesMost files
+// hold the most value, or a footer cannot be read, ok is false.
+func (b *bounder) latestRows(files []File, fs func() (icebergio.IO, context.CancelFunc, error)) func(col string) (int64, bool) {
+	type count struct {
+		rows int64
+		ok   bool
+	}
+	var mu sync.Mutex
+	counted := map[string]count{}
+	ids := map[string]int{}
+	for id, k := range b.kinds {
+		ids[k.name] = id
+	}
+	return func(col string) (int64, bool) {
+		mu.Lock()
+		defer mu.Unlock()
+		if c, done := counted[col]; done {
+			return c.rows, c.ok
+		}
+		id, known := ids[col]
+		held := b.topFiles[id]
+		c := count{}
+		if known && b.seen[id] == len(files) && len(held) > 0 && len(held) <= footerFilesMost {
+			fsys, release, err := fs()
+			if err == nil {
+				c.ok = true
+				for _, i := range held {
+					n, ok := rowsAtMost(fsys.Open, files[i], id, b.hi[id])
+					c.rows, c.ok = c.rows+n, c.ok && ok
+				}
+			}
+			if release != nil {
+				release()
+			}
+		}
+		counted[col] = c
+		return c.rows, c.ok
+	}
+}
+
+// rowsAtMost is the rows of the row groups of f whose most value of field
+// id, by their statistics, is most or more; ok is false where its footer
+// cannot be read or a row group's statistics of the field cannot be
+// decoded.
+func rowsAtMost(open func(path string) (icebergio.File, error), f File, id int, most float64) (rows int64, ok bool) {
+	r, err := open(f.Path)
+	if err != nil {
+		return 0, false
+	}
+	defer r.Close()
+	meta, err := parquetFooter(r, f.Size)
+	if err != nil {
+		return 0, false
+	}
+	col := -1
+	for i := 0; i < meta.Schema.NumColumns(); i++ {
+		if meta.Schema.Column(i).SchemaNode().FieldID() == int32(id) {
+			col = i
+		}
+	}
+	if col < 0 {
+		return 0, false
+	}
+	for g := 0; g < meta.NumRowGroups(); g++ {
+		rg := meta.RowGroup(g)
+		cc, err := rg.ColumnChunk(col)
+		if err != nil {
+			return 0, false
+		}
+		hi, known := statMost(cc)
+		if !known {
+			return 0, false
+		}
+		if hi >= most {
+			rows += rg.NumRows()
+		}
+	}
+	return rows, true
+}
+
+// parquetFooter reads the Parquet footer of r, of size bytes.
+func parquetFooter(r io.ReaderAt, size int64) (*metadata.FileMetaData, error) {
+	if size < 12 {
+		return nil, fmt.Errorf("a Parquet file of %d bytes", size)
+	}
+	tail := make([]byte, 8)
+	if _, err := r.ReadAt(tail, size-8); err != nil {
+		return nil, err
+	}
+	if string(tail[4:]) != "PAR1" {
+		return nil, errors.New("not a Parquet file")
+	}
+	n := int64(binary.LittleEndian.Uint32(tail))
+	if n+8 > size {
+		return nil, errors.New("a footer longer than its file")
+	}
+	buf := make([]byte, n)
+	if _, err := r.ReadAt(buf, size-8-n); err != nil {
+		return nil, err
+	}
+	return metadata.NewFileMetaData(buf, nil)
+}
+
+// statMost is the most value of a column chunk by its statistics: an
+// integer's, or a decimal's unscaled value.
+func statMost(cc *metadata.ColumnChunkMetaData) (float64, bool) {
+	if set, err := cc.StatsSet(); err != nil || !set {
+		return 0, false
+	}
+	st, err := cc.Statistics()
+	if err != nil || st == nil || !st.HasMinMax() {
+		return 0, false
+	}
+	switch s := st.(type) {
+	case *metadata.Int32Statistics:
+		return float64(s.Max()), true
+	case *metadata.Int64Statistics:
+		return float64(s.Max()), true
+	case *metadata.FixedLenByteArrayStatistics:
+		return bigEndianInt(s.Max())
+	case *metadata.ByteArrayStatistics:
+		return bigEndianInt(s.Max())
+	}
+	return 0, false
 }
 
 // bounds are the bounds of the columns every one of files data files had

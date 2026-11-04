@@ -1099,6 +1099,7 @@ func (w *setWalker) joinRows(n *planNode, rows []rowsEstimate, outs [][]column, 
 		if c, found := w.joinKey(conds[0], outs[side]); found {
 			share = 1 / c.distinct
 		}
+		latest, latestShare, isLatest := w.latestRows(n.Children[1-side], conds[0], scans[side], scans[side+1])
 		for i := scans[side]; i < scans[side+1]; i++ {
 			if w.scans[i].selective {
 				// DuckDB's rows already are its filter's: one audience's rows,
@@ -1107,6 +1108,10 @@ func (w *setWalker) joinRows(n *planNode, rows []rowsEstimate, outs [][]column, 
 				share = 1
 			}
 			w.scans[i].selective = true
+		}
+		if isLatest {
+			// No more than the rows of the files that hold the latest value.
+			return max(min(other.ours*share, latest), 1), other.kept * min(share, latestShare)
 		}
 		return max(other.ours*share, 1), other.kept * share
 	case (equal || strings.Contains(name, "HASH")) && typ == "INNER":
@@ -1219,6 +1224,91 @@ func (w *setWalker) joinKey(cond string, side []column) (column, bool) {
 		}
 	}
 	return column{}, false
+}
+
+// latestRows is, for a join on cond of one table's scan, scans from to to,
+// to one row, one, that is the most value of a column over its table
+// unfiltered, as of a scalar subquery's latest version: the rows of the
+// scanned table's files whose upper bound of the key is its most value
+// (Table.TopRows), or of their row groups that hold it, by their footers
+// (Table.latestRows), which hold every row of that value; and their share
+// of its rows. ok is false where one is not such a row, or where its
+// table's most value may be below the scanned table's, whose rows of it
+// other files may hold. A lookup of 1.41 billion rows over versions 0 to 2
+// had 189,400 at version 2, where a third of its rows, by the versions'
+// distinct count, took a report's working set for 191 GB, ten times what it
+// held. Its 2 files that hold version 2 have 19.7 million rows, and their
+// row groups that do 384,204: the report is estimated at 15 GB.
+func (w *setWalker) latestRows(one *planNode, cond string, from, to int) (rows, share float64, ok bool) {
+	if to-from != 1 || w.scans[from].t == nil || w.scans[from].t.Rows <= 0 {
+		return 0, 0, false
+	}
+	t := w.scans[from].t
+	m := equality.FindStringSubmatch(cond)
+	if m == nil {
+		return 0, 0, false
+	}
+	key := ""
+	for _, name := range []string{bareName(m[1]), bareName(m[2])} {
+		if _, found := t.TopRows[name]; found {
+			key = name
+		}
+	}
+	col, found := mostOf(one)
+	if key == "" || !found {
+		return 0, 0, false
+	}
+	tables := w.tablesOf([]column{{name: col}})
+	for _, v := range tables {
+		if b, bounded := v.Bounds[col]; !bounded || b[1] < t.Bounds[key][1] {
+			return 0, 0, false
+		}
+	}
+	if len(tables) == 0 {
+		return 0, 0, false
+	}
+	top := float64(t.TopRows[key])
+	if t.latestRows != nil {
+		// Of those files, the row groups that hold it.
+		if n, counted := t.latestRows(key); counted {
+			top = min(top, float64(n))
+		}
+	}
+	return top, min(1, top/float64(t.Rows)), true
+}
+
+// mostOf is the column whose most value one is, through a scalar
+// subquery's projections and checks of its single row: an ungrouped
+// max(...) of a scan's one column, which no filter narrows.
+func mostOf(one *planNode) (string, bool) {
+	n := one
+	for len(n.Children) == 1 && !isMost(n) {
+		switch strings.ToUpper(n.Name) {
+		case "PROJECTION", "UNGROUPED_AGGREGATE":
+			n = n.Children[0]
+		default:
+			return "", false
+		}
+	}
+	if !isMost(n) {
+		return "", false
+	}
+	for n = n.Children[0]; strings.ToUpper(n.Name) == "PROJECTION" && len(n.Children) == 1; n = n.Children[0] {
+	}
+	name := strings.ToUpper(n.Name)
+	cols := n.strs("Projections")
+	if !strings.Contains(name, "SCAN") || strings.HasPrefix(name, "CTE") || strings.HasPrefix(name, "DELIM") ||
+		len(n.Children) > 0 || len(n.strs("Filters")) > 0 || len(cols) != 1 {
+		return "", false
+	}
+	return bareName(cols[0]), true
+}
+
+// isMost says n is an ungrouped aggregate of a single max(...).
+func isMost(n *planNode) bool {
+	aggs := n.strs("Aggregates")
+	return strings.ToUpper(n.Name) == "UNGROUPED_AGGREGATE" && len(n.Children) == 1 && len(aggs) == 1 &&
+		strings.HasPrefix(strings.ToLower(strings.TrimSpace(aggs[0])), "max(")
 }
 
 // distinctJoin is the rows of an inner join on equal columns whose

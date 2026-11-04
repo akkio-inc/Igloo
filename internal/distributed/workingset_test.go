@@ -819,6 +819,77 @@ func TestLatestVersionOfAnAudience(t *testing.T) {
 	}
 }
 
+// TestLatestVersionFiles checks that a lookup joined to its latest version,
+// the most of its versions table's, keeps no more than the rows of its files
+// that hold that version: of 1.41 billion rows over versions 0 to 2, 189,400
+// at version 2, where a third of them, by the versions' distinct count, took
+// a report's working set for ten times what it held. Where the versions
+// table's latest may be below the lookup's, where every file holds the
+// latest version, or where the subquery filters the versions, its distinct
+// count stands.
+func TestLatestVersionFiles(t *testing.T) {
+	plan := func(lookup, versions *Table, filters string) planEstimate {
+		t.Helper()
+		st := newPlanStats([]*Stage{{Inputs: []Input{{Table: lookup}, {Table: versions}}}}, 16)
+		scan := []any{"Projections", []string{"ver"}, "Estimated Cardinality", "934"}
+		if filters != "" {
+			scan = append(scan, "Filters", filters)
+		}
+		latest := op("PROJECTION", []map[string]any{op("UNGROUPED_AGGREGATE", []map[string]any{op("PROJECTION", []map[string]any{
+			op("UNGROUPED_AGGREGATE", []map[string]any{op("PROJECTION", []map[string]any{op("ICEBERG_SCAN", nil, scan...)},
+				"Projections", "ver", "Estimated Cardinality", "934")}, "Aggregates", "max(#0)")}, "Projections", "#0", "Estimated Cardinality", "1")},
+			"Aggregates", []string{"\"first\"(#0)", "count_star()"})}, "Projections", []string{"#0"}, "Estimated Cardinality", "1")
+		members := op("HASH_GROUP_BY", []map[string]any{op("HASH_JOIN", []map[string]any{
+			op("ICEBERG_SCAN", nil, "Projections", []string{"ver", "member"}, "Filters", "(NOT (member IS NULL))", "Estimated Cardinality", "282687110"), latest},
+			"Join Type", "INNER", "Conditions", "ver = SUBQUERY", "Estimated Cardinality", "282687110")},
+			"Groups", []string{"#1"}, "Aggregates", []string{}, "Estimated Cardinality", "282687110")
+		p, err := planOf(planJSON(t, members), st)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	grouped := func(p planEstimate) float64 {
+		var rows float64
+		for _, h := range p.parts {
+			if h.op == "HASH_GROUP_BY" {
+				rows = max(rows, h.rows)
+			}
+		}
+		return rows
+	}
+	lookup := func(top int64) *Table {
+		return &Table{Name: "lookup", Rows: 1_413_435_550, Bytes: 20e9, Columns: []Column{{Name: "ver", Type: "INTEGER"}, {Name: "member", Type: "VARCHAR"}},
+			Distinct: map[string]int64{"ver": 3}, Bounds: map[string][2]float64{"ver": {0, 2}}, TopRows: map[string]int64{"ver": top}}
+	}
+	versions := func(most float64) *Table {
+		return &Table{Name: "versions", Rows: 934, Bytes: 1e5, Columns: []Column{{Name: "ver", Type: "INTEGER"}, {Name: "audience", Type: "VARCHAR"}},
+			Bounds: map[string][2]float64{"ver": {0, most}}}
+	}
+	if rows := grouped(plan(lookup(189_400), versions(2), "")); rows > 189_400 {
+		t.Errorf("the latest version's members: %.0f rows, want no more than its files' 189,400", rows)
+	}
+	// Its 2 files that hold version 2 have 19.7 million rows, and their row
+	// groups that do, by their footers, 384,204.
+	inGroups := lookup(19_689_142)
+	inGroups.latestRows = func(col string) (int64, bool) { return 384_204, col == "ver" }
+	if rows := grouped(plan(inGroups, versions(2), "")); rows > 384_204 {
+		t.Errorf("by the row groups that hold the latest version: %.0f rows, want no more than 384,204", rows)
+	}
+	third := grouped(plan(lookup(1_413_435_550), versions(2), ""))
+	if third < 1e7 {
+		t.Errorf("every file holding the latest version: %.0f rows, want the distinct count's third", third)
+	}
+	for name, p := range map[string]planEstimate{
+		"the versions' latest below the lookup's": plan(lookup(189_400), versions(1), ""),
+		"the versions filtered":                   plan(lookup(189_400), versions(2), "audience='a'"),
+	} {
+		if rows := grouped(p); rows != third {
+			t.Errorf("%s: %.0f rows, want the distinct count's %.0f", name, rows, third)
+		}
+	}
+}
+
 // TestPlanKeeps checks the share of the rows a plan's scans read that its
 // result keeps, which a fill writes (see fillCost): all of them for a
 // copy, a filter's share for a filtered one, and no more than a hundredth

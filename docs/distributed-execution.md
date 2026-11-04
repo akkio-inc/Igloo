@@ -720,7 +720,13 @@ it computes keeps no more than a hundredth of its input for what is above it;
 a semi-join keeps at least a row for each of its keys; a join to one row, as
 of a scalar subquery's latest version, keeps what a filter by a constant
 does, where DuckDB keeps every row, unless its scan is filtered so already,
-as one audience's rows of a lookup are, which DuckDB counted; one group by
+as one audience's rows of a lookup are, which DuckDB counted; where that
+row is the most value of a column over a table, unfiltered, it keeps no
+more than the rows of the row groups that hold the most value, read from
+the footers of the few files whose Iceberg bounds reach it (a lookup of
+1.41 billion rows had 189,400 of its latest version, in row groups of
+384,204, where a third of its rows by the versions' distinct count took a
+report for 191 GB, ten times what it held; it is now taken for 15 GB); one group by
 DuckDB's estimate of keys nothing knows is not one row; a `TOP_N` keeps what
 it says; a cross product with a small source of
 its own, as `FLATTEN` over a list of objects becomes, makes a row for each

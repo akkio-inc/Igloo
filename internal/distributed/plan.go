@@ -137,6 +137,16 @@ type Table struct {
 	// readers hold of a row group is about what the columns it reads take
 	// of it (see scanBytes).
 	ColumnBytes map[string]int64
+	// TopRows are, of the columns Bounds has, the rows of the data files
+	// whose upper bound is the column's most value, by lower-case name: no
+	// fewer than the rows of that value. A lookup whose versions are written
+	// to files of their own has its latest version's rows so.
+	TopRows map[string]int64
+	// latestRows counts, of a column TopRows has, the rows of the row groups
+	// that hold its most value, from the footers of the files that do; ok
+	// is false where it cannot (see bounder.latestRows). Nil where the
+	// table's files were not listed.
+	latestRows func(col string) (rows int64, ok bool)
 	// Buckets are the bucket transforms of its partition spec that every
 	// data file of its snapshot was written under (see bucket.go); each
 	// File's Buckets says the file's bucket of each.

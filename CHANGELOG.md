@@ -630,6 +630,16 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   audience, which FLATTENs people's objects and took 7 s alone, is estimated at
   3.7 s, where it was at 1.9.
 
+- Auto mode estimates a join to a lookup's latest version, `ver = (SELECT max(ver)
+  FROM versions)`, by the rows of the row groups that hold that version: Iceberg's
+  bounds name the few files that reach it, and their Parquet footers the row
+  groups. A lookup of 1.41 billion rows over versions 0 to 2 had 189,400 rows of
+  version 2, in 2 files of 19.7 million rows and row groups of 384,204. Taking a
+  third of its rows, by the versions' distinct count, put a report's working set
+  at 191 GB where it held 19 to 20 GB; it is now estimated at 15 GB. Columns of
+  `DECIMAL(p,0)`, as a Snowflake `NUMBER` of integers arrives, have bounds as
+  integer columns do.
+
 - Auto mode carries a statement's run on one number of workers over to others by
   its fixed costs first and its work after. TPC-DS q95 at a hundred times the data
   took 4.8 s on 16 workers; scaling its whole estimate by that run made 8 workers

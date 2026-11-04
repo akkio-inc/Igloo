@@ -1,17 +1,29 @@
 package distributed
 
 import (
+	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
+	"io/fs"
+	"math/big"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/apache/arrow-go/v18/arrow"
+	"github.com/apache/arrow-go/v18/arrow/array"
+	"github.com/apache/arrow-go/v18/arrow/decimal128"
+	"github.com/apache/arrow-go/v18/arrow/memory"
+	"github.com/apache/arrow-go/v18/parquet"
+	"github.com/apache/arrow-go/v18/parquet/pqarrow"
 	"github.com/apache/iceberg-go"
 	icebergcatalog "github.com/apache/iceberg-go/catalog"
+	icebergio "github.com/apache/iceberg-go/io"
 	"github.com/apache/iceberg-go/table"
 
 	"github.com/akkio-inc/igloo/internal/catalog"
@@ -269,3 +281,122 @@ func TestTableLoadsShared(t *testing.T) {
 		t.Errorf("%d loads in all, want 3", n)
 	}
 }
+
+// TestBounderTopRows checks the rows of the files that hold a column's most
+// value: a lookup's versions written to files of their own give the latest
+// version's rows; a file without bounds of the column leaves it out.
+func TestBounderTopRows(t *testing.T) {
+	b := newBounder([]Column{{ID: 1, Name: "Ver", Type: "INTEGER"}, {ID: 2, Name: "day", Type: "DATE"}})
+	le := func(v int32) []byte { return binary.LittleEndian.AppendUint32(nil, uint32(v)) }
+	b.add(map[int][]byte{1: le(0), 2: le(5)}, map[int][]byte{1: le(1), 2: le(9)}, 1_000_000)
+	b.add(map[int][]byte{1: le(2), 2: le(3)}, map[int][]byte{1: le(2), 2: le(9)}, 150_000)
+	b.add(map[int][]byte{1: le(2)}, map[int][]byte{1: le(2)}, 39_400)
+	if got := b.topRows(3); len(got) != 1 || got["ver"] != 189_400 {
+		t.Errorf("top rows %v, want ver's 189,400 alone", got)
+	}
+	if got := b.bounds(3); got["ver"] != [2]float64{0, 2} {
+		t.Errorf("bounds %v", got)
+	}
+}
+
+// TestFooterTopRows checks the rows of a column's most value counted from
+// the row groups of the files that hold it, by their Parquet footers: a
+// version column as a Snowflake NUMBER arrives, DECIMAL(38,0), whose
+// Iceberg bounds are its unscaled values in big-endian bytes, and a BIGINT.
+func TestFooterTopRows(t *testing.T) {
+	be := func(v int64) []byte { return big.NewInt(v).FillBytes(make([]byte, 1)) }
+	le := func(v int64) []byte { return binary.LittleEndian.AppendUint64(nil, uint64(v)) }
+	b := newBounder([]Column{{ID: 3, Name: "VER", Type: "DECIMAL(38,0)"}, {ID: 4, Name: "seq", Type: "BIGINT"}})
+	// Three files: of version 0; of versions 0 to 2 in row groups of 4 rows,
+	// (0, 0), (0, 2) and (2, 2); and of versions 0 to 1.
+	vers := [][]int64{{0, 0, 0, 0, 0}, {0, 0, 0, 0, 0, 1, 2, 2, 2, 2}, {0, 1, 1, 1}}
+	var files []File
+	data := map[string][]byte{}
+	for i, v := range vers {
+		seq := make([]int64, len(v))
+		for j := range seq {
+			seq[j] = int64(10*i + j)
+		}
+		path := fmt.Sprintf("s3://b/t/data/%d.parquet", i)
+		data[path] = parquetOf(t, v, seq, 4)
+		files = append(files, File{Path: path, Size: int64(len(data[path])), Rows: int64(len(v))})
+		b.add(map[int][]byte{3: be(slices.Min(v)), 4: le(seq[0])}, map[int][]byte{3: be(slices.Max(v)), 4: le(seq[len(seq)-1])}, int64(len(v)))
+	}
+	if got := b.bounds(3); got["ver"] != [2]float64{0, 2} || got["seq"] != [2]float64{0, 23} {
+		t.Errorf("bounds %v", got)
+	}
+	top := b.topRows(3)
+	if top["ver"] != 10 {
+		t.Errorf("the files' top rows of ver: %d, want the 10 of the file that holds version 2", top["ver"])
+	}
+	opened := 0
+	fsys := memFS{files: data, opened: &opened}
+	latest := b.latestRows(files, func() (icebergio.IO, context.CancelFunc, error) { return fsys, func() {}, nil })
+	// ver: the row groups (0, 2) and (2, 2); seq: its last file's one row
+	// group, which holds 23. Each column's files are read once.
+	for range 2 {
+		if n, ok := latest("ver"); !ok || n != 6 {
+			t.Errorf("ver by the footers: %d rows (%v), want 6", n, ok)
+		}
+	}
+	if n, ok := latest("seq"); !ok || n != 4 || opened != 2 {
+		t.Errorf("seq by the footers: %d rows (%v), want 4; %d files opened, want 2", n, ok, opened)
+	}
+	// A footer that cannot be read counts nothing.
+	unreadable := b.latestRows(files, func() (icebergio.IO, context.CancelFunc, error) { return memFS{opened: &opened}, func() {}, nil })
+	if _, ok := unreadable("ver"); ok {
+		t.Error("ver counted without its footers")
+	}
+}
+
+// memFS serves files in memory, by path, counting those opened.
+type memFS struct {
+	icebergio.IO
+	files  map[string][]byte
+	opened *int
+}
+
+func (m memFS) Open(path string) (icebergio.File, error) {
+	d, ok := m.files[path]
+	if !ok {
+		return nil, errors.New("no such file")
+	}
+	*m.opened++
+	return memFile{bytes.NewReader(d)}, nil
+}
+
+// parquetOf writes a Parquet file of a DECIMAL(38,0) column of field ID 3,
+// ver, and a BIGINT of field ID 4, seq, in row groups of rowGroup rows.
+func parquetOf(t *testing.T, ver, seq []int64, rowGroup int64) []byte {
+	t.Helper()
+	field := func(name string, typ arrow.DataType, id string) arrow.Field {
+		return arrow.Field{Name: name, Type: typ, Metadata: arrow.NewMetadata([]string{"PARQUET:field_id"}, []string{id})}
+	}
+	schema := arrow.NewSchema([]arrow.Field{field("VER", &arrow.Decimal128Type{Precision: 38, Scale: 0}, "3"), field("seq", arrow.PrimitiveTypes.Int64, "4")}, nil)
+	vb := array.NewDecimal128Builder(memory.DefaultAllocator, &arrow.Decimal128Type{Precision: 38, Scale: 0})
+	sb := array.NewInt64Builder(memory.DefaultAllocator)
+	for i := range ver {
+		vb.Append(decimal128.FromI64(ver[i]))
+		sb.Append(seq[i])
+	}
+	rec := array.NewRecord(schema, []arrow.Array{vb.NewArray(), sb.NewArray()}, int64(len(ver)))
+	defer rec.Release()
+	var buf bytes.Buffer
+	w, err := pqarrow.NewFileWriter(schema, &buf, parquet.NewWriterProperties(parquet.WithMaxRowGroupLength(rowGroup)), pqarrow.DefaultWriterProps())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Write(rec); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return buf.Bytes()
+}
+
+// memFile is a file in memory, for footers to be read from.
+type memFile struct{ *bytes.Reader }
+
+func (memFile) Close() error               { return nil }
+func (memFile) Stat() (fs.FileInfo, error) { return nil, errors.New("no file information") }
