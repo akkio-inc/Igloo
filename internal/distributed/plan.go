@@ -459,6 +459,7 @@ func (pl *planner) plan(stmt node) (*Plan, error) {
 	q := clone(stmt).(node)
 	pl.gov = pl.newGovernance(q)
 	pl.dropOrders(q)
+	pl.liftScalars(q)
 	pruned := pl.pruneBranches(q)
 	pl.markTopK(q)
 	out, err := pl.query(q, true, nil)
@@ -1173,6 +1174,16 @@ func (pl *planner) analyze(c *candidate, ctes cteScope) error {
 	return checkLambdas(sel)
 }
 
+// coordinatorReads is how much a subquery the coordinator computes from
+// scratch may read: what it reads in the time a statement must take to be
+// worth workers.
+func (pl *planner) coordinatorReads() int64 {
+	if pl.opts.minBytes > 0 {
+		return pl.opts.minBytes
+	}
+	return pl.opts.maxBroadcast
+}
+
 // combinedSubqueries checks that the subqueries in v, parts of an
 // aggregation the coordinator computes over the combined groups, are scalar
 // subqueries that stand on their own, which bind alone: one that reads the
@@ -1180,10 +1191,7 @@ func (pl *planner) analyze(c *candidate, ctes cteScope) error {
 // coordinator computes them from scratch, so they may read no more than it
 // reads in the time a statement must take to be worth workers.
 func (pl *planner) combinedSubqueries(v any, ctes cteScope) error {
-	limit := pl.opts.minBytes
-	if limit <= 0 {
-		limit = pl.opts.maxBroadcast
-	}
+	limit := pl.coordinatorReads()
 	var err error
 	walk(v, func(n node) bool {
 		if err != nil || str(n["class"]) != "SUBQUERY" {

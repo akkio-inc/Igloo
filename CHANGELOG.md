@@ -591,6 +591,9 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
 
 ### Distributed execution
 
+- TPC-DS q09 runs on workers, where it stayed on one machine. A scalar subquery in
+  the columns of a statement that does not group, one aggregate of all the rows of a
+  large table, is a relation of one row that the workers compute.
 - Auto mode estimates a statement's time on one machine by what each of its
   operators takes, not by its hash tables' rows alone: scans by their rows and
   width, joins by the rows probed, built on and made, aggregates by their rows,

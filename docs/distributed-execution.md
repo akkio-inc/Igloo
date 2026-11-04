@@ -217,6 +217,11 @@ In detail, a part runs distributed when:
   scalar subquery of `min`, `max`, `sum`, `avg` (or arithmetic on them) or a
   count a `LEFT JOIN` to its groups, in `WHERE` or in a select list that does
   not group.
+  A scalar subquery in the select list of a statement that does not group,
+  one aggregate of all of its rows, that reads more than the coordinator
+  would read itself (see [when](#when)) is a relation of one row that workers
+  compute, cross joined to the statement's `FROM`: TPC-DS q09's columns are
+  fifteen counts and averages of ranges of `store_sales`.
   It may also read relations workers compute: common table expressions
   and subqueries in `FROM` that are themselves such `SELECT`s, with
   grouping and `DISTINCT` but no `ORDER BY` or `LIMIT`, and no window
