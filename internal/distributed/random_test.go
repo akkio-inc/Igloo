@@ -54,6 +54,13 @@ var randomFound = []string{
 		agg AS (SELECT sec, c, count(*) AS n, sum(x) AS sx, 0 AS gc FROM items GROUP BY sec, c),
 		ranked AS (SELECT sec, c, n, sx, gc, row_number() OVER (PARTITION BY sec ORDER BY sx DESC NULLS LAST, gc, c NULLS LAST) AS r FROM agg)
 		SELECT t0.* FROM (SELECT sec, c, n, sx, gc, r FROM ranked) AS t0 WHERE t0.sec + 1 > 2 AND t0.r <= 3`,
+	`WITH s2 AS (SELECT 'ash' AS section, dim.w AS c, t.v AS x FROM f t JOIN dim ON t.k = dim.k UNION ALL SELECT 'ash' AS sec, t.g AS c, t.d AS x FROM f2 t),
+		items AS (SELECT CAST(NULL AS VARCHAR) AS sec, t.g AS c, t.d AS x FROM f2 t WHERE t.v IS NOT NULL UNION ALL SELECT 'Birch' AS sec, t.g AS c, t.d AS x FROM f2 t
+		UNION ALL SELECT s2.section AS section, s2.c AS c, s2.x AS x FROM s2 AS s2 UNION ALL SELECT 'ash' AS tag, t.id % 5 AS c, t.v AS x FROM f2 t
+		UNION ALL SELECT 'ash' AS tag, t.h AS c, t.v AS x FROM f t UNION ALL SELECT 'ash' AS sec, t.g AS c, t.d AS x FROM f2 t),
+		agg AS (SELECT sec, c, count(*) AS n, sum(x) AS sx, 0 AS gc FROM items GROUP BY sec, c),
+		ranked AS (SELECT sec, c, n, sx, gc, rank() OVER (PARTITION BY sec, c ORDER BY n DESC) AS r FROM agg)
+		SELECT t0.* FROM (SELECT sec, c, n, sx, gc, r FROM ranked) AS t0 WHERE t0.sec IN ('ash', 'Birch') AND t0.r <= 4`,
 	// The one section left of a UNION, not ALL, kept its rows alike.
 	`WITH s0 AS (SELECT CAST(NULL AS VARCHAR) AS sec, dim.w AS c, t.v AS x FROM f t JOIN dim ON t.k = dim.k WHERE t.k BETWEEN 55 AND 156),
 		s1 AS (SELECT 'ash' AS sec, t.h AS c, t.v AS x FROM f t),

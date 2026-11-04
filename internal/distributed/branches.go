@@ -392,11 +392,10 @@ func unionBranches(q node, setop string, all any) []node {
 // rebuild makes q, a union of branches (see unionBranches), the union of
 // those keep says, some of them: the first casts its columns to q's types,
 // under q's names, so that q's columns stay as they were, and the one branch
-// left of a UNION that is not ALL keeps its rows distinct. The unions left
-// nest as they did, as DuckDB parses them: a tree of another shape does not
-// print as itself. q stays as it was, and rebuild returns false, if it cannot
-// be described, or the first branch left is no plain SELECT of as many
-// columns, or the one left of such a UNION has modifiers.
+// left of a UNION that is not ALL keeps its rows distinct. q stays as it was,
+// and rebuild returns false, if it cannot be described, or the first branch
+// left is no plain SELECT of as many columns, or the one left of such a UNION
+// has modifiers.
 func (b *brancher) rebuild(q node, branches []node, keep []bool, scope cteScope) bool {
 	cols, err := b.pl.describe(q, scope)
 	at := slices.Index(keep, true)
@@ -433,30 +432,29 @@ func (b *brancher) rebuild(q node, branches []node, keep []bool, scope cteScope)
 	if distinct != nil {
 		first["modifiers"] = distinct
 	}
-	// The branches in the order unionBranches found them, each union of them
-	// with both sides left as it was, one with one side left as that side.
-	next := 0
-	var kept func(n node) node
-	kept = func(n node) node {
-		if str(n["type"]) != "SET_OPERATION_NODE" {
-			next++
-			if keep[next-1] {
-				return n
+	// The union of the branches left, as DuckDB parses it: it nests unions in
+	// its own way, and a tree nested another way does not print as itself.
+	tree := first
+	if slices.Contains(keep[at+1:], true) {
+		var texts []string
+		for i, br := range branches {
+			if !keep[i] {
+				continue
 			}
-			return nil
+			text, err := b.pl.p.print(br)
+			if err != nil {
+				return false
+			}
+			texts = append(texts, "("+text+")")
 		}
-		l, r := kept(child(n, "left")), kept(child(n, "right"))
-		switch {
-		case l == nil:
-			return r
-		case r == nil:
-			return l
+		op := " UNION ALL "
+		if q["setop_all"] != true {
+			op = " UNION "
 		}
-		n["left"], n["right"] = l, r
-		return n
+		if tree, err = b.pl.p.parse(strings.Join(texts, op)); err != nil {
+			return false
+		}
 	}
-	// q may be the tree itself.
-	tree := maps.Clone(kept(q))
 	clear(q)
 	maps.Copy(q, tree)
 	return true
