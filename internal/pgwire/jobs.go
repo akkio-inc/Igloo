@@ -1207,15 +1207,7 @@ func (s *Server) RunJob(ctx context.Context, j tasks.Job) (int64, error) {
 		}
 		used := res.used
 		peak, sampled := sess.wl.peak, sess.wl.sampled
-		switch {
-		case err == nil && !workload.ReadNothing(used.BytesRead, used.CPUTime):
-			for _, key := range []string{shape, exact} {
-				s.workload.Observe(key, workload.FootprintOf(used.MemoryAllocated, peak, sampled))
-				s.workload.ObserveCost(key, used.CPUTime)
-			}
-		case err != nil:
-			s.observeUnfinished(shape, exact, peak, sampled, time.Since(start)-sess.wl.queued, used.MemoryAllocated, err)
-		}
+		s.observeRefresh(shape, exact, res, peak, sampled, time.Since(start)-sess.wl.queued, err)
 		if !sampled {
 			peak = 0
 		}
@@ -1226,6 +1218,32 @@ func (s *Server) RunJob(ctx context.Context, j tasks.Job) (int64, error) {
 		return rows, err
 	}
 	return -1, fmt.Errorf("unknown kind of job %q", j.Kind)
+}
+
+// observeRefresh records what a refresh of shape and exact, res, ended with err
+// after running for ran, held, for admission (see workload.Controller), as a
+// statement's run is recorded: where its query ran on workers, that it did,
+// so that the next refresh reserves nothing here for what runs here held, as
+// those of a view of a billion rows did, up to 9.1 GB, before its query ran on
+// workers; what it held here where it completed here, by what it allocated and
+// was seen holding; and, where it ended before its end, at least what it was
+// seen holding (see observeUnfinished).
+func (s *Server) observeRefresh(shape, exact string, res refreshResult, peak int64, sampled bool, ran time.Duration, err error) {
+	used := res.used
+	switch {
+	case res.parts.workers > 0:
+		if err == nil {
+			s.workload.ObserveOnWorkers(shape)
+			s.workload.ObserveOnWorkers(exact)
+		}
+	case err == nil && !workload.ReadNothing(used.BytesRead, used.CPUTime):
+		for _, key := range []string{shape, exact} {
+			s.workload.Observe(key, workload.FootprintOf(used.MemoryAllocated, peak, sampled))
+			s.workload.ObserveCost(key, used.CPUTime)
+		}
+	case err != nil:
+		s.observeUnfinished(shape, exact, peak, sampled, ran, used.MemoryAllocated, err)
+	}
 }
 
 // stillDue checks that j, as read when its run came due, is still the job

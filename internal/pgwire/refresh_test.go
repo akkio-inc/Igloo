@@ -518,6 +518,29 @@ func TestUnfinishedOutOfMemory(t *testing.T) {
 	}
 }
 
+// TestObserveRefresh checks what a refresh's run leaves for the next: what it
+// held where it ran here, and that it ran on workers where its query did, so
+// that the next reserves nothing here, as a statement's run does.
+func TestObserveRefresh(t *testing.T) {
+	const gib = int64(1) << 30
+	ctl := workload.NewController(44 * gib)
+	s := &Server{workload: ctl, queryMemory: 40 * gib}
+	here := refreshResult{used: audit.Resources{CPUTime: 900 * time.Second, BytesRead: 15 * gib, MemoryAllocated: 6 * gib}}
+	s.observeRefresh("shape", "exact", here, 0, false, 140*time.Second, nil)
+	if got, _ := ctl.Footprint("shape"); got != workload.FootprintOf(6*gib, 0, false) || ctl.RunsOnWorkers("exact", "shape") {
+		t.Errorf("a refresh that ran here: footprint %d, on workers %v", got, ctl.RunsOnWorkers("exact", "shape"))
+	}
+	there := refreshResult{used: audit.Resources{CPUTime: time.Second, BytesRead: gib}, parts: distParts{workers: 16}}
+	s.observeRefresh("shape", "exact", there, 0, false, 10*time.Second, context.Canceled)
+	if ctl.RunsOnWorkers("exact", "shape") {
+		t.Error("a refresh that failed on workers counts as one that ran there")
+	}
+	s.observeRefresh("shape", "exact", there, 0, false, 10*time.Second, nil)
+	if !ctl.RunsOnWorkers("exact", "shape") {
+		t.Error("a refresh whose query ran on workers does not count as one that ran there")
+	}
+}
+
 func TestRefreshCost(t *testing.T) {
 	t.Parallel()
 	env := startRefreshServer(t)
