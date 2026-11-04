@@ -362,6 +362,7 @@ func serve() error {
 	var tables *distributed.Iceberg
 	if cat != nil {
 		tables = distributed.NewIceberg(cat)
+		tables.SetVersions(eng.TableVersion)
 	}
 
 	// Reading ahead for statements lists their scans as distributed

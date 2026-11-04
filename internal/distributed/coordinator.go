@@ -328,8 +328,8 @@ func (co *Coordinator) Close() error {
 	return co.parser.close()
 }
 
-// Table returns a catalog table at its current snapshot, its nested
-// columns' types printed as DuckDB prints them.
+// Table returns a catalog table as recently loaded (see Source.Table), its
+// nested columns' types printed as DuckDB prints them.
 func (co *Coordinator) Table(ctx context.Context, schema, name string) (*Table, error) {
 	t, err := co.opts.Source.Table(ctx, schema, name)
 	if err != nil || t == nil {
@@ -376,7 +376,7 @@ func (co *Coordinator) Workers(ctx context.Context) int { return len(co.pool.rea
 // IsUnsupported is true means it runs on the coordinator as usual.
 //
 // Every SELECT comes here, so deciding is cheap: workers are known from the
-// last background check, and tables' sizes may be a few seconds old.
+// last background check, and tables' sizes may be up to a minute old.
 // Execute reads the tables' current snapshots.
 func (co *Coordinator) Plan(ctx context.Context, query string, env Env, mode Mode) (*Plan, error) {
 	plan, d, err := co.plan(ctx, query, env, mode, false, nil)

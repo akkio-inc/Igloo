@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"math"
 	"regexp"
 	"slices"
@@ -855,12 +856,70 @@ type sessionEnv struct {
 	userFns  map[string]bool
 }
 
+// resolve resolves a name as DuckDB would in this session (see
+// resolver.resolve), with the session's resolver made on first use. l, if not
+// nil, times making it and resolving.
+func (e *sessionEnv) resolve(ctx context.Context, parts []string, l *lookupSteps) (resolution, error) {
+	if e.resolver == nil {
+		r, err := e.s.newResolver(ctx, e.sess)
+		l.step("resolver")
+		if err != nil {
+			return resolution{}, err
+		}
+		e.resolver = r
+	}
+	res, err := e.resolver.resolve(tableRef{parts: parts}, nil)
+	l.step("resolve")
+	return res, err
+}
+
+// lookupLogged is how long one of the planner's lookups in the session takes
+// before it is logged with what each of its steps took. Auto mode gives up
+// planning a cheap statement once planning makes no progress for half a
+// second (see distributed's limitPlanning): in a mixed load, 112 dashboard
+// statements did, each in one lookup that took that long.
+const lookupLogged = 250 * time.Millisecond
+
+// lookupSteps times the steps of one of the planner's lookups in the session.
+// A nil one times nothing.
+type lookupSteps struct {
+	start, last time.Time
+	steps       []any
+}
+
+func startLookup() *lookupSteps {
+	now := time.Now()
+	return &lookupSteps{start: now, last: now}
+}
+
+// step records that the step called name ended now.
+func (l *lookupSteps) step(name string) {
+	if l == nil {
+		return
+	}
+	now := time.Now()
+	l.steps = append(l.steps, name+"_ms", now.Sub(l.last).Milliseconds())
+	l.last = now
+}
+
+// done logs the lookup, of what called name, if it took lookupLogged or longer.
+func (l *lookupSteps) done(log *slog.Logger, what string, name []string) {
+	took := time.Since(l.start)
+	if took < lookupLogged {
+		return
+	}
+	log.Info("a lookup in the session took long", append([]any{"lookup", what, "name", strings.Join(name, "."),
+		"ms", took.Milliseconds()}, l.steps...)...)
+}
+
 // Table resolves a name to a catalog table as DuckDB would in this
 // session. Only a name that can mean exactly one catalog table qualifies.
 // For users who read only what grants allow, the table must be one the
 // statement was checked to read.
 func (e *sessionEnv) Table(ctx context.Context, parts []string) (*distributed.Table, bool, error) {
-	o, ok, err := e.catalogTable(ctx, parts)
+	l := startLookup()
+	defer l.done(e.s.log, "table", parts)
+	o, ok, err := e.catalogTable(ctx, parts, l)
 	if err != nil || !ok {
 		return nil, false, err
 	}
@@ -872,7 +931,9 @@ func (e *sessionEnv) Table(ctx context.Context, parts []string) (*distributed.Ta
 		}
 	}
 	governed := false
-	if e.s.Protected(ctx, o.schema, o.name) {
+	protected := e.s.Protected(ctx, o.schema, o.name)
+	l.step("policies")
+	if protected {
 		wrapped, ok := e.st.policyRead(o.schema, o.name)
 		if !ok {
 			return &distributed.Table{Schema: o.schema, Name: o.name, Unsupported: "masking or row access policies, or a clean room, apply to it"}, true, nil
@@ -880,53 +941,55 @@ func (e *sessionEnv) Table(ctx context.Context, parts []string) (*distributed.Ta
 		governed = wrapped
 	}
 	t, err := e.s.dist.Table(ctx, o.schema, o.name)
+	l.step("catalog")
 	if err != nil {
 		return nil, false, err
 	}
-	if governed && t != nil {
+	// Workers must read the columns as DuckDB does here.
+	cols, err := e.s.boundColumns(ctx, e.sess, catalogName, o.schema, o.name, t.Columns)
+	l.step("columns")
+	why := columnsDiffer(t.Columns, cols, err)
+	if governed {
 		c := *t
 		c.Governed = true
 		t = &c
 	}
-	// Workers must read the columns as DuckDB does here.
-	cols, err := e.s.boundColumns(ctx, e.sess, catalogName, o.schema, o.name, t.Columns)
-	if err != nil {
-		t.Unsupported = "DuckDB's columns of it could not be read: " + err.Error()
-	}
-	if len(cols) != len(t.Columns) && t.Unsupported == "" {
-		t.Unsupported = "its columns differ between DuckDB and the catalog"
-	}
-	for i, c := range cols {
-		if i >= len(t.Columns) {
-			break
-		}
-		switch {
-		case t.Unsupported != "":
-		case !strings.EqualFold(t.Columns[i].Name, c.Name):
-			t.Unsupported = "its columns differ between DuckDB and the catalog"
-		case t.Columns[i].Type != c.Type:
-			t.Unsupported = fmt.Sprintf("DuckDB reads column %s as %s, not %s", c.Name, c.Type, t.Columns[i].Type)
-		}
+	if why != "" && (err != nil || t.Unsupported == "") {
+		t.Unsupported = why
 	}
 	return t, true, nil
 }
 
+// columnsDiffer says how cols, a table's columns as DuckDB bound them, or err
+// binding them, differ from catalog, its columns as the catalog has them; ""
+// where they do not.
+func columnsDiffer(catalog, cols []distributed.Column, err error) string {
+	if err != nil {
+		return "DuckDB's columns of it could not be read: " + err.Error()
+	}
+	if len(cols) != len(catalog) {
+		return "its columns differ between DuckDB and the catalog"
+	}
+	for i, c := range cols {
+		switch {
+		case !strings.EqualFold(catalog[i].Name, c.Name):
+			return "its columns differ between DuckDB and the catalog"
+		case catalog[i].Type != c.Type:
+			return fmt.Sprintf("DuckDB reads column %s as %s, not %s", c.Name, c.Type, catalog[i].Type)
+		}
+	}
+	return ""
+}
+
 // catalogTable resolves a name to a table of Igloo's catalog as DuckDB
 // would in this session; ok is false unless it means exactly one such
-// table.
-func (e *sessionEnv) catalogTable(ctx context.Context, parts []string) (o object, ok bool, err error) {
+// table. l, if not nil, times its steps.
+func (e *sessionEnv) catalogTable(ctx context.Context, parts []string, l *lookupSteps) (o object, ok bool, err error) {
 	catalogName := e.s.catalogName()
 	if catalogName == "" {
 		return o, false, nil
 	}
-	if e.resolver == nil {
-		r, err := e.s.newResolver(ctx, e.sess)
-		if err != nil {
-			return o, false, err
-		}
-		e.resolver = r
-	}
-	res, err := e.resolver.resolve(tableRef{parts: parts}, nil)
+	res, err := e.resolve(ctx, parts, l)
 	if err != nil {
 		return o, false, err
 	}
@@ -952,7 +1015,7 @@ func (e *sessionEnv) Computes(ctx context.Context, parts []string) (bool, error)
 	if !e.st.readsIndexes() || !indexReference(parts, e.s.catalogName(), indexNames(e.st.indexPins)) {
 		return false, nil
 	}
-	o, ok, err := e.catalogTable(ctx, parts)
+	o, ok, err := e.catalogTable(ctx, parts, nil)
 	return ok && strings.EqualFold(o.schema, iddomain.IndexSchema), err
 }
 
@@ -975,14 +1038,9 @@ func (e *sessionEnv) Value(ctx context.Context, query string) (any, error) {
 // View reports whether a name may mean a view in this session: a view of
 // any database, or a name that does not resolve to exactly one relation.
 func (e *sessionEnv) View(ctx context.Context, parts []string) (bool, error) {
-	if e.resolver == nil {
-		r, err := e.s.newResolver(ctx, e.sess)
-		if err != nil {
-			return false, err
-		}
-		e.resolver = r
-	}
-	res, err := e.resolver.resolve(tableRef{parts: parts}, nil)
+	l := startLookup()
+	defer l.done(e.s.log, "view", parts)
+	res, err := e.resolve(ctx, parts, l)
 	if err != nil {
 		return false, err
 	}
@@ -999,14 +1057,9 @@ func (e *sessionEnv) View(ctx context.Context, parts []string) (bool, error) {
 // expanded the view the same way for users who read only what grants
 // allow, so the tables it reads are among those it allowed (see Table).
 func (e *sessionEnv) ViewDefinition(ctx context.Context, parts []string) (*distributed.ViewDefinition, bool, error) {
-	if e.resolver == nil {
-		r, err := e.s.newResolver(ctx, e.sess)
-		if err != nil {
-			return nil, false, err
-		}
-		e.resolver = r
-	}
-	res, err := e.resolver.resolve(tableRef{parts: parts}, nil)
+	l := startLookup()
+	defer l.done(e.s.log, "view definition", parts)
+	res, err := e.resolve(ctx, parts, l)
 	if err != nil {
 		return nil, false, err
 	}
@@ -1285,11 +1338,15 @@ func (e *sessionEnv) UserFunction(ctx context.Context, name string) (bool, error
 		return false, nil
 	}
 	if e.userFns == nil {
+		l := startLookup()
+		defer l.done(e.s.log, "functions", nil)
 		defs, err := macroDefinitions(ctx, e.sess.conn, `NOT internal`)
+		l.step("session")
 		if err != nil {
 			return false, err
 		}
 		standard, err := e.s.snowflakeMacros(ctx)
+		l.step("standard")
 		if err != nil {
 			return false, err
 		}

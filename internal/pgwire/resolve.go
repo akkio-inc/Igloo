@@ -1000,11 +1000,17 @@ func (x *tableIndex) get(ctx context.Context, s *Server, sess *session, query st
 	if m := fresh(); m != nil {
 		return m, nil
 	}
+	start := time.Now()
 	defer s.shareCatalog(sess)()
 	if m := fresh(); m != nil {
 		// Another session built it meanwhile.
 		return m, nil
 	}
+	defer func() {
+		if took := time.Since(start); took >= lookupLogged {
+			s.log.Info("listed the catalog's tables or views for the server's index, which took long", "ms", took.Milliseconds())
+		}
+	}()
 	rows, err := sess.conn.QueryContext(ctx, query, nil)
 	if err != nil {
 		return nil, err

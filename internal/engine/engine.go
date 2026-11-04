@@ -438,6 +438,10 @@ func (e *Engine) DataVersion() uint64 { return e.proxy.DataVersion() }
 // changed (see catalogproxy.Proxy.TablesVersion).
 func (e *Engine) TablesVersion(loads []catalogproxy.Load) uint64 { return e.proxy.TablesVersion(loads) }
 
+// TableVersion goes up whenever the catalog's table schema.name may have
+// changed (see catalogproxy.Proxy.TableVersion).
+func (e *Engine) TableVersion(schema, name string) uint64 { return e.proxy.TableVersion(schema, name) }
+
 // RecordLoads records the catalog's tables DuckDB loads until the func it
 // returns is called, which returns them (see catalogproxy's RecordLoads).
 func (e *Engine) RecordLoads() func() []catalogproxy.Load { return e.proxy.RecordLoads() }

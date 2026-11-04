@@ -1001,7 +1001,9 @@ and `EXPLAIN DISTRIBUTED` plan for as long as planning takes. Planning
 describes each part of the statement in the session once, keeps the SQL
 it printed of each part, and logs `planned a statement` with its time,
 stages, descriptions, other lookups in the session and its wait for the
-catalog lock when it takes a second or more.
+catalog lock when it takes a second or more. A lookup in the session that
+takes a quarter of a second or more logs `a lookup in the session took long`
+with what each of its steps took.
 
 ## Same results as one machine
 

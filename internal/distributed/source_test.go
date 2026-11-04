@@ -1,8 +1,14 @@
 package distributed
 
 import (
+	"context"
+	"errors"
+	"fmt"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/apache/iceberg-go"
 	icebergcatalog "github.com/apache/iceberg-go/catalog"
@@ -162,5 +168,104 @@ func TestDistinctCountsLoaded(t *testing.T) {
 	}
 	if got := distinctCounts("not json"); got != nil {
 		t.Errorf("unreadable counts: %v", got)
+	}
+}
+
+// TestTableLoadsShared checks that lookups of a table not loaded share one load
+// of it, that a lookup of one whose decision lapsed decides by it at once while
+// it loads again, that one past tableStale waits for that load, until its
+// context ends, and that one at a newer version of the table waits for a load
+// at that version.
+func TestTableLoadsShared(t *testing.T) {
+	src := NewIceberg(restTable(t, "2", iceberg.NestedField{ID: 1, Name: "id", Type: iceberg.PrimitiveTypes.Int64}))
+	var loads atomic.Int32
+	gate := make(chan struct{})
+	load := src.loader
+	src.loader = func(ctx context.Context, schema, name string) (*Table, error) {
+		loads.Add(1)
+		<-gate
+		return load(ctx, schema, name)
+	}
+	lookup := func(ctx context.Context) error {
+		tab, err := src.Table(ctx, "s", "t")
+		if err == nil && (len(tab.Columns) != 1 || tab.Columns[0].Name != "id") {
+			err = fmt.Errorf("columns %v", tab.Columns)
+		}
+		return err
+	}
+	loaded := func(n int32) {
+		t.Helper()
+		for start := time.Now(); loads.Load() < n; time.Sleep(time.Millisecond) {
+			if time.Since(start) > 10*time.Second {
+				t.Fatalf("%d loads, want %d", loads.Load(), n)
+			}
+		}
+	}
+	var wg sync.WaitGroup
+	for range 8 {
+		wg.Go(func() {
+			if err := lookup(t.Context()); err != nil {
+				t.Error(err)
+			}
+		})
+	}
+	loaded(1)
+	gate <- struct{}{}
+	wg.Wait()
+	if n := loads.Load(); n != 1 {
+		t.Fatalf("8 lookups loaded the table %d times", n)
+	}
+	age := func(d time.Duration) {
+		src.mu.Lock()
+		defer src.mu.Unlock()
+		lt := src.tables["s\x00t"]
+		lt.at = time.Now().Add(-d)
+		src.tables["s\x00t"] = lt
+	}
+	// The load this lookup starts waits at the gate meanwhile.
+	age(tableTTL + time.Second)
+	if err := lookup(t.Context()); err != nil {
+		t.Fatalf("a lookup of a table loaded %s ago: %v", tableTTL+time.Second, err)
+	}
+	loaded(2)
+	age(tableStale + time.Second)
+	ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
+	defer cancel()
+	if err := lookup(ctx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("a lookup that waited for a load past its context: %v", err)
+	}
+	gate <- struct{}{}
+	if err := lookup(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if n := loads.Load(); n != 2 {
+		t.Errorf("%d loads in all, want 2", n)
+	}
+	// Once the table's version went up, as a change raises it, a lookup of it
+	// loaded just now waits for a load at the new version, which later lookups
+	// decide by.
+	var version atomic.Uint64
+	src.SetVersions(func(string, string) uint64 { return version.Load() })
+	if err := lookup(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	version.Store(1)
+	done := make(chan error, 1)
+	go func() { done <- lookup(t.Context()) }()
+	loaded(3)
+	select {
+	case err := <-done:
+		t.Fatalf("a lookup at a newer version decided by the load at the older one: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	gate <- struct{}{}
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if err := lookup(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if n := loads.Load(); n != 3 {
+		t.Errorf("%d loads in all, want 3", n)
 	}
 }

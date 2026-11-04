@@ -23,7 +23,7 @@ import (
 type Source interface {
 	// Table returns schema.name, with its columns named and typed as DuckDB
 	// reads them. Workers cannot read it if Unsupported is set. Its snapshot
-	// may be a few seconds old: it decides only whether to distribute.
+	// may be up to a minute old: it decides only whether to distribute.
 	Table(ctx context.Context, schema, name string) (*Table, error)
 	// Refresh brings t to the table's current snapshot. It fails if the
 	// table's columns changed since, their types included.
@@ -93,18 +93,48 @@ type Iceberg struct {
 	order  []string
 	// cached counts the files of the snapshots kept.
 	cached int
-	// tables are recently loaded tables, for deciding.
-	tables map[string]loadedTable
+	// tables are recently loaded tables, for deciding, and loading the loads
+	// under way, by the same keys.
+	tables  map[string]loadedTable
+	loading map[string]*tableLoad
+	// loader loads a table's metadata: load, which tests replace. versions,
+	// if set, says a table's version, which goes up whenever the table may
+	// have changed (see SetVersions).
+	loader   func(ctx context.Context, schema, name string) (*Table, error)
+	versions func(schema, name string) uint64
 }
 
 type loadedTable struct {
-	t  *Table
-	at time.Time
+	t       *Table
+	at      time.Time
+	version uint64
 }
 
-// tableTTL is how long a loaded table's metadata decides whether a
-// statement is distributed.
-const tableTTL = 10 * time.Second
+// tableLoad is a load of a table's metadata at version, which every lookup of
+// the table at that version meanwhile waits for: t and err once done is closed.
+type tableLoad struct {
+	done    chan struct{}
+	version uint64
+	t       *Table
+	err     error
+}
+
+// A loaded table decides whether a statement is distributed for tableTTL; past
+// that, for up to tableStale, the lookup that finds it starts loading it again
+// and decides by it meanwhile, as later lookups do until the load is done; as
+// long as the table's version is the one it was loaded at, which a change to
+// the table raises. Lookups of a table not loaded, loaded longer ago or at an
+// older version, share one load. Each lookup of a table whose decision had
+// lapsed loaded it again itself: under a mixed load, lookups that loaded the
+// same tables at once took 0.3 to 0.7 s each, past the half second auto mode
+// gives the planning of a cheap statement (see limitPlanning). A statement
+// that runs on workers loads its tables afresh before it runs (Refresh), and
+// runs on one machine if their columns changed.
+const (
+	tableTTL     = 10 * time.Second
+	tableStale   = time.Minute
+	tableLoadMax = 30 * time.Second
+)
 
 // maxCachedSnapshots and maxCachedFiles bound the snapshots whose file
 // lists are kept, and their files: a table of 100,000 files committed to
@@ -117,7 +147,9 @@ const (
 
 // NewIceberg reads tables through cat.
 func NewIceberg(cat *catalog.Client) *Iceberg {
-	return &Iceberg{cat: cat, files: map[string][]File{}, tables: map[string]loadedTable{}}
+	s := &Iceberg{cat: cat, files: map[string][]File{}, tables: map[string]loadedTable{}, loading: map[string]*tableLoad{}}
+	s.loader = s.load
+	return s
 }
 
 type icebergHandle struct {
@@ -128,30 +160,83 @@ type icebergHandle struct {
 	columns []Column
 }
 
-// Table returns a table's metadata, loaded at most tableTTL ago.
+// SetVersions has s decide by a loaded table only at the version it was loaded
+// at (see tableTTL): versions says a table's version, which goes up whenever
+// the table may have changed. The catalog proxy's (catalogproxy.TableVersion)
+// goes up with every change DuckDB makes to it, and when DuckDB, preparing a
+// statement, loads a table another replica or engine changed; so a statement
+// is planned with its tables as it was prepared with them, whatever their age.
+// It is set before s is used.
+func (s *Iceberg) SetVersions(versions func(schema, name string) uint64) { s.versions = versions }
+
+// Table returns a table's metadata, loaded at most tableTTL ago, or at most
+// tableStale ago while it loads again, at its current version (see tableTTL).
 func (s *Iceberg) Table(ctx context.Context, schema, name string) (*Table, error) {
 	key := schema + "\x00" + name
+	var version uint64
+	if s.versions != nil {
+		version = s.versions(schema, name)
+	}
 	s.mu.Lock()
 	lt, ok := s.tables[key]
+	if age := time.Since(lt.at); ok && lt.version == version && age < tableStale {
+		if age >= tableTTL {
+			s.startLoad(key, schema, name, version)
+		}
+		s.mu.Unlock()
+		return copyTable(lt.t), nil
+	}
+	ld := s.startLoad(key, schema, name, version)
 	s.mu.Unlock()
-	if ok && time.Since(lt.at) < tableTTL {
-		c := *lt.t
-		c.Columns = slices.Clone(lt.t.Columns)
-		return &c, nil
+	select {
+	case <-ld.done:
+	case <-ctx.Done():
+		return nil, context.Cause(ctx)
 	}
-	t, err := s.load(ctx, schema, name)
-	if err != nil {
-		return nil, err
+	if ld.err != nil {
+		return nil, ld.err
 	}
-	s.mu.Lock()
-	if len(s.tables) > 4096 {
-		clear(s.tables)
+	return copyTable(ld.t), nil
+}
+
+// startLoad returns the load of the table at version under way, or starts one,
+// which a load at an older version then makes way for. It runs apart from the
+// context of the lookup that started it, which may end while others wait for
+// it, for at most tableLoadMax. s.mu is held.
+func (s *Iceberg) startLoad(key, schema, name string, version uint64) *tableLoad {
+	if ld := s.loading[key]; ld != nil && ld.version == version {
+		return ld
 	}
-	s.tables[key] = loadedTable{t: t, at: time.Now()}
-	s.mu.Unlock()
+	ld := &tableLoad{done: make(chan struct{}), version: version}
+	s.loading[key] = ld
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), tableLoadMax)
+		defer cancel()
+		t, err := s.loader(ctx, schema, name)
+		s.mu.Lock()
+		ld.t, ld.err = t, err
+		// One that made way for a load at a newer version may have read the
+		// table before what raised its version.
+		if s.loading[key] == ld {
+			if err == nil {
+				if len(s.tables) > 4096 {
+					clear(s.tables)
+				}
+				s.tables[key] = loadedTable{t: t, at: time.Now(), version: version}
+			}
+			delete(s.loading, key)
+		}
+		s.mu.Unlock()
+		close(ld.done)
+	}()
+	return ld
+}
+
+// copyTable is t with columns of its own, for a caller to change.
+func copyTable(t *Table) *Table {
 	c := *t
 	c.Columns = slices.Clone(t.Columns)
-	return &c, nil
+	return &c
 }
 
 // Refresh loads the table's current metadata into t. The statement was
