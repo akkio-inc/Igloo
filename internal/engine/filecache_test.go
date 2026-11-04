@@ -3,11 +3,13 @@ package engine
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -102,6 +104,83 @@ func TestReadManifest(t *testing.T) {
 func TestSameETag(t *testing.T) {
 	if !sameETag(`"abc"`, "abc") || !sameETag("abc", `"abc"`) || sameETag("", "") || sameETag(`"abc"`, `"abd"`) {
 		t.Fatal("sameETag")
+	}
+}
+
+// TestExternalFileCacheGivesWay fills DuckDB's external file cache with
+// files read from a stand-in for object storage, to most of DuckDB's memory
+// limit, and then runs statements that need that memory: one large hash
+// table, a single block of 512 MiB, and many groups, many small blocks.
+// DuckDB drops the cached ranges for each, as it did for a single block of 2
+// GiB with 5.3 of 6 GB cached, alone and beside scans filling it again.
+func TestExternalFileCacheGivesWay(t *testing.T) {
+	ext := os.Getenv("IGLOO_TEST_EXTENSION_DIR")
+	if ext == "" {
+		t.Skip("IGLOO_TEST_EXTENSION_DIR not set")
+	}
+	ctx := context.Background()
+	connector, err := duckdb.NewConnector("", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer connector.Close() //nolint:errcheck
+	c, err := connector.Connect(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close() //nolint:errcheck
+	conn := c.(*duckdb.Conn)
+	exec := func(q string) error {
+		_, err := conn.ExecContext(ctx, q, nil)
+		return err
+	}
+	dir := t.TempDir()
+	for i := range 4 {
+		f := filepath.Join(dir, fmt.Sprintf("t%d.parquet", i))
+		q := fmt.Sprintf("COPY (SELECT range AS a, hash(range) AS b, hash(range + 1) AS c FROM range(%d, %d)) TO %s (FORMAT parquet)",
+			i*20_000_000, (i+1)*20_000_000, literal(f))
+		if err := exec(q); err != nil {
+			t.Fatal(err)
+		}
+	}
+	srv := httptest.NewServer(http.FileServer(http.Dir(dir)))
+	defer srv.Close()
+	for _, q := range []string{
+		"SET extension_directory = " + literal(ext), "LOAD httpfs", "SET threads = 4", "SET memory_limit = '1200MB'",
+		"SET enable_external_file_cache = true",
+	} {
+		if err := exec(q); err != nil {
+			t.Fatalf("%s: %v", q, err)
+		}
+	}
+	cached := func() int64 {
+		t.Helper()
+		v, err := queryString(ctx, conn, "SELECT coalesce(sum(memory_usage_bytes), 0)::VARCHAR FROM duckdb_memory() WHERE tag = 'EXTERNAL_FILE_CACHE'")
+		if err != nil {
+			t.Fatal(err)
+		}
+		n, _ := strconv.ParseInt(v, 10, 64)
+		return n
+	}
+	fill := func() {
+		t.Helper()
+		for i := range 4 {
+			if err := exec(fmt.Sprintf("SELECT sum(a), sum(b), sum(c) FROM read_parquet('%s/t%d.parquet')", srv.URL, i)); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if n := cached(); n < 800<<20 {
+			t.Fatalf("the cache holds %d MiB, want most of 1,200", n>>20)
+		}
+	}
+	for _, s := range []struct{ name, q string }{
+		{"a large hash table", "SELECT count(*) FROM range(25000000) a(i) JOIN range(25000000) b(j) ON i = j"},
+		{"many groups", "SELECT count(*) FROM (SELECT i % 10000000 AS k, sum(i) FROM range(30000000) t(i) GROUP BY 1)"},
+	} {
+		fill()
+		if err := exec(s.q); err != nil {
+			t.Errorf("%s, beside %d MiB cached: %v", s.name, cached()>>20, err)
+		}
 	}
 }
 
