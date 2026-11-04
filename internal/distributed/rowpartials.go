@@ -16,12 +16,13 @@ import (
 //
 // So such a stage may instead write each row's own partial results, as the
 // partial results of a group of that one row, with no GROUP BY: the completing
-// stage combines either kind the same, and a task may write either. Its tasks
-// group to begin with, counting each group's rows (groupRowsColumn); a worker
-// whose task found every group of one row runs the stage's other tasks a row at
-// a time (see Worker.byRow). A stage whose groups are known to be about as many
-// as its rows, by the distinct counts of the one table it reads, starts a row
-// at a time.
+// stage combines either kind the same, and a task may write either. Grouped,
+// tasks count each group's rows (groupRowsColumn). Each worker chooses for its
+// tasks of the stage: the first probes a sample of its rows, and a task that
+// finds every group of one row has the next ones write a row at a time too (see
+// rowprobe.go). A stage whose groups are known to be about as many as its
+// rows, by the distinct counts of the one table it reads, starts a row at a
+// time everywhere.
 
 // groupRowsColumn is the column of an aggregation's partial results that counts each
 // group's rows: 1 for each when a task writes them a row at a time.

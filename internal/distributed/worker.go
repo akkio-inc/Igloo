@@ -138,11 +138,10 @@ type Worker struct {
 	runningMu sync.Mutex
 	running   map[*runningTask]bool
 
-	// byRow are the stages whose partial results its tasks write a row at a
-	// time, as a task of theirs found each group to be one row (see
-	// rowSpec), by statement and stage, with when that was found.
+	// byRow is how the stages that write partial results write them, by
+	// statement and stage (see stageRows).
 	byRowMu sync.Mutex
-	byRow   map[string]time.Time
+	byRow   map[string]*stageRows
 
 	// footerCache holds data files' footers by path; see footers.
 	footersMu   sync.Mutex
@@ -779,7 +778,12 @@ func (w *Worker) run(ctx context.Context, req *taskRequest) (string, *taskResult
 		"by_field_id", byID, "seconds", time.Since(start).Seconds())
 
 	query := req.SQL
-	byRow := req.RowSQL != "" && (req.RowsFirst || w.rowsAtOnce(req))
+	byRow := req.RowSQL != "" && req.RowsFirst
+	if req.RowSQL != "" && !byRow {
+		if byRow, err = w.rowsAtOnce(ctx, conn, req); err != nil {
+			return "", nil, err
+		}
+	}
 	if byRow {
 		query = req.RowSQL
 	}
@@ -1098,40 +1102,6 @@ func mapValue(m any, key string) (any, bool) {
 	return nil, false
 }
 
-// rowsAtOnce reports whether req's stage writes its partial results a row at
-// a time on this worker (see rowSpec).
-func (w *Worker) rowsAtOnce(req *taskRequest) bool {
-	w.byRowMu.Lock()
-	defer w.byRowMu.Unlock()
-	_, ok := w.byRow[byRowKey(req)]
-	return ok
-}
-
-// noteRowsAtOnce has the next tasks of req's stage write their partial
-// results a row at a time: req's found each group to be one row. Notes an
-// hour old go.
-func (w *Worker) noteRowsAtOnce(req *taskRequest) {
-	w.byRowMu.Lock()
-	defer w.byRowMu.Unlock()
-	if w.byRow == nil {
-		w.byRow = map[string]time.Time{}
-	}
-	now := time.Now()
-	for k, at := range w.byRow {
-		if now.Sub(at) > time.Hour {
-			delete(w.byRow, k)
-		}
-	}
-	w.byRow[byRowKey(req)] = now
-	w.log.Debug("writing a stage's partial results a row at a time: a task's groups were each one row", "query", req.Query,
-		"stage", req.Task/tasksPerStage)
-}
-
-// byRowKey names req's stage.
-func byRowKey(req *taskRequest) string {
-	return req.Query + "/" + strconv.Itoa(req.Task/tasksPerStage)
-}
-
 // asInt64 returns v, an integer DuckDB returned, as an int64.
 func asInt64(v driver.Value) (int64, bool) {
 	switch n := v.(type) {
@@ -1207,7 +1177,19 @@ func checkRows(ctx context.Context, conn *duckdb.Conn, files []string, rows int6
 // can send a task at all. sfMacros says the SQL calls Igloo's macros for
 // Snowflake's functions, which the worker then defines.
 func checkTaskSQL(ctx context.Context, conn *duckdb.Conn, req *taskRequest) (sfMacros bool, err error) {
-	rows, err := conn.QueryContext(ctx, "SELECT json_serialize_sql("+quoteLiteral(req.SQL)+")::VARCHAR", nil)
+	sfMacros, err = checkSQL(ctx, conn, req, req.SQL)
+	if err != nil || req.RowSQL == "" {
+		return sfMacros, err
+	}
+	// The SQL that writes partial results a row at a time is held to the same
+	// (see rowSpec).
+	rowMacros, err := checkSQL(ctx, conn, req, req.RowSQL)
+	return sfMacros || rowMacros, err
+}
+
+// checkSQL is checkTaskSQL of one of req's statements, sql.
+func checkSQL(ctx context.Context, conn *duckdb.Conn, req *taskRequest, sql string) (sfMacros bool, err error) {
+	rows, err := conn.QueryContext(ctx, "SELECT json_serialize_sql("+quoteLiteral(sql)+")::VARCHAR", nil)
 	if err != nil {
 		return false, err
 	}

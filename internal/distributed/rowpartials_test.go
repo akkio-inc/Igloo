@@ -111,6 +111,31 @@ func TestWorkerRowPartials(t *testing.T) {
 	if n := run(task("q-first", 0, "l_orderkey % 10", true)); n != 2 {
 		t.Errorf("a task told to start a row at a time ran grouped (groups of up to %d rows)", n)
 	}
+
+	// With inputs large enough to probe, the first task of a stage probes a
+	// sample: groups of one row each have it, and the stage's other tasks, write
+	// a row at a time from the start; groups of several leave them grouped. The
+	// tasks read the whole of their input after the probe.
+	minRows := probeMinRows
+	defer func() { probeMinRows = minRows }()
+	probeMinRows = 1000
+	view.Rows = h.files[li.key()][0].Rows
+	probed := func(query string, n int, group string) *taskResult {
+		t.Helper()
+		_, res, err := w.run(ctx, task(query, n, group, false))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return res
+	}
+	for n := range 2 {
+		if res := probed("q-probe-unique", n, unique); res.groupRows != 2 || res.Rows != view.Rows {
+			t.Errorf("task %d of a stage of single-row groups: groups of up to %d rows, %d rows of %d", n, res.groupRows, res.Rows, view.Rows)
+		}
+	}
+	if res := probed("q-probe-several", 0, "l_orderkey % 10"); res.groupRows <= 2 || res.Rows != 10 {
+		t.Errorf("a stage of groups of several rows: groups of up to %d rows, %d groups of 10", res.groupRows, res.Rows)
+	}
 }
 
 // TestStatMax checks reading the largest value of a column from the statistics
