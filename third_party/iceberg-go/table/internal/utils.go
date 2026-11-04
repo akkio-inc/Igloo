@@ -209,12 +209,20 @@ type DataFileStatistics struct {
 }
 
 func (d *DataFileStatistics) PartitionValue(field iceberg.PartitionField, sc *iceberg.Schema) any {
-	agg, ok := d.ColAggs[field.SourceID()]
-	if !ok {
+	if !field.Transform.PreservesOrder() {
 		return nil
 	}
 
-	if !field.Transform.PreservesOrder() {
+	return d.PartitionValueOfOne(field, sc)
+}
+
+// PartitionValueOfOne is PartitionValue of a file its writer made to hold the
+// rows of one partition, under any transform, one that does not keep order
+// (bucket) included: the transform of the file's lowest value, which must be
+// that of its highest too. Igloo's addition; see IGLOO_PATCHES.md.
+func (d *DataFileStatistics) PartitionValueOfOne(field iceberg.PartitionField, sc *iceberg.Schema) any {
+	agg, ok := d.ColAggs[field.SourceID()]
+	if !ok {
 		return nil
 	}
 

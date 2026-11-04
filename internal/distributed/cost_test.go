@@ -146,6 +146,64 @@ func TestChoose(t *testing.T) {
 	}
 }
 
+// TestPlannedMemory checks that a statement whose working set by DuckDB's
+// plan fits the replica is not short of memory by what its stages exchange:
+// F5-like at ten times the data, whose stages read 30.7 GB for exchanges,
+// held 19 to 20 GB as its plan said (15.3 GB), and ran in 23.5 s on a
+// replica of 44 GB beside dashboards, where 4 workers took 166.5 s.
+func TestPlannedMemory(t *testing.T) {
+	replica := machine{cores: 16, threads: 24, memory: 44e9}
+	f5 := features{bytes: 736851919, exchanged: 30700362940, held: 736851919, rows: 1.5187e9, levels: 7, stages: 13,
+		planned: true, planSet: 15.3e9, planBytes: 736851822, planWork: 14 * 16}
+	e := f5.estimate(replica, benchWorkers)
+	e.others = 4
+	if workers, _, reason := choose(e, runs{}, false, DefaultThreshold, time.Now()); workers || e.memory {
+		t.Errorf("F5-like beside four: workers %v, short of memory %v (%s)", workers, e.memory, reason)
+	}
+	// Its plan over the replica's share: short of memory, as before.
+	f5.planSet = 40e9
+	if e := f5.estimate(replica, benchWorkers); !e.memory || !e.spills {
+		t.Errorf("held at 40 GB: short of memory %v, spills %v", e.memory, e.spills)
+	}
+	// Without a plan, by what its stages exchange.
+	f5.planned = false
+	if e := f5.estimate(replica, benchWorkers); !e.memory {
+		t.Error("without a plan: not short of memory")
+	}
+}
+
+// TestDirectReads checks that what stages that write no exchange read counts
+// apart (features.direct), and that workers read it at one machine's cold rate
+// a core, not workerReadShare of it: on 16 workers of 8 cores and 12 threads
+// just started, their disks empty, a dashboard's first four tiles' stages of
+// 15.9 to 16.7 GB, sending partial aggregates to the coordinator, took 11.9 to
+// 14.9 s at once.
+func TestDirectReads(t *testing.T) {
+	impressions := &Table{Schema: "main", Name: "impressions", Bytes: 16.7e9, Columns: []Column{{Name: "k", Type: "VARCHAR"}}}
+	audience := &Table{Schema: "main", Name: "audience", Bytes: 1e9, Columns: []Column{{Name: "k", Type: "VARCHAR"}}}
+	x := &Exchange{ID: 0}
+	tile := []*Stage{{Inputs: []Input{{Table: impressions, Split: true}}}}
+	report := []*Stage{
+		{Inputs: []Input{{Table: audience, Split: true}}, Out: x},
+		{Inputs: []Input{{Exchange: x, Partitioned: true}, {Table: impressions}}},
+	}
+	if f := planFeatures(tile); f.direct != 16.7e9 || f.bytes != 16.7e9 {
+		t.Errorf("a stage to the coordinator: direct %d of %d bytes", f.direct, f.bytes)
+	}
+	if f := planFeatures(report); f.direct != 16.7e9 || f.bytes != 17.7e9 {
+		t.Errorf("a report whose last stage reads a table: direct %d of %d bytes", f.direct, f.bytes)
+	}
+	work := func(f features) float64 { return f.onFleet(16, benchWorkers).estimate - startCost - levelCost }
+	if w := work(planFeatures(tile)); w < 11.9/1.25 || w > 14.9*1.25 {
+		t.Errorf("the tile's reading on 16 workers: %.1f s; its stages took 11.9 to 14.9 s", w)
+	}
+	f := planFeatures(tile)
+	f.direct = 0
+	if slower, w := work(f), work(planFeatures(tile)); slower < 2*w {
+		t.Errorf("read by a stage that writes an exchange: %.1f s, want at least twice %.1f s", slower, w)
+	}
+}
+
 // TestEstimateTimes checks the estimates of a plan: one machine's from
 // the coordinator's cores and threads, reading cold, longer short of
 // memory; the workers' from their start, their stages and their cores and

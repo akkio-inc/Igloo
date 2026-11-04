@@ -1,0 +1,18 @@
+Build with Debian's GCC 12.
+
+GCC 12 moves a returned local into a unique_ptr of its base class only when
+told to, in the C++14 the extension is written in.
+
+diff --git a/src/execution/operator/physical_iceberg_create_table.cpp b/src/execution/operator/physical_iceberg_create_table.cpp
+index 9ba0a8bcb..bd5767102 100644
+--- a/src/execution/operator/physical_iceberg_create_table.cpp
++++ b/src/execution/operator/physical_iceberg_create_table.cpp
+@@ -24,7 +24,7 @@ PhysicalIcebergCreateTable::PhysicalIcebergCreateTable(PhysicalPlan &physical_pl
+ unique_ptr<GlobalOperatorState> PhysicalIcebergCreateTable::GetGlobalOperatorState(ClientContext &context) const {
+ 	auto global_state = make_uniq<IcebergCreateTableGlobalState>();
+ 	MakeCreateTableRequest(context, *global_state);
+-	return global_state;
++	return std::move(global_state);
+ }
+ 
+ void PhysicalIcebergCreateTable::MakeCreateTableRequest(ClientContext &client_context,

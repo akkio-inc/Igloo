@@ -52,8 +52,24 @@ type taskRequest struct {
 	Variables []variable `json:"variables,omitempty"`
 	Views     []viewDef  `json:"views"`
 	SQL       string     `json:"sql"`
+	// RowSQL, for a shuffle task that writes an aggregation's partial
+	// results, writes each row's own instead, and RowsFirst says to run it
+	// rather than SQL; otherwise the worker runs it once a task of the
+	// stage found each of its groups to be one row (see rowSpec).
+	RowSQL    string `json:"row_sql,omitempty"`
+	RowsFirst bool   `json:"rows_first,omitempty"`
+	// Repair says the task runs again what a lost worker held, which readers
+	// wait for: it takes the worker's next free slots before any other task
+	// (see fairSlots).
+	Repair bool `json:"repair,omitempty"`
+	// Background says the statement runs in the background: its tasks take the
+	// worker's slots after other statements' (see fairSlots and WithBackground).
+	Background bool `json:"background,omitempty"`
 	// Columns, if set, rename the result's columns positionally.
 	Columns []string `json:"columns,omitempty"`
+	// Sorted says the task sorts its rows, which the coordinator merges in
+	// that order (see merge.go): the file of its result keeps it.
+	Sorted bool `json:"sorted,omitempty"`
 	// Shuffle, if set, makes the task write its result to this directory
 	// in object storage, partitioned by its __b column, instead of sending
 	// it back; the response lists the files. Partitions is how many
@@ -186,6 +202,12 @@ type taskResult struct {
 	// task wrote.
 	Files []shuffleFile `json:"files,omitempty"`
 	Error *taskErr      `json:"error,omitempty"`
+	// Waited is how long the task waited for the worker's slots, in seconds.
+	Waited float64 `json:"waited,omitempty"`
+	// groupRows, for a shuffle task that wrote an aggregation's partial
+	// results, is the most rows any of its groups had, or 0 if not known
+	// (see rowSpec).
+	groupRows int64
 	// attempt is the directory the attempt that answered was given to
 	// write under, as the coordinator knows it (see checkWritten).
 	attempt string

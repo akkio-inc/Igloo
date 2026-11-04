@@ -23,6 +23,8 @@ type listingEnv struct {
 	proxy  *Proxy
 	lists  atomic.Int32
 	direct string
+	// listDelay holds up the catalog's answers to listings, in nanoseconds.
+	listDelay atomic.Int64
 }
 
 func newListingEnv(t *testing.T, ttl time.Duration) *listingEnv {
@@ -38,6 +40,7 @@ func newListingEnv(t *testing.T, ttl time.Duration) *listingEnv {
 		rest := strings.TrimPrefix(r.URL.Path, target.Path+"/")
 		if r.Method == http.MethodGet && listPath.MatchString(rest) {
 			e.lists.Add(1)
+			time.Sleep(time.Duration(e.listDelay.Load()))
 		}
 		forward.ServeHTTP(w, r)
 	}))
@@ -179,14 +182,14 @@ func TestListingsKept(t *testing.T) {
 // TestListingsExpire checks that a kept listing is asked for again once
 // ListTTL has passed, and that a negative ListTTL keeps none.
 func TestListingsExpire(t *testing.T) {
-	e := newListingEnv(t, 50*time.Millisecond)
+	e := newListingEnv(t, time.Second)
 	e.tables(t)
 	e.tables(t)
 	if got := e.lists.Load(); got != 1 {
 		t.Fatalf("%d listings reached the catalog, want 1", got)
 	}
 	e.createTable(t, e.direct, "u")
-	time.Sleep(100 * time.Millisecond)
+	time.Sleep(1100 * time.Millisecond)
 	if got := e.tables(t); !slices.Equal(got, []string{"t", "u"}) {
 		t.Errorf("tables after the listing expired: %v", got)
 	}
@@ -243,5 +246,91 @@ func TestListingsGeneration(t *testing.T) {
 	none.Invalidate()
 	if none.Generation() != 0 {
 		t.Error("a nil proxy's generation")
+	}
+}
+
+// TestListingsOfOtherNamespacesKept checks that a commit to a table that is
+// there forgets no listing, and a table made in one namespace only that
+// namespace's.
+func TestListingsOfOtherNamespacesKept(t *testing.T) {
+	e := newListingEnv(t, time.Minute)
+	e.must(t, e.proxy.URL(), http.MethodPost, "namespaces", `{"namespace": ["sales"]}`)
+	sales := func() string { return e.must(t, e.proxy.URL(), http.MethodGet, "namespaces/sales/tables", "") }
+	e.tables(t)
+	sales()
+	e.call(t, e.proxy.URL(), http.MethodPost, "namespaces/public/tables/t", `{"requirements": [], "updates": []}`)
+	e.call(t, e.proxy.URL(), http.MethodPost, "transactions/commit", `{"table-changes": []}`)
+	e.tables(t)
+	sales()
+	if got := e.lists.Load(); got != 2 {
+		t.Errorf("after commits: %d listings reached the catalog, want 2", got)
+	}
+	e.createTable(t, e.proxy.URL(), "u")
+	if got := e.tables(t); !slices.Equal(got, []string{"t", "u"}) {
+		t.Errorf("tables after a create: %v", got)
+	}
+	sales()
+	if got := e.lists.Load(); got != 3 {
+		t.Errorf("after a create in public: %d listings reached the catalog, want 3", got)
+	}
+}
+
+// TestStaleListings checks which listings each kind of change makes stale.
+func TestStaleListings(t *testing.T) {
+	public := listScope{"tables", "public"}
+	for _, c := range []struct {
+		method, rest, body string
+		scopes             []listScope
+		all                bool
+	}{
+		{http.MethodPost, "v1/p/namespaces/public/tables/t", `{"requirements": [{"type": "assert-table-uuid"}]}`, nil, false},
+		{http.MethodPost, "v1/p/namespaces/public/tables/t/metrics", `{}`, nil, false},
+		{http.MethodPost, "v1/p/namespaces/public/properties", `{"updates": {}}`, nil, false},
+		{http.MethodPost, "v1/p/transactions/commit", `{"table-changes": [{"identifier": {"namespace": ["public"], "name": "t"}}]}`, nil, false},
+		{http.MethodPost, "v1/p/namespaces/public/tables/t", `{"requirements": [{"type": "assert-create"}]}`, []listScope{public}, false},
+		{http.MethodPost, "v1/p/transactions/commit", `{"table-changes": [{"identifier": {"namespace": ["A", "b"], "name": "t"},
+			"requirements": [{"type": "assert-create"}]}]}`, []listScope{{"tables", "a\x1fb"}}, false},
+		{http.MethodPost, "v1/p/namespaces/Public/tables", `{"name": "u"}`, []listScope{public}, false},
+		{http.MethodPost, "v1/p/namespaces/public/register", `{"name": "u"}`, []listScope{public}, false},
+		{http.MethodDelete, "v1/p/namespaces/public/tables/t", ``, []listScope{public}, false},
+		{http.MethodPost, "v1/p/tables/rename", `{"source": {"namespace": ["public"], "name": "t"},
+			"destination": {"namespace": ["sales"], "name": "t"}}`, []listScope{public, {"tables", "sales"}}, false},
+		{http.MethodPost, "v1/p/namespaces/public/views", `{"name": "v"}`, []listScope{{"views", "public"}}, false},
+		{http.MethodDelete, "v1/p/namespaces/public/views/v", ``, []listScope{{"views", "public"}}, false},
+		{http.MethodPost, "v1/p/namespaces", `{"namespace": ["x"]}`, []listScope{{kind: "namespaces"}}, false},
+		{http.MethodDelete, "v1/p/namespaces/x", ``, []listScope{{kind: "namespaces"}, {"tables", "x"}, {"views", "x"}}, false},
+		{http.MethodPost, "v1/p/tables/rename", `{}`, nil, true},
+		{http.MethodPost, "v1/p/transactions/commit", `{"table-changes": [{}]}`, nil, true},
+		{http.MethodPost, "v1/p/something/else", `{}`, nil, true},
+	} {
+		scopes, all := staleListings(c.method, c.rest, []byte(c.body))
+		if !slices.Equal(scopes, c.scopes) || all != c.all {
+			t.Errorf("%s %s %s: %v, all %v", c.method, c.rest, c.body, scopes, all)
+		}
+	}
+}
+
+// TestListingsRenewed checks that a listing asked for once half its time is
+// up is asked of the catalog again in the background, so that one asked for
+// after its first answer would have expired is answered without waiting for
+// the catalog.
+func TestListingsRenewed(t *testing.T) {
+	e := newListingEnv(t, time.Second)
+	e.tables(t)
+	time.Sleep(600 * time.Millisecond)
+	e.listDelay.Store(int64(300 * time.Millisecond))
+	start := time.Now()
+	e.tables(t)
+	if took := time.Since(start); took > 250*time.Millisecond {
+		t.Errorf("a kept listing past half its time took %v", took)
+	}
+	time.Sleep(500 * time.Millisecond)
+	start = time.Now()
+	e.tables(t)
+	if took := time.Since(start); took > 250*time.Millisecond {
+		t.Errorf("a listing renewed in the background took %v: it waited for the catalog", took)
+	}
+	if got := e.lists.Load(); got != 2 {
+		t.Errorf("%d listings reached the catalog, want 2", got)
 	}
 }

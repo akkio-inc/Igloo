@@ -226,11 +226,21 @@ func startTestWorkerLimited(t *testing.T, dir string, i int, gate *taskGate, rb 
 	if err := os.MkdirAll(tmp, 0o700); err != nil {
 		t.Fatal(err)
 	}
+	// Igloo's own extensions, as engine.OpenWorker loads them: rb if given, and
+	// Igloo's build of iceberg (whose iceberg_bucket writes bucketed tables),
+	// which loads avro from DuckDB's extension directory.
+	var own []string
+	if rb != "" {
+		own = append(own, "LOAD "+quoteLiteral(rb))
+	}
+	if ice, ext := os.Getenv("IGLOO_TEST_ICEBERG_EXTENSION"), os.Getenv("IGLOO_TEST_EXTENSION_DIR"); ice != "" && ext != "" {
+		own = append(own, "SET extension_directory = "+quoteLiteral(ext), "LOAD "+quoteLiteral(ice))
+	}
 	dsn := ""
 	var load []string
-	if rb != "" {
+	if len(own) > 0 {
 		dsn = "?allow_unsigned_extensions=true"
-		load = []string{"LOAD " + quoteLiteral(rb), "SET allow_unsigned_extensions = false"}
+		load = append(own, "SET allow_unsigned_extensions = false")
 	}
 	c, err := duckdb.NewConnector(dsn, nil)
 	if err != nil {
@@ -470,6 +480,29 @@ func TestDistributedStatements(t *testing.T) {
 	}
 }
 
+// TestHeavyOnWorkers checks that a statement whose shape held the workers
+// heavily, against the others there, runs there in the background once it is
+// known to: its tasks give way to the others' (see distributed.WithBackground).
+func TestHeavyOnWorkers(t *testing.T) {
+	t.Parallel()
+	ds := startDistServer(t, 2)
+	// Every run on workers is far over this line: one makes the shape heavy.
+	ds.srv.heavyOnWorkers = newHeavyHistoryOf(time.Nanosecond)
+	conn := ds.testServer.admin(t, pgx.QueryExecModeExec)
+	mustExec(t, conn, "SET search_path = 'lake.public,memory.main'")
+	mustExec(t, conn, "SET distributed_execution = on")
+	query := "SELECT amount, count(*) AS n FROM orders GROUP BY amount ORDER BY amount"
+	for run := range 3 {
+		if _, err := conn.Exec(context.Background(), query); err != nil {
+			t.Fatal(err)
+		}
+		q := lastRun(t, ds.history, query)
+		if background := strings.Contains(q.Placement, "in the background"); q.Workers == 0 || background != (run > 0) {
+			t.Errorf("run %d: %d workers, placement %q", run+1, q.Workers, q.Placement)
+		}
+	}
+}
+
 // Grants hold: a user reads through workers only what they may read.
 func TestDistributedGrants(t *testing.T) {
 	t.Parallel()
@@ -572,6 +605,35 @@ func TestDistributedOutOfMemory(t *testing.T) {
 	}
 	if q := lastRun(t, ds.history, query); q.SQLState != "53200" {
 		t.Errorf("history: %s %s", q.Outcome, q.SQLState)
+	}
+}
+
+// A statement auto mode does not plan for workers, on a small table, that runs
+// out of memory here runs on the workers already running, rather than wait to
+// run here again.
+func TestDistributedAfterOutOfMemoryUnplanned(t *testing.T) {
+	t.Parallel()
+	ds := startDistServer(t, 2)
+	conn := ds.testServer.admin(t, pgx.QueryExecModeSimpleProtocol)
+	mustExec(t, conn, "SET search_path = 'lake.public,memory.main'")
+	const query = "SELECT amount, count(*) AS n FROM orders GROUP BY amount ORDER BY amount"
+	want := texts(t, conn, query)
+	if q := lastRun(t, ds.history, query); q.Workers != 0 || q.PlanKey != "" {
+		t.Fatalf("auto mode planned it: %d workers, plan key %q", q.Workers, q.PlanKey)
+	}
+	var once atomic.Bool
+	ds.srv.failLocal = func(_ context.Context, st *statement) error {
+		if strings.Contains(st.query, "FROM orders GROUP BY amount") && once.CompareAndSwap(false, true) {
+			return &duckdb.Error{Type: duckdb.ErrorTypeOutOfMemory, Msg: "Out of Memory Error: failed to allocate data of size 8.0 KiB (42.8 GiB/42.2 GiB used)"}
+		}
+		return nil
+	}
+	defer func() { ds.srv.failLocal = nil }()
+	if got := texts(t, conn, query); !slices.Equal(got, want) {
+		t.Errorf("after running out of memory here: %q, want %q", got, want)
+	}
+	if q := lastRun(t, ds.history, query); q.Workers == 0 || q.Outcome != audit.OutcomeOK {
+		t.Errorf("history: %d workers, %s %s: %q", q.Workers, q.Outcome, q.SQLState, q.Placement)
 	}
 }
 
@@ -1096,7 +1158,7 @@ func TestLocalRunStands(t *testing.T) {
 	}
 	// So small a table reads nothing to speak of, which says nothing of its
 	// shape (see workload.ReadNothing): a run that did not, as a report's.
-	if _, ok := ds.srv.workload.Took(q.Shape); ok {
+	if _, _, ok := ds.srv.workload.Took(q.Shape); ok {
 		t.Error("a time from a run that read nothing")
 	}
 	busy := "SELECT sum(i * i % 7) FROM range(500000000) AS t(i)"
@@ -1106,7 +1168,7 @@ func TestLocalRunStands(t *testing.T) {
 	if b.Resources == nil || b.Resources.CPUTime < workload.LightCPU {
 		t.Fatalf("a busy statement took %+v", b.Resources)
 	}
-	if took, ok := ds.srv.workload.Took(b.Shape); !ok || took <= 0 || took > b.Duration {
+	if took, _, ok := ds.srv.workload.Took(b.Shape); !ok || took <= 0 || took > b.Duration {
 		t.Errorf("took %s here (%v), of a run of %s", took, ok, b.Duration)
 	}
 	ds.srv.workload.ObserveTook(q.Shape, 714*time.Second)

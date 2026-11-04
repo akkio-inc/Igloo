@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"slices"
 	"strconv"
 	"strings"
@@ -17,6 +18,7 @@ import (
 
 	"github.com/akkio-inc/igloo/internal/audit"
 	"github.com/akkio-inc/igloo/internal/auth"
+	"github.com/akkio-inc/igloo/internal/distributed"
 	"github.com/akkio-inc/igloo/internal/incremental"
 	"github.com/akkio-inc/igloo/internal/policy"
 	"github.com/akkio-inc/igloo/internal/tasks"
@@ -129,8 +131,10 @@ type refreshResult struct {
 	policies []string
 	action   string
 	detail   string
-	// used is what DuckDB measured of the statements it ran.
-	used audit.Resources
+	// used is what DuckDB measured of the statements it ran, and parts
+	// where its query ran when it ran on workers, for the history.
+	used  audit.Resources
+	parts distParts
 }
 
 // refreshView refreshes j, a materialized view or dynamic table, as user
@@ -159,7 +163,7 @@ func (s *Server) refreshView(ctx context.Context, sess *session, user auth.User,
 	r := &refresher{s: s, sess: sess, job: j, schema: schema, table: table, qualified: qualified, query: query, st: state,
 		digest: digest(query), access: checked, guard: g}
 	res, err := r.run(ctx)
-	res.used = r.used
+	res.used, res.parts = r.used, r.parts
 	if err != nil {
 		return res, err
 	}
@@ -188,31 +192,50 @@ type refresher struct {
 	// rewrote its query, for a run of its query on workers (see rebuild).
 	access *access
 	guard  *guard
-	// placement is where its query ran, when it ran on workers.
+	// placement is where its query ran, when it ran on workers, and parts
+	// what that took, for the history.
 	placement string
+	parts     distParts
+	// stateless says it refreshes in full and keeps no state, though it could
+	// (see bitmapsOnWorkers).
+	stateless bool
 }
 
 // rebuild replaces the view's rows with its query's, the query on workers
 // where auto mode would run it there as a read by the view's owner (see
-// fillOn), the view written from their results.
+// fill), the view written from their results.
 func (r *refresher) rebuild(ctx context.Context) (int64, error) {
-	write := func(ctx context.Context, source string) (int64, error) {
+	return r.fill(ctx, "the query", r.query, r.rebuildWriter, func(ctx context.Context, source string) (int64, error) {
 		return r.replaceRows(ctx, "SELECT * FROM ("+source+") AS refresh")
-	}
+	})
+}
+
+// fill runs query, one of the refresh's that reads its tables in full, and
+// writes its rows with write, given query or the SQL that combines workers'
+// results of it: on workers where auto mode would run it there as a read by
+// the view's owner, as a client's CREATE TABLE ... AS runs (see fillOn), and
+// on workers too once it runs out of memory here. writer, if set, is how
+// workers would write the rows themselves. what names the query in the log,
+// which says where each ran.
+func (r *refresher) fill(ctx context.Context, what, query string, writer func(context.Context, *statement) *tableWrite,
+	write func(ctx context.Context, source string) (int64, error)) (int64, error) {
 	start := time.Now()
 	f := &stagedFill{s: r.s, sess: r.sess, ctx: ctx}
 	defer f.close()
-	src := r.s.fillSource(ctx, r.sess, &statement{access: r.access, guard: r.guard}, r.query)
-	if src != nil {
-		src.writer = r.rebuildWriter(ctx, src)
+	src := r.s.fillSource(ctx, r.sess, &statement{access: r.access, guard: r.guard}, query)
+	if src != nil && writer != nil {
+		src.writer = writer(ctx, src)
 	}
-	rows, parts, _, err := r.s.fillOn(f, src, func(ctx context.Context) (int64, error) { return write(ctx, r.query) }, write)
+	rows, parts, _, err := r.s.fillOn(f, src, func(ctx context.Context) (int64, error) { return write(ctx, query) }, write)
+	took := time.Since(cmp.Or(parts.since, start))
 	if err == nil && parts.key != "" {
-		r.s.dist.ObserveOn(parts.key, parts.workers, parts.large, time.Since(cmp.Or(parts.since, start)))
+		r.s.dist.ObserveOn(parts.key, parts.workers, parts.large, took)
 	}
 	if err == nil && parts.workers > 0 {
-		r.placement = parts.placement
+		r.placement, r.parts = parts.placement, parts
 	}
+	r.s.log.Info("a refresh ran "+what, "kind", r.job.Kind, "name", r.job.Name, "placement", cmp.Or(parts.placement, "this replica"),
+		"workers", parts.workers, "rows", rows, "seconds", math.Round(took.Seconds()*10)/10, "err", err)
 	return rows, err
 }
 
@@ -268,17 +291,19 @@ func digest(s string) string {
 }
 
 func (r *refresher) run(ctx context.Context) (refreshResult, error) {
-	// Planning resolves the query's tables and lists their columns, which
-	// walk the catalog's in-memory set: it holds the catalog lock
-	// exclusively. The rest holds it only to change the catalog (temporary
-	// tables, the state table) and while DuckDB binds what it runs, as a
-	// user's statements do (see catalogRunLock): a full refresh runs a
-	// query as long as any read, and held it for its whole run.
+	// A refresh holds the catalog lock while DuckDB binds what it runs, shared,
+	// as a user's statements do (see catalogRunLock), and alone only to change
+	// the catalog: to write the view's table and its state table. Planning
+	// resolves the query's tables from the server's index (see indexedTables),
+	// binds the query and its tables to read their columns, and loads their
+	// snapshots from the catalog itself; its temporary views and tables are
+	// the session's own. A full refresh runs a query as long as any read, and
+	// held the lock for its whole run; planning, which listed the columns from
+	// information_schema, walking the catalog, held it alone for up to 13 s,
+	// while every dashboard waited.
 	defer r.dropTemps()
 	r.st.Incremental, r.st.Reason = false, ""
-	release := r.s.holdCatalog(r.sess)
 	reason := r.planQuery(ctx)
-	release()
 	if reason == "" {
 		r.st.Incremental = true
 	} else {
@@ -291,6 +316,10 @@ func (r *refresher) run(ctx context.Context) (refreshResult, error) {
 	if r.st.Mode == refreshFull {
 		why = "its REFRESH_MODE is FULL"
 	}
+	if why == "" && r.st.Mode != refreshIncremental && r.bitmapsOnWorkers(ctx) {
+		why, r.stateless = bitmapsOnWorkers, true
+		r.st.Incremental, r.st.Reason = false, why
+	}
 	if why == "" {
 		why = r.baseline(ctx)
 	}
@@ -302,6 +331,129 @@ func (r *refresher) run(ctx context.Context) (refreshResult, error) {
 		why = reason
 	}
 	return r.full(ctx, why)
+}
+
+// stateRowGroupBytes is about how many bytes of a state's bitmaps each of its
+// files' row groups holds (see slices), as many as of Igloo's other files.
+const stateRowGroupBytes = distributed.RowGroupBytes
+
+// slices returns the ranges of rowid of rel, a temporary table of state rows
+// about to be written, to write them in: about stateRowGroupBytes of their
+// bitmaps each, or one range of them all (lo -1) for a state of no bitmaps.
+//
+// DuckDB writes at least a vector of rows, up to 2,048, in each row group of
+// a Parquet file, whatever its row group size in rows or bytes: the 800 bitmaps
+// of a billion impressions' distinct devices by advertiser and channel, 2 GB,
+// were one row group, and reading them back took more than 1 GB at once, which
+// a replica busy with dashboards could not give. The refresh failed and ran
+// again, for minutes. Each slice is written as a row group of its own (see
+// stateInserts); slices of 8 MB read back in 1 GB.
+func (r *refresher) slices(ctx context.Context, rel string) ([][2]int64, error) {
+	var blobs []string
+	for _, c := range r.plan.StateColumns() {
+		if c.Type == "BLOB" {
+			blobs = append(blobs, "coalesce(octet_length("+quoteIdent(c.Name)+"), 0)")
+		}
+	}
+	if len(blobs) == 0 {
+		return [][2]int64{{-1, -1}}, nil
+	}
+	n, err := r.count(ctx, "SELECT count(*) FROM "+rel)
+	if err != nil {
+		return nil, err
+	}
+	width, err := r.count(ctx, "SELECT CAST(coalesce(avg("+strings.Join(blobs, " + ")+"), 0) AS BIGINT) FROM "+rel)
+	if err != nil {
+		return nil, err
+	}
+	per := max(r.s.stateRowGroupBytes/max(width, 1), 1)
+	var out [][2]int64
+	for lo := int64(0); lo < n; lo += per {
+		out = append(out, [2]int64{lo, lo + per})
+	}
+	return out, nil
+}
+
+// slicesAStatement is how many slices of a state one INSERT writes (see
+// stateInserts).
+const slicesAStatement = 64
+
+// stateInserts returns the INSERTs into state that write rows(slice) for
+// each of slices, slicesAStatement of them a statement, joined by UNION ALL.
+// Each slice reaches DuckDB's writer as a vector of its own, which the
+// state's row group size of one row (see sliceRowGroups) makes a row group of
+// its own. A statement a slice made a file a slice, which on object storage
+// is a request each: 650 bitmaps of 7.7 MB, 5 GB, took 93 s to write that
+// way, most of a refresh that took 145 s, and 15.5 s 64 a statement, in 11
+// files, which read back in 8 s rather than 4.
+func stateInserts(state string, slices [][2]int64, rows func(slice [2]int64) string) []string {
+	var out []string
+	for lo := 0; lo < len(slices); lo += slicesAStatement {
+		var parts []string
+		for _, slice := range slices[lo:min(lo+slicesAStatement, len(slices))] {
+			parts = append(parts, "("+rows(slice)+")")
+		}
+		out = append(out, "INSERT INTO "+state+" "+strings.Join(parts, " UNION ALL "))
+	}
+	return out
+}
+
+// sliceRowGroups gives the state table name a row group size of one row,
+// which ends a row group at each vector DuckDB's writer gets, where the state
+// is written in slices (see stateInserts), unless it has it.
+func (r *refresher) sliceRowGroups(ctx context.Context, name string, slices [][2]int64) error {
+	if r.s.ddl == nil || len(slices) == 0 || slices[0][0] < 0 {
+		return nil
+	}
+	tbl, err := r.s.ddl.LoadTable(ctx, refreshSchema, name)
+	if err != nil {
+		return err
+	}
+	if tbl.Properties()[rowGroupSizeProperty] == "1" {
+		return nil
+	}
+	if _, err := r.exec(ctx, "SELECT * FROM set_iceberg_table_properties("+quoteName([]string{r.s.catalogName(), refreshSchema, name})+
+		", {'"+rowGroupSizeProperty+"': '1'})"); err != nil {
+		return fmt.Errorf("size the row groups of the state table %s.%s: %w", refreshSchema, name, err)
+	}
+	r.s.ddl.TableChanged(refreshSchema, name)
+	return nil
+}
+
+// inSlice is the condition that a row of alias, of a temporary table, is in
+// slice (see slices), with the AND before it, or nothing for all rows.
+func inSlice(alias string, slice [2]int64) string {
+	if slice[0] < 0 {
+		return ""
+	}
+	return fmt.Sprintf(" AND %s.rowid >= %d AND %s.rowid < %d", alias, slice[0], alias, slice[1])
+}
+
+// bitmapsOnWorkers is why a view counting distinct values is refreshed in
+// full, its query on workers (see refresher.bitmapsOnWorkers).
+const bitmapsOnWorkers = "it counts distinct values, and workers run its query whole faster than this replica merges its bitmaps"
+
+// bitmapsOnWorkers says the view counts distinct values, which an incremental
+// refresh keeps in bitmaps and merges on this replica, and auto mode would run
+// its query on workers. Going on from 800 groups' bitmaps of distinct devices
+// over 1.5 billion impressions, incremental refreshes here took 64 to 385 s,
+// up to 66 CPU-minutes, and cost the dashboards beside them 13 to 36% of
+// their rate; refreshed in full, its query on 16 workers took 41 to 140 s,
+// and the dashboards ran their best. So it runs on workers and keeps no
+// state, and goes on incrementally only where workers would not run it.
+func (r *refresher) bitmapsOnWorkers(ctx context.Context) bool {
+	if r.plan == nil || !r.plan.Grouped || !r.plan.Bitmaps() || r.s.dist == nil {
+		return false
+	}
+	src := r.s.fillSource(ctx, r.sess, &statement{access: r.access, guard: r.guard}, r.query)
+	if src == nil {
+		return false
+	}
+	defer src.close() //nolint:errcheck
+	user := r.sess.currentUser()
+	env := &sessionEnv{s: r.s, sess: r.sess, user: user, st: src}
+	_, err := r.s.dist.Plan(ctx, src.query, env, sessionMode(r.sess, user))
+	return err == nil
 }
 
 // planQuery plans the query, and loads its tables' current snapshots. It
@@ -319,9 +471,8 @@ func (r *refresher) planQuery(ctx context.Context) string {
 	if err != nil {
 		return "Igloo could not resolve its tables: " + err.Error()
 	}
-	conn := r.sess.conn
 	env := incremental.Env{
-		Parser: connParser{conn},
+		Parser: connParser{r.sess.conn},
 		Table: func(_ context.Context, parts []string) (string, string, bool, error) {
 			rs, err := res.resolve(tableRef{parts: parts}, nil)
 			if err != nil {
@@ -337,20 +488,15 @@ func (r *refresher) planQuery(ctx context.Context) string {
 			}
 			return o.schema, o.name, true, nil
 		},
-		Columns: func(ctx context.Context, schema, name string) ([]string, error) {
-			return queryStrings(ctx, r.sess, `SELECT column_name FROM information_schema.columns
-				WHERE table_catalog = $1 AND table_schema = $2 AND table_name = $3 ORDER BY ordinal_position`, s.catalogName(), schema, name)
-		},
+		Columns: r.columnNames,
 		Describe: func(ctx context.Context, query string) ([]incremental.Column, error) {
-			rows, err := queryRows(ctx, conn, "DESCRIBE "+query)
+			cols, err := r.described(ctx, query)
 			if err != nil {
 				return nil, err
 			}
-			out := make([]incremental.Column, len(rows))
-			for i, row := range rows {
-				name, _ := row[0].(string)
-				typ, _ := row[1].(string)
-				out[i] = incremental.Column{Name: name, Type: typ}
+			out := make([]incremental.Column, len(cols))
+			for i, c := range cols {
+				out[i] = incremental.Column{Name: c.Name, Type: c.Type}
 			}
 			return out, nil
 		},
@@ -794,7 +940,14 @@ func (r *refresher) mergeGroups(ctx context.Context, input, detail string) (refr
 	} else {
 		stateStmts = append(stateStmts, "DELETE FROM "+state+" AS s WHERE EXISTS (SELECT 1 FROM __igloo_delta AS d WHERE "+p.Match("s", "d")+")")
 	}
-	stateStmts = append(stateStmts, "INSERT INTO "+state+" "+alive)
+	slices, err := r.slices(ctx, "__igloo_merged")
+	if err != nil {
+		return refreshResult{}, "", err
+	}
+	if err := r.sliceRowGroups(ctx, r.st.State, slices); err != nil {
+		return refreshResult{}, "", err
+	}
+	stateStmts = append(stateStmts, stateInserts(state, slices, func(slice [2]int64) string { return alive + inSlice("m", slice) })...)
 	var rows int64
 	if whole != "" {
 		rows, err = r.replaceRows(ctx, whole, stateStmts...)
@@ -816,7 +969,7 @@ func (r *refresher) full(ctx context.Context, why string) (refreshResult, error)
 		detail = fmt.Sprintf("ran the query over every row (%d rows, %d bytes of files): %s", rows, bytes, why)
 	}
 	p := r.plan
-	if p == nil || p.Reason != "" || r.snaps == nil || r.st.Mode == refreshFull {
+	if p == nil || p.Reason != "" || r.snaps == nil || r.st.Mode == refreshFull || r.stateless {
 		// Nothing to go on from: the query as it is, and no state.
 		rows, err := r.rebuild(ctx)
 		if err != nil {
@@ -849,9 +1002,20 @@ func (r *refresher) full(ctx context.Context, why string) (refreshResult, error)
 	if err != nil {
 		return refreshResult{}, err
 	}
-	if err := r.temp(ctx, "TABLE", "__igloo_full", p.Partials(input, false)); err != nil {
+	// The groups' partial aggregates over every row, the refresh's heaviest
+	// query, run where any read of them would: a count of distinct devices
+	// over a billion impressions ran on this replica for up to 257 s, beside
+	// the dashboards, that took 2 to 12 s on workers.
+	partials := p.Partials(input, false)
+	if err := r.makeTemp(ctx, "TABLE", "__igloo_full", partials); err != nil {
 		return refreshResult{}, err
 	}
+	if _, err := r.fill(ctx, "its partial aggregates", partials, nil, func(ctx context.Context, source string) (int64, error) {
+		return r.exec(ctx, "INSERT INTO temp.main.__igloo_full SELECT * FROM ("+source+") AS full_partials")
+	}); err != nil {
+		return refreshResult{}, err
+	}
+	detail += r.onWorkers()
 	if reason, err := r.keepState(ctx); err != nil {
 		return refreshResult{}, err
 	} else if reason != "" {
@@ -876,7 +1040,17 @@ func (r *refresher) full(ctx context.Context, why string) (refreshResult, error)
 	if err != nil {
 		return refreshResult{}, err
 	}
-	n, err := r.replaceRows(ctx, final, "INSERT INTO "+state+" "+rows)
+	slices, err := r.slices(ctx, "__igloo_full")
+	if err != nil {
+		return refreshResult{}, err
+	}
+	if err := r.sliceRowGroups(ctx, name, slices); err != nil {
+		return refreshResult{}, err
+	}
+	stateStmts := stateInserts(state, slices, func(slice [2]int64) string {
+		return "SELECT " + r.stateColumns() + " FROM (" + p.StateRows("__igloo_full AS full_state WHERE true"+inSlice("full_state", slice)) + ") AS f"
+	})
+	n, err := r.replaceRows(ctx, final, stateStmts...)
 	if err != nil {
 		return refreshResult{}, err
 	}
@@ -999,12 +1173,29 @@ func (r *refresher) stateColumns() string {
 	return strings.Join(names, ", ")
 }
 
-// viewColumns lists the columns of the view's table, holding the catalog
-// lock to list them.
+// viewColumns lists the columns of the view's table.
 func (r *refresher) viewColumns(ctx context.Context) ([]string, error) {
-	defer r.s.holdCatalog(r.sess)()
-	return queryStrings(ctx, r.sess, `SELECT column_name FROM information_schema.columns
-		WHERE table_catalog = $1 AND table_schema = $2 AND table_name = $3 ORDER BY ordinal_position`, r.s.catalogName(), r.schema, r.table)
+	return r.columnNames(ctx, r.schema, r.table)
+}
+
+// columnNames lists the columns of the catalog's table schema.name, as DuckDB
+// binds a query of them all.
+func (r *refresher) columnNames(ctx context.Context, schema, name string) ([]string, error) {
+	cols, err := r.described(ctx, "SELECT * FROM "+quoteName([]string{r.s.catalogName(), schema, name}))
+	if err != nil {
+		return nil, err
+	}
+	names := make([]string, len(cols))
+	for i, c := range cols {
+		names[i] = c.Name
+	}
+	return names, nil
+}
+
+// described returns the names and types of the columns of query's result, as
+// DuckDB binds it, which holds the catalog lock shared.
+func (r *refresher) described(ctx context.Context, query string) ([]distributed.Column, error) {
+	return describedColumns(ctx, r.sess.conn, query)
 }
 
 // pinAt returns how to read table at its snapshot v: AT (VERSION => v),
@@ -1020,31 +1211,35 @@ func (r *refresher) pinAt(ctx context.Context, table string, v int64) (increment
 }
 
 // temp makes a temporary view or table, which the refresh drops when it
-// ends: a table empty, holding the catalog lock, and then filled, which
-// holds it only while DuckDB binds the query (see runTempCreate).
+// ends: a table empty, and then filled. The session's temporary objects are
+// its own, outside the Iceberg catalog: making one holds the catalog lock only
+// while DuckDB binds its query, shared, as filling it does.
 func (r *refresher) temp(ctx context.Context, kind, name, query string) error {
+	if err := r.makeTemp(ctx, kind, name, query); err != nil || kind != "TABLE" {
+		return err
+	}
+	_, err := r.exec(ctx, "INSERT INTO temp.main."+quoteIdent(name)+"\n"+query)
+	return err
+}
+
+// makeTemp is temp, a table left empty.
+func (r *refresher) makeTemp(ctx context.Context, kind, name, query string) error {
 	create := "CREATE OR REPLACE TEMP " + kind + " " + quoteIdent(name) + " AS " + query
 	if kind == "TABLE" {
 		create += "\nWITH NO DATA"
 	}
-	release := r.s.holdCatalog(r.sess)
-	_, err := r.exec(ctx, create)
-	release()
-	if err != nil {
+	r.sess.temps = true
+	if _, err := r.exec(ctx, create); err != nil {
 		return err
 	}
 	if !slices.Contains(r.temps, kind+" "+name) {
 		r.temps = append(r.temps, kind+" "+name)
 	}
-	if kind == "TABLE" {
-		_, err = r.exec(ctx, "INSERT INTO temp.main."+quoteIdent(name)+"\n"+query)
-	}
-	return err
+	return nil
 }
 
 func (r *refresher) dropTemps() {
 	ctx := context.Background()
-	defer r.s.holdCatalog(r.sess)()
 	for _, t := range slices.Backward(r.temps) {
 		kind, name, _ := strings.Cut(t, " ")
 		_, _ = r.sess.conn.ExecContext(ctx, "DROP "+kind+" IF EXISTS temp.main."+quoteIdent(name), nil)
@@ -1113,7 +1308,7 @@ func (r *refresher) write(ctx context.Context, stmts ...string) (int64, error) {
 func (r *refresher) done(ctx context.Context, res refreshResult) (refreshResult, string, error) {
 	st := &r.st
 	st.Action, st.Detail, st.DataTimestamp = res.action, res.detail, time.Now().UTC()
-	if r.snaps != nil && r.plan != nil && r.plan.Reason == "" && st.Unkeepable != r.digest && st.Mode != refreshFull {
+	if r.snaps != nil && r.plan != nil && r.plan.Reason == "" && st.Unkeepable != r.digest && st.Mode != refreshFull && !r.stateless {
 		st.Query, st.Sources = r.digest, r.snaps
 		if snap, err := r.snapshot(ctx, r.schema, r.table); err == nil {
 			st.Table = snap
@@ -1209,7 +1404,6 @@ func (s *Server) refreshReason(ctx context.Context, sess *session, user auth.Use
 		return "", err
 	}
 	r := &refresher{s: s, sess: sess, query: rewritten, digest: digest(rewritten), st: refreshState{Mode: refreshAuto}}
-	defer s.holdCatalog(sess)()
 	return r.planQuery(ctx), nil
 }
 
@@ -1269,14 +1463,12 @@ func (s *Server) refreshUpstream(ctx context.Context, sess *session, j tasks.Job
 	if len(downstream) == 0 {
 		return nil
 	}
-	release := s.holdCatalog(sess)
 	r, err := s.newResolver(ctx, sess)
 	var reads readSet
 	if err == nil {
 		r.lenient = true
 		reads, err = r.analyze(j.Statement, nil, 0)
 	}
-	release()
 	if err != nil {
 		return err
 	}

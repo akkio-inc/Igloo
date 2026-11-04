@@ -92,6 +92,16 @@ const (
 	// s on 4 and 127 s on 16 (see TestFleetCalibration).
 	levelCost       = 5.0
 	workerReadShare = 0.4
+	// directReadShare is workerReadShare for what stages read that write
+	// no exchange, sending their rows or partial aggregates to the
+	// coordinator: a worker's core reads those at one machine's cold rate.
+	// On 16 workers of 8 cores and 12 threads just started, their disks
+	// empty, a dashboard's first four tiles' stages of 15.9 to 16.7 GB took
+	// 11.9 to 14.9 s at once, 8.8 to 11 MB/s a core each, where the cold rate
+	// is 8.9 at their threads and workerReadShare of it 3.6. With their disks
+	// warm, one such tile, estimated at 72 s on workers, ran on one machine
+	// for 42 s and 844 CPU-s, where workers took 1 to 16 s for it after.
+	directReadShare = 1.0
 	// largeStageCost is what a level of stages takes on the large worker,
 	// where its exchanges, if any, stay on its own disk: at ten times the
 	// data, stages exchanging through workers' disks ran three to eight
@@ -172,9 +182,14 @@ type option struct {
 	// is what it took on as many workers; failed that it failed there
 	// lately, after failedAfter seconds.
 	estimate, seconds float64
-	measured          bool
-	failed            bool
-	failedAfter       float64
+	// work is the part of estimate its workers' cores share: their reading,
+	// rows, spilling and writing (see onFleet). The rest is fixed: the
+	// statement's start, its levels' rounds, the workers it starts and the
+	// client's taking its rows.
+	work        float64
+	measured    bool
+	failed      bool
+	failedAfter float64
 	// started is how many workers it starts; spill is what each of its
 	// workers does with its share of the working set.
 	started int
@@ -241,7 +256,8 @@ func threadsPerCore(threads, cores int) float64 {
 
 // onFleet estimates the plan's time on n of f's workers: a statement's own
 // start, each level of its stages' round of tasks (levelCost), and what
-// its stages read, at workerReadShare of one machine's cold rate, or the
+// its stages read, at workerReadShare of one machine's cold rate, or at
+// directReadShare of it what stages that write no exchange read, or the
 // rows they go through, whichever takes longer, on n workers' cores at
 // their threads a core; and the start of the workers that do not run.
 //
@@ -265,9 +281,11 @@ func (x features) onFleet(n int, f fleet) option {
 		}
 	}
 	cores := float64(n * max(f.cores, 1))
-	rate := coldRateAt(threadsPerCore(f.threads, f.cores)) * workerReadShare
-	work := max(float64(x.bytes)/(cores*rate), x.rows/(cores*rowRate))
-	o.estimate = startCost + float64(max(x.levels, 1))*levelCost + work*o.spill.factor + x.onWorkersWrite(n*max(f.cores, 1))
+	rate := coldRateAt(threadsPerCore(f.threads, f.cores))
+	read := float64(x.bytes-x.direct)/workerReadShare + float64(x.direct)/directReadShare
+	work := max(read/(cores*rate), x.rows/(cores*rowRate))
+	o.work = work*o.spill.factor + x.onWorkersWrite(n*max(f.cores, 1))
+	o.estimate = startCost + float64(max(x.levels, 1))*levelCost + o.work
 	if n > f.running {
 		o.estimate += f.start.Seconds()
 		o.started = n - f.running
@@ -359,9 +377,8 @@ func fleetBucket(n int) int { return bits.Len(uint(max(n, 0))) }
 
 // correct sets the options' seconds from what the statement took before,
 // r: an option on as many workers as a run, by fleetBucket, or on the large
-// worker, takes what that took; another on the fleet takes its estimate
-// times what the nearest run took over its own estimate, as the estimates
-// ran short or long for the statement. The large worker is corrected only
+// worker, takes what that took; another on the fleet takes what the nearest
+// run took, carried over by transfer. The large worker is corrected only
 // by its own runs: one machine without exchanges is another kind of run.
 // An option on which the statement failed within exploreEvery takes no
 // less than failurePenalty times what it ran before it failed.
@@ -397,7 +414,7 @@ func correctAt(opts []option, r runs, f fleet, now time.Time) {
 				best = m
 			}
 		}
-		opts[i].seconds = o.estimate * best.seconds / best.estimate
+		opts[i].seconds = transfer(o, best)
 	}
 	for i, o := range opts {
 		fail, failed := r.failures[fleetBucket(o.workers)].recent(now)
@@ -412,6 +429,28 @@ func correctAt(opts []option, r runs, f fleet, now time.Time) {
 	for i := range opts {
 		opts[i].cost = opts[i].costOn(f)
 	}
+}
+
+// transfer is what o should take by what m, a run on another number of the
+// fleet's workers, took (m.seconds). The time m took past its work's
+// estimate is fixed, a statement's start and its levels' rounds, which o
+// takes too, with its own starting of workers; o's work is its estimate,
+// scaled down as m's was where m took less than its work's estimate. The
+// fixed costs are what the estimates overstate most: TPC-DS statements of
+// 7 to 13 stages at a hundred times the data, exchanging under 2 GB, took
+// 2.1 to 4.8 s at the median on 16 workers, where startCost and levelCost
+// alone put seven levels at 43 s.
+// Scaled whole by m's run over m's estimate, a
+// statement of seven levels that took 4.8 s on 16 workers was taken to take
+// about 5 s on 8, and took 14.7 s there. Options without a work estimate
+// are scaled whole.
+func transfer(o, m option) float64 {
+	if o.work <= 0 || m.work <= 0 || m.estimate <= 0 {
+		return o.estimate * m.seconds / m.estimate
+	}
+	share := min(1, m.seconds/m.work)
+	fixed := m.seconds - m.work*share
+	return max(fixed+(o.estimate-o.work)-(m.estimate-m.work), 0) + o.work*share
 }
 
 func abs(n int) int {

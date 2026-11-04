@@ -235,11 +235,23 @@ In detail, a part runs distributed when:
   partitioned by `y`, and a subquery of one row
   (`ver = (SELECT max(ver) FROM t WHERE ...)`) one that every task reads.
   A correlated subquery over a large table is the join it means, where its
-  `WHERE` only makes its columns equal to the statement's and otherwise
-  filters its own rows: `EXISTS` a semi join, `NOT EXISTS` an anti join, and a
+  `WHERE` makes its columns equal to the statement's and otherwise
+  filters its own rows: `EXISTS` a semi join, an `OR` of `EXISTS` by the same
+  columns one semi join to the union of their keys, `NOT EXISTS` an anti join, and a
   scalar subquery of `min`, `max`, `sum`, `avg` (or arithmetic on them) or a
   count a `LEFT JOIN` to its groups, in `WHERE` or in a select list that does
-  not group.
+  not group. An `EXISTS` or `NOT EXISTS` may also compare its columns to the
+  statement's otherwise (TPC-DS q94's `ws1.ws_warehouse_sk <> ws2.ws_warehouse_sk`),
+  which its join checks beside the equal ones. Where the statement joins
+  several tables, its rows are divided by the one whose columns the subquery
+  reads, as TPC-DS q32's sales joined to their items and dates are by the
+  item, when inner joins are all that join it to the others. So is a `LEFT
+  JOIN` of several tables to a large one.
+  A scalar subquery in the select list of a statement that does not group,
+  one aggregate of all of its rows, that reads more than the coordinator
+  would read itself (see [when](#when)) is a relation of one row that workers
+  compute, cross joined to the statement's `FROM`: TPC-DS q09's columns are
+  fifteen counts and averages of ranges of `store_sales`.
   It may also read relations workers compute: common table expressions
   and subqueries in `FROM` that are themselves such `SELECT`s, with
   grouping and `DISTINCT` but no `ORDER BY` or `LIMIT`, and no window
@@ -340,7 +352,8 @@ aggregates over `DISTINCT` values of unrelated
 expressions in one `SELECT` (`count(DISTINCT a), count(DISTINCT b)`),
 window functions over rows but those of the next section, a large table read again in a correlated
 subquery expression of another shape (`NOT IN`, whose rows depend on whether
-any of its subquery's is `NULL`; a correlation by anything but equal columns;
+any of its subquery's is `NULL`; a correlation with no equal columns, or by
+anything but equal columns in a scalar subquery or an `OR` of `EXISTS`;
 a scalar subquery of another aggregate, or that gives a value over no rows),
 subqueries in `GROUP BY`, samples of a number of rows,
 large tables joined on different keys in one `SELECT`, statements that call user-defined macros
@@ -500,9 +513,13 @@ statement's rows are in the table when that commit is, or not at all.
   makes more files where their partitions are mixed. Auto mode has this replica
   write a table whose files would be under 8 MiB on average, or need that sort,
   where it has the room; `distributed_execution = 'on'` still sends it to workers.
+- **Bucketed tables** too, of integers, dates and timestamps: each file holds
+  one bucket's rows, as workers divide them with `iceberg_bucket`, so a
+  file's bucket is that of its lowest value.
 - **On the coordinator's way instead**, as the log says at debug level: tables
-  partitioned by bucket, or identity of decimals, whose partition values
-  cannot be read from a file's bounds or written to its manifest; tables with
+  partitioned by bucket of a string, whose Parquet bounds may be cut short, or
+  identity of decimals, whose partition values cannot be read from a file's
+  bounds or written to its manifest; tables with
   an Iceberg sort order (Igloo keeps [its own as a property](sql.md));
   fixed, nanosecond and format-version-1 columns; a query that sorts,
   limits or groups in its last step; a fill estimated at less than 256 MiB in
@@ -624,7 +641,10 @@ what it reads from object storage cold per core (about 9 MB/s at one and a
 half threads a core, 16 MB/s at four; its read cache holds what it read
 lately, which a statement's first run seldom has), and the workers', at
 0.4 of that rate for their cores and threads, as their tasks read column
-chunks in parts and write and read exchanges; each no less than the rows
+chunks in parts and write and read exchanges, and at the full rate what
+parts that write no exchange read, sending their rows or partial
+aggregates to the replica (a dashboard's tiles of 16 GB took 12 to 15 s
+on 16 workers just started, their disks empty); each no less than the rows
 its parts go through take at 150 million rows a second per core, once for
 the scan and again for each join and grouping (a hundredth of a table's
 rows where a part filters it so), for a statement that reads little but
@@ -632,9 +652,15 @@ joins much. Where DuckDB's plan says (see spilling, below), the replica's
 reading is what its scans project, each table's columns once, rather than
 what the parts name, which for a part reading a view's every column was
 77 GB of a table of 470 columns where the replica read 9.6 GB; and its
-time is no less than its hash tables take, at 10 million rows a second per
-core for a table larger than the processor's caches, as 16 joins of 400
-million rows to 400 million took 2,166 core-seconds. Workers also take
+time is no less than its operators take of its cores, by the rows the plan
+says each makes and takes in, at costs fitted to DuckDB's profiles of the
+estimate corpus: a scan's row and byte, a hash join's row probed, built on
+and made, an aggregate's row and group and its distinct and median-like
+aggregates, a sort's or window's rows times their logarithm, and an
+UNNEST's row, a microsecond and more where the statement writes the list,
+as FLATTEN of a row's object does. Of the corpus's statements that took 2 s
+or more alone, it puts 58% within twice what they took on a first run,
+where hash tables' rows alone put 8%. Workers also take
 about 8 seconds to start a statement and 5 for each level of its stages
 (stages that read what another wrote wait for it; those of one level run
 at once), plus the time to start workers that are stopped. Against the
@@ -646,7 +672,10 @@ the replica would take longer than `IGLOO_WORKER_THRESHOLD` (a minute), or
 would run short of memory, and the workers are estimated to be at least
 1.5 times faster. Short of memory by what it exchanges, workers need only be
 no slower: a report estimated at 52 s, what it reads, took 174 s by way of the
-guard, and 68 to 87 s on workers. A working set four or more times the
+guard, and 68 to 87 s on workers. Where DuckDB's plan says what it holds,
+it is short of memory only if that is over the replica's room too: a report
+whose stages read 30.7 GB for exchanges held 19 to 20 GB, as its plan said,
+and ran in 23.5 s on the replica, where 4 workers took 166.5 s. A working set four or more times the
 replica's room runs on workers whatever they are estimated to take, as long as
 there are workers.
 
@@ -717,7 +746,13 @@ it computes keeps no more than a hundredth of its input for what is above it;
 a semi-join keeps at least a row for each of its keys; a join to one row, as
 of a scalar subquery's latest version, keeps what a filter by a constant
 does, where DuckDB keeps every row, unless its scan is filtered so already,
-as one audience's rows of a lookup are, which DuckDB counted; one group by
+as one audience's rows of a lookup are, which DuckDB counted; where that
+row is the most value of a column over a table, unfiltered, it keeps no
+more than the rows of the row groups that hold the most value, read from
+the footers of the few files whose Iceberg bounds reach it (a lookup of
+1.41 billion rows had 189,400 of its latest version, in row groups of
+384,204, where a third of its rows by the versions' distinct count took a
+report for 191 GB, ten times what it held; it is now taken for 15 GB); one group by
 DuckDB's estimate of keys nothing knows is not one row; a `TOP_N` keeps what
 it says; a cross product with a small source of
 its own, as `FLATTEN` over a list of objects becomes, makes a row for each
@@ -763,6 +798,42 @@ estimate counts its spilling; workers' does not, as their exchanges'
 partitions are sized to their memory and a task that runs out runs again
 over more of them. `EXPLAIN DISTRIBUTED`'s `spill` rows show the working
 set against each machine's room, and what it would spill.
+
+**How the working set is checked.** `bench/estimates.py` runs a corpus of
+statements alone on a replica, at two scales: TPC-H's and TPC-DS's queries,
+reports' shapes, `bench/mixed.py`'s dashboard tiles, synthetic stand-ins for
+a dashboard burst's distinct counts, joins to audiences, `FLATTEN`s and
+windows, and one statement for each kind of operator. It records DuckDB's
+plan of each, the rows each operator made, and the peak of what DuckDB held
+for it, sampled every few milliseconds; `TestEstimateCorpus` replays the
+estimate over them (`internal/distributed/testdata/estimates`) and fails if
+it gets worse. Over 450 statements, the estimate on a first run is within
+twice what they held for 67% of them, and more than four times short for 2,
+where it was 50% and 43; with DuckDB's estimates of each operator's rows
+replaced by the rows it made, 86% and 2, where it was 49% and 67. What it
+counts besides each operator's rows: what a scan's readers hold, about three
+times the part of a row group the columns it reads take, compressed, on each
+thread (Iceberg's manifests give the columns' sizes), which held 100 to 300
+MB for dashboard tiles whose hash tables held next to nothing; a correlated
+or `LATERAL` subquery's join, which materializes its input whole and, as
+`UNNEST` of a list the statement writes, makes as many rows of each as the
+list has values; aggregates that keep their values (`list`, `string_agg`);
+and distinct aggregates sized by their pairs of groups and values where
+their distinct counts are known. The bounds Iceberg's manifests keep of
+columns of integer types, dates and timestamps bound how many distinct
+values they have, and so how many groups a grouping by them makes
+(`date_trunc` and casts of timestamps to dates included), and how many rows a
+join of them makes at least. And what operators made in statements that ran
+to their end on the replica (DuckDB's profiler counts each one's rows)
+corrects later statements by the same columns, whatever their shape: how
+many groups a grouping's keys made of how many rows, how many rows a join of
+two columns made of its inputs', and what share of a table a scan with the
+same filters kept, their constants aside. A statement grouping 400 million
+rows by a key of 500 strings was estimated at 32 GB; after another grouping
+by the same key ran, at 0.4 GB. A statement that ran to its end on the
+replica before, without reaching the share of its memory at which it may
+have spilled, is placed by the most it held then, as the replica sampled
+it, not by its plan.
 
 **How many workers.** Igloo weighs the statement on 1, 2, 4 and so on of
 the workers, up to `IGLOO_WORKER_MAX`, and on the workers running now, each
@@ -868,10 +939,16 @@ if they are estimated at no more than half again the replica's estimate,
 which is then a floor. Runs on workers count with runs on about as many
 (1, 2 to 3, 4 to 7, 8 to 15 and so on), kept apart for each, and runs on the
 large worker apart from them: how many workers a statement runs on takes
-what it took on each before for that one's time, and the others' estimates
-times what the nearest it ran on took over its estimate, so a statement
-that took 127 s on 16 workers, estimated at 89, is taken to need 164 s on
-8, and one that then took 112 s on 8 runs on 8 next. A statement that
+what it took on each before for that one's time. The others' times come
+from the nearest it ran on: what that run took past its estimated work
+counts as fixed (the statement's start and its stages' rounds, which the
+estimates overstate most), and the work as estimated for the other number,
+scaled down as the run's was where it took less than its estimated work.
+So a statement that took 127 s on 16 workers, estimated at 89, is taken
+to need 153 s on 8, and one that then took 112 s on 8 runs on 8 next. A
+TPC-DS statement of seven levels at a hundred times the data that took 4.8
+s on 16 workers stays there: scaled whole by its run over its estimate,
+8 workers looked as fast for less, and took 14.7 s. A statement that
 failed on a number of workers, or on the large worker, in the last day (a
 worker out of memory, a read that failed) is taken to need one and a half
 times as long as it ran there before it failed, so that other ways weigh
@@ -974,15 +1051,49 @@ more than 64 deep, or one that would compute a relation from itself, runs
 on one machine. In auto mode planning stops once it stalls: a statement
 runs on one machine once planning has planned no stage and described no
 new part for a tenth of the time the statement is expected to take there
-(what it took before, else the estimate), between half a second and a
-minute, or once planning has taken that time in all. A report expected
-to take minutes plans as long as it progresses; a cheap statement whose
-planning stalls waits half a second for it. `distributed_execution = on`
+(the longest of what it and statements of its shape took there lately,
+else the estimate), between half a second and a minute, or once planning
+has taken that time in all. A statement that ran on workers waits at least
+as long as it took there. Time the session
+spends waiting for the catalog lock, behind DDL or a refresh that holds it,
+counts for neither: the statement waits for the lock wherever it runs. A
+report expected to take minutes plans as long as it progresses; a cheap
+statement whose planning stalls waits half a second for it. `distributed_execution = on`
 and `EXPLAIN DISTRIBUTED` plan for as long as planning takes. Planning
 describes each part of the statement in the session once, keeps the SQL
 it printed of each part, and logs `planned a statement` with its time,
-stages, descriptions and other lookups in the session when it takes a
-second or more.
+stages, descriptions, other lookups in the session and its wait for the
+catalog lock when it takes a second or more. A lookup in the session that
+takes a quarter of a second or more logs `a lookup in the session took long`
+with what each of its steps took.
+
+Stages that do not read each other's rows run side by side, and the
+coordinator sends a statement's tasks to a worker as it has room for them,
+as many as its slots run at once. Each task has a worker it goes to first
+(a scan's share of files, the worker whose read cache holds them from
+earlier statements; others, each worker in turn), and goes there when that
+worker has room; a worker with room that
+no waiting task goes to first takes the task that has waited longest. A slow
+or busy worker so runs fewer of a stage's tasks, and the others more, rather
+than hold up the stage until it has run a share as large as theirs. A worker
+runs as many tasks at once as it has slots, and gives the next free ones to
+a task that runs again what a lost worker held, then to the statement that
+has started the fewest tasks there, so that a short statement gets past a
+long one's, and among those, to the first task to come.
+
+Statements in the background give way to the others on each worker: the
+refreshes of materialized views and dynamic tables, pipes' loads, and
+statements whose shape held the workers 5 seconds or more and 8 times as long
+as the other statements there, in each of its latest runs (see [heavy statements beside short
+ones](workload-management.md#heavy-statements-beside-short-ones)). Their tasks
+get a quarter of a worker's slots before other tasks, rounded down, and one
+before them whenever none of theirs has started there for 10 seconds, so that
+dashboards that keep the workers busy slow them and never stop them; more only
+once no other statement's task has run or waited there for 2 seconds. Beside a full
+refresh on 16 workers that took them for 40 to 140 s at a time, dashboards'
+statements on workers took 9.7 s at the median and 42 s at the 95th percentile,
+against 6.6 and 23 s while none ran. `placement` in the history ends with `in
+the background` for them.
 
 ## Same results as one machine
 
@@ -1224,7 +1335,9 @@ other manifests only with that port open between them, or say `object`.
   task whose worker is lost while it runs it, runs as smaller tasks spread
   over the workers left, one each, divided by its files, buckets or
   partitions, so that a loss costs about a worker's share of a stage over
-  the workers left rather than all of it on one. A statement with `LIMIT`,
+  the workers left rather than all of it on one. They take the workers' next
+  free slots before any other task, the statement's own included, since its
+  readers wait for them. A statement with `LIMIT`,
   samples or a volatile function among those tasks could not mix two runs of
   them, and its parts all run again, once, as they do if a task writes other
   rows than it did. One that still answers as the same run was busy, and the
@@ -1287,7 +1400,11 @@ other manifests only with that port open between them, or say `object`.
   the replica's memory, but never moves one to workers by them. A stage
   that joins a table filtered by a constant to other rows, as an audience
   joins events, shows as a `semi-join estimate` of the share of rows it
-  keeps, which the estimates do not count yet. The query is checked as it
+  keeps, which the estimates do not count yet. `left out` counts the
+  branches of unions, and the arms of a CASE that makes kinds of each row
+  as a translated FLATTEN does, whose constant a filter around them rejects,
+  through GROUP BYs of its column and rankings over each of its values: the
+  stages compute none of their rows. The query is checked as it
   would be when run, grants and policies included, and the same rewrites
   apply: it is prepared again as its run prepares it, through ID domains'
   ids and bitmap indexes with the bitmaps it reads, and planned and checked

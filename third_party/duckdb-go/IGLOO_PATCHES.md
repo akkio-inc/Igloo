@@ -27,6 +27,19 @@ were removed; the code is otherwise unchanged except for these patches:
   each other but never alongside such DDL or a listing, which hold it
   exclusively (see `Server.catalogRunLock` in `internal/pgwire`); upstream
   has no way to run code between binding a statement and running it.
+- `igloo_guard.go` (new), with a `callGuard` field on `Conn` in
+  `connection.go` and calls in `Conn.prepareExtractedStmt`, `Stmt.Close`,
+  `Stmt.ExecContext`, `Stmt.ExecBound`, `Stmt.executeBound`
+  (`statement.go`), `Stmt.executeBoundStreaming` (`igloo_stream.go`),
+  `rows.Next` and `rows.Close` (`rows.go`) and `recordReader.Next`
+  (`arrow.go`): `Conn.SetCallGuard`, a hook the connection runs each call
+  through that binds, runs or drops a statement's plan on the calling
+  thread. Igloo locks the goroutine to its thread for the call and marks
+  the thread as the statement's, so a C++ exception that escapes DuckDB
+  there, as the iceberg extension throws Out of Memory out of a destructor
+  when a statement is bound at the memory limit, ends that statement's
+  session rather than the process (see `internal/engine/terminate`).
+  Upstream has no way to run code around those calls.
 
 - `igloo_interrupt.go` (new): `Conn.Interrupt`, `Conn.Progress` and
   `RegisterScalarUDFOn`. Igloo's memory watch cancels the statement that has

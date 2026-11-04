@@ -12,8 +12,8 @@ import (
 // need to know of DuckDB's functions: which are volatile (see volatileSet),
 // which give results that can change between runs or sessions (see
 // sessionFunctions), and which are aggregates. Listing them takes DuckDB
-// some 25 ms and walks the catalog, which preparing a statement does
-// holding the catalog lock exclusively, so every statement of a
+// some 25 ms and walks the catalog's schemas, which preparing a statement
+// did holding the catalog lock exclusively, so every statement of a
 // dashboard's burst that repeats a subquery waited for the others'
 // listings. They are the same in every session, Igloo's own macros
 // included (it makes them in each), so they are listed once each time the
@@ -47,7 +47,7 @@ const functionListQuery = `SELECT system.main.lower(function_name) || chr(9) || 
 func (s *Server) functionSets(ctx context.Context, sess *session) (*functionSets, error) {
 	gen := s.resultGeneration()
 	f := &s.functions
-	if !sess.temps {
+	if !sess.tempMacros {
 		f.mu.Lock()
 		if f.sets != nil && f.gen == gen {
 			defer f.mu.Unlock()
@@ -55,15 +55,15 @@ func (s *Server) functionSets(ctx context.Context, sess *session) (*functionSets
 		}
 		f.mu.Unlock()
 	}
-	// Listing them walks the catalog (see catalogRunLock).
-	release := s.holdCatalog(sess)
+	// Listing them walks the catalog's schemas (see catalogRunLock).
+	release := s.shareCatalog(sess)
 	rows, err := queryStrings(ctx, sess, functionListQuery)
 	release()
 	if err != nil {
 		return nil, err
 	}
 	sets := functionSetsOf(rows)
-	if !sess.temps {
+	if !sess.tempMacros {
 		f.mu.Lock()
 		f.gen, f.sets = gen, sets
 		f.mu.Unlock()

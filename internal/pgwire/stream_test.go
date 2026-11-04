@@ -21,7 +21,6 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 
-	"github.com/akkio-inc/igloo/internal/catalogproxy"
 	"github.com/akkio-inc/igloo/internal/distributed"
 	"github.com/akkio-inc/igloo/internal/prefetch"
 )
@@ -305,8 +304,7 @@ func TestStreamFailureClassified(t *testing.T) {
 	if sess.ranOutOfMemory(context.Background(), err) || isOutOfMemory(err) || distributed.OutOfMemory(err) {
 		t.Error("taken for running out of memory")
 	}
-	if distributed.DataError(err) || distributed.IsUnsupported(err) || prefetch.BlockRace(err) || commitConflict(err) || bitmapsDidNotFit(err) ||
-		catalogproxy.RefusedShared(err.Error()) {
+	if distributed.DataError(err) || distributed.IsUnsupported(err) || prefetch.BlockRace(err) || commitConflict(err) || bitmapsDidNotFit(err) {
 		t.Error("taken for another failure")
 	}
 }
@@ -467,6 +465,85 @@ func TestLimitedPortalBetweenStatements(t *testing.T) {
 	receive("ReadyForQuery")
 	if got+rest != 100000 {
 		t.Fatalf("the portal sent %d rows in all, want 100000", got+rest)
+	}
+	send(&pgproto3.Query{String: "COMMIT"})
+	receive("ReadyForQuery")
+}
+
+// TestPortalReadsAcrossThreads reads a portal a row at a time, an Execute
+// for each, while other sessions run statements, so the session's commands
+// run on whichever threads Go has free. A portal resumes in each read the
+// coroutine its first read made, and Go ends the process when a switch to
+// one is on another thread, or under other thread locks, than it was made
+// with: when each command ran locked to its thread, JDBC's fetch size ended
+// the process.
+func TestPortalReadsAcrossThreads(t *testing.T) {
+	ts := startServer(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	var busy sync.WaitGroup
+	for range 4 {
+		other := ts.admin(t, pgx.QueryExecModeExec)
+		busy.Go(func() {
+			for ctx.Err() == nil {
+				_, _ = other.Exec(ctx, "SELECT count(*) FROM range(200000) t(i) WHERE i % 7 = 3")
+			}
+		})
+	}
+	defer busy.Wait()
+	defer cancel()
+
+	conn := ts.admin(t, pgx.QueryExecModeSimpleProtocol)
+	h, err := conn.PgConn().Hijack()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer h.Conn.Close() //nolint:errcheck
+	_ = h.Conn.SetDeadline(time.Now().Add(2 * time.Minute))
+	fe := h.Frontend
+	send := func(msgs ...pgproto3.FrontendMessage) {
+		t.Helper()
+		for _, m := range msgs {
+			fe.Send(m)
+		}
+		if err := fe.Flush(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	receive := func(until string) int {
+		t.Helper()
+		rows := 0
+		for {
+			msg, err := fe.Receive()
+			if err != nil {
+				t.Fatalf("the session ended: %v", err)
+			}
+			switch m := msg.(type) {
+			case *pgproto3.DataRow:
+				rows++
+			case *pgproto3.ErrorResponse:
+				t.Fatalf("error: %s", m.Message)
+			}
+			if fmt.Sprintf("%T", msg) == "*pgproto3."+until {
+				return rows
+			}
+		}
+	}
+
+	const reads = 400
+	send(&pgproto3.Query{String: "BEGIN"})
+	receive("ReadyForQuery")
+	send(&pgproto3.Parse{Name: "rows", Query: fmt.Sprintf("SELECT i FROM range(%d) t(i)", reads+1)},
+		&pgproto3.Bind{PreparedStatement: "rows", DestinationPortal: "p"})
+	n := 0
+	for range reads {
+		send(&pgproto3.Execute{Portal: "p", MaxRows: 1}, &pgproto3.Flush{})
+		n += receive("PortalSuspended")
+	}
+	send(&pgproto3.Execute{Portal: "p"}, &pgproto3.Sync{})
+	n += receive("CommandComplete")
+	receive("ReadyForQuery")
+	if n != reads+1 {
+		t.Fatalf("the portal sent %d rows in all, want %d", n, reads+1)
 	}
 	send(&pgproto3.Query{String: "COMMIT"})
 	receive("ReadyForQuery")

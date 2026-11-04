@@ -33,8 +33,14 @@ type correlation struct {
 	// outer and inner are the columns its WHERE makes equal, the statement's
 	// and its own, in pairs.
 	outer, inner []node
-	// where are the conditions of its WHERE on its own columns alone.
-	where []node
+	// where are the conditions of its WHERE on its own columns alone, and
+	// residual those of its WHERE on its columns and the statement's that do
+	// not make one equal to the other, such as TPC-DS q94's
+	// ws1.ws_warehouse_sk <> ws2.ws_warehouse_sk, which an EXISTS's join checks
+	// beside its keys, and a join of an aggregate cannot; reads are the
+	// subquery's own columns they read, and outerReads the statement's.
+	where, residual   []node
+	reads, outerReads []node
 }
 
 // correlationOf returns q's correlation, or nil if it has not that shape. ctes
@@ -99,13 +105,37 @@ func (pl *planner) correlationOf(q node, ctes cteScope) *correlation {
 			continue
 		}
 		l, r := child(cond, "left"), child(cond, "right")
-		if str(cond["class"]) != "COMPARISON" || str(cond["type"]) != "COMPARE_EQUAL" || str(l["class"]) != "COLUMN_REF" || str(r["class"]) != "COLUMN_REF" {
-			return nil
-		}
 		li, lok := inner(l)
 		ri, rok := inner(r)
+		if str(cond["class"]) != "COMPARISON" || str(cond["type"]) != "COMPARE_EQUAL" || str(l["class"]) != "COLUMN_REF" ||
+			str(r["class"]) != "COLUMN_REF" || lok && rok && li == ri {
+			if hasClass(cond, "AGGREGATE") || hasClass(cond, "WINDOW") || hasVolatile(cond) {
+				return nil
+			}
+			known := true
+			walk(cond, func(n node) bool {
+				if str(n["class"]) != "COLUMN_REF" {
+					return true
+				}
+				is, ok := inner(n)
+				known = known && ok
+				reads := &c.outerReads
+				if is {
+					reads = &c.reads
+				}
+				if !slices.ContainsFunc(*reads, func(o node) bool { return sameRef(o, n) }) {
+					*reads = append(*reads, n)
+				}
+				return known
+			})
+			if !known {
+				return nil
+			}
+			c.residual = append(c.residual, cond)
+			continue
+		}
 		switch {
-		case !lok || !rok || li == ri:
+		case !lok || !rok:
 			return nil
 		case li:
 			c.inner, c.outer = append(c.inner, l), append(c.outer, r)
@@ -150,13 +180,18 @@ func (pl *planner) readsOuter(sel node, c *correlation, ctes cteScope) bool {
 		return false
 	}
 	q["from_table"] = clone(sel["from_table"])
-	items := make([]any, len(c.outer))
-	for i, e := range c.outer {
-		items[i] = clone(e)
+	items := make([]any, 0, len(c.outer)+len(c.outerReads))
+	for _, e := range slices.Concat(c.outer, c.outerReads) {
+		items = append(items, clone(e))
 	}
 	q["select_list"] = items
 	_, err = pl.describe(q, ctes)
 	return err == nil
+}
+
+// sameRef reports whether column references a and b name the same column.
+func sameRef(a, b node) bool {
+	return slices.EqualFunc(columnNames(a), columnNames(b), strings.EqualFold)
 }
 
 // setWhere makes q's WHERE the conjunction of conds.
@@ -211,6 +246,15 @@ func (pl *planner) joinOn(sel node, kind, alias string, sub node, names []any, c
 		child(cond, "right")["column_names"] = []any{alias, names[i]}
 		conds[i] = cond
 	}
+	for _, r := range c.residual {
+		conds = append(conds, rewrite(clone(r), func(n node) (node, bool) {
+			i := slices.IndexFunc(c.reads, func(o node) bool { return str(n["class"]) == "COLUMN_REF" && sameRef(o, n) })
+			if i < 0 {
+				return nil, false
+			}
+			return node{"class": "COLUMN_REF", "type": "COLUMN_REF", "alias": "", "column_names": []any{alias, names[len(c.outer)+i]}}, true
+		}).(node))
+	}
 	on, err := pl.andOf(conds)
 	if err != nil {
 		return nil, err
@@ -218,6 +262,57 @@ func (pl *planner) joinOn(sel node, kind, alias string, sub node, names []any, c
 	join["condition"], join["join_type"], join["left"] = on, kind, sel["from_table"]
 	sel["from_table"] = join
 	return right, nil
+}
+
+// innerItem reports whether the columns outer are all qualified by the name of
+// one table or subquery of FROM clause from that joinedInner finds.
+func innerItem(from node, outer []node) bool {
+	name := ""
+	for _, e := range outer {
+		parts := columnNames(e)
+		if len(parts) != 2 || name != "" && !strings.EqualFold(name, parts[0]) {
+			return false
+		}
+		name = parts[0]
+	}
+	return joinedInner(from, name)
+}
+
+// joinedInner reports whether FROM clause from has one table or subquery
+// called name, which inner and cross joins only join to the others, or which
+// is on the side of a LEFT, SEMI or ANTI join whose rows it keeps: each row
+// from makes has one row of it.
+func joinedInner(from node, name string) bool {
+	found := 0
+	var visit func(n node) bool
+	visit = func(n node) bool {
+		switch str(n["type"]) {
+		case "JOIN":
+			jt, rt := str(n["join_type"]), str(n["ref_type"])
+			switch {
+			case rt != "REGULAR" && rt != "CROSS":
+				return false
+			case jt == "SEMI" || jt == "ANTI" || jt == "LEFT":
+				// Its rows are its left side's, with or without rows of the
+				// right: another EXISTS made the join, or a scalar subquery.
+				return visit(child(n, "left"))
+			case jt != "INNER":
+				return false
+			}
+			return visit(child(n, "left")) && visit(child(n, "right"))
+		case "BASE_TABLE", "SUBQUERY":
+			alias := str(n["alias"])
+			if alias == "" {
+				alias = str(n["table_name"])
+			}
+			if strings.EqualFold(alias, name) {
+				found++
+			}
+			return true
+		}
+		return false
+	}
+	return visit(from) && found == 1
 }
 
 // keyColumns are the names of a correlated subquery's keys as a join reads them.
@@ -252,19 +347,21 @@ func (pl *planner) existsJoin(sel, cond node, ctes cteScope) (bool, error) {
 	if q == nil {
 		return false, nil
 	}
-	if t := str(child(sel, "from_table")["type"]); negated && t != "BASE_TABLE" && t != "SUBQUERY" {
-		// The left of an anti join read by partition must be partitioned too,
-		// which it can tell only of one item (see addOuterJoin).
-		return false, nil
-	}
 	c := pl.correlationOf(q, ctes)
 	if c == nil || !pl.readsOuter(sel, c, ctes) {
 		return false, nil
 	}
+	if t := str(child(sel, "from_table")["type"]); negated && t != "BASE_TABLE" && t != "SUBQUERY" && !innerItem(child(sel, "from_table"), c.outer) {
+		// The left of an anti join read by partition must be partitioned too:
+		// one item, or the item of an inner join's that its key is a column of
+		// (see addOuterJoin), as TPC-DS q69's customers, joined to their
+		// addresses and demographics, are kept by their key.
+		return false, nil
+	}
 	sub := clone(q).(node)
-	items := make([]any, len(c.inner))
-	for i, e := range c.inner {
-		items[i] = clone(e)
+	items := make([]any, 0, len(c.inner)+len(c.reads))
+	for _, e := range slices.Concat(c.inner, c.reads) {
+		items = append(items, clone(e))
 	}
 	sub["select_list"] = items
 	if err := pl.setWhere(sub, c.where); err != nil {
@@ -279,7 +376,11 @@ func (pl *planner) existsJoin(sel, cond node, ctes cteScope) (bool, error) {
 	}
 	alias := "__igloo_in" + strconv.Itoa(pl.ins)
 	pl.ins++
-	right, err := pl.joinOn(sel, kind, alias, sub, keyColumns(len(c.inner)), c)
+	names := keyColumns(len(c.inner))
+	for i := range c.reads {
+		names = append(names, "__igloo_r"+strconv.Itoa(i))
+	}
+	right, err := pl.joinOn(sel, kind, alias, sub, names, c)
 	if err != nil {
 		return false, err
 	}
@@ -357,7 +458,7 @@ func (pl *planner) scalarJoins(sel node, ctes cteScope) error {
 			return same, true
 		}
 		c := pl.correlationOf(q, ctes)
-		if c == nil || !pl.readsOuter(sel, c, ctes) {
+		if c == nil || len(c.residual) > 0 || !pl.readsOuter(sel, c, ctes) {
 			return same, true
 		}
 		sub := clone(q).(node)

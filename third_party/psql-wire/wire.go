@@ -114,8 +114,6 @@ type Server struct {
 	closing atomic.Bool
 	// Used to make reading closing and calling wg.Add be a single atomic operation.
 	closingMu sync.RWMutex
-	// commandWrap, if set, runs each command (see CommandWrapper).
-	commandWrap func(ctx context.Context, run func() error) error
 	// This WaitGroup tracks the number of connections that are actively
 	// serving a request. Idle connections are not counted. This is used during
 	// Shutdown and Close to wait for outstanding requests to finish.

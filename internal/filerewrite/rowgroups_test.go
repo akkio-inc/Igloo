@@ -8,9 +8,9 @@ import (
 )
 
 // TestTargetRows checks the rows a rewrite aims a row group at: as many as
-// make TargetRowGroupBytes at the files' bytes a row, or a sixteenth of a
-// smaller table, between DuckDB's 122,880 and MaxRowGroupRows, unless the table
-// sets a limit.
+// make TargetRowGroupBytes at the files' bytes a row, up to MaxRowGroupRows,
+// or a sixteenth of a smaller table, but no fewer than DuckDB's 122,880 for
+// that, unless the table sets a limit.
 func TestTargetRows(t *testing.T) {
 	for _, c := range []struct {
 		name       string
@@ -18,7 +18,9 @@ func TestTargetRows(t *testing.T) {
 		want       int64
 	}{
 		{"narrow rows: 2.9 bytes each", 2_454_907_540, 832_597_840, 5_690_101},
-		{"wide rows: 190 bytes each", 7_597_826_246, 40_000_000, DefaultRowGroupRows},
+		{"wide rows: 190 bytes each", 7_597_826_246, 40_000_000, 88_326},
+		{"bitmaps of 2.5 MB each", 2_000_000_000, 800, 6},
+		{"rows wider than the target", 1 << 30, 16, 1},
 		{"nothing to measure", 0, 0, DefaultRowGroupRows},
 		{"a byte a row", 1 << 40, 1 << 40, TargetRowGroupBytes},
 		{"a small table of wide rows", 80_000_000, 1_000_000, DefaultRowGroupRows},

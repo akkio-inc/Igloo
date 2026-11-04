@@ -199,6 +199,17 @@ func (pl *planner) semiJoins(sel node, ctes cteScope) error {
 	var keep, ins []node
 	joined := false
 	for _, cond := range conjuncts(child(sel, "where_clause")) {
+		// An OR of correlated EXISTS, as one (see anyExists).
+		if merged := pl.anyExists(cond, ctes); merged != nil {
+			ok, err := pl.existsJoin(sel, merged, ctes)
+			if err != nil {
+				return err
+			}
+			if ok {
+				joined = true
+				continue
+			}
+		}
 		// A correlated EXISTS or NOT EXISTS (see correlated.go).
 		ok, err := pl.existsJoin(sel, cond, ctes)
 		if err != nil {

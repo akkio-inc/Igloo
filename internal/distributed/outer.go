@@ -88,10 +88,10 @@ func ownerIn(items []*fromItem, name string) *fromItem {
 
 // addOuterJoin records ref, a join whose sides added the uses and rels of
 // rd between the indexes of us and rs (left side from [0] to [1], right
-// from [1] to [2]), if it is a LEFT, RIGHT or FULL join of one item of sc
-// to another with conditions conds, and marks the sides that may be read by
-// partition for it.
-func (sc *scope) addOuterJoin(ref node, rd *reads, conds []node, us, rs [3]int) {
+// from [1] to [2]) and the items lefts to sc on its left, if it is a LEFT,
+// RIGHT or FULL join of one item of sc to another with conditions conds, and
+// marks the sides that may be read by partition for it.
+func (sc *scope) addOuterJoin(ref node, rd *reads, conds []node, us, rs [3]int, lefts []*fromItem) {
 	kind := str(ref["join_type"])
 	switch kind {
 	case "OUTER":
@@ -132,6 +132,18 @@ func (sc *scope) addOuterJoin(ref node, rd *reads, conds []node, us, rs [3]int) 
 		return nil, nil
 	}
 	left, markLeft := item([2]int{us[0], rs[0]}, [2]int{us[1], rs[1]})
+	if left == nil && kind == "LEFT" {
+		// A LEFT or anti join of items joined to each other keeps each of their
+		// rows by the item its condition reads: that one read by partition,
+		// every row they make is in its key's partition alone, as TPC-DS q69's
+		// customers joined to their addresses are (see existsJoin), and q32's
+		// sales joined to their items, by the item, to the average of the item's
+		// sales (see scalarJoins).
+		left, markLeft = keyItem(conds, rd.uses[us[0]:us[1]], rd.rels[rs[0]:rs[1]], lefts, sc)
+		if left != nil && !joinedInner(child(ref, "left"), left.name) {
+			left = nil
+		}
+	}
 	right, markRight := item([2]int{us[1], rs[1]}, [2]int{us[2], rs[2]})
 	if left == nil || right == nil {
 		return
@@ -144,6 +156,57 @@ func (sc *scope) addOuterJoin(ref node, rd *reads, conds []node, us, rs [3]int) 
 	if oj.nullable(right) {
 		markRight()
 	}
+}
+
+// keyItem returns the item of sc, among the tables uses and relations rels of
+// a join's left side, whose columns the left of every one of conds, equalities
+// of a column of the left side to one of the right, reads; and the func that
+// marks it a side of the join. A column its name alone names is of the one
+// item of the side's, items, that has a column so called, when all of their
+// columns are known. It returns nil if the conditions read more than one item,
+// or one of none of them.
+func keyItem(conds []node, uses []*tableUse, rels []*relUse, items []*fromItem, sc *scope) (*fromItem, func()) {
+	owner := func(col string) string {
+		found := ""
+		for _, it := range items {
+			switch {
+			case it.columns == nil:
+				return ""
+			case slices.Contains(it.columns, col) && found != "":
+				return ""
+			case slices.Contains(it.columns, col):
+				found = it.name
+			}
+		}
+		return found
+	}
+	name := ""
+	for _, c := range conds {
+		l := child(c, "left")
+		parts := columnNames(l)
+		if str(c["class"]) != "COMPARISON" || str(c["type"]) != "COMPARE_EQUAL" || str(l["class"]) != "COLUMN_REF" || len(parts) == 0 || len(parts) > 2 {
+			return nil, nil
+		}
+		of := strings.ToLower(parts[0])
+		if len(parts) == 1 {
+			of = owner(strings.ToLower(parts[0]))
+		}
+		if of == "" || name != "" && name != of {
+			return nil, nil
+		}
+		name = of
+	}
+	for _, u := range uses {
+		if u.scope == sc && u.item != nil && u.item.name == name {
+			return u.item, func() {}
+		}
+	}
+	for _, r := range rels {
+		if r.sc == sc && r.item != nil && r.item.name == name {
+			return r.item, func() {}
+		}
+	}
+	return nil, nil
 }
 
 // outerPairs reads by partition the other side of each outer join of the

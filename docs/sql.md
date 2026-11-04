@@ -45,6 +45,22 @@ the statement as it runs; query history shows it as sent. A report that
 selected twice from one subquery of 17 common table expressions took 597 s
 on an 8-core machine and takes 128 s.
 
+Three or more common table expressions of one `WITH` that each group the
+same rows the same way, as reports write to count one join several ways (a
+`SELECT DISTINCT id, x`, a `count(DISTINCT day)` by `id, x` and a `count(*)`
+by `id, x`, all over the same `FROM` and `WHERE`), have DuckDB scan, join and
+group those rows once for each. Igloo groups them once, in either dialect, in
+a common table expression marked `MATERIALIZED` (named `_igloo_siblings_1`,
+...) with every aggregate they ask for, and each reads its columns from it.
+It does so where each is `SELECT [DISTINCT] ... FROM ... [WHERE ...] [GROUP
+BY ...]` and nothing else, with the same `FROM` and `WHERE` (compared as
+shared subqueries are) and the same groups, selects only its groups and
+`count`, `sum`, `min`, `max` and `avg` calls (no `FILTER` or `OVER`), names
+every column, and calls no volatile function. Keeping the groups costs about
+one grouping, so two stay as written. A report of two sets of three over 40
+million rows took 110 CPU-seconds rather than 224, and 11 s rather than 40 on
+16 cores.
+
 A `UNION ALL` whose branches select from the same rows, as reports write to
 compare several measures of one audience (`SELECT v.id, 'email' AS
 channel, ... FROM v JOIN g ON g.id = v.id UNION ALL SELECT v.id, 'video',
@@ -806,7 +822,7 @@ FROM igloo.login_history WHERE result = 'failure';
 | `workers`, `stages`, `exchanges` | How many workers ran parts of the statement ([distributed execution](distributed-execution.md)), in how many stages of tasks, and how many exchanges of rows from one stage to later ones the stages wrote; 0 when it ran on one replica |
 | `plan_key` | For a statement that could run on workers, what identifies it across runs: its text without literals other than integers, and its tables' sizes to a factor of two; `auto` mode runs it where it was faster before ([distributed execution](distributed-execution.md#when)); `NULL` for others |
 | `placement` | For such a statement, where it ran and why: `this replica`, how many workers, or `the large worker`, and `auto` mode's reason, such as `4 workers: one machine should take 97 s and workers 33 s; 4 workers, 33 s, within a fifth of the fastest, 16 workers at 28 s, for 30% of its cost` (see [when](distributed-execution.md#when)); `NULL` for others |
-| `catalog_wait_ms` | Time it waited for the replica's catalog lock, which DDL and listings of the catalog (`information_schema`, `SHOW`, `DESCRIBE`) hold alone and binding other statements holds shared (see [concurrency on a replica](operations.md#concurrency-on-a-replica)) |
+| `catalog_wait_ms` | Time it waited for the replica's catalog lock, which DDL holds alone and preparing, binding and listings of the catalog (`information_schema`, `SHOW`, `DESCRIBE`) hold shared (see [concurrency on a replica](operations.md#concurrency-on-a-replica)) |
 
 `igloo.login_history` has `event_time`, `user_name`, `result` (`success` or
 `failure`), `reason`, `client_address`, `application_name`, `session_id`,

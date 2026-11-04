@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -421,7 +422,14 @@ func (w *Worker) shuffleLocal(ctx context.Context, conn *duckdb.Conn, req *taskR
 	release, ok := w.local.reserve(2 * req.Expect)
 	defer release()
 	if !ok {
-		w.log.Info("writing an exchange to object storage: the worker's disk is short of room for it",
+		// A warning at most once a minute, and the rest at debug level: on a
+		// disk short of room, a line for each task held the tasks up behind
+		// the log's output.
+		level := slog.LevelDebug
+		if last := w.shortWarned.Load(); time.Since(time.Unix(0, last)) >= time.Minute && w.shortWarned.CompareAndSwap(last, time.Now().UnixNano()) {
+			level = slog.LevelWarn
+		}
+		w.log.Log(ctx, level, "writing an exchange to object storage: the worker's disk is short of room for it",
 			"query", req.Query, "task", req.Task, "expect", req.Expect)
 		return w.shuffle(ctx, conn, req.Shuffle, query, cols, req.Partitions, req.Slots)
 	}

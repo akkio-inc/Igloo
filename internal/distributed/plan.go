@@ -127,6 +127,26 @@ type Table struct {
 	// lower-case name, as ANALYZE keeps them; a column without one is
 	// missing.
 	Distinct map[string]int64
+	// Bounds are the least and most values of its columns of integer types,
+	// dates (as days since 1970) and timestamps (as microseconds), by
+	// lower-case name, as its data files' statistics give them: a column has
+	// no more distinct values than its bounds span.
+	Bounds map[string][2]float64
+	// ColumnBytes are what its columns take in its data files, compressed,
+	// by lower-case name, as its files' statistics give them: what a scan's
+	// readers hold of a row group is about what the columns it reads take
+	// of it (see scanBytes).
+	ColumnBytes map[string]int64
+	// TopRows are, of the columns Bounds has, the rows of the data files
+	// whose upper bound is the column's most value, by lower-case name: no
+	// fewer than the rows of that value. A lookup whose versions are written
+	// to files of their own has its latest version's rows so.
+	TopRows map[string]int64
+	// latestRows counts, of a column TopRows has, the rows of the row groups
+	// that hold its most value, from the footers of the files that do; ok
+	// is false where it cannot (see bounder.latestRows). Nil where the
+	// table's files were not listed.
+	latestRows func(col string) (rows int64, ok bool)
 	// Buckets are the bucket transforms of its partition spec that every
 	// data file of its snapshot was written under (see bucket.go); each
 	// File's Buckets says the file's bucket of each.
@@ -227,6 +247,9 @@ type Plan struct {
 	// streamMerged says the session reads a merge of sorted rows as a
 	// stream (see StreamMerged).
 	streamMerged bool
+	// pruned counts the branches of unions and arms of CASE left out of it,
+	// which a filter around them rejects (see pruneBranches).
+	pruned int
 }
 
 // StreamMerged has Execute leave a merge of the sorted rows a statement
@@ -311,8 +334,10 @@ type planOptions struct {
 	// every machine sees the same time.
 	now time.Time
 	// aggregation, if set, overrides how aggregations complete their groups
-	// where there is a choice (aggGather or aggByGroup), for tests.
-	aggregation string
+	// where there is a choice (aggGather or aggByGroup), for tests; partials
+	// whether stages write their partial results a row at a time (see
+	// rowpartials.go).
+	aggregation, partials string
 	// sizes are the sizes of relations measured before (see probe.go), by
 	// relation key; taskMemory is what a worker's task may plan on, to
 	// check that a measured relation every task reads fits it.
@@ -353,11 +378,15 @@ type planner struct {
 	producing map[string]bool
 	depth     int
 	// started is when planning began, progress when it last planned a
-	// stage or described a part (Unix nanoseconds), and stalled why its
-	// limits ended it (see limitPlanning).
-	started  time.Time
-	progress atomic.Int64
-	stalled  atomic.Value
+	// stage or described a part (Unix nanoseconds), waited how long the
+	// session had waited for the catalog lock then and waitedFrom when planning
+	// began (see CatalogWaits), and stalled why its limits ended it (see
+	// limitPlanning).
+	started    time.Time
+	progress   atomic.Int64
+	waited     atomic.Int64
+	waitedFrom time.Duration
+	stalled    atomic.Value
 	// describes are the session's descriptions of parts, by their text,
 	// for the statement (see describe), and profile what planning spent.
 	describes *describeCache
@@ -440,6 +469,8 @@ func (pl *planner) plan(stmt node) (*Plan, error) {
 	q := clone(stmt).(node)
 	pl.gov = pl.newGovernance(q)
 	pl.dropOrders(q)
+	pl.liftScalars(q)
+	pruned := pl.pruneBranches(q)
 	pl.markTopK(q)
 	out, err := pl.query(q, true, nil)
 	if err != nil {
@@ -478,6 +509,18 @@ func (pl *planner) plan(stmt node) (*Plan, error) {
 		if s.SQL, err = pl.p.print(s.fragment); err != nil {
 			return nil, unsupported("%v", err)
 		}
+		if s.rows == nil || s.Out == nil {
+			continue
+		}
+		rf, err := pl.rowFragment(s.fragment, s.rows)
+		if err != nil {
+			return nil, err
+		}
+		if rf != nil {
+			if s.rowSQL, err = pl.p.print(rf); err != nil {
+				return nil, unsupported("%v", err)
+			}
+		}
 	}
 	if pl.opts.writes {
 		pl.markWrites(out)
@@ -491,7 +534,7 @@ func (pl *planner) plan(stmt node) (*Plan, error) {
 		keys[x.ID] = k
 	}
 	return &Plan{Stages: pl.stages, final: out, pins: pins, local: pl.reasons, uncertain: written(pl.uncertain, pl.stages), relKeys: keys,
-		versions: pl.versions, buckets: slices.Compact(slices.Clone(pl.bucketNotes))}, nil
+		versions: pl.versions, buckets: slices.Compact(slices.Clone(pl.bucketNotes)), pruned: pruned}, nil
 }
 
 // pinReads finds the tables the coordinator reads itself, in final, that
@@ -1141,6 +1184,16 @@ func (pl *planner) analyze(c *candidate, ctes cteScope) error {
 	return checkLambdas(sel)
 }
 
+// coordinatorReads is how much a subquery the coordinator computes from
+// scratch may read: what it reads in the time a statement must take to be
+// worth workers.
+func (pl *planner) coordinatorReads() int64 {
+	if pl.opts.minBytes > 0 {
+		return pl.opts.minBytes
+	}
+	return pl.opts.maxBroadcast
+}
+
 // combinedSubqueries checks that the subqueries in v, parts of an
 // aggregation the coordinator computes over the combined groups, are scalar
 // subqueries that stand on their own, which bind alone: one that reads the
@@ -1148,10 +1201,7 @@ func (pl *planner) analyze(c *candidate, ctes cteScope) error {
 // coordinator computes them from scratch, so they may read no more than it
 // reads in the time a statement must take to be worth workers.
 func (pl *planner) combinedSubqueries(v any, ctes cteScope) error {
-	limit := pl.opts.minBytes
-	if limit <= 0 {
-		limit = pl.opts.maxBroadcast
-	}
+	limit := pl.coordinatorReads()
 	var err error
 	walk(v, func(n node) bool {
 		if err != nil || str(n["class"]) != "SUBQUERY" {
@@ -1359,7 +1409,7 @@ func (pl *planner) from(ref node, splittable bool, ctes cteScope, sc *scope, rd 
 		}
 		conds := append(conjuncts(child(ref, "condition")), usingConds(ref, sc.items[items0:items], sc.items[items:])...)
 		if splittable {
-			sc.addOuterJoin(ref, rd, conds, [3]int{uses0, uses, len(rd.uses)}, [3]int{rels0, rels, len(rd.rels)})
+			sc.addOuterJoin(ref, rd, conds, [3]int{uses0, uses, len(rd.uses)}, [3]int{rels0, rels, len(rd.rels)}, sc.items[items0:items])
 		}
 		jt := str(ref["join_type"])
 		switch {
@@ -2190,6 +2240,9 @@ type jobBuild struct {
 	// enough is the rows of any that its last stage needs (see
 	// Stage.enough), or 0.
 	enough int64
+	// rows, if set, is how fragment, the partial results for second, may be
+	// written a row at a time (see rowSpec).
+	rows *rowSpec
 }
 
 // viewMark is the key that marks a table reference with the view a
@@ -2336,7 +2389,7 @@ func placeholderRef(name string) node {
 // completed on workers, a second; the last writes to out, or to the
 // coordinator without one.
 func (pl *planner) emit(j *job, b *jobBuild, out *Exchange) (*Stage, error) {
-	last := &Stage{fragment: b.fragment, Columns: b.columns}
+	last := &Stage{fragment: b.fragment, Columns: b.columns, rows: b.rows}
 	for _, k := range j.keyed {
 		var x *Exchange
 		if k.use != nil && k.bucketed {

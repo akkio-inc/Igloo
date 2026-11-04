@@ -114,8 +114,11 @@ type Worker struct {
 	opts      WorkerOptions
 	transport *transport
 	log       *slog.Logger
-	activity  *activity.Tracker
-	srv       *http.Server
+	// shortWarned is when the worker last warned, in Unix nanoseconds, that its
+	// disk was short of room for a task's exchange (see shuffleLocal).
+	shortWarned atomic.Int64
+	activity    *activity.Tracker
+	srv         *http.Server
 	// beforeTask, if set, runs before each task; tests use it to make a
 	// worker fail or hang. r's context is the task's.
 	beforeTask func(rw http.ResponseWriter, r *http.Request) bool
@@ -137,6 +140,11 @@ type Worker struct {
 	slotCount int
 	runningMu sync.Mutex
 	running   map[*runningTask]bool
+
+	// byRow is how the stages that write partial results write them, by
+	// statement and stage (see stageRows).
+	byRowMu sync.Mutex
+	byRow   map[string]*stageRows
 
 	// footerCache holds data files' footers by path; see footers.
 	footersMu   sync.Mutex
@@ -479,11 +487,12 @@ func (w *Worker) serveTask(rw http.ResponseWriter, r *http.Request) {
 	// Wait for its slots (see taskSlots); the coordinator's task waits
 	// with it.
 	take := int64(w.taskSlots(req.Slots))
-	if err := w.slots.acquire(ctx, req.Query, take); err != nil {
+	if err := w.slots.acquire(ctx, req.Query, take, req.Repair, req.Background); err != nil {
 		log.Debug("task canceled while it waited to run")
 		w.opts.Metrics.task("canceled", start)
 		return
 	}
+	waited := time.Since(start)
 	defer w.slots.release(req.Query, take)
 	done, err := w.admit(ctx, &runningTask{query: req.Query, task: req.Task, started: time.Now(), cancel: cancel, erased: req.Erased})
 	if err != nil {
@@ -499,6 +508,9 @@ func (w *Worker) serveTask(rw http.ResponseWriter, r *http.Request) {
 	defer done()
 	path, res, err := w.run(ctx, &req)
 	done()
+	if res != nil {
+		res.Waited = waited.Seconds()
+	}
 	if path != "" {
 		defer os.Remove(path) //nolint:errcheck
 	}
@@ -598,7 +610,7 @@ func (w *Worker) serveTask(rw http.ResponseWriter, r *http.Request) {
 		rw.Header().Set("Content-Length", strconv.Itoa(len(head)+1))
 		_, _ = rw.Write(append(head, '\n'))
 		w.opts.Metrics.task("ok", start)
-		log.Debug("shuffle task done", "rows", res.Rows, "files", len(res.Files), "seconds", time.Since(start).Seconds())
+		log.Debug("shuffle task done", "rows", res.Rows, "files", len(res.Files), "seconds", time.Since(start).Seconds(), "waited_seconds", res.Waited)
 		return
 	}
 
@@ -632,7 +644,7 @@ func (w *Worker) serveTask(rw http.ResponseWriter, r *http.Request) {
 	}
 	w.opts.Metrics.task("ok", start)
 	w.opts.Metrics.sent(n)
-	log.Debug("task done", "rows", res.Rows, "bytes", n, "seconds", time.Since(start).Seconds())
+	log.Debug("task done", "rows", res.Rows, "bytes", n, "seconds", time.Since(start).Seconds(), "waited_seconds", res.Waited)
 }
 
 func (w *Worker) fail(rw http.ResponseWriter, status int, te *taskErr) {
@@ -773,6 +785,15 @@ func (w *Worker) run(ctx context.Context, req *taskRequest) (string, *taskResult
 		"by_field_id", byID, "seconds", time.Since(start).Seconds())
 
 	query := req.SQL
+	byRow := req.RowSQL != "" && req.RowsFirst
+	if req.RowSQL != "" && !byRow {
+		if byRow, err = w.rowsAtOnce(ctx, conn, req); err != nil {
+			return "", nil, err
+		}
+	}
+	if byRow {
+		query = req.RowSQL
+	}
 	if len(req.Columns) > 0 {
 		names := make([]string, len(req.Columns))
 		for i, c := range req.Columns {
@@ -788,12 +809,16 @@ func (w *Worker) run(ctx context.Context, req *taskRequest) (string, *taskResult
 		res, err := w.writeFiles(ctx, conn, req, query, cols)
 		return "", res, err
 	}
-	if req.Shuffle != "" && req.Local != "" {
-		res, err := w.shuffleLocal(ctx, conn, req, query, cols)
-		return "", res, err
-	}
 	if req.Shuffle != "" {
-		res, err := w.shuffle(ctx, conn, req.Shuffle, query, cols, req.Partitions, req.Slots)
+		var res *taskResult
+		if req.Local != "" {
+			res, err = w.shuffleLocal(ctx, conn, req, query, cols)
+		} else {
+			res, err = w.shuffle(ctx, conn, req.Shuffle, query, cols, req.Partitions, req.Slots)
+		}
+		if err == nil && req.RowSQL != "" && !byRow && res.groupRows == 1 {
+			w.noteRowsAtOnce(req)
+		}
 		return "", res, err
 	}
 	// Columns Parquet would change cross as text; see transferType.
@@ -808,17 +833,41 @@ func (w *Worker) run(ctx context.Context, req *taskRequest) (string, *taskResult
 			sel[i] = "CAST(" + quoteIdent(c.Name) + " AS " + t + ") AS " + quoteIdent(c.Name)
 		}
 	}
+	// Row groups of about RowGroupBytes: by their bytes where the rows have
+	// no order to keep, which DuckDB bounds only then, and otherwise by as
+	// many rows as their types make that many bytes.
+	opts := "FORMAT parquet, ROW_GROUP_SIZE_BYTES " + strconv.Itoa(RowGroupBytes)
+	if req.Sorted {
+		opts = "FORMAT parquet, ROW_GROUP_SIZE " + strconv.FormatInt(RowGroupRows(rowWidth(cols)), 10)
+	} else if _, err := conn.ExecContext(ctx, "SET SESSION preserve_insertion_order = false", nil); err != nil {
+		return "", nil, err
+	}
 	var b [16]byte
 	_, _ = rand.Read(b[:])
 	path := filepath.Join(w.opts.TempDir, hex.EncodeToString(b[:])+".parquet")
 	res, err := conn.ExecContext(ctx, "COPY (SELECT "+strings.Join(sel, ", ")+" FROM ("+query+")) TO "+
-		quoteLiteral(path)+" (FORMAT parquet)", nil)
+		quoteLiteral(path)+" ("+opts+")", nil)
 	if err != nil {
 		_ = os.Remove(path)
 		return "", nil, err
 	}
 	rows, _ := res.RowsAffected()
 	return path, &taskResult{Columns: cols, Rows: rows}, nil
+}
+
+// RowGroupBytes is about how many bytes of rows, as DuckDB holds them, a row
+// group of a file Igloo writes for itself holds at most: a task's result, a
+// sort's runs, a refresh's state. A reader holds a row group's column at
+// once, which, at DuckDB's 122,880 rows a group, rows of bitmaps of 2.5 MB
+// took to 2 GB. DuckDB puts a vector of rows, up to 2,048, in a row group
+// whatever it is asked, so rows wider than 4 KB take more.
+const RowGroupBytes = 8 << 20
+
+// RowGroupRows is how many rows of width bytes make a row group of
+// RowGroupBytes, up to DuckDB's 122,880: for writes that keep their rows'
+// order, where DuckDB bounds a row group by its rows only.
+func RowGroupRows(width int64) int64 {
+	return min(max(RowGroupBytes/max(width, 1), 1), 122_880)
 }
 
 // shuffleRowGroup is how many rows a shuffle task writes to a row group.
@@ -1010,10 +1059,12 @@ func (w *Worker) writePartitions(ctx context.Context, conn *duckdb.Conn, dir, qu
 	}
 	defer res.Close() //nolint:errcheck
 	out := &taskResult{Files: []shuffleFile{}}
+	counted := false
 	for _, c := range cols {
 		if c.Name != "__b" {
 			out.Columns = append(out.Columns, c)
 		}
+		counted = counted || c.Name == groupRowsColumn
 	}
 	// filename, count, file_size_bytes, footer_size_bytes,
 	// column_statistics, partition_keys.
@@ -1039,8 +1090,47 @@ func (w *Worker) writePartitions(ctx context.Context, conn *duckdb.Conn, dir, qu
 		}
 		out.Files = append(out.Files, shuffleFile{Path: f, Partition: n, Rows: rows, Size: size})
 		out.Rows += rows
+		if len(dest) > 4 {
+			if m, ok := statMax(dest[4], groupRowsColumn); ok && counted {
+				out.groupRows = max(out.groupRows, m)
+				continue
+			}
+		}
+		counted = false
+	}
+	if !counted {
+		out.groupRows = 0
 	}
 	return out, nil
+}
+
+// statMax is the largest value of column col in a file the COPY wrote, from
+// its column_statistics, if they say.
+func statMax(stats driver.Value, col string) (int64, bool) {
+	// DuckDB names the column quoted.
+	c, ok := mapValue(stats, quoteIdent(col))
+	if !ok {
+		c, _ = mapValue(stats, col)
+	}
+	v, _ := mapValue(c, "max")
+	s, ok := v.(string)
+	if !ok {
+		return 0, false
+	}
+	n, err := strconv.ParseInt(s, 10, 64)
+	return n, err == nil
+}
+
+// mapValue is the value of key in m, a MAP DuckDB returned.
+func mapValue(m any, key string) (any, bool) {
+	switch m := m.(type) {
+	case duckdb.OrderedMap:
+		return m.Get(key)
+	case duckdb.Map:
+		v, ok := m[key]
+		return v, ok
+	}
+	return nil, false
 }
 
 // asInt64 returns v, an integer DuckDB returned, as an int64.
@@ -1118,7 +1208,19 @@ func checkRows(ctx context.Context, conn *duckdb.Conn, files []string, rows int6
 // can send a task at all. sfMacros says the SQL calls Igloo's macros for
 // Snowflake's functions, which the worker then defines.
 func checkTaskSQL(ctx context.Context, conn *duckdb.Conn, req *taskRequest) (sfMacros bool, err error) {
-	rows, err := conn.QueryContext(ctx, "SELECT json_serialize_sql("+quoteLiteral(req.SQL)+")::VARCHAR", nil)
+	sfMacros, err = checkSQL(ctx, conn, req, req.SQL)
+	if err != nil || req.RowSQL == "" {
+		return sfMacros, err
+	}
+	// The SQL that writes partial results a row at a time is held to the same
+	// (see rowSpec).
+	rowMacros, err := checkSQL(ctx, conn, req, req.RowSQL)
+	return sfMacros || rowMacros, err
+}
+
+// checkSQL is checkTaskSQL of one of req's statements, sql.
+func checkSQL(ctx context.Context, conn *duckdb.Conn, req *taskRequest, sql string) (sfMacros bool, err error) {
+	rows, err := conn.QueryContext(ctx, "SELECT json_serialize_sql("+quoteLiteral(sql)+")::VARCHAR", nil)
 	if err != nil {
 		return false, err
 	}

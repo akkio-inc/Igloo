@@ -45,6 +45,29 @@ var randomFound = []string{
 	`SELECT * FROM (SELECT c0, c1, a0, pw, rank() OVER (ORDER BY a0 DESC NULLS FIRST, c0 ASC, c1 DESC) AS r FROM (SELECT c0, c1, a0,
 		rank() OVER (ORDER BY c0, c1) AS pw FROM (SELECT t.u AS c0, t.g AS c1, max(t.v) FILTER (WHERE t.h > 3) AS a0 FROM f t JOIN dim ON t.k = dim.k
 		GROUP BY t.u, t.g) p) x) y WHERE r <= 9`,
+	// Sections left out of a union of five, three left, which nested otherwise
+	// than DuckDB parses them and did not print as themselves.
+	`WITH s1 AS (SELECT CAST(NULL AS INTEGER) AS tag, t.h AS c, t.v AS x FROM f t WHERE NOT (t.h = 2 OR t.g > 42) AND t.g < 5),
+		items AS (SELECT CAST(4 AS BIGINT) AS sec, (t.k % 7) AS c, t.d AS x FROM f t UNION ALL SELECT CAST(4 AS BIGINT) AS sec, t.id % 5 AS c, t.v AS x FROM f2 t
+		UNION ALL SELECT s1.tag AS tag, s1.c AS c, s1.x AS x FROM s1 AS s1 UNION ALL SELECT 3 AS section, (t.k % 7) AS c, t.d AS x FROM f t
+		UNION ALL SELECT CAST(NULL AS INTEGER) AS sec, dim.w AS c, t.v AS x FROM f t JOIN dim ON t.k = dim.k),
+		agg AS (SELECT sec, c, count(*) AS n, sum(x) AS sx, 0 AS gc FROM items GROUP BY sec, c),
+		ranked AS (SELECT sec, c, n, sx, gc, row_number() OVER (PARTITION BY sec ORDER BY sx DESC NULLS LAST, gc, c NULLS LAST) AS r FROM agg)
+		SELECT t0.* FROM (SELECT sec, c, n, sx, gc, r FROM ranked) AS t0 WHERE t0.sec + 1 > 2 AND t0.r <= 3`,
+	`WITH s2 AS (SELECT 'ash' AS section, dim.w AS c, t.v AS x FROM f t JOIN dim ON t.k = dim.k UNION ALL SELECT 'ash' AS sec, t.g AS c, t.d AS x FROM f2 t),
+		items AS (SELECT CAST(NULL AS VARCHAR) AS sec, t.g AS c, t.d AS x FROM f2 t WHERE t.v IS NOT NULL UNION ALL SELECT 'Birch' AS sec, t.g AS c, t.d AS x FROM f2 t
+		UNION ALL SELECT s2.section AS section, s2.c AS c, s2.x AS x FROM s2 AS s2 UNION ALL SELECT 'ash' AS tag, t.id % 5 AS c, t.v AS x FROM f2 t
+		UNION ALL SELECT 'ash' AS tag, t.h AS c, t.v AS x FROM f t UNION ALL SELECT 'ash' AS sec, t.g AS c, t.d AS x FROM f2 t),
+		agg AS (SELECT sec, c, count(*) AS n, sum(x) AS sx, 0 AS gc FROM items GROUP BY sec, c),
+		ranked AS (SELECT sec, c, n, sx, gc, rank() OVER (PARTITION BY sec, c ORDER BY n DESC) AS r FROM agg)
+		SELECT t0.* FROM (SELECT sec, c, n, sx, gc, r FROM ranked) AS t0 WHERE t0.sec IN ('ash', 'Birch') AND t0.r <= 4`,
+	// The one section left of a UNION, not ALL, kept its rows alike.
+	`WITH s0 AS (SELECT CAST(NULL AS VARCHAR) AS sec, dim.w AS c, t.v AS x FROM f t JOIN dim ON t.k = dim.k WHERE t.k BETWEEN 55 AND 156),
+		s1 AS (SELECT 'ash' AS sec, t.h AS c, t.v AS x FROM f t),
+		items AS (SELECT s0.sec AS sec, s0.c AS c, s0.x AS x FROM s0 AS s0 UNION SELECT s1.sec AS sec, s1.c AS c, s1.x AS x FROM s1 AS s1),
+		agg AS (SELECT sec, c, count(*) AS n, sum(x) AS sx, 0 AS gc FROM items GROUP BY sec, c),
+		ranked AS (SELECT sec, c, n, sx, gc, row_number() OVER (PARTITION BY sec ORDER BY n DESC, gc, c NULLS FIRST) AS r FROM agg)
+		SELECT t0.* FROM (SELECT sec, c, n, sx, gc, r FROM ranked ORDER BY sec) AS t0 WHERE t0.sec IS NULL AND t0.r <= 5`,
 }
 
 // randomTables are the tables random queries read: f and f2 alike, f2 smaller, and
@@ -99,7 +122,7 @@ func (g *gen) pred(t string) string {
 
 // subqueryPred is a condition that reads a subquery, of f's columns as t names them.
 func (g *gen) subqueryPred(t string) string {
-	switch g.n(0, 8) {
+	switch g.n(0, 10) {
 	case 0:
 		return fmt.Sprintf("%s.v > (SELECT avg(v) FROM f2 WHERE h = %d)", t, g.n(0, 6))
 	case 1:
@@ -117,6 +140,16 @@ func (g *gen) subqueryPred(t string) string {
 		return fmt.Sprintf("%s.v %s (SELECT v FROM f2 WHERE h = %d AND id < %d)", t, g.pick("> ALL", ">= ANY", "= ANY"), g.n(0, 6), g.n(20, 400))
 	case 7:
 		return fmt.Sprintf("%s.h = (SELECT max(w) FROM dim WHERE dim.k = %s.k)", t, t)
+	case 9:
+		// Rows of the same key but another value, as TPC-DS q94 asks of an
+		// order's other warehouses (see correlation.residual).
+		return fmt.Sprintf("%sEXISTS (SELECT 1 FROM f2 WHERE f2.k = %s.k AND f2.%s)", g.pick("", "NOT "), t,
+			g.pick("h <> "+t+".h", "v > "+t+".v", "g IS DISTINCT FROM "+t+".g AND f2.h < 4"))
+	case 8:
+		// Rows of either of two tables of the same key, as TPC-DS q10 asks of web
+		// and catalog sales; one EXISTS of their union (see anyExists).
+		return fmt.Sprintf("(EXISTS (SELECT 1 FROM dim WHERE dim.k = %[1]s.k AND dim.w > %[2]d) OR EXISTS (SELECT 1 FROM f2 WHERE f2.k = %[1]s.k AND f2.h = %[3]d))",
+			t, g.n(0, 25), g.n(0, 6))
 	default:
 		return fmt.Sprintf("%s.g > (SELECT min(g) FROM f2 WHERE f2.k = %s.k)", t, t)
 	}
@@ -124,7 +157,7 @@ func (g *gen) subqueryPred(t string) string {
 
 // from is a FROM clause over f as t, perhaps joined to dim or f2 (as o).
 func (g *gen) from() (string, string) {
-	switch g.n(0, 6) {
+	switch g.n(0, 7) {
 	case 0:
 		return "f t JOIN dim ON t.k = dim.k", "t"
 	case 1:
@@ -133,6 +166,9 @@ func (g *gen) from() (string, string) {
 		return "f t JOIN f2 o ON t.k = o.k AND t.h = o.h", "t"
 	case 3:
 		return fmt.Sprintf("f t FULL JOIN (SELECT * FROM dim WHERE w < %d) dim ON t.k = dim.k", g.n(5, 29)), "t"
+	case 4:
+		// A LEFT JOIN to f's rows joined to others, by f's key (see keyItem).
+		return "f t JOIN dim ON t.k = dim.k LEFT JOIN f2 o ON t.k = o.k AND t.h = o.h", "t"
 	default:
 		return "f t", "t"
 	}
@@ -240,9 +276,161 @@ func (g *gen) orderAll(cols []string) string {
 	return strings.Join(out, ", ")
 }
 
+// sections is a report of sections, as a profile report computes them: a union whose
+// branches each name their section by a constant, perhaps in common table expressions
+// of their own, grouped by section, ranked within each, and filtered on the section
+// from outside, which leaves out of the plan the branches the filter rejects (see
+// pruneBranches). Read twice, ranked over every section, grouped in more than one
+// grouping set or not by section, filtered together with another column, under a
+// LIMIT, DISTINCT ON, QUALIFY, SAMPLE, a volatile function, INTERSECT or EXCEPT, they
+// stay: each is a place a filter must stop, and a change that lets it pass one of
+// them returns other rows than one machine.
+func (g *gen) sections() string {
+	// The sections' tags, of one type, a few alike, one NULL; and filters on them.
+	tags, typ := []string{"'ash'", "'Birch'", "'CEDAR'", "CAST(NULL AS VARCHAR)", "'elm'", "'ash'"}, "VARCHAR"
+	filters := []string{
+		"upper(%[1]s) IN ('ASH', 'CEDAR')", "%[1]s IN ('ash', 'Birch')", "%[1]s NOT IN ('ash', 'elm')",
+		"%[1]s NOT IN ('ash', NULL)", "%[1]s IS NULL", "%[1]s IS NOT NULL", "CAST(%[1]s AS VARCHAR(10)) = 'Birch'",
+		"lower(%[1]s) LIKE 'c%%'", "coalesce(%[1]s, 'none') IN ('none', 'elm')", "(%[1]s = 'ash' OR %[1]s IS NULL)",
+		"NOT (upper(%[1]s) = 'ASH')", "length(%[1]s) > 3", "%[1]s > 'B'", "upper(%[1]s) = upper('birch')",
+	}
+	if g.chance(0.3) {
+		tags, typ = []string{"1", "2", "3", "CAST(NULL AS INTEGER)", "CAST(4 AS BIGINT)", "2"}, "BIGINT"
+		filters = []string{"%[1]s IN (1, 3)", "%[1]s NOT IN (2)", "%[1]s IS NULL", "CAST(%[1]s AS VARCHAR) IN ('1', '4')",
+			"%[1]s + 1 > 2", "%[1]s BETWEEN 2 AND 3", "coalesce(%[1]s, 0) = 0"}
+	}
+	// A branch reads f, f2 or f joined to dim, for an integer column c and a
+	// numeric one x, whose types differ between branches.
+	sources := []struct{ from, c, x string }{
+		{"f t", "t.h", "t.v"}, {"f2 t", "t.g", "t.d"}, {"f t JOIN dim ON t.k = dim.k", "dim.w", "t.v"},
+		{"f2 t", "t.id % 5", "t.v"}, {"f t", "(t.k % 7)", "t.d"},
+	}
+	// branch reads a source for a section; the union's first names the columns.
+	branch := func(tag, name string) string {
+		src := sources[g.r.IntN(len(sources))]
+		where := ""
+		if g.chance(0.5) {
+			where = " WHERE " + g.pred("t")
+		}
+		// Or sections of each row by a CASE over a key, as Snowflake's FLATTEN
+		// translated makes them: of the section itself, or of a struct's field
+		// through stars and an unnest, with an arm of NULL.
+		var arms []string
+		for i := range g.n(2, 3) {
+			arms = append(arms, fmt.Sprintf("WHEN k.i = %d THEN %%s", i))
+		}
+		armed := func(value func(tag string) string) string {
+			var b strings.Builder
+			b.WriteString("CASE")
+			for _, a := range arms {
+				b.WriteString(" " + fmt.Sprintf(a, value(tags[g.r.IntN(len(tags))])))
+			}
+			b.WriteString(" ELSE " + value("NULL") + " END")
+			return b.String()
+		}
+		switch g.n(0, 5) {
+		case 0:
+			return fmt.Sprintf("SELECT %s AS %s, %s AS c, %s AS x FROM %s CROSS JOIN range(%d) AS k(i)%s",
+				armed(func(tag string) string { return tag }), name, src.c, src.x, src.from, len(arms)+1, where)
+		case 1:
+			kind := armed(func(tag string) string {
+				if tag == "NULL" {
+					return g.pick("NULL", "struct_pack(sec := CAST(NULL AS "+typ+"), w := B.c)")
+				}
+				return "struct_pack(sec := CAST(" + tag + " AS " + typ + "), w := " + g.pick("1", "B.c") + ")"
+			})
+			inner := fmt.Sprintf("SELECT B.*, %s AS s FROM (SELECT %s AS c, %s AS x FROM %s%s) AS B CROSS JOIN range(%d) AS k(i)",
+				kind, src.c, src.x, src.from, where, len(arms)+1)
+			if g.chance(0.5) {
+				inner = "SELECT B.*, unnest([1, 2]) AS e FROM (" + inner + ") AS B"
+			}
+			return fmt.Sprintf("SELECT q.s.sec AS %s, q.c AS c, q.x AS x FROM (%s) AS q", name, inner)
+		}
+		return fmt.Sprintf("SELECT %s AS %s, %s AS c, %s AS x FROM %s%s", tag, name, src.c, src.x, src.from, where)
+	}
+	op := g.pick("UNION ALL", "UNION ALL", "UNION ALL", "UNION", "INTERSECT", "EXCEPT ALL")
+	var ctes, branches []string
+	for i := range g.n(2, 5) {
+		tag, name := tags[g.r.IntN(len(tags))], "sec"
+		if i > 0 {
+			name = g.pick("sec", "section", "tag")
+		}
+		b := branch(tag, name)
+		if g.chance(0.2) {
+			// A section of its own two branches.
+			b += " UNION ALL " + branch(tag, "sec")
+		}
+		if g.chance(0.5) {
+			// Its own common table expression, which the union reads, by name
+			// or by a star, which keeps it if it comes first.
+			cte := fmt.Sprintf("s%d", i)
+			ctes = append(ctes, cte+" AS ("+b+")")
+			b = fmt.Sprintf("SELECT %[1]s.%[2]s AS %[2]s, %[1]s.c AS c, %[1]s.x AS x FROM %[1]s AS %[1]s", cte, name)
+			if g.chance(0.3) {
+				b = fmt.Sprintf("SELECT %[1]s.* FROM %[1]s AS %[1]s", cte)
+			}
+		}
+		branches = append(branches, b)
+	}
+	ctes = append(ctes, "items AS ("+strings.Join(branches, " "+op+" ")+")")
+	// Grouped by section, in one grouping set or more; gc tells a rollup's rows
+	// from groups whose c is NULL, so that the ranking's order is total.
+	agg := "SELECT sec, c, count(*) AS n, sum(x) AS sx, 0 AS gc FROM items GROUP BY sec, c"
+	switch g.n(0, 9) {
+	case 0, 1:
+		agg = "SELECT sec, c, count(*) AS n, sum(x) AS sx, grouping(c) AS gc FROM items GROUP BY GROUPING SETS ((sec, c), (sec))"
+	case 2:
+		// A section of groups not of sections.
+		agg = "SELECT min(sec) AS sec, c, count(*) AS n, sum(x) AS sx, 0 AS gc FROM items GROUP BY c"
+	case 3:
+		// Groups of every section, whose section is NULL.
+		agg = "SELECT sec, c, count(*) AS n, sum(x) AS sx, grouping(sec) AS gc FROM items GROUP BY GROUPING SETS ((sec, c), (c))"
+	}
+	ctes = append(ctes, "agg AS ("+agg+")")
+	win := g.pick("row_number() OVER (PARTITION BY sec ORDER BY n DESC, gc, c NULLS FIRST)", "rank() OVER (PARTITION BY sec, c ORDER BY n DESC)",
+		"row_number() OVER (PARTITION BY sec ORDER BY sx DESC NULLS LAST, gc, c NULLS LAST)", "row_number() OVER (ORDER BY sec NULLS FIRST, gc, c NULLS FIRST)",
+		"dense_rank() OVER (PARTITION BY c ORDER BY sec NULLS LAST)")
+	ctes = append(ctes, "ranked AS (SELECT sec, c, n, sx, gc, "+win+" AS r FROM agg)")
+	q := "WITH " + strings.Join(ctes, ", ") + " "
+	// filter takes the section's column, %[1]s, and n's, %[2]s.
+	filter := filters[g.r.IntN(len(filters))]
+	cut := fmt.Sprintf("r <= %d", g.n(1, 6))
+	if g.chance(0.2) {
+		filter = "(" + filter + " OR %[1]s IS NULL AND %[2]s > 3)"
+	}
+	if g.chance(0.25) {
+		// The filter on the table expression itself.
+		return q + "SELECT * FROM ranked WHERE " + fmt.Sprintf(filter, "sec", "n") + " AND " + cut
+	}
+	inner := "SELECT sec, c, n, sx, gc, r FROM ranked"
+	switch g.n(0, 10) {
+	case 0:
+		// Every row, so that the result is the same whichever it keeps.
+		inner += " ORDER BY sec, c LIMIT 100000"
+	case 1, 2, 3:
+		inner += " ORDER BY sec"
+	case 4:
+		// Some rows, of every section: (sec, c, gc) is unique.
+		inner += fmt.Sprintf(" ORDER BY sec NULLS FIRST, c NULLS FIRST, gc, n LIMIT %d", g.n(2, 30))
+	case 5:
+		inner = "SELECT DISTINCT ON (c) sec, c, n, sx, gc, r FROM ranked ORDER BY c NULLS FIRST, sec NULLS FIRST, gc"
+	case 6:
+		inner += fmt.Sprintf(" QUALIFY row_number() OVER (ORDER BY n DESC, sec NULLS FIRST, c NULLS FIRST, gc) <= %d", g.n(2, 30))
+	case 7:
+		inner += " USING SAMPLE 100 PERCENT (bernoulli)"
+	case 8:
+		inner += " WHERE gen_random_uuid() IS NOT NULL"
+	}
+	other := ""
+	if g.chance(0.15) {
+		other = ", (SELECT count(*) AS m FROM agg) AS t1"
+	}
+	return q + "SELECT t0.* FROM (" + inner + ") AS t0" + other + " WHERE " + fmt.Sprintf(filter, "t0.sec", "t0.n") + " AND t0." + cut
+}
+
 // query is a random query.
 func (g *gen) query() string {
-	switch g.n(0, 12) {
+	switch g.n(0, 14) {
 	case 0, 1:
 		// Groups kept to a ranking's first, by a later SELECT, through a projection
 		// that may have a window of its own.
@@ -361,9 +549,22 @@ func (g *gen) query() string {
 			q += fmt.Sprintf(" ORDER BY sv DESC NULLS LAST, u LIMIT %d", g.n(1, 20))
 		}
 		return q
+	case 13:
+		return g.sections()
+	case 14:
+		return g.siblings()
 	case 8:
-		// Subqueries in WHERE.
-		q := "SELECT f.h, count(*), sum(f.v) FROM f WHERE " + g.subqueryPred("f")
+		// Subqueries in WHERE, of f alone or joined to others, as TPC-DS q69's
+		// customers are to their addresses (see innerItem).
+		from := g.pick("f", "f", "f JOIN dim ON f.k = dim.k", "f CROSS JOIN (SELECT DISTINCT w FROM dim WHERE w < 3) AS d",
+			"f JOIN (SELECT DISTINCT k AS dk, name, w FROM dim) AS d ON f.k = d.dk")
+		pred := g.subqueryPred("f")
+		if strings.Contains(from, "dk") && g.chance(0.5) {
+			// A key its name alone names, of the item f is joined to, as TPC-DS
+			// q32 compares a sale to its item's average (see keyItem).
+			pred = fmt.Sprintf("f.v > (SELECT %s * avg(v) FROM f2 WHERE f2.k = dk%s)", g.pick("1.3", "1"), g.pick("", fmt.Sprintf(" AND f2.h < %d", g.n(1, 6))))
+		}
+		q := "SELECT f.h, count(*), sum(f.v) FROM " + from + " WHERE " + pred
 		if g.chance(0.5) {
 			q += " AND " + g.pred("f")
 		}
@@ -385,10 +586,42 @@ func (g *gen) query() string {
 	}
 }
 
+// siblings is sibling aggregations over one join as Igloo merges them (see package
+// pgwire's siblings.go): one materialized grouping that each sibling reads its
+// columns of.
+func (g *gen) siblings() string {
+	from, t := g.from()
+	where := ""
+	if g.chance(0.7) {
+		where = " WHERE " + g.pred(t)
+	}
+	keys := g.groupCols(t)
+	var ks, kcols, names []string
+	for i, k := range keys {
+		ks = append(ks, fmt.Sprintf("%s AS _k%d", k, i+1))
+		kcols = append(kcols, fmt.Sprintf("_k%d", i+1))
+		names = append(names, fmt.Sprintf("c%d", i))
+	}
+	merged := fmt.Sprintf("SELECT %s, count(DISTINCT %s.h) AS _a1, count(*) AS _a2, sum(%s.v) AS _a3, max(%s.d) AS _a4 FROM %s%s GROUP BY %s",
+		strings.Join(ks, ", "), t, t, t, from, where, strings.Join(keys, ", "))
+	sel := func(cols ...string) string {
+		var out []string
+		for i, k := range kcols {
+			out = append(out, k+" AS "+names[i])
+		}
+		return strings.Join(append(out, cols...), ", ")
+	}
+	using := strings.Join(names, ", ")
+	return fmt.Sprintf("WITH _igloo_siblings_1 AS MATERIALIZED (%s), seen AS (SELECT %s FROM _igloo_siblings_1), "+
+		"days AS (SELECT %s FROM _igloo_siblings_1), views AS (SELECT %s FROM _igloo_siblings_1) "+
+		"SELECT count(*), sum(days.n), sum(views.n), sum(views.sv), max(views.md) FROM seen JOIN days USING (%s) JOIN views USING (%s)",
+		merged, sel(), sel("_a1 AS n"), sel("_a2 AS n", "_a3 AS sv", "_a4 AS md"), using, using)
+}
+
 // TestRandomAgreement runs randomFound and random queries (IGLOO_TEST_RANDOM_QUERIES,
 // 150 by default) from IGLOO_TEST_RANDOM_SEED on one machine and on workers, with the planner's joins
-// and with every join partitioned, and fails on any result that differs. A query one
-// machine refuses is not counted.
+// and with every join partitioned and partial results a row at a time, and fails on any result that
+// differs. A query one machine refuses is not counted.
 func TestRandomAgreement(t *testing.T) {
 	queries, seed := 150, uint64(1)
 	if v := os.Getenv("IGLOO_TEST_RANDOM_QUERIES"); v != "" {
@@ -414,8 +647,9 @@ func TestRandomAgreement(t *testing.T) {
 	g := &gen{r: rand.New(rand.NewPCG(seed, seed^0x9e3779b97f4a7c15))}
 	ctx := context.Background()
 	broadcast := h.co.maxBroadcast
-	// cut counts runs whose stages kept only some rows early, by QUALIFY or LIMIT.
-	ran, invalid, failed, cut := 0, 0, 0, 0
+	// cut counts runs whose stages kept only some rows early, by QUALIFY or LIMIT,
+	// and pruned those that left out branches of unions or arms of CASE a filter rejects.
+	ran, invalid, failed, cut, pruned := 0, 0, 0, 0, 0
 	for i := range len(randomFound) + queries {
 		q, name := "", ""
 		if i < len(randomFound) {
@@ -433,9 +667,11 @@ func TestRandomAgreement(t *testing.T) {
 		}
 		distributed := false
 		for _, partitioned := range []bool{false, true} {
-			h.co.maxBroadcast = broadcast
+			// Partitioned, partial results are written a row at a time wherever
+			// they may be (see rowSpec).
+			h.co.maxBroadcast, h.co.partialRows = broadcast, ""
 			if partitioned {
-				h.co.maxBroadcast = 1
+				h.co.maxBroadcast, h.co.partialRows = 1, partialsByRow
 			}
 			got, gotCols, plan, ex, err := h.run(ctx, q, ModeOn)
 			if IsUnsupported(err) {
@@ -444,6 +680,9 @@ func TestRandomAgreement(t *testing.T) {
 			distributed = true
 			if plan != nil && (strings.Contains(plan.describe(), " QUALIFY ") || strings.Contains(plan.describe(), " LIMIT ")) {
 				cut++
+			}
+			if plan != nil && plan.pruned > 0 {
+				pruned++
 			}
 			msg := ""
 			switch {
@@ -471,9 +710,10 @@ func TestRandomAgreement(t *testing.T) {
 			ran++
 		}
 	}
-	h.co.maxBroadcast = broadcast
+	h.co.maxBroadcast, h.co.partialRows = broadcast, ""
 	total := len(randomFound) + queries
-	t.Logf("seed %d: %d queries, %d not valid SQL, %d ran on workers, %d runs cut rows early, %d results differed", seed, total, invalid, ran, cut, failed)
+	t.Logf("seed %d: %d queries, %d not valid SQL, %d ran on workers, %d runs cut rows early, %d left out branches or arms, %d results differed",
+		seed, total, invalid, ran, cut, pruned, failed)
 	if valid := total - invalid; valid > 0 && ran*2 < valid {
 		t.Errorf("only %d of %d valid queries ran on workers", ran, valid)
 	}

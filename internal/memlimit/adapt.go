@@ -17,6 +17,16 @@ import (
 // spill files and give their memory back, and once memory has stayed
 // plentiful it raises the limit back toward the configured one. Statements
 // then run slower, spilling more, rather than fail.
+//
+// On a replica it lowers the limit from what DuckDB holds, where that is
+// less: after a start, a limit lowered from 43.8 GiB to 42 asked nothing of
+// a DuckDB that held about 30 of files' ranges it had read back (see the
+// engine's filecache.go), and the memory watch canceled a report 0.4 s
+// later, before the next step. Below what it holds, DuckDB drops those
+// ranges first. A worker reads nothing back, and what its DuckDB holds is
+// its tasks' work, which it needs: lowered from that, a shortfall would cut
+// a shuffle's memory deeper than the shortfall. So a worker lowers it from
+// the limit.
 
 // High is the memory left, of total, below which Adapt lowers DuckDB's
 // memory limit: an eighth of it, at least 512 MiB, twice Low, so that it
@@ -37,13 +47,15 @@ const (
 
 // Adapt keeps DuckDB's memory limit, base as configured, low enough that
 // the memory DuckDB uses besides fits beside it (see High), never below
-// half of base. set changes the limit. It returns when ctx ends, and does
-// nothing when total or base is 0.
-func Adapt(ctx context.Context, total, base int64, set func(int64) error, log *slog.Logger) {
+// half of base. set changes the limit, and held, if not nil, reads what
+// DuckDB holds under it, caches included, which it then lowers it from where
+// that is less. It returns when ctx ends, and does nothing when total or
+// base is 0.
+func Adapt(ctx context.Context, total, base int64, set func(int64) error, held func() (int64, bool), log *slog.Logger) {
 	if total <= 0 || base <= 0 {
 		return
 	}
-	a := &adapter{total: total, base: base, limit: base, available: Available, set: set, log: log}
+	a := &adapter{total: total, base: base, limit: base, available: Available, set: set, held: held, log: log}
 	t := time.NewTicker(adaptEvery)
 	defer t.Stop()
 	for {
@@ -60,6 +72,7 @@ type adapter struct {
 	total, base, limit int64
 	available          func() (int64, bool)
 	set                func(int64) error
+	held               func() (int64, bool)
 	log                *slog.Logger
 	// plentySince is when memory last became plentiful, zero while it is
 	// not; failedAt when a change last failed.
@@ -76,9 +89,16 @@ func (a *adapter) step(now time.Time) {
 	switch {
 	case left < high:
 		a.plentySince = time.Time{}
-		// Down by what is missing, and a step more, so that DuckDB frees
-		// enough at once rather than a little at every check.
-		if want := max(floor, a.limit-(high-left)-a.total/64); a.limit-want >= minChange {
+		// Down by what is missing, and a step more, from what DuckDB holds
+		// where that is under its limit and told, so that DuckDB frees enough
+		// at once rather than a little at every check.
+		from := a.limit
+		if a.held != nil {
+			if h, ok := a.held(); ok && h < from {
+				from = h
+			}
+		}
+		if want := max(floor, from-(high-left)-a.total/64); a.limit-want >= minChange {
 			a.change(now, want, left)
 		}
 	case left > 2*high && a.limit < a.base:

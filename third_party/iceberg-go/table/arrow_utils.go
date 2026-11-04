@@ -1392,12 +1392,15 @@ func filesToDataFiles(ctx context.Context, fileIO iceio.IO, meta *MetadataBuilde
 
 	currentSchema, currentSpec := meta.CurrentSchema(), *partitionSpec
 
-	return filesToDataFilesOf(ctx, fileIO, currentSchema, currentSpec, meta.defaultSortOrderID, meta.props, filePaths, concurrency)
+	return filesToDataFilesOf(ctx, fileIO, currentSchema, currentSpec, meta.defaultSortOrderID, meta.props, filePaths, concurrency, false)
 }
 
 // filesToDataFilesOf is filesToDataFiles of a schema and sort order given.
+// onePartition says each file holds the rows of one partition, so its
+// partition is read from its bounds under any transform (see
+// PartitionValueOfOne).
 func filesToDataFilesOf(ctx context.Context, fileIO iceio.IO, currentSchema *iceberg.Schema, currentSpec iceberg.PartitionSpec, sortOrderID int,
-	props iceberg.Properties, filePaths []string, concurrency int,
+	props iceberg.Properties, filePaths []string, concurrency int, onePartition bool,
 ) (_ []iceberg.DataFile, err error) {
 	dataFiles := make([]iceberg.DataFile, len(filePaths))
 	eg, ctx := errgroup.WithContext(ctx)
@@ -1415,7 +1418,7 @@ func filesToDataFilesOf(ctx context.Context, fileIO iceio.IO, currentSchema *ice
 				}
 			}()
 
-			dataFiles[i] = fileToDataFile(ctx, fileIO, filePath, currentSchema, currentSpec, sortOrderID, props)
+			dataFiles[i] = fileToDataFile(ctx, fileIO, filePath, currentSchema, currentSpec, sortOrderID, props, onePartition)
 
 			return nil
 		})
@@ -1428,7 +1431,7 @@ func filesToDataFilesOf(ctx context.Context, fileIO iceio.IO, currentSchema *ice
 	return dataFiles, nil
 }
 
-func fileToDataFile(ctx context.Context, fileIO iceio.IO, filePath string, currentSchema *iceberg.Schema, currentSpec iceberg.PartitionSpec, sortOrderID int, props iceberg.Properties) iceberg.DataFile {
+func fileToDataFile(ctx context.Context, fileIO iceio.IO, filePath string, currentSchema *iceberg.Schema, currentSpec iceberg.PartitionSpec, sortOrderID int, props iceberg.Properties, onePartition bool) iceberg.DataFile {
 	format := tblutils.FormatFromFileName(filePath)
 	rdr := must(format.Open(ctx, fileIO, filePath))
 	defer rdr.Close()
@@ -1452,11 +1455,11 @@ func fileToDataFile(ctx context.Context, fileIO iceio.IO, filePath string, curre
 	partitionValues := make(map[int]any)
 	if !currentSpec.Equals(*iceberg.UnpartitionedSpec) {
 		for _, field := range currentSpec.Fields() {
-			if !field.Transform.PreservesOrder() {
+			if !field.Transform.PreservesOrder() && !onePartition {
 				panic(fmt.Errorf("cannot infer partition value from parquet metadata for a non-linear partition field: %s with transform %s", field.Name, field.Transform))
 			}
 
-			partitionVal := statistics.PartitionValue(field, currentSchema)
+			partitionVal := statistics.PartitionValueOfOne(field, currentSchema)
 			if partitionVal != nil {
 				partitionValues[field.FieldID] = partitionVal
 			}

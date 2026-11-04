@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"slices"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -95,18 +96,34 @@ func (t *ranTask) onDisk() bool {
 	})
 }
 
-// ranOn notes t, which its exchange's files now hold.
-func (e *execution) ranOn(t *ranTask) {
-	if !e.local {
-		return
-	}
+// receivedRan adds what t wrote to its exchange, and notes t there as a task
+// whose files the exchange holds, at once, so that a repair finds the files of
+// any task the exchange lists. If t's worker was lost before it answered, what
+// it wrote on its disk went with it, and is written again on the others before
+// any reader is given it. Noted apart from its files, a task that answered as
+// its worker was found lost was missed by the repair, and its files stayed
+// listed on a worker the run had gone on without: a reader failed with
+// "not a worker of the statement".
+func (e *execution) receivedRan(ctx context.Context, t *ranTask) error {
 	x := e.exchanges[t.stage.Out.ID]
 	x.mu.Lock()
-	x.ran = append(x.ran, t)
-	x.mu.Unlock()
-	if t.onDisk() {
-		e.watchHolder(t.worker)
+	err := e.receivedLocked(x, t.task, t.head, &worker{addr: t.worker})
+	if err == nil && e.local {
+		x.ran = append(x.ran, t)
 	}
+	x.mu.Unlock()
+	if err != nil || !e.local || !t.onDisk() {
+		return err
+	}
+	if !e.wentWithout(t.worker) {
+		e.watchHolder(t.worker)
+		return nil
+	}
+	lost := &lostError{worker: t.worker, err: fmt.Errorf("worker %s answered task %d after the statement went on without it", t.worker, t.task.Task)}
+	if !e.recover(ctx, t.worker, lost, false) {
+		return lost
+	}
+	return nil
 }
 
 // watchHolder watches the worker at addr, which holds exchange files of the run on its
@@ -232,37 +249,44 @@ func (e *execution) recover(ctx context.Context, addr string, err error, reader 
 		}
 		e.lost[addr] = true
 		e.mu.Unlock()
+		if e.places != nil {
+			e.places.leave(addr)
+		}
 	}
 	start := time.Now()
-	n, rerr := e.writeAgain(ctx, addr)
+	n, waited, rerr := e.writeAgain(ctx, addr)
+	if rerr != nil {
+		if ctx.Err() == nil {
+			e.co.log.Warn("could not run again only what a lost worker held; the statement's parts run again", "query", e.qid, "worker", addr,
+				"found_by", by, "err", rerr)
+		}
+		// Its files are still listed, and stay on a worker of the run: a task
+		// made now finds them gone as lost, which ends the run as lost, where
+		// on a worker not the statement's they ended it as an error. Found by
+		// its heartbeat before any reader, it ends nothing itself.
+		return false
+	}
 	// Tasks may read its disk no more: what readers need of it is on the others.
 	// Until now they could, as a task made meanwhile still lists its files, and
 	// finds them gone as lost, rather than not the statement's.
 	e.mu.Lock()
 	e.ws = slices.DeleteFunc(slices.Clone(e.ws), func(w *worker) bool { return w.addr == addr })
 	e.mu.Unlock()
-	if rerr != nil {
-		if ctx.Err() == nil {
-			e.co.log.Warn("could not run again only what a lost worker held; the statement's parts run again", "query", e.qid, "worker", addr,
-				"found_by", by, "err", rerr)
-		}
-		return false
-	}
 	if n > 0 {
 		e.co.log.Warn("a worker holding exchanged rows on its disk was lost; ran again only its tasks that readers still need", "query", e.qid,
-			"worker", addr, "found_by", by, "tasks", n, "seconds", time.Since(start).Seconds())
+			"worker", addr, "found_by", by, "tasks", n, "seconds", time.Since(start).Seconds(), "longest_slot_wait_seconds", waited)
 	}
 	return true
 }
 
 // writeAgain runs again what readers yet to run need of what the lost worker at addr
-// wrote, returning how many tasks that took: for each exchange that the stages yet to
-// end read, the tasks that wrote it there, once those that wrote there what they read
-// in turn have.
-func (e *execution) writeAgain(ctx context.Context, addr string) (int, error) {
+// wrote, returning how many tasks that took, and the longest any of them waited for a
+// worker's slots, in seconds: for each exchange that the stages yet to end read, the
+// tasks that wrote it there, once those that wrote there what they read in turn have.
+func (e *execution) writeAgain(ctx context.Context, addr string) (int, float64, error) {
 	if repairFault != nil {
 		if err := repairFault(); err != nil {
-			return 0, err
+			return 0, 0, err
 		}
 	}
 	seen := map[*exchangeRun]bool{}
@@ -307,35 +331,44 @@ func (e *execution) writeAgain(ctx context.Context, addr string) (int, error) {
 			}
 		}
 	}
-	var count atomic.Int64
+	var (
+		count  atomic.Int64
+		mu     sync.Mutex
+		waited float64
+	)
 	for _, tasks := range order {
 		for _, t := range tasks {
 			if !repeatable(t.stage) {
-				return 0, fmt.Errorf("stage %d's tasks may write something else each time", t.stage.ID)
+				return 0, 0, fmt.Errorf("stage %d's tasks may write something else each time", t.stage.ID)
 			}
 		}
 		g, gctx := errgroup.WithContext(ctx)
 		for _, t := range tasks {
 			g.Go(func() error {
-				n, err := e.taskAgain(gctx, t)
+				n, w, err := e.taskAgain(gctx, t)
 				if err != nil {
 					return err
 				}
 				count.Add(int64(n))
+				mu.Lock()
+				waited = max(waited, w)
+				mu.Unlock()
 				return nil
 			})
 		}
 		if err := g.Wait(); err != nil {
-			return 0, err
+			return 0, 0, err
 		}
 	}
-	return int(count.Load()), nil
+	return int(count.Load()), waited, nil
 }
 
 // taskAgain runs t again on the workers left, as smaller tasks if it is a whole one
 // that can be divided, and has its exchange hold what they wrote in place of what it
-// wrote before. It returns how many tasks it ran.
-func (e *execution) taskAgain(ctx context.Context, t *ranTask) (int, error) {
+// wrote before. It returns how many tasks it ran, and the longest any waited for a
+// worker's slots, in seconds; they go before the other tasks waiting there
+// (taskRequest.Repair).
+func (e *execution) taskAgain(ctx context.Context, t *ranTask) (int, float64, error) {
 	round := t.rounds + 1
 	pieces := []piece{t.piece}
 	if k := min(t.units, e.usable()); !t.piece.split() && k > 1 {
@@ -349,6 +382,7 @@ func (e *execution) taskAgain(ctx context.Context, t *ranTask) (int, error) {
 	for n, p := range pieces {
 		g.Go(func() error {
 			task, _ := t.request(p, round)
+			task.Repair = true
 			first := t.first + 1 + n
 			w, head, err := e.co.dispatch(gctx, task, e.targets(), first, "", nil)
 			if err != nil {
@@ -360,11 +394,11 @@ func (e *execution) taskAgain(ctx context.Context, t *ranTask) (int, error) {
 		})
 	}
 	if err := g.Wait(); err != nil {
-		return 0, err
+		return 0, 0, err
 	}
 	if len(again) == 1 && again[0].head.Rows != t.head.Rows {
 		// Divided, a task that groups its rows may well write more of them.
-		return 0, fmt.Errorf("task %d wrote %d rows, and %d when it ran again", t.task.Task, t.head.Rows, again[0].head.Rows)
+		return 0, 0, fmt.Errorf("task %d wrote %d rows, and %d when it ran again", t.task.Task, t.head.Rows, again[0].head.Rows)
 	}
 	x := t.run.exchanges[t.stage.Out.ID]
 	// At once: a task made in between would read short of what t wrote, and check
@@ -381,22 +415,23 @@ func (e *execution) taskAgain(ctx context.Context, t *ranTask) (int, error) {
 		if i := slices.Index(x.ran, t); i >= 0 {
 			x.ran = slices.Replace(x.ran, i, i+1, again...)
 		}
+		x.again++
 	}
 	x.mu.Unlock()
 	if err != nil {
-		return 0, err
+		return 0, 0, err
 	}
+	waited := 0.0
 	for _, a := range again {
 		if a.onDisk() {
 			t.run.watchHolder(a.worker)
 		}
+		waited = max(waited, a.head.Waited)
 	}
-	t.run.writtenAgain.Add(1)
-	e.writtenAgain.Add(1)
 	for range again {
 		e.co.opts.Metrics.task("ran_again_for_lost_worker")
 	}
-	return len(again), nil
+	return len(again), waited, nil
 }
 
 // forget takes what t wrote out of x, whose lock the caller holds.

@@ -17,10 +17,12 @@ import (
 
 	"github.com/akkio-inc/igloo/internal/auth"
 	"github.com/akkio-inc/igloo/internal/config"
+	"github.com/akkio-inc/igloo/internal/distributed"
 	"github.com/akkio-inc/igloo/internal/erasure"
 	"github.com/akkio-inc/igloo/internal/schedule"
 	"github.com/akkio-inc/igloo/internal/sqllex"
 	"github.com/akkio-inc/igloo/internal/tasks"
+	"github.com/akkio-inc/igloo/internal/workload"
 )
 
 // Tasks, pipes, materialized views, dynamic tables and alerts. DuckDB has
@@ -1086,6 +1088,12 @@ func (s *Server) RunJob(ctx context.Context, j tasks.Job) (int64, error) {
 	if j.Kind == tasks.KindAlert {
 		return s.runAlert(ctx, j)
 	}
+	switch j.Kind {
+	case tasks.KindMaterializedView, tasks.KindDynamicTable, tasks.KindPipe:
+		// A refresh or a pipe's load runs in the background: on workers, its
+		// tasks give way to sessions' statements' (see distributed.WithBackground).
+		ctx = distributed.WithBackground(ctx)
+	}
 	if err := s.stillDue(ctx, j); err != nil {
 		return -1, err
 	}
@@ -1131,14 +1139,14 @@ func (s *Server) RunJob(ctx context.Context, j tasks.Job) (int64, error) {
 		}
 		start := time.Now()
 		var loads []tasks.Load
-		// COPY INTO reaches the catalog's in-memory set (see
-		// copyIntoStatement); hold the exclusive side.
-		releaseCatalog := s.holdCatalog(sess)
-		err = sess.runCancelable(ctx, j.Statement, func(ctx context.Context) error {
+		err = sess.runCancelable(ctx, j.Statement, s.rerunsAlone(sess, func(ctx context.Context) error {
+			// COPY INTO reaches the catalog's in-memory set (see
+			// copyIntoStatement); hold the exclusive side as it runs, and not
+			// as it waits for memory (see rerunsAlone).
+			defer s.holdCatalog(sess)()
 			loads, _, err = s.copyInto(ctx, sess, owner, cp, j.Name)
 			return err
-		})
-		releaseCatalog()
+		}))
 		if err == nil && len(loads) == 0 {
 			return 0, tasks.ErrIdle
 		}
@@ -1167,6 +1175,11 @@ func (s *Server) RunJob(ctx context.Context, j tasks.Job) (int64, error) {
 		return rows, err
 
 	case tasks.KindMaterializedView, tasks.KindDynamicTable:
+		// A refresh makes its temporary views and tables itself, after it
+		// plans (see refresher.temp): until then its session has none, and
+		// resolves names from the server's indexes rather than a listing that
+		// walks the catalog, holding the catalog lock alone.
+		sess.temps = false
 		if j.Kind == tasks.KindDynamicTable {
 			if err := s.refreshUpstream(ctx, sess, j); err != nil {
 				return -1, err
@@ -1179,23 +1192,65 @@ func (s *Server) RunJob(ctx context.Context, j tasks.Job) (int64, error) {
 		if j.Kind == tasks.KindDynamicTable {
 			text = "ALTER DYNAMIC TABLE " + quoteName([]string{schema, table}) + " REFRESH"
 		}
-		err := sess.runCancelable(ctx, text, func(ctx context.Context) error {
+		// It waits its turn, reserves what its refreshes held, and is
+		// sampled as it runs, as a statement is: it is one, CREATE OR REPLACE
+		// TABLE ... AS of the view's query. A refresh of a view of a billion
+		// rows allocated 5.1 GiB every minute, which nothing reserved or
+		// sampled, and the dashboards beside it ran out of memory. It is
+		// sampled whatever it reserves, so that a run that fails says what it
+		// held: once one had failed, the next reserved too little to be
+		// admitted as more than a light statement, which nothing samples.
+		shape, exact := s.workloadShape(ctx, sess, text), s.workloadExact(sess, text)
+		sess.wl.counted, sess.wl.sample, sess.wl.shape, sess.wl.exact = true, true, shape, exact
+		err := sess.runCancelable(ctx, text, s.rerunsAlone(sess, func(ctx context.Context) error {
 			var err error
 			res, err = s.refreshView(ctx, sess, owner, j)
 			return err
-		})
+		}))
+		sess.wl.counted, sess.wl.sample, sess.wl.shape, sess.wl.exact = false, false, "", ""
 		rows := res.rows
 		if err != nil {
 			rows = -1
 		}
 		used := res.used
-		s.recordQuery(sess, queryRecord{text: text, used: &used,
-			start: start, err: err, rows: rows, written: []auth.Object{{Schema: schema, Table: table}}, policies: res.policies,
+		peak, sampled := sess.wl.peak, sess.wl.sampled
+		s.observeRefresh(shape, exact, res, peak, sampled, time.Since(start)-sess.wl.queued, err)
+		if !sampled {
+			peak = 0
+		}
+		s.recordQuery(sess, queryRecord{text: text, used: &used, peak: peak, shape: shape, exact: exact, queued: sess.wl.queued,
+			start: start, err: err, rows: rows, written: []auth.Object{{Schema: schema, Table: table}}, policies: res.policies, parts: res.parts,
 			analyze:  s.rewrite(ctx, sess, owner, "CREATE OR REPLACE TABLE "+quoteName([]string{s.catalogName(), schema, table})+" AS "+j.Statement),
 			stmtType: duckdb.STATEMENT_TYPE_CREATE})
 		return rows, err
 	}
 	return -1, fmt.Errorf("unknown kind of job %q", j.Kind)
+}
+
+// observeRefresh records what a refresh of shape and exact, res, ended with err
+// after running for ran, held, for admission (see workload.Controller), as a
+// statement's run is recorded: where its query ran on workers, that it did,
+// so that the next refresh reserves nothing here for what runs here held, as
+// those of a view of a billion rows did, up to 9.1 GB, before its query ran on
+// workers; what it held here where it completed here, by what it allocated and
+// was seen holding; and, where it ended before its end, at least what it was
+// seen holding (see observeUnfinished).
+func (s *Server) observeRefresh(shape, exact string, res refreshResult, peak int64, sampled bool, ran time.Duration, err error) {
+	used := res.used
+	switch {
+	case res.parts.workers > 0:
+		if err == nil {
+			s.workload.ObserveOnWorkers(shape)
+			s.workload.ObserveOnWorkers(exact)
+		}
+	case err == nil && !workload.ReadNothing(used.BytesRead, used.CPUTime):
+		for _, key := range []string{shape, exact} {
+			s.workload.Observe(key, workload.FootprintOf(used.MemoryAllocated, peak, sampled))
+			s.workload.ObserveCost(key, used.CPUTime)
+		}
+	case err != nil:
+		s.observeUnfinished(shape, exact, peak, sampled, ran, used.MemoryAllocated, err)
+	}
 }
 
 // stillDue checks that j, as read when its run came due, is still the job

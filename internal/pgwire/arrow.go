@@ -128,11 +128,7 @@ func (e *EmbeddedSession) SetApplicationName(name string) { e.sess.setApplicatio
 func (e *EmbeddedSession) Cancel() bool {
 	e.sess.mu.Lock()
 	defer e.sess.mu.Unlock()
-	if e.sess.running == nil {
-		return false
-	}
-	e.sess.running()
-	return true
+	return e.sess.cancelLocked()
 }
 
 // PreparedStatement is a statement prepared in an embedded session to run
@@ -149,7 +145,11 @@ type PreparedStatement struct {
 // if grants, the catalog or the session's settings changed since.
 func (e *EmbeddedSession) Prepare(ctx context.Context, query string) (*PreparedStatement, error) {
 	ctx = context.WithValue(ctx, sessionKey{}, e.sess)
-	stmts, err := e.srv.parse(ctx, wire.Query{Query: query})
+	var stmts []*wire.PreparedStatement
+	err := e.guarded(func() (err error) {
+		stmts, err = e.srv.parse(ctx, wire.Query{Query: query})
+		return err
+	})
 	if err != nil {
 		return nil, pgError(err)
 	}
@@ -211,11 +211,13 @@ func (p *PreparedStatement) Run(ctx context.Context, params []any, out ResultWri
 		return err
 	}
 	ctx = context.WithValue(ctx, sessionKey{}, p.e.sess)
-	return p.e.runStatement(ctx, p.ps, args, out)
+	return p.e.guarded(func() error { return p.e.runStatement(ctx, p.ps, args, out) })
 }
 
 // Close releases the statement.
-func (p *PreparedStatement) Close() error { return p.e.sess.release(p.ps) }
+func (p *PreparedStatement) Close() error {
+	return p.e.guarded(func() error { return p.e.sess.release(p.ps) })
+}
 
 // bind renders values as the text-format parameters a SQL client would
 // send for parameters of types oids, so the statement decodes and checks

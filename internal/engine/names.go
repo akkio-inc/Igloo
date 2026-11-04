@@ -9,10 +9,10 @@ import (
 )
 
 // respellTimeout bounds looking tables up again by the catalog's names (see
-// respell).
+// Respell).
 const respellTimeout = 30 * time.Second
 
-// respell gives back the catalog's names to DuckDB-Iceberg's entries for
+// Respell gives back the catalog's names to DuckDB-Iceberg's entries for
 // the tables that statements or views named in another case since it last
 // ran. The catalog finds a table by its name in any case, and DuckDB-Iceberg
 // names its entry for a table as it was last looked up, so listings would
@@ -21,11 +21,11 @@ const respellTimeout = 30 * time.Second
 // again; the lookup is a bind, which loads the table from the catalog as
 // any bind of it does, and runs nothing.
 //
-// Listings run under the catalog lock held exclusively, so CatalogLock calls
-// this once it has the lock: whatever a statement bound before, the listing
-// lists the catalog's names. Each table that cannot be looked up (dropped
-// meanwhile, say) is left as it is.
-func (e *Engine) respell() {
+// Listings call it before they list (see pgwire's catalogRunLock), and so
+// does CatalogLock once it has the lock: whatever a statement bound before,
+// the listing lists the catalog's names. Each table that cannot be looked up
+// (dropped meanwhile, say) is left as it is.
+func (e *Engine) Respell() {
 	if e.proxy == nil || e.catalog == "" {
 		return
 	}

@@ -99,18 +99,19 @@ type Engine struct {
 	purges  []func()
 	// forecasting forecasts with the model pack's models (see Forecasting).
 	forecasting *tsforecast.Service
-	// catMu keeps binding, walking and changing the attached catalog's
-	// in-memory set of tables apart. See CatalogLock. catLocked is when it
-	// was taken exclusively, in Unix nanoseconds, or 0 while it is not.
+	// catMu keeps changes to the attached catalog's tables apart from the
+	// steps that look them up. See CatalogLock. catLocked is when it was
+	// taken exclusively, in Unix nanoseconds, or 0 while it is not.
 	catMu     catalogMutex
 	catLocked atomic.Int64
 	// catShared counts the holders of its shared side.
 	catShared atomic.Int64
 	// releaseTempDir lets go of the spill directory; see claimTempDir.
 	releaseTempDir func()
-	// bitmaps says the rb extension is loaded (see loadRB).
-	bitmaps bool
-	log     *slog.Logger
+	// bitmaps says the rb extension is loaded, and icebergOwn Igloo's build
+	// of the iceberg extension (see loadOwn).
+	bitmaps, icebergOwn bool
+	log                 *slog.Logger
 	// cfg is what it was opened with, and isBackground says it is the
 	// second DuckDB of a process, for heavy statements (see background.go);
 	// bg is that one, opened at its first use, and the rest its upkeep.
@@ -156,7 +157,7 @@ func Open(ctx context.Context, cfg config.Config, log *slog.Logger, opts ...Opti
 		opt(&o)
 	}
 	release := claimTempDir(cfg.DuckDB.TempDir, log)
-	connector, err := duckdb.NewConnector(rbDSN(cfg.DuckDB.Path, rbToLoad(cfg)), nil)
+	connector, err := duckdb.NewConnector(unsignedDSN(cfg.DuckDB.Path, ownToLoad(cfg)), nil)
 	if err != nil {
 		release()
 		return nil, fmt.Errorf("open duckdb: %w", err)
@@ -262,63 +263,39 @@ func (e *Engine) Catalog() string { return e.catalog }
 // LocalDatabase is the name of DuckDB's own database.
 func (e *Engine) LocalDatabase() string { return e.local }
 
-// CatalogLock keeps the embedded DuckDB from crashing when the attached
-// Iceberg catalog's tables are walked and changed at the same time. It takes
-// the lock exclusively; CatalogShare takes it shared.
+// CatalogLock keeps changes to the attached Iceberg catalog's tables apart
+// from the steps that look them up, on this instance, so that a change made in
+// steps reads as one. It takes the lock exclusively; CatalogShare takes it
+// shared.
 //
-// DuckDB-Iceberg keeps one in-memory set of the catalog's tables per schema
-// of the attached catalog, shared by every session's connection, and three
-// things reach it:
+// Igloo builds DuckDB-Iceberg with patches (extensions/iceberg) that keep its
+// in-memory set of the catalog's tables safe under concurrency: binds,
+// listings, renames and drops each take the set's own lock, never across a
+// request to the catalog, and every entry a transaction bound or listed stays
+// alive until the transaction ends. DuckDB's own build frees memory still in
+// use when a rename or drop commits beside a bind or a listing, and the
+// process segfaults, so Igloo attaches the catalog only with its build (see
+// setup), and this lock is not what keeps the process up.
 //
-//   - Binding a statement looks each table it names up in the set and, under
-//     DuckDB-Iceberg's lock on the set, replaces the table's entry with a
-//     fresh one. DuckDB binds a statement that reads the catalog again each
-//     time it runs, not only when it is prepared.
-//   - A listing (duckdb_tables(), duckdb_views(), duckdb_columns(),
-//     information_schema, pg_catalog, SHOW, DESCRIBE, a missing-table
-//     suggestion) walks the set under that lock and reads the entries it
-//     found after letting go of it; its transaction keeps them alive, but
-//     only as the set had them at its latest walk, so when a bind replaces
-//     an entry between two walks of one listing, the second walk frees what
-//     the first one is still reading.
-//   - A rename or drop finds the table's entry and, when it commits, erases
-//     it from the set without that lock.
-//
-// So an erase alongside a bind or a walk, or a bind between a listing's
-// walks, on this instance corrupts the set or frees memory still in use:
-// the process segfaults, or a later listing loops forever, taking down every
-// session on the replica. A dbt run swapping tables (CTAS, rename, drop)
-// while a BI tool browses schemas or a dashboard refreshes hits this.
-//
-// So the steps that reach the set hold this lock while they run. DDL,
-// listings, and preparing a statement (Igloo's checks list the catalog) hold
-// it exclusively and run one at a time; binding a statement, which DuckDB
-// does again as each run starts, holds it shared, alongside other binds,
-// which DuckDB-Iceberg's own lock keeps apart. What does not reach the set —
-// reading table data once bound, and INSERT/UPDATE/DELETE writing and
-// committing a snapshot of the tables bound — holds nothing. The pgwire
-// layer decides which steps take it and how (see Server.catalogRunLock,
-// holdCatalog, shareCatalog, and the bind hold Server.openSession sets on
-// each session's connection). Callers outside a session take it
-// exclusively. DDL on another replica or engine reaches this replica only
-// through the Iceberg REST catalog, not this set, so it cannot crash this
-// instance and this lock does not cover it; a listing here may lag such a
+// What it keeps is that a change made in steps reads as one: CREATE OR REPLACE
+// TABLE ... AS drops the old table and renames the new one into its place
+// holding it exclusively, and a statement bound meanwhile, holding it shared,
+// finds the table before or after the swap, never missing. So DDL holds it
+// exclusively, one at a time, and the steps that look tables up hold it
+// shared, side by side: binding a statement, which DuckDB does again as each
+// run starts, preparing one, listing the catalog (duckdb_tables(),
+// information_schema, pg_catalog, SHOW, DESCRIBE), and Igloo's checks, which
+// list it. What does not look tables up — reading table data once bound, and
+// INSERT/UPDATE/DELETE writing and committing a snapshot of the tables bound —
+// holds nothing. The pgwire layer decides which steps take it and how (see
+// Server.catalogRunLock, holdCatalog, shareCatalog, and the bind hold
+// Server.openSession sets on each session's connection). DDL on another
+// replica or engine reaches this replica only through the Iceberg REST
+// catalog, and this lock does not cover it; a listing here may lag such a
 // change by a sync.
 //
-// The catalog proxy holds every holder to this: while the lock is held
-// shared, it refuses the requests DuckDB-Iceberg makes before it walks the
-// set (listing a schema's tables) or erases from it (a drop or a rename),
-// so DuckDB fails the statement instead (see catalogproxy's shared holds,
-// and SharedRefusals). A step that walks or erases without the exclusive
-// side fails rather than crash the instance, and a query prepared under
-// the shared side is prepared again under the exclusive one, as a run is
-// bound again under it (see pgwire's runBound). The proxy cannot serve the
-// request, nor wait for the other binds to end: it cannot tell which
-// session made it, and the session that did holds the shared side itself.
-//
 // Once it has the lock, it gives back the catalog's names to the tables
-// that binds named in another case (see respell), before the holder lists
-// anything.
+// that binds named in another case (see Respell).
 //
 // It returns the func that releases it, for use with defer:
 //
@@ -333,7 +310,7 @@ func (e *Engine) CatalogLock() func() {
 	e.checkOrder("the catalog lock")
 	e.catMu.Lock()
 	e.catLocked.Store(time.Now().UnixNano())
-	e.respell()
+	e.Respell()
 	return func() {
 		e.catLocked.Store(0)
 		e.catMu.Unlock()
@@ -369,16 +346,16 @@ func (e *Engine) CatalogTryLock(ctx context.Context, wait time.Duration) (releas
 		}
 	}
 	e.catLocked.Store(time.Now().UnixNano())
-	e.respell()
+	e.Respell()
 	return func() {
 		e.catLocked.Store(0)
 		e.catMu.Unlock()
 	}, true
 }
 
-// CatalogShare takes the catalog lock shared, for binding a statement
-// against the catalog's in-memory set (see CatalogLock), and returns the
-// func that releases it.
+// CatalogShare takes the catalog lock shared, for a step that looks the
+// catalog's tables up, as binding a statement or listing them does (see
+// CatalogLock), and returns the func that releases it.
 func (e *Engine) CatalogShare() func() {
 	e.checkOrder("the catalog lock, shared")
 	e.catMu.RLock()
@@ -394,10 +371,6 @@ func (e *Engine) shared() func() {
 		e.catMu.RUnlock()
 	}
 }
-
-// SharedRefusals is how many of DuckDB's catalog requests the catalog proxy
-// refused because the catalog lock was held shared (see CatalogLock).
-func (e *Engine) SharedRefusals() uint64 { return e.proxy.Refusals() }
 
 // CatalogShareContext is CatalogShare that stops waiting, and returns ctx's
 // error, when ctx ends. The lock cannot stop waiting, so a goroutine
@@ -464,6 +437,10 @@ func (e *Engine) DataVersion() uint64 { return e.proxy.DataVersion() }
 // TablesVersion changes whenever one of the tables loads loaded may have
 // changed (see catalogproxy.Proxy.TablesVersion).
 func (e *Engine) TablesVersion(loads []catalogproxy.Load) uint64 { return e.proxy.TablesVersion(loads) }
+
+// TableVersion goes up whenever the catalog's table schema.name may have
+// changed (see catalogproxy.Proxy.TableVersion).
+func (e *Engine) TableVersion(schema, name string) uint64 { return e.proxy.TableVersion(schema, name) }
 
 // RecordLoads records the catalog's tables DuckDB loads until the func it
 // returns is called, which returns them (see catalogproxy's RecordLoads).
@@ -738,9 +715,11 @@ func (e *Engine) setup(ctx context.Context, cfg config.Config, log *slog.Logger,
 	if err := configure(cfg, serverThreadsPerCore, exec, query); err != nil {
 		return err
 	}
-	if e.bitmaps, err = loadRB(cfg, log, exec, query); err != nil {
+	own, err := loadOwn(cfg, log, exec, query)
+	if err != nil {
 		return err
 	}
+	e.bitmaps, e.icebergOwn = own["rb"], own["iceberg"]
 	if e.local, err = queryString(ctx, conn, "SELECT current_database()"); err != nil {
 		return fmt.Errorf("read database name: %w", err)
 	}
@@ -821,7 +800,6 @@ func (e *Engine) setup(ctx context.Context, cfg config.Config, log *slog.Logger,
 	if e.proxy, err = catalogproxy.New(proxyOpts); err != nil {
 		return err
 	}
-	e.proxy.SetSharedHold(func() bool { return e.catShared.Load() > 0 && e.catLocked.Load() == 0 })
 	// The proxy gives tables Igloo creates a target file size, which
 	// DuckDB refuses to write a partitioned table with unless told to
 	// ignore it there, as it does when a table has none.
@@ -838,6 +816,12 @@ func (e *Engine) setup(ctx context.Context, cfg config.Config, log *slog.Logger,
 	// for that many (see maintenance's sizeRowGroups).
 	if err := exec(fmt.Sprintf("SET GLOBAL partitioned_write_max_open_files = %d", OpenPartitionFiles)); err != nil {
 		return fmt.Errorf("configure iceberg writes: %w", err)
+	}
+	if !e.icebergOwn {
+		// DuckDB's own build crashes when a table is renamed or dropped while
+		// another session looks tables up (see CatalogLock).
+		return fmt.Errorf("attach catalog %s: Igloo's build of the iceberg extension is not loaded: the image has it at "+
+			"%s, and tests load it from IGLOO_TEST_ICEBERG_EXTENSION", cfg.Catalog.URI, icebergFile)
 	}
 	attach := attachStatement(cfg.Catalog, e.proxy.URL())
 	for {
@@ -1139,8 +1123,16 @@ func azureChain() string {
 }
 
 // extensionStatements load the extensions every deployment uses.
+//
+// httpfs then keeps its connections to object storage open between files
+// and reuses them. By default it opens one for each file it reads and closes
+// it after, and every closed connection holds a local port for a minute: a
+// replica reading a table of 300 manifests in two dozen sessions at once
+// held 28,000, every port it has, and its statements failed with "Could not
+// connect to server".
 func extensionStatements() []string {
-	return append([]string{"LOAD httpfs", "LOAD iceberg", "LOAD avro", "LOAD tpch"}, mediaStatements()...)
+	return append([]string{"LOAD httpfs", "SET GLOBAL httpfs_connection_caching = true", "LOAD iceberg", "LOAD avro", "LOAD tpch"},
+		mediaStatements()...)
 }
 
 // secret registers Igloo's storage credentials, for the paths of scope.

@@ -187,7 +187,7 @@ func prefetchScans(scans []distributed.Scan) []prefetch.Scan {
 }
 
 // scanNames are the catalog objects that names stand for, as of a catalog
-// generation, for what statements read ahead. Listing them takes the catalog
+// generation, for what statements read ahead. Listing them took the catalog
 // lock exclusively, and a statement's reads resolve a name for each table and
 // view: a dashboard's statements, about to run, took it several times each, and
 // held up every prepare beside them, for names that had not changed. What is

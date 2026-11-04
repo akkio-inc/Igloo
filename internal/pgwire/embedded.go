@@ -195,8 +195,9 @@ func (s *Server) openEmbedded(ctx context.Context, user auth.User, token *auth.T
 		activity: s.activity,
 		open:     make(map[*wire.PreparedStatement]*statement),
 		client:   client,
-		// Igloo's own work in these sessions (clean room runs, say) makes
-		// temporary tables other than through statements it prepares.
+		// Igloo's own work in these sessions (clean room runs and refreshes,
+		// say) makes temporary tables and views other than through statements
+		// it prepares; never macros.
 		temps: true,
 	}
 	if token != nil {
@@ -215,6 +216,29 @@ func (s *Server) openEmbedded(ctx context.Context, user auth.User, token *auth.T
 	// and Flight SQL statements go through parse, which refreshes them.
 	s.refreshLimits(ctx, sess, user)
 	return &EmbeddedSession{srv: s, sess: sess, types: newTypeMap()}, nil
+}
+
+// errParked is what an embedded session's calls return once one of its calls
+// into DuckDB parked its thread (see Server.parked).
+var errParked = pgerror.WithCode(errors.New("the session ended: an exception escaped DuckDB in one of its statements"), codes.Internal)
+
+// guarded runs fn, which may call into DuckDB, and returns its error, or
+// errParked once one of the session's calls into DuckDB parked its thread:
+// that call's goroutine waits there for good, so fn runs on a goroutine of
+// its own, and the console's or Flight SQL's request that ran it fails
+// rather than wait with it. A session that parked runs nothing more.
+func (e *EmbeddedSession) guarded(fn func() error) error {
+	if e.sess.isParked() {
+		return errParked
+	}
+	done := make(chan error, 1)
+	go func() { done <- fn() }()
+	select {
+	case err := <-done:
+		return err
+	case <-e.sess.parkedC:
+		return errParked
+	}
 }
 
 // User is the session's user as of its last role check.
@@ -271,6 +295,10 @@ func (e *EmbeddedSession) RunQuery(ctx context.Context, query string, out Result
 }
 
 func (e *EmbeddedSession) run(ctx context.Context, query string, out ResultWriter, readOnly bool) error {
+	return e.guarded(func() error { return e.runUnguarded(ctx, query, out, readOnly) })
+}
+
+func (e *EmbeddedSession) runUnguarded(ctx context.Context, query string, out ResultWriter, readOnly bool) error {
 	ctx = context.WithValue(ctx, sessionKey{}, e.sess)
 	stmts, err := e.srv.parse(ctx, wire.Query{Query: query, SimpleQuery: true})
 	if err != nil {
@@ -487,10 +515,9 @@ func (s *Server) CancelStatement(pid int32, by string) bool {
 	}
 	sess.mu.Lock()
 	defer sess.mu.Unlock()
-	if sess.running == nil {
+	if !sess.cancelLocked() {
 		return false
 	}
-	sess.running()
 	s.log.Info("statement canceled", "user", sess.user.Name, "pid", pid, "by", by)
 	return true
 }

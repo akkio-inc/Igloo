@@ -16,7 +16,6 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
-	"os"
 	"regexp"
 	"slices"
 	"strings"
@@ -49,6 +48,7 @@ import (
 	"github.com/akkio-inc/igloo/internal/federation"
 	"github.com/akkio-inc/igloo/internal/iddomain"
 	"github.com/akkio-inc/igloo/internal/lockorder"
+	"github.com/akkio-inc/igloo/internal/logwriter"
 	"github.com/akkio-inc/igloo/internal/memlimit"
 	"github.com/akkio-inc/igloo/internal/modelpack"
 	"github.com/akkio-inc/igloo/internal/models"
@@ -80,11 +80,13 @@ type Engine interface {
 	// path a new one starts with.
 	UseDefaultSchema(ctx context.Context, conn *duckdb.Conn) error
 	// CatalogLock and CatalogShare take the lock that keeps changes to the
-	// structure of the catalog's in-memory set of tables from running
-	// alongside walks and binds of it, exclusively and shared; each returns the
-	// func that releases it. See engine.Engine.CatalogLock.
+	// catalog's tables apart from the steps that look them up, exclusively
+	// and shared; each returns the func that releases it. Respell gives
+	// tables back the names the catalog spells them with before a listing.
+	// See engine.Engine.CatalogLock.
 	CatalogLock() func()
 	CatalogShare() func()
+	Respell()
 	// CatalogShareContext is CatalogShare that gives up when ctx ends, and
 	// CatalogLockedFor is how long the lock has been held exclusively.
 	CatalogShareContext(ctx context.Context) (func(), error)
@@ -111,9 +113,6 @@ type Engine interface {
 	// it returns is called, and ReloadTables loads such tables again, so
 	// that DataVersion goes up if any changed meanwhile.
 	RecordLoads() func() []catalogproxy.Load
-	// SharedRefusals counts DuckDB's catalog requests refused while the
-	// catalog lock was held shared (see sharedprepare.go).
-	SharedRefusals() uint64
 	ReloadTables(ctx context.Context, loads []catalogproxy.Load) error
 	// DistinctCounts returns the distinct counts of the catalog's tables'
 	// columns, by catalog.schema.table as DuckDB names it, lower-cased, and
@@ -196,7 +195,9 @@ type Options struct {
 	// means a store in memory.
 	Policies policy.Store
 	// Scanner lists statements' scans, and Prefetcher reads ahead what they
-	// are about to read (see prefetch.go); either nil turns it off.
+	// are about to read (see prefetch.go); either nil turns that off. Without
+	// a Scanner, nothing estimates what a statement holds before its first run
+	// (see Server.planned).
 	Scanner    *distributed.Scanner
 	Prefetcher *prefetch.Prefetcher
 	// IDDomains keeps ID domains and their members (package iddomain). Nil
@@ -212,8 +213,9 @@ type Options struct {
 	// plans aggregates in passes against (see aggpasses.go); 0 runs none
 	// in passes.
 	QueryMemory int64
-	// HeavyInBackground runs heavy reads in a second DuckDB of this process
-	// whose threads give way to the first's (see background.go).
+	// HeavyInBackground runs clients' heavy statements, not only jobs', in a
+	// second DuckDB of this process whose threads give way to the first's (see
+	// background.go).
 	HeavyInBackground bool
 	// ResultCacheSize is IGLOO_RESULT_CACHE_SIZE: the memory the results
 	// the server keeps of queries may take (see resultcache.go); 0 keeps
@@ -253,6 +255,8 @@ type Options struct {
 	shedStuckAfter time.Duration
 	exit           func(code int)
 	stuckGrace     time.Duration
+	// stateRowGroupBytes, when set, replaces stateRowGroupBytes (for tests).
+	stateRowGroupBytes int64
 	// ReportRewrite has the statement layer recognize the counting CTEs
 	// of audience reports and answer them through the report API
 	// (IGLOO_REPORT_REWRITE; see reportrecognize.go).
@@ -451,13 +455,20 @@ type Server struct {
 	// functions is what statements' rewrites and the result cache know of
 	// DuckDB's functions (see functionlist.go).
 	functions functionList
+	// sharedSens is the sensitivity of sessions with no temporary views or
+	// macros of their own (see sensitivity).
+	sharedSens struct {
+		mu   lockorder.Mutex
+		sens *sensitivity
+	}
 	// afterNewValues, if set, runs when an assignment has found new values
 	// and is about to take the lease, for tests.
 	afterNewValues func()
 	// idComplete caches which member tables' snapshots have every row's
 	// ids (see idcount.go).
 	idComplete idComplete
-	// scanner and prefetcher read ahead for statements, or are nil.
+	// scanner and prefetcher read ahead for statements, or are nil; scanner
+	// also lists what statements read for Server.planned.
 	scanner    *distributed.Scanner
 	scanNames  scanNames
 	prefetcher *prefetch.Prefetcher
@@ -479,6 +490,11 @@ type Server struct {
 	shedStuckAfter time.Duration
 	exitProcess    func(code int)
 	freeMemory     func(context.Context)
+	// stateRowGroupBytes is about how many bytes of a refresh state's rows a
+	// row group of its files holds (see refresher.sizeRowGroups).
+	stateRowGroupBytes int64
+	// captured is when captureOutOfMemory last logged, in Unix nanoseconds.
+	captured atomic.Int64
 	// stuck lets the client of a statement that does not stop once
 	// canceled go (see watchStuck).
 	stuck *stuckWatch
@@ -536,11 +552,19 @@ type Server struct {
 	// starts to be prepared, with the context that ends its preparing (for
 	// tests).
 	beforePrepare func(ctx context.Context, text string)
+	// beforeRun, if set, runs as a client's statement (query) has the
+	// catalog lock it runs under, between the steps before its run and the
+	// run (for tests).
+	beforeRun func(sess *session, query string)
 	// heavy says which statements run in the second DuckDB (see
-	// background.go), and lane is that DuckDB; heavy is nil to run all in
-	// the first.
-	heavy *heavyHistory
-	lane  backgroundLane
+	// background.go), and lane is that DuckDB; heavyClients says clients'
+	// heavy statements run there too, not only jobs'.
+	heavy        *heavyHistory
+	lane         backgroundLane
+	heavyClients bool
+	// heavyOnWorkers says which statements run on workers in the background,
+	// by the seconds statements of their shapes took there (see background.go).
+	heavyOnWorkers *heavyHistory
 	// beforeFill, if set, runs as a staged CREATE TABLE ... AS starts to
 	// fill its table, with the context that ends the fill (for tests).
 	beforeFill func(context.Context)
@@ -562,7 +586,8 @@ type Server struct {
 	// memory here.
 	failLocal func(ctx context.Context, st *statement) error
 	// failFill, if set, runs before a fill's query runs on this replica
-	// (see fillOn), and fails it with its error.
+	// (see fillOn), and fails it with its error; query is empty for a fill
+	// no worker could run.
 	failFill func(ctx context.Context, query string) error
 	// writesRunning holds the notes' keys of this replica's statements whose
 	// workers write a table's files (see tableWrite).
@@ -788,11 +813,10 @@ func New(engine Engine, opts Options, log *slog.Logger) (*Server, error) {
 	}
 	s.deleteTargets = deletefiles.NewTargets()
 	s.queryMemory = opts.QueryMemory
-	if opts.HeavyInBackground {
-		s.heavy = newHeavyHistory()
-		if e, ok := s.engine.(interface{ WatchForeground(func() bool) }); ok {
-			e.WatchForeground(s.workload.HeldBehindSecond)
-		}
+	s.heavy, s.heavyClients = newHeavyHistory(), opts.HeavyInBackground
+	s.heavyOnWorkers = newHeavyHistoryOf(heavySeconds * time.Second)
+	if e, ok := s.engine.(interface{ WatchForeground(func() bool) }); ok {
+		e.WatchForeground(s.workload.HeldBehindSecond)
 	}
 	s.scanner, s.prefetcher = opts.Scanner, opts.Prefetcher
 	s.bitmaps, s.bitmapMinRows, s.bitmapIndexesOn = opts.Bitmaps, opts.BitmapMinRows, opts.BitmapIndexes
@@ -802,11 +826,13 @@ func New(engine Engine, opts Options, log *slog.Logger) (*Server, error) {
 		s.memoryCritical = memlimit.Critical(opts.MemoryTotal)
 	}
 	s.shedStuckAfter = cmp.Or(opts.shedStuckAfter, shedStuckAfter)
+	s.stateRowGroupBytes = cmp.Or(opts.stateRowGroupBytes, stateRowGroupBytes)
 	s.stuck = &stuckWatch{grace: cmp.Or(opts.stuckGrace, stuckGrace), log: s.log}
 	s.exitProcess = opts.exit
 	s.freeMemory = opts.FreeMemory
 	if s.exitProcess == nil {
-		s.exitProcess = os.Exit
+		// With the log written out first: it says why.
+		s.exitProcess = logwriter.Exit
 	}
 	s.rewriteMemory = opts.RewriteMemory
 	s.idFillRewriteRows = cmp.Or(opts.idFillRewriteRows, idFillRewriteRows)
@@ -856,7 +882,6 @@ func New(engine Engine, opts Options, log *slog.Logger) (*Server, error) {
 		wire.BackendKeyData(s.backendKeyData),
 		wire.CancelRequest(s.cancelRequest),
 		wire.SessionMiddleware(s.openSession),
-		wire.CommandWrapper(s.statementThread),
 		wire.CloseConn(s.closeSession),
 		wire.Statements(newStatementCache),
 		wire.Portals(newPortalCache),
@@ -912,6 +937,14 @@ type session struct {
 	pid, secret int32
 	added       time.Time
 	conn        *duckdb.Conn
+	// left is set once the session has left the server (see leave).
+	left atomic.Bool
+	// callGuard runs each call of the session's connections into DuckDB
+	// that binds, runs or drops a plan (see openSession), and parkedC is
+	// closed once one of them parked its thread (see parked).
+	callGuard func(call func())
+	parkOnce  sync.Once
+	parkedC   chan struct{}
 	// memo keeps what the checks of the statement being prepared would
 	// otherwise ask DuckDB more than once; nil outside prepareChecked.
 	memo *checkMemo
@@ -933,8 +966,10 @@ type session struct {
 	// running with it on (see setBitmaps); nil otherwise.
 	bitmapsRestore func()
 	// temps says the session may have temporary tables or views, which
-	// the server's index of tables leaves out (see indexedTables).
-	temps bool
+	// the server's index of tables leaves out (see indexedTables), and
+	// tempMacros that it may have temporary macros of its own, which the
+	// server's list of functions leaves out (see functionSets).
+	temps, tempMacros bool
 	// open holds every DuckDB statement prepared for this client, keyed by
 	// the wire statement that owns it, so none outlive the connection.
 	open     map[*wire.PreparedStatement]*statement
@@ -953,10 +988,9 @@ type session struct {
 	// outer is the context runCancelable runs the statement's steps under,
 	// which a shed by the memory watch does not end, while it runs.
 	outer context.Context
-	// bindAlone has DuckDB's binds on the session's connection hold the
-	// catalog lock exclusively rather than shared, while a run whose bind
-	// the catalog proxy refused binds again (see runBound).
-	bindAlone bool
+	// alone says the statement runs again alone, having run out of memory
+	// beside others (see alone.go).
+	alone bool
 	// held, while set, keeps queries recorded for the history (see
 	// holdRecords).
 	held *[]queryRecord
@@ -1070,10 +1104,11 @@ type session struct {
 	// last took it exclusively, for logging long holds (see unlockCatalog).
 	catWait  time.Duration
 	catSince time.Time
-	// sharedPrepare is set while prepareChecked prepares a statement holding
-	// the catalog lock shared, which stops at DuckDB's first failure to
-	// prepare it (see sharedprepare.go).
-	sharedPrepare bool
+	// catWaited is how long the session has waited for the engine lock in all,
+	// and catWaitFrom when the wait under way began (Unix nanoseconds, zero for
+	// none), for planning on other goroutines (see sessionEnv.CatalogWaited).
+	catWaited   atomic.Int64
+	catWaitFrom atomic.Int64
 
 	// mu guards the fields below, which cancel requests and user changes
 	// reach from other connections.
@@ -1086,6 +1121,8 @@ type session struct {
 	// because Igloo exits (see exitForMemory).
 	statement string
 	started   time.Time
+	// reserved is the memory the running statement reserved as it started.
+	reserved int64
 	// runShape is the running statement's shape, inBackground says it runs in the
 	// second DuckDB, and elsewhere on workers, for the statements beside it (see
 	// besideIsHeavy and othersRunning).
@@ -1095,6 +1132,12 @@ type session struct {
 	shed         bool
 	shedAt       time.Time
 	exiting      bool
+	// stepping counts the client's statements the session is in the steps
+	// of, and canceled says a cancel request, the console's cancel or the
+	// client going ended the one it runs, whether a step of it ran then or
+	// it was between two (see steps).
+	stepping int
+	canceled bool
 	// stuck, set for a client's session, lets the client go when its
 	// statement does not stop once canceled; watched is the context of the
 	// statement's run it watches (see watchStuck).
@@ -1214,21 +1257,39 @@ func (s *Server) openSession(ctx context.Context) (context.Context, error) {
 	}
 	s.sessions.connected(sess, conn)
 	sess.wl.meter, sess.wl.controller = meter, s.workload
-	// Binding a statement looks its tables up in the catalog's in-memory set
-	// and replaces their entries there, and DuckDB binds a statement that
-	// reads the catalog again each time it runs, not only when it is
+	// Binding a statement looks its tables up, and DuckDB binds a statement
+	// that reads the catalog again each time it runs, not only when it is
 	// prepared. Hold the catalog lock shared for every bind on this
-	// connection, so none runs while DDL renames or drops a table or a
-	// listing walks the set (see shareCatalog); running the statement after
-	// that holds nothing more.
-	conn.SetBindHold(func() func() {
-		if sess.bindAlone {
-			return s.holdCatalog(sess)
-		}
-		return s.shareCatalog(sess)
-	})
+	// connection, so none finds a table that DDL is swapping in steps missing
+	// (see shareCatalog); running the statement after that holds nothing
+	// more.
+	conn.SetBindHold(func() func() { return s.shareCatalog(sess) })
+	// A C++ exception that escapes DuckDB in one of this connection's calls
+	// that bind, run or drop a plan, which nothing can catch, ends this
+	// session rather than the process (see parked): the iceberg extension's
+	// scan state threw Out of Memory out of its destructor in the optimizer of
+	// a statement bound again at the replica's memory limit, and the process
+	// ended with every session's statement.
+	// The session's connection to the second DuckDB, for heavy statements,
+	// has the same guard (see backgroundConnOf).
+	ended := func(what string) { s.parked(ctx, sess, what) }
+	sess.parkedC = make(chan struct{})
+	sess.callGuard = func(call func()) { terminate.Statement(ended, call) }
+	conn.SetCallGuard(sess.callGuard)
 	for _, stmt := range sessionCatalogSetup(sess.user.Name, sess.user.Role == auth.RoleAdmin, s.version, s.engine.BitmapsLoaded()) {
-		if _, err := conn.ExecContext(ctx, stmt, nil); err != nil {
+		_, err := conn.ExecContext(ctx, stmt, nil)
+		if isOutOfMemory(err) {
+			// Other statements hold the memory: again alone, as a statement
+			// runs alone (see runAloneTurn).
+			wait, stop := context.WithTimeout(ctx, aloneWait)
+			done, _, aerr := s.workload.Admit(wait, workload.Limits{Alone: true})
+			stop()
+			if aerr == nil {
+				_, err = conn.ExecContext(ctx, stmt, nil)
+				done()
+			}
+		}
+		if err != nil {
 			s.sessions.remove(sess)
 			s.releaseConn()
 			return ctx, errors.Join(fmt.Errorf("set up session catalog: %w", err), meter.Close())
@@ -1243,9 +1304,12 @@ func (s *Server) closeSession(ctx context.Context) error {
 	if sess == nil || sess.conn == nil {
 		return nil
 	}
-	s.sessions.remove(sess)
-	s.releaseConn()
-	s.metrics.sessionClosed(string(sess.currentUser().Role))
+	s.leave(sess)
+	if sess.isParked() {
+		// A thread waits for good in one of its connections' calls: closing
+		// what that call is using would free it under the thread.
+		return nil
+	}
 
 	sess.closeCursors(ctx, true)
 	sess.dropModelResults(s.modelRuntime)
@@ -1255,6 +1319,19 @@ func (s *Server) closeSession(ctx context.Context) error {
 	}
 	errs = append(errs, sess.closeBackgroundConn())
 	return errors.Join(append(errs, sess.wl.meter.Close())...)
+}
+
+// leave takes sess out of the server's sessions and gives back its
+// connection slot, once: when its client's connection closes, or when one of
+// its calls into DuckDB parked its thread (see parked), after which its
+// connection's close may never be handled.
+func (s *Server) leave(sess *session) {
+	if !sess.left.CompareAndSwap(false, true) {
+		return
+	}
+	s.sessions.remove(sess)
+	s.releaseConn()
+	s.metrics.sessionClosed(string(sess.currentUser().Role))
 }
 
 // release closes the DuckDB statement behind ps.
@@ -1413,7 +1490,9 @@ func (s *Server) runHere(ctx context.Context, sess *session, st *statement, args
 // rearm returns the context to run a statement again under after ctx, the
 // one runCancelable gave it, ended because the memory watch canceled it:
 // one under outer that a cancel request or the memory watch can end, with
-// what is left of the statement timeout. While ctx lasts, it is ctx.
+// what is left of the statement timeout. While ctx lasts, it is ctx. It is
+// ended already if a cancel request, the console's cancel or the client
+// going ended the statement too, which running it again would undo.
 func (sess *session) rearm(outer, ctx context.Context) (context.Context, context.CancelFunc) {
 	if ctx.Err() == nil {
 		return ctx, func() {}
@@ -1426,13 +1505,74 @@ func (sess *session) rearm(outer, ctx context.Context) (context.Context, context
 		again, cancel = context.WithCancel(outer)
 	}
 	sess.mu.Lock()
-	sess.running, sess.shed = cancel, false
+	sess.shed = false
+	sess.armLocked(cancel, false)
 	if sess.watched != nil {
 		// The stuck watch watches the run again (see watchStuck).
 		sess.watched = again
 	}
 	sess.mu.Unlock()
 	return again, cancel
+}
+
+// steps has sess in the steps of a client's statement from now until the
+// function it returns: what Igloo does for it under cancelable, and its run
+// under runCancelable. Between two of them, as the statement waits for the
+// catalog's lock, none runs, and a cancel request, the console's cancel or
+// the client going found nothing to end: the statement ran to its end. It
+// now ends the next step, which starts canceled (see armLocked).
+func (sess *session) steps() (end func()) {
+	sess.mu.Lock()
+	if sess.stepping == 0 {
+		sess.canceled = false
+	}
+	sess.stepping++
+	sess.mu.Unlock()
+	return func() {
+		sess.mu.Lock()
+		if sess.stepping--; sess.stepping == 0 {
+			sess.canceled = false
+		}
+		sess.mu.Unlock()
+	}
+}
+
+// armLocked, under sess.mu, makes cancel what a cancel request ends of the
+// statement sess runs: the step of it that starts now (see cancelable,
+// runCancelable and rearm). A step of a statement that was canceled starts
+// canceled. fresh says the step may start a statement, as one outside a
+// client's statement's steps does, which a cancel of the one before does not
+// end.
+func (sess *session) armLocked(cancel context.CancelFunc, fresh bool) {
+	if fresh && sess.stepping == 0 {
+		sess.canceled = false
+	}
+	sess.running = cancel
+	if sess.canceled {
+		cancel()
+	}
+}
+
+// cancelLocked ends, under sess.mu, the statement sess runs, for a cancel
+// request, the console's cancel or the client going: the step of it that
+// runs, and the steps after. It reports whether sess was running one.
+func (sess *session) cancelLocked() bool {
+	if sess.running == nil && sess.stepping == 0 {
+		return false
+	}
+	sess.canceled = true
+	if sess.running != nil {
+		sess.running()
+	}
+	return true
+}
+
+// wasCanceled says a cancel request, the console's cancel or the client
+// going ended the statement sess runs (see cancelLocked).
+func (sess *session) wasCanceled() bool {
+	sess.mu.Lock()
+	defer sess.mu.Unlock()
+	return sess.canceled
 }
 
 // cancelable returns a context that a cancel request, the session's
@@ -1448,11 +1588,16 @@ func (sess *session) cancelable(ctx context.Context, query string) (context.Cont
 		ctx, cancel = context.WithCancel(ctx)
 	}
 	sess.mu.Lock()
-	sess.running, sess.statement, sess.started, sess.shed = cancel, redactQuery(query), time.Now(), false
+	sess.statement, sess.started, sess.shed = redactQuery(query), time.Now(), false
+	sess.armLocked(cancel, true)
 	sess.mu.Unlock()
 	return ctx, func(err error) error {
-		ended := ctx.Err()
 		sess.mu.Lock()
+		// Read under mu, which a cancel holds as it ends the step: one that
+		// came as the step ended is seen here, or found no step to end. Read
+		// before, a memory-watch cancel in between was lost, and the
+		// statement ran to its end.
+		ended := ctx.Err()
 		shed, exiting := sess.shed, sess.exiting
 		sess.running, sess.statement, sess.started = nil, "", time.Time{}
 		sess.mu.Unlock()
@@ -1489,17 +1634,26 @@ func (sess *session) runCancelable(ctx context.Context, query string, fn func(co
 	sess.outer = ctx
 	ctx, cancel := context.WithCancel(ctx)
 	sess.mu.Lock()
-	sess.running, sess.statement, sess.started, sess.shed, sess.queued = cancel, redactQuery(query), time.Now(), false, true
+	sess.statement, sess.started, sess.shed, sess.queued = redactQuery(query), time.Now(), false, true
+	sess.armLocked(cancel, true)
+	canceled, exiting := sess.canceled, sess.exiting
 	sess.runShape = sess.wl.controller.Alike(sess.wl.exact, sess.wl.shape)
 	sess.mu.Unlock()
 
 	defer func() {
 		sess.mu.Lock()
-		sess.running, sess.statement, sess.started, sess.queued = nil, "", time.Time{}, false
+		sess.running, sess.statement, sess.started, sess.queued, sess.reserved = nil, "", time.Time{}, false, 0
 		sess.runShape, sess.elsewhere = "", false
 		sess.mu.Unlock()
 		cancel()
 	}()
+	switch {
+	case canceled && exiting:
+		return errServerExiting
+	case canceled:
+		// Between its steps (see steps).
+		return errCanceledBeforeRun
+	}
 
 	queued, cancelQueued := ctx, context.CancelFunc(func() {})
 	if timeout := sess.queuedTimeout(); timeout > 0 {
@@ -1512,7 +1666,7 @@ func (sess *session) runCancelable(ctx context.Context, query string, fn func(co
 	}
 	defer release()
 	sess.mu.Lock()
-	sess.started, sess.queued = time.Now(), false
+	sess.started, sess.queued, sess.reserved = time.Now(), false, sess.wl.reserved
 	sess.mu.Unlock()
 	if timeout := sess.statementTimeout(); timeout > 0 {
 		var cancelRun context.CancelFunc
@@ -1536,6 +1690,11 @@ func (sess *session) runCancelable(ctx context.Context, query string, fn func(co
 	stopWatch := sess.watchStuck(ctx)
 	err = fn(ctx)
 	stopWatch()
+	if alone := (*runAlone)(nil); errors.As(err, &alone) {
+		// It gives back its place, and waits for all of the memory.
+		release()
+		err = sess.runAgainAlone(sess.outer, ctx, alone, fn)
+	}
 	if err != nil && errors.Is(ctx.Err(), context.DeadlineExceeded) {
 		return errStatementTimeout
 	}
@@ -1611,8 +1770,9 @@ func (s *Server) ShedMemory(available int64) bool {
 	s.orphans.reset()
 	longest.mu.Lock()
 	defer longest.mu.Unlock()
-	if longest.running == nil {
-		return false
+	if longest.running == nil || longest.queued {
+		// It ended the step it ran a moment ago, or waits in line for its run.
+		return acted
 	}
 	longest.shed, longest.shedAt = true, time.Now()
 	longest.running()
@@ -1673,9 +1833,9 @@ func txStatus(ctx context.Context) types.ServerStatus {
 // and clients such as psql look up an OID before listing its columns.
 var listsColumns = regexp.MustCompile(`(?i)\b(pg_attribute|pg_class|information_schema"?\s*\.\s*"?columns|pg_information_schema_columns|duckdb_columns)\b`)
 
-// listsCatalog matches a statement whose run walks the catalog's in-memory
-// set of tables and views and so, unlike a plain data read, holds the
-// catalog lock exclusively while it runs (see catalogRunLock). It covers
+// listsCatalog matches a statement whose run lists the catalog's tables and
+// views and so, unlike a plain data read, holds the catalog lock shared while
+// it runs, not only for its bind (see catalogRunLock). It covers
 // DuckDB's catalog listing functions and the pg_catalog, information_schema
 // and sqlite_master relations BI tools and drivers read, by the names the
 // statement is written with and the names Igloo rewrites them to, and SHOW,
@@ -2080,6 +2240,9 @@ func (s *Server) preparedQuery(ctx context.Context, sess *session, user auth.Use
 			// Simple-protocol statements run once.
 			defer sess.release(ps) //nolint:errcheck
 		}
+		// A cancel between its steps, as it waits for an AI function's
+		// first calls or the catalog's lock, ends it too.
+		defer sess.steps()()
 
 		args, err := decodeParams(params, st.params)
 		if err != nil {
@@ -2121,7 +2284,7 @@ func (s *Server) preparedQuery(ctx context.Context, sess *session, user auth.Use
 		if s.beforeRefresh != nil {
 			s.beforeRefresh(pctx)
 		}
-		readied := s.timePhases(ctx, sess, "statement readied to run")
+		readied := s.timePhases(ctx, sess, "statement readied to run", q.Query)
 		bitmaps := st.bitmaps
 		err = s.readyStatement(pctx, sess, st)
 		if err == nil && st.bitmaps != bitmaps {
@@ -2198,6 +2361,9 @@ func (s *Server) preparedQuery(ctx context.Context, sess *session, user auth.Use
 		// the metrics and ownership bookkeeping below, to keep the exclusive
 		// window short (see catalogRunLock, holdCatalog).
 		releaseCatalog := s.catalogRunLock(sess, st)
+		if s.beforeRun != nil {
+			s.beforeRun(sess, q.Query)
+		}
 		outer := ctx
 		// A query or a change of data waits its turn behind the replica's
 		// limit of statements at once, if there is one.
@@ -2206,9 +2372,18 @@ func (s *Server) preparedQuery(ctx context.Context, sess *session, user auth.Use
 		if sess.wl.counted || st.staged != nil {
 			sess.wl.shape = s.workloadShape(ctx, sess, st.shapeText())
 			sess.wl.exact = s.workloadExact(sess, st.shapeText())
+			if tr != nil && tr.flattenKey != "" {
+				// Its FLATTENs take one form, then the other, then the faster
+				// (see flattenForm), which DuckDB's text says and the client's
+				// does not: by that text a dashboard's statements were new again
+				// in its second run, and waited for one another as statements
+				// nothing is known of do. The client's text keys them.
+				sess.wl.shape, sess.wl.exact = tr.flattenKey, tr.flattenExact
+			}
 		}
 		shape, exact := sess.wl.shape, sess.wl.exact
 		sess.wl.apart = s.runsApart(sess, st)
+		sess.wl.planned = func(ctx context.Context) (int64, bool) { return s.planned(ctx, sess, st) }
 		err = sess.runCancelable(ctx, q.Query, func(ctx context.Context) error {
 			runOnce := func() error {
 				p, done, err := s.runDistributed(ctx, sess, sess.currentUser(), st, args, tw, sessionMode(sess, sess.currentUser()))
@@ -2241,7 +2416,8 @@ func (s *Server) preparedQuery(ctx context.Context, sess *session, user auth.Use
 					// below, rather than on workers with bitmaps.
 					return err
 				}
-				if err != nil && parts.key != "" && tw.Written() == 0 && outer.Err() == nil && sess.ranOutOfMemory(ctx, err) {
+				s.captureOutOfMemory(sess, err)
+				if err != nil && s.mayMoveAfterOutOfMemory(sess, &parts) && tw.Written() == 0 && outer.Err() == nil && sess.ranOutOfMemory(ctx, err) {
 					return s.afterOutOfMemory(outer, ctx, sess, st, args, tw, &parts, err)
 				}
 				return err
@@ -2252,7 +2428,10 @@ func (s *Server) preparedQuery(ctx context.Context, sess *session, user auth.Use
 					err = s.rerunWithoutIndexes(ctx, sess, st, err, runOnce)
 				}
 				if st.bitmaps && bitmapsDidNotFit(err) && tw.Written() == 0 && outer.Err() == nil {
-					return s.rerunWithoutBitmaps(ctx, sess, st, err, runOnce)
+					err = s.rerunWithoutBitmaps(ctx, sess, st, err, runOnce)
+				}
+				if outer.Err() == nil && sess.mayRunAlone(st, err, tw.Written() > 0) {
+					return s.againAlone(sess, err)
 				}
 				return err
 			}
@@ -2288,7 +2467,7 @@ func (s *Server) preparedQuery(ctx context.Context, sess *session, user auth.Use
 			spend = &sp
 			aiNotice(w, sp)
 		}
-		sess.wl.counted, sess.wl.shape, sess.wl.exact, sess.wl.apart = false, "", "", false
+		sess.wl.counted, sess.wl.shape, sess.wl.exact, sess.wl.apart, sess.wl.planned = false, "", "", false, nil
 		if st.filled != nil {
 			// A fill's query ran on workers, or here, as a read of it would
 			// (see fillOn): the history says where, and auto mode learns how
@@ -2304,10 +2483,11 @@ func (s *Server) preparedQuery(ctx context.Context, sess *session, user auth.Use
 		// A run planned to no rows says nothing of others of its shape (see
 		// workload.ReadNothing).
 		measured := used != nil && !workload.ReadNothing(used.BytesRead, used.CPUTime)
-		if measured && tr != nil && tr.flattenKey != "" {
-			s.workload.ObserveForm(tr.flattenKey, tr.flattenLists, used.CPUTime)
-		}
 		peak, sampled := sess.wl.peak, sess.wl.sampled
+		if measured && tr != nil && tr.flattenKey != "" {
+			s.workload.ObserveForm(tr.flattenKey, tr.flattenLists, used.CPUTime,
+				workload.FootprintOf(used.MemoryAllocated, peak, sampled), time.Since(start)-sess.wl.queued)
+		}
 		if used != nil && parts.workers == 0 && s.heavy != nil && (measured || !s.heavy.known(shape)) {
 			// Which of this replica's DuckDBs the next like it runs in.
 			s.heavy.observe(shape, used.CPUTime, sess.wl.ranInBackground)
@@ -2318,6 +2498,10 @@ func (s *Server) preparedQuery(ctx context.Context, sess *session, user auth.Use
 			if err == nil {
 				s.workload.ObserveOnWorkers(shape)
 				s.workload.ObserveOnWorkers(exact)
+				if s.heavyOnWorkers != nil {
+					// Whether the next like it runs there in the background.
+					s.heavyOnWorkers.observe(shape, time.Since(start)-sess.wl.queued, false)
+				}
 			}
 		case measured:
 			// What it held here, for the next statement like it, and the next the same.
@@ -2329,14 +2513,8 @@ func (s *Server) preparedQuery(ctx context.Context, sess *session, user auth.Use
 		case used != nil:
 			s.workload.ObserveEmpty(exact)
 		case err != nil && sampled:
-			// It ended before its end, holding at least that much, or, if it
-			// ran a while, all the memory: it may have held any of what the
-			// statements beside it were charged with.
-			if time.Since(start)-sess.wl.queued >= workload.LongUnfinished {
-				peak = max(peak, s.queryMemory)
-			}
-			s.workload.ObserveUnfinished(shape, peak)
-			s.workload.ObserveUnfinished(exact, peak)
+			// It ended before its end, holding at least that much.
+			s.observeUnfinished(shape, exact, peak, sampled, time.Since(start)-sess.wl.queued, 0, err)
 		}
 		if !sampled {
 			peak = 0
@@ -2370,9 +2548,19 @@ func (s *Server) preparedQuery(ctx context.Context, sess *session, user auth.Use
 		if err == nil && parts.key != "" {
 			// How long it took where it ran, for where it runs next time.
 			s.dist.ObserveOn(parts.key, parts.workers, parts.large, time.Since(cmp.Or(parts.since, start)))
+			if parts.workers > 0 && tr != nil && tr.flattenKey != "" {
+				// Its FLATTENs' form, by what it took of the workers, as the
+				// replica measured none of it (see ObserveFormOnWorkers).
+				s.workload.ObserveFormOnWorkers(tr.flattenKey, tr.flattenLists, time.Since(cmp.Or(parts.since, start)), parts.workers)
+			}
 			if parts.workers == 0 && peak > 0 {
 				// What it held here, against what its plan said it would.
 				s.dist.ObservePeak(parts.key, peak)
+			}
+			if ops, ok := sess.wl.meter.LastOperators(); ok && parts.workers == 0 && !sess.wl.ranInBackground {
+				// The rows its operators made here, which later statements'
+				// estimates learn from.
+				s.dist.ObserveOperators(parts.key, operatorRows(ops))
 			}
 		}
 		s.recordQuery(sess, queryRecord{text: q.Query, start: start, err: err, rows: tw.rows(), acc: st.access,
@@ -2407,10 +2595,10 @@ const (
 type catalogHold struct{ mode catalogMode }
 
 // holdCatalog takes the engine's catalog lock exclusively for one step of
-// handling a statement that reaches the catalog's in-memory set of tables
-// (see engine.Engine.CatalogLock and catalogRunLock). shareCatalog takes it
-// shared, for DuckDB binding a statement (the bind hold openSession sets):
-// binds are safe alongside each other, not alongside the rest. Holds are
+// handling a statement that changes the catalog's tables (see
+// engine.Engine.CatalogLock and catalogRunLock). shareCatalog takes it
+// shared, for a step that looks them up: DuckDB binding a statement (the bind
+// hold openSession sets), preparing or rechecking one, a listing. Holds are
 // reentrant per session: the several steps that reach the set while one
 // statement is handled (preparing it, binding it, rechecking it, running it,
 // and the commands that resolve or list catalog objects) each take one
@@ -2426,28 +2614,15 @@ func (s *Server) holdCatalog(sess *session) func() {
 	return s.catalogHold(sess, catalogExclusive)
 }
 
-// statementThread runs run, a session's command, on a thread of its own (see
-// terminate.Statement), from which a C++ exception that escapes DuckDB, which
-// nothing can catch, parks the thread rather than end the process: the iceberg
-// extension's scan state threw Out of Memory out of its destructor in the
-// optimizer of a statement bound again at the replica's memory limit, and the
-// process ended with every session's statement.
-func (s *Server) statementThread(ctx context.Context, run func() error) error {
-	sess := sessionFrom(ctx)
-	if sess == nil {
-		return run()
-	}
-	var err error
-	terminate.Statement(func(what string) { s.parked(ctx, sess, what) }, func() { err = run() })
-	return err
-}
-
-// parked ends the session whose statement's thread parked, as what escaped
-// DuckDB there says: it lets go of the session's hold on the catalog lock and of
-// what its statement was admitted with, which the thread, waiting for good,
-// would keep from every other session, and closes the client's connection. The
+// parked ends the session one of whose calls into DuckDB parked its thread
+// (see openSession's call guard), as what escaped DuckDB there says: it lets
+// go of the session's hold on the catalog lock and of what its statement was
+// admitted with, which the thread, waiting for good, would keep from every
+// other session, takes the session out of the server's, so the memory watch
+// does not wait on its statement, and closes the client's connection. The
 // thread keeps its DuckDB connection, and what DuckDB held for its statement.
 func (s *Server) parked(ctx context.Context, sess *session, what string) {
+	sess.parkOnce.Do(func() { close(sess.parkedC) })
 	sess.mu.Lock()
 	text, user, pid := sess.statement, sess.user.Name, sess.pid
 	sess.mu.Unlock()
@@ -2455,11 +2630,23 @@ func (s *Server) parked(ctx context.Context, sess *session, what string) {
 	s.log.Error("a C++ exception escaped DuckDB on a statement's thread, where nothing could catch it; the statement and its session end, "+
 		"and its thread and DuckDB connection wait for good", "pid", pid, "user", user, "statement_sha256", hex.EncodeToString(sum[:8]), "what", what)
 	s.unlockCatalog(sess)
+	s.leave(sess)
 	if done := sess.wl.admitted; done != nil {
 		done()
 	}
 	if c := wire.AcceptedConn(ctx); c != nil {
 		_ = c.Close()
+	}
+}
+
+// isParked reports whether one of the session's calls into DuckDB parked its
+// thread (see parked).
+func (sess *session) isParked() bool {
+	select {
+	case <-sess.parkedC:
+		return true
+	default:
+		return false
 	}
 }
 
@@ -2509,6 +2696,7 @@ func (s *Server) relockCatalog(sess *session) {
 	}
 	s.unlockCatalog(sess)
 	start := time.Now()
+	sess.catWaitFrom.Store(start.UnixNano())
 	switch want {
 	case catalogExclusive:
 		sess.catRelease = s.engine.CatalogLock()
@@ -2518,6 +2706,8 @@ func (s *Server) relockCatalog(sess *session) {
 		sess.catRelease = s.engine.CatalogShare()
 		sess.catWait += time.Since(start)
 	}
+	sess.catWaited.Add(int64(time.Since(start)))
+	sess.catWaitFrom.Store(0)
 	sess.catHeld = want
 }
 
@@ -2589,39 +2779,33 @@ func (s *Server) shareCatalogForLogin(ctx context.Context, sess *session) (func(
 }
 
 // catalogRunLock holds the catalog lock exclusively for a run that changes
-// the catalog or lists it, and not at all for any other run.
+// the catalog, shared for one that lists it, and not at all for any other
+// run (see engine.Engine.CatalogLock).
 //
-// DuckDB-Iceberg's one in-memory set of the catalog's tables is the shared
-// state that is not safe under concurrency (see engine.Engine.CatalogLock).
-// DDL that renames or drops a table removes entries from it without
-// DuckDB-Iceberg's own lock, and a listing walks it while a bind replaces
-// the entries of the tables it names, so the runs that do either take the
-// lock exclusively and run on their own: DDL, by its statement type (create,
+// DDL takes it exclusively, so that what other sessions look up meanwhile
+// finds the catalog before or after it: DDL by its statement type (create,
 // drop, alter, attach, detach, whatever the database: the last statement of
 // several an admin sends may be one, and the Iceberg DDL Igloo recognizes,
-// changesIceberg, is always one), EXECUTE of a statement prepared in SQL
-// that may be any of these (see executeHolds), and listings
-// (information_schema, pg_catalog, duckdb_tables()/views()/columns(), SHOW,
-// DESCRIBE, PRAGMA; see listsCatalog). Preparing and rechecking any
-// statement take it exclusively too, since Igloo's checks list the catalog
-// (see prepareChecked, recheck).
+// changesIceberg, is always one), and EXECUTE of a statement prepared in SQL
+// that may be one (see executeHolds). A listing (information_schema,
+// pg_catalog, duckdb_tables()/views()/columns(), SHOW, DESCRIBE, PRAGMA; see
+// listsCatalog) takes it shared, alongside binds, prepares and other
+// listings, and gives tables back the names the catalog spells them with
+// first (see engine.Engine.Respell). Listings took it exclusively while
+// DuckDB-Iceberg's set of tables could not be walked beside a bind, and a BI
+// tool's schema browser, listing a namespace's tables a second, held up every
+// dashboard's binds.
 //
 // The run of any other statement holds the lock only while DuckDB binds the
 // statement again to run it, which it does each time for a statement that
-// reads the catalog, replacing the entries of the tables it names (see the
-// bind hold openSession sets). Those binds hold it shared: they take
-// DuckDB-Iceberg's own lock, so they run alongside each other, just not
-// alongside DDL, a listing or a prepare.
-//
-// After that bind the run holds nothing: a data read scans the files of the
-// tables it bound, and a write (INSERT, UPDATE, DELETE, MERGE) commits a new
-// snapshot of them — neither changes the set or walks it. Holding nothing
-// lets reads and writes run concurrently and, as importantly, keeps a long
-// run from blocking another session that needs to prepare, list or change
-// the catalog, and a write from blocking a second writer whose commit it
-// must see to retry on a conflict. Statements that do not reach the catalog
-// (SET, transaction control) and sessions with no catalog attached hold
-// nothing either.
+// reads the catalog (see the bind hold openSession sets), shared. After that
+// bind the run holds nothing: a data read scans the files of the tables it
+// bound, and a write (INSERT, UPDATE, DELETE, MERGE) commits a new snapshot of
+// them. Holding nothing lets reads and writes run concurrently and keeps a
+// long run from holding up DDL, and a write from blocking a second writer
+// whose commit it must see to retry on a conflict. Statements that do not
+// reach the catalog (SET, transaction control) and sessions with no catalog
+// attached hold nothing either.
 //
 // CREATE TABLE ... AS of an Iceberg table, which runs outside any
 // transaction block, and of a temporary table are carried out in steps that
@@ -2638,8 +2822,12 @@ func (s *Server) catalogRunLock(sess *session, st *statement) func() {
 	if st.stmtType == duckdb.STATEMENT_TYPE_EXECUTE && !sess.executeHolds(st.query) {
 		return func() {}
 	}
-	if st.changesIceberg || st.listsCatalog || changesCatalog(st.stmtType) || st.stmtType == duckdb.STATEMENT_TYPE_EXECUTE {
+	if st.changesIceberg || changesCatalog(st.stmtType) || st.stmtType == duckdb.STATEMENT_TYPE_EXECUTE {
 		return s.holdCatalog(sess)
+	}
+	if st.listsCatalog && s.catalogName() != "" {
+		s.engine.Respell()
+		return s.shareCatalog(sess)
 	}
 	return func() {}
 }
@@ -2700,13 +2888,11 @@ func (s *Server) readyStatement(ctx context.Context, sess *session, st *statemen
 	// counts of the tables its prepare loaded.
 	s.registerDistinctCounts(ctx, sess)
 	// Rechecking re-plans with EXPLAIN and may re-apply policies, both of
-	// which read and fill in the catalog's set; release before the run
-	// takes the side it needs (see holdCatalog, catalogRunLock). A
+	// which look tables up: it holds the lock shared, and lets go before the
+	// run takes the side it needs (see holdCatalog, catalogRunLock). A
 	// statement with nothing to check again, as an admin's that reads no
 	// connection while the policies, the catalog and the session's settings
-	// stay as they were, holds nothing here: every run of one would
-	// otherwise wait its turn for the lock with the statements being
-	// prepared.
+	// stay as they were, holds nothing here.
 	deciding := sess.phase("recheck")
 	again, err := s.needsRecheck(ctx, sess, st)
 	deciding()
@@ -2715,7 +2901,7 @@ func (s *Server) readyStatement(ctx context.Context, sess *session, st *statemen
 	}
 	if again {
 		locked := sess.phase("catalog_lock")
-		relist := s.holdCatalog(sess)
+		relist := s.shareCatalog(sess)
 		locked()
 		rechecking := sess.phase("recheck")
 		err := s.recheck(ctx, sess, st)
@@ -2775,20 +2961,12 @@ func (s *Server) rewriteCounting(ctx context.Context, sess *session, user auth.U
 
 // prepareHeld is prepareChecked holding the catalog lock as mode says.
 func (s *Server) prepareHeld(ctx context.Context, sess *session, user auth.User, text string, oids []uint32, mode catalogMode) (st *statement, err error) {
-	// Preparing reads and fills in the catalog's in-memory set of tables:
-	// DuckDB binds the statement (and suggests names for a missing table),
-	// and Igloo resolves names, loads schemas and checks grants the same way,
-	// filling in each table it names on first use. Hold the exclusive side so
-	// no other statement reads the set while this changes it (see
-	// holdCatalog), or the shared side for a query that may be prepared
-	// alongside others (see sharedprepare.go).
-	defer s.timePhases(ctx, sess, "statement prepared")()
+	// Preparing looks the tables the statement names up: DuckDB binds it,
+	// and Igloo resolves names, loads schemas and checks grants the same way
+	// (see sharedprepare.go).
+	defer s.timePhases(ctx, sess, "statement prepared", text)()
 	locked := sess.phase("catalog_lock")
 	defer s.catalogHold(sess, mode)()
-	if mode == catalogShared {
-		sess.sharedPrepare = true
-		defer func() { sess.sharedPrepare = false }()
-	}
 	locked()
 	// DuckDB plans it with the tables' distinct counts as last loaded.
 	s.registerDistinctCounts(ctx, sess)
@@ -2818,8 +2996,8 @@ func (s *Server) prepareHeld(ctx context.Context, sess *session, user auth.User,
 		sess.memo = &checkMemo{plans: map[string]any{}}
 		defer func() { sess.memo = nil }()
 	}
-	if !sess.temps && mayCreateTemporary(text) {
-		sess.temps = true
+	if !(sess.temps && sess.tempMacros) && mayCreateTemporary(text) {
+		sess.temps, sess.tempMacros = true, true
 	}
 	// The counting CTEs of audience reports become calls of the report API
 	// (see reportrecognize.go), which the statement then goes through as
@@ -3012,6 +3190,9 @@ func (s *Server) prepareCheckedText(ctx context.Context, sess *session, user aut
 	if factored := s.factorUnions(ctx, sess, query); factored != "" {
 		query = factored
 	}
+	if merged := s.mergeSiblings(ctx, sess, query); merged != "" {
+		query = merged
+	}
 	shared := s.shareSubqueries(ctx, sess, query)
 	sharing()
 	preparing := sess.phase("duckdb_prepare")
@@ -3027,17 +3208,12 @@ func (s *Server) prepareCheckedText(ctx context.Context, sess *session, user aut
 	if st == nil {
 		st, err = prepare(ctx, sess.conn, query, oids)
 		if err != nil && query != written {
-			s.log.Debug("statement runs with its unions as written", "err", err)
+			s.log.Debug("statement runs with its unions and sibling aggregations as written", "err", err)
 			query = written
 			st, err = prepare(ctx, sess.conn, query, oids)
 		}
 	}
 	preparing()
-	if err != nil && sess.sharedPrepare {
-		// Prepared again under the exclusive lock, which the steps below
-		// need (see sharedprepare.go).
-		return fail(err)
-	}
 	if err != nil && s.ddl != nil && missingRelation.MatchString(err.Error()) {
 		// Perhaps a view another replica just created, or one this replica
 		// could not make when it last synced, which DuckDB cannot bind (see
@@ -3465,9 +3641,7 @@ func (r *registry) cancel(pid, secret int32) {
 		return
 	}
 	sess.mu.Lock()
-	if sess.running != nil {
-		sess.running()
-	}
+	sess.cancelLocked()
 	sess.mu.Unlock()
 }
 

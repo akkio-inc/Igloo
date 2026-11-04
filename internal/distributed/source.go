@@ -2,17 +2,24 @@ package distributed
 
 import (
 	"context"
+	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"iter"
+	"math/big"
 	"reflect"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/apache/arrow-go/v18/parquet/metadata"
 	"github.com/apache/iceberg-go"
+	icebergio "github.com/apache/iceberg-go/io"
 	"github.com/apache/iceberg-go/table"
 
 	"github.com/akkio-inc/igloo/internal/catalog"
@@ -22,7 +29,7 @@ import (
 type Source interface {
 	// Table returns schema.name, with its columns named and typed as DuckDB
 	// reads them. Workers cannot read it if Unsupported is set. Its snapshot
-	// may be a few seconds old: it decides only whether to distribute.
+	// may be up to a minute old: it decides only whether to distribute.
 	Table(ctx context.Context, schema, name string) (*Table, error)
 	// Refresh brings t to the table's current snapshot. It fails if the
 	// table's columns changed since, their types included.
@@ -84,21 +91,54 @@ type Iceberg struct {
 
 	mu    sync.Mutex
 	files map[string][]File
+	// stats are what each snapshot's files' statistics give its columns
+	// (see fileStats), by the same keys as files.
+	stats map[string]fileStats
 	order []string
 	// cached counts the files of the snapshots kept.
 	cached int
-	// tables are recently loaded tables, for deciding.
-	tables map[string]loadedTable
+	// tables are recently loaded tables, for deciding, and loading the loads
+	// under way, by the same keys.
+	tables  map[string]loadedTable
+	loading map[string]*tableLoad
+	// loader loads a table's metadata: load, which tests replace. versions,
+	// if set, says a table's version, which goes up whenever the table may
+	// have changed (see SetVersions).
+	loader   func(ctx context.Context, schema, name string) (*Table, error)
+	versions func(schema, name string) uint64
 }
 
 type loadedTable struct {
-	t  *Table
-	at time.Time
+	t       *Table
+	at      time.Time
+	version uint64
 }
 
-// tableTTL is how long a loaded table's metadata decides whether a
-// statement is distributed.
-const tableTTL = 10 * time.Second
+// tableLoad is a load of a table's metadata at version, which every lookup of
+// the table at that version meanwhile waits for: t and err once done is closed.
+type tableLoad struct {
+	done    chan struct{}
+	version uint64
+	t       *Table
+	err     error
+}
+
+// A loaded table decides whether a statement is distributed for tableTTL; past
+// that, for up to tableStale, the lookup that finds it starts loading it again
+// and decides by it meanwhile, as later lookups do until the load is done; as
+// long as the table's version is the one it was loaded at, which a change to
+// the table raises. Lookups of a table not loaded, loaded longer ago or at an
+// older version, share one load. Each lookup of a table whose decision had
+// lapsed loaded it again itself: under a mixed load, lookups that loaded the
+// same tables at once took 0.3 to 0.7 s each, past the half second auto mode
+// gives the planning of a cheap statement (see limitPlanning). A statement
+// that runs on workers loads its tables afresh before it runs (Refresh), and
+// runs on one machine if their columns changed.
+const (
+	tableTTL     = 10 * time.Second
+	tableStale   = time.Minute
+	tableLoadMax = 30 * time.Second
+)
 
 // maxCachedSnapshots and maxCachedFiles bound the snapshots whose file
 // lists are kept, and their files: a table of 100,000 files committed to
@@ -111,7 +151,9 @@ const (
 
 // NewIceberg reads tables through cat.
 func NewIceberg(cat *catalog.Client) *Iceberg {
-	return &Iceberg{cat: cat, files: map[string][]File{}, tables: map[string]loadedTable{}}
+	s := &Iceberg{cat: cat, files: map[string][]File{}, tables: map[string]loadedTable{}, loading: map[string]*tableLoad{}}
+	s.loader = s.load
+	return s
 }
 
 type icebergHandle struct {
@@ -122,30 +164,128 @@ type icebergHandle struct {
 	columns []Column
 }
 
-// Table returns a table's metadata, loaded at most tableTTL ago.
+// SetVersions has s decide by a loaded table only at the version it was loaded
+// at (see tableTTL): versions says a table's version, which goes up whenever
+// the table may have changed. The catalog proxy's (catalogproxy.TableVersion)
+// goes up with every change DuckDB makes to it, and when DuckDB, preparing a
+// statement, loads a table another replica or engine changed; so a statement
+// is planned with its tables as it was prepared with them, whatever their age.
+// It is set before s is used.
+func (s *Iceberg) SetVersions(versions func(schema, name string) uint64) { s.versions = versions }
+
+// WatchChanges loads again, in the background, the tables loaded lately whose
+// version went up, until ctx ends: whenever changed, which goes up with any
+// table's version (catalogproxy.Proxy.DataVersion), has gone up since it last
+// looked, every tableWatch. A lookup of a table at a version not loaded waited
+// for its load, 0.3 to 1.2 s under a mixed load: in one window, 37 of the 38
+// lookups that waited so began within 7 s of a commit of the ELT, and so did
+// 17 of the 19 statements that gave up planning at the half second auto mode
+// gives a cheap one (see limitPlanning). Loaded as the commit is made, the
+// table is there by the time they look it up, or nearly.
+func (s *Iceberg) WatchChanges(ctx context.Context, changed func() uint64) {
+	if s.versions == nil {
+		return
+	}
+	seen := changed()
+	tick := time.NewTicker(tableWatch)
+	defer tick.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-tick.C:
+		}
+		if v := changed(); v != seen {
+			seen = v
+			s.loadChanged()
+		}
+	}
+}
+
+// tableWatch is how often WatchChanges looks for changed tables.
+const tableWatch = 100 * time.Millisecond
+
+// loadChanged starts loading the tables loaded within tableStale whose
+// version is no longer the one they were loaded at.
+func (s *Iceberg) loadChanged() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for key, lt := range s.tables {
+		schema, name, _ := strings.Cut(key, "\x00")
+		if v := s.versions(schema, name); v != lt.version && time.Since(lt.at) < tableStale {
+			s.startLoad(key, schema, name, v)
+		}
+	}
+}
+
+// Table returns a table's metadata, loaded at most tableTTL ago, or at most
+// tableStale ago while it loads again, at its current version (see tableTTL).
 func (s *Iceberg) Table(ctx context.Context, schema, name string) (*Table, error) {
 	key := schema + "\x00" + name
+	var version uint64
+	if s.versions != nil {
+		version = s.versions(schema, name)
+	}
 	s.mu.Lock()
 	lt, ok := s.tables[key]
+	if age := time.Since(lt.at); ok && lt.version == version && age < tableStale {
+		if age >= tableTTL {
+			s.startLoad(key, schema, name, version)
+		}
+		s.mu.Unlock()
+		return copyTable(lt.t), nil
+	}
+	ld := s.startLoad(key, schema, name, version)
 	s.mu.Unlock()
-	if ok && time.Since(lt.at) < tableTTL {
-		c := *lt.t
-		c.Columns = slices.Clone(lt.t.Columns)
-		return &c, nil
+	select {
+	case <-ld.done:
+	case <-ctx.Done():
+		return nil, context.Cause(ctx)
 	}
-	t, err := s.load(ctx, schema, name)
-	if err != nil {
-		return nil, err
+	if ld.err != nil {
+		return nil, ld.err
 	}
-	s.mu.Lock()
-	if len(s.tables) > 4096 {
-		clear(s.tables)
+	return copyTable(ld.t), nil
+}
+
+// startLoad returns the load of the table at version under way, or starts one,
+// which a load at an older version then makes way for. It runs apart from the
+// context of the lookup that started it, which may end while others wait for
+// it, for at most tableLoadMax. s.mu is held.
+func (s *Iceberg) startLoad(key, schema, name string, version uint64) *tableLoad {
+	if ld := s.loading[key]; ld != nil && ld.version == version {
+		return ld
 	}
-	s.tables[key] = loadedTable{t: t, at: time.Now()}
-	s.mu.Unlock()
+	ld := &tableLoad{done: make(chan struct{}), version: version}
+	s.loading[key] = ld
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), tableLoadMax)
+		defer cancel()
+		t, err := s.loader(ctx, schema, name)
+		s.mu.Lock()
+		ld.t, ld.err = t, err
+		// One that made way for a load at a newer version may have read the
+		// table before what raised its version.
+		if s.loading[key] == ld {
+			if err == nil {
+				if len(s.tables) > 4096 {
+					clear(s.tables)
+				}
+				s.tables[key] = loadedTable{t: t, at: time.Now(), version: version}
+			}
+			delete(s.loading, key)
+		}
+		s.mu.Unlock()
+		close(ld.done)
+	}()
+	return ld
+}
+
+// copyTable is t with columns of its own, for a caller to change.
+func copyTable(t *Table) *Table {
 	c := *t
 	c.Columns = slices.Clone(t.Columns)
-	return &c, nil
+	return &c
 }
 
 // Refresh loads the table's current metadata into t. The statement was
@@ -247,8 +387,10 @@ func (s *Iceberg) Files(ctx context.Context, t *Table) ([]File, error) {
 	key := h.tbl.MetadataLocation() + "#" + strconv.FormatInt(h.snap.SnapshotID, 10)
 	s.mu.Lock()
 	files, ok := s.files[key]
+	st := s.stats[key]
 	s.mu.Unlock()
 	if ok {
+		st.set(t)
 		return files, nil
 	}
 
@@ -258,7 +400,10 @@ func (s *Iceberg) Files(ctx context.Context, t *Table) ([]File, error) {
 	}
 	files = make([]File, 0, len(tasks))
 	bucketed := len(t.Buckets) > 0
+	bounding := newBounder(t.Columns)
 	for _, task := range tasks {
+		bounding.add(task.File.LowerBoundValues(), task.File.UpperBoundValues(), task.File.Count())
+		bounding.size(task.File.ColumnSizes())
 		if f := strings.ToUpper(string(task.File.FileFormat())); f != "PARQUET" {
 			return nil, unsupported("%s has %s files", t, f)
 		}
@@ -309,19 +454,366 @@ func (s *Iceberg) Files(ctx context.Context, t *Table) ([]File, error) {
 		files = append(files, f)
 	}
 
+	st = fileStats{bounds: bounding.bounds(len(tasks)), sizes: bounding.columnBytes(len(tasks)), top: bounding.topRows(len(tasks))}
+	if len(st.top) > 0 {
+		// Read when a statement asks, with a context of its own: the
+		// snapshot's stats outlive this call.
+		tbl := h.tbl
+		st.latest = bounding.latestRows(files, func() (icebergio.IO, context.CancelFunc, error) {
+			ctx, cancel := context.WithTimeout(context.Background(), footerReadLimit)
+			fsys, err := tbl.FS(ctx)
+			return fsys, cancel, err
+		})
+	}
+	st.set(t)
 	s.mu.Lock()
 	if _, ok := s.files[key]; !ok {
-		s.files[key] = files
+		if s.stats == nil {
+			s.stats = map[string]fileStats{}
+		}
+		s.files[key], s.stats[key] = files, st
 		s.order = append(s.order, key)
 		s.cached += len(files)
 		for len(s.order) > maxCachedSnapshots || s.cached > maxCachedFiles && len(s.order) > 1 {
 			s.cached -= len(s.files[s.order[0]])
 			delete(s.files, s.order[0])
+			delete(s.stats, s.order[0])
 			s.order = s.order[1:]
 		}
 	}
 	s.mu.Unlock()
 	return files, nil
+}
+
+// fileStats are what a snapshot's data files' statistics give its columns:
+// their bounds (Table.Bounds), sizes (Table.ColumnBytes) and the rows of
+// the files that hold their most values (Table.TopRows).
+type fileStats struct {
+	bounds map[string][2]float64
+	sizes  map[string]int64
+	top    map[string]int64
+	latest func(col string) (int64, bool)
+}
+
+func (f fileStats) set(t *Table) {
+	t.Bounds, t.ColumnBytes, t.TopRows, t.latestRows = f.bounds, f.sizes, f.top, f.latest
+}
+
+// bounder gathers the bounds of a table's columns of integer types, dates
+// and timestamps over its data files: the least of their lower bounds and
+// the most of their upper ones (see Table.Bounds), and the rows of the
+// files whose upper bound is that most (Table.TopRows).
+type bounder struct {
+	// kinds are the columns bounded, by field ID: their names, and how their
+	// values are written (Iceberg's single-value serialization).
+	kinds map[int]boundKind
+	lo    map[int]float64
+	hi    map[int]float64
+	top   map[int]int64
+	// topFiles are the files, in the order added, whose upper bound of each
+	// field is its most; files counts those added.
+	topFiles map[int][]int
+	files    int
+	// seen counts the files with both bounds of each field.
+	seen map[int]int
+	// names are the top-level columns' names by field ID, and sizes their
+	// compressed bytes over the files, which sized counts.
+	names map[int]string
+	sizes map[int]int64
+	sized map[int]int
+}
+
+type boundKind struct {
+	name string
+	size int
+}
+
+func newBounder(cols []Column) *bounder {
+	b := &bounder{kinds: map[int]boundKind{}, lo: map[int]float64{}, hi: map[int]float64{}, top: map[int]int64{}, topFiles: map[int][]int{}, seen: map[int]int{},
+		names: map[int]string{}, sizes: map[int]int64{}, sized: map[int]int{}}
+	for _, c := range cols {
+		if c.ID != 0 {
+			b.names[c.ID] = strings.ToLower(c.Name)
+		}
+		if c.ID == 0 || c.Nested != nil {
+			continue
+		}
+		switch t := strings.ToUpper(c.Type); {
+		case t == "INTEGER", t == "DATE", t == "SMALLINT", t == "TINYINT":
+			b.kinds[c.ID] = boundKind{strings.ToLower(c.Name), 4}
+		case t == "BIGINT", t == "TIMESTAMP", t == "TIMESTAMP WITH TIME ZONE":
+			b.kinds[c.ID] = boundKind{strings.ToLower(c.Name), 8}
+		case wholeDecimal.MatchString(t):
+			b.kinds[c.ID] = boundKind{strings.ToLower(c.Name), decimalBound}
+		}
+	}
+	return b
+}
+
+// wholeDecimal matches a decimal type of no fractional digits, as a
+// Snowflake NUMBER of integers arrives: its values are integers as an
+// integer type's are.
+var wholeDecimal = regexp.MustCompile(`^DECIMAL\(\d+,\s*0\)$`)
+
+// decimalBound is the size of a decimal's bound, which Iceberg writes as its
+// unscaled value in big-endian two's complement, in as few bytes as it
+// takes.
+const decimalBound = -1
+
+// value decodes a bound of a field of size bytes: a little-endian integer,
+// or a decimal's unscaled value (decimalBound).
+func (b *bounder) value(raw []byte, size int) (float64, bool) {
+	switch {
+	case size == 4 && len(raw) == 4:
+		return float64(int32(binary.LittleEndian.Uint32(raw))), true
+	case size == 8 && len(raw) == 8:
+		return float64(int64(binary.LittleEndian.Uint64(raw))), true
+	case size == decimalBound:
+		return bigEndianInt(raw)
+	}
+	return 0, false
+}
+
+// bigEndianInt decodes a two's complement integer of 1 to 16 big-endian
+// bytes, as Iceberg's bounds and Parquet's statistics write a decimal's
+// unscaled value.
+func bigEndianInt(raw []byte) (float64, bool) {
+	if len(raw) == 0 || len(raw) > 16 {
+		return 0, false
+	}
+	v := new(big.Int).SetBytes(raw)
+	if raw[0]&0x80 != 0 {
+		v.Sub(v, new(big.Int).Lsh(big.NewInt(1), uint(8*len(raw))))
+	}
+	f, _ := v.Float64()
+	return f, true
+}
+
+// size takes in a data file's columns' sizes.
+func (b *bounder) size(sizes map[int]int64) {
+	for id := range b.names {
+		if n, ok := sizes[id]; ok {
+			b.sizes[id] += n
+			b.sized[id]++
+		}
+	}
+}
+
+// columnBytes are the sizes of the top-level columns every one of files
+// data files had a size of, by lower-case name; nil if none. A nested
+// column's size is its first field's, which counts it in part.
+func (b *bounder) columnBytes(files int) map[string]int64 {
+	var out map[string]int64
+	for id, name := range b.names {
+		if files == 0 || b.sized[id] != files {
+			continue
+		}
+		if out == nil {
+			out = map[string]int64{}
+		}
+		out[name] = b.sizes[id]
+	}
+	return out
+}
+
+// add takes in the next data file's lower and upper bounds, and its rows.
+func (b *bounder) add(lower, upper map[int][]byte, rows int64) {
+	for id, k := range b.kinds {
+		lo, okLo := b.value(lower[id], k.size)
+		hi, okHi := b.value(upper[id], k.size)
+		if !okLo || !okHi {
+			continue
+		}
+		switch {
+		case b.seen[id] == 0 || hi > b.hi[id]:
+			b.top[id], b.topFiles[id] = rows, []int{b.files}
+		case hi == b.hi[id]:
+			b.top[id], b.topFiles[id] = b.top[id]+rows, append(b.topFiles[id], b.files)
+		}
+		if b.seen[id] == 0 {
+			b.lo[id], b.hi[id] = lo, hi
+		} else {
+			b.lo[id], b.hi[id] = min(b.lo[id], lo), max(b.hi[id], hi)
+		}
+		b.seen[id]++
+	}
+	b.files++
+}
+
+// topRows are the rows of the files whose upper bound of a column is its
+// most, of the columns every one of files data files had bounds of, by
+// lower-case name; nil if none.
+func (b *bounder) topRows(files int) map[string]int64 {
+	var out map[string]int64
+	for id, k := range b.kinds {
+		if files == 0 || b.seen[id] != files {
+			continue
+		}
+		if out == nil {
+			out = map[string]int64{}
+		}
+		out[k.name] = b.top[id]
+	}
+	return out
+}
+
+// footerFilesMost is how many files' footers a column's latest rows are
+// counted from (see latestRows), and footerReadLimit how long reading them
+// may take; with more, or longer, the files' rows stand. The lookup of
+// 14.1 billion rows at a hundred times the data has its latest version in 8
+// of its 1,483 files, 76.3 million rows, and in row groups of 2.05 million.
+const (
+	footerFilesMost = 16
+	footerReadLimit = 10 * time.Second
+)
+
+// latestRows returns what Table.LatestRows does for a table of files, which
+// b took in, read through fs when first asked for a column: the rows of the
+// row groups of the files that hold the column's most value whose most
+// value it is, by the files' Parquet footers. A lookup's versions written
+// in turn sit in row groups of their own where its files hold several: a
+// lookup of 1.41 billion rows over versions 0 to 2, whose 2 files that hold
+// version 2 have 19.7 million rows, has 384,204 in their row groups that
+// hold it, and 189,400 of version 2. Where more than footerFilesMost files
+// hold the most value, or a footer cannot be read, ok is false.
+func (b *bounder) latestRows(files []File, fs func() (icebergio.IO, context.CancelFunc, error)) func(col string) (int64, bool) {
+	type count struct {
+		rows int64
+		ok   bool
+	}
+	var mu sync.Mutex
+	counted := map[string]count{}
+	ids := map[string]int{}
+	for id, k := range b.kinds {
+		ids[k.name] = id
+	}
+	return func(col string) (int64, bool) {
+		mu.Lock()
+		defer mu.Unlock()
+		if c, done := counted[col]; done {
+			return c.rows, c.ok
+		}
+		id, known := ids[col]
+		held := b.topFiles[id]
+		c := count{}
+		if known && b.seen[id] == len(files) && len(held) > 0 && len(held) <= footerFilesMost {
+			fsys, release, err := fs()
+			if err == nil {
+				c.ok = true
+				for _, i := range held {
+					n, ok := rowsAtMost(fsys.Open, files[i], id, b.hi[id])
+					c.rows, c.ok = c.rows+n, c.ok && ok
+				}
+			}
+			if release != nil {
+				release()
+			}
+		}
+		counted[col] = c
+		return c.rows, c.ok
+	}
+}
+
+// rowsAtMost is the rows of the row groups of f whose most value of field
+// id, by their statistics, is most or more; ok is false where its footer
+// cannot be read or a row group's statistics of the field cannot be
+// decoded.
+func rowsAtMost(open func(path string) (icebergio.File, error), f File, id int, most float64) (rows int64, ok bool) {
+	r, err := open(f.Path)
+	if err != nil {
+		return 0, false
+	}
+	defer r.Close()
+	meta, err := parquetFooter(r, f.Size)
+	if err != nil {
+		return 0, false
+	}
+	col := -1
+	for i := 0; i < meta.Schema.NumColumns(); i++ {
+		if meta.Schema.Column(i).SchemaNode().FieldID() == int32(id) {
+			col = i
+		}
+	}
+	if col < 0 {
+		return 0, false
+	}
+	for g := 0; g < meta.NumRowGroups(); g++ {
+		rg := meta.RowGroup(g)
+		cc, err := rg.ColumnChunk(col)
+		if err != nil {
+			return 0, false
+		}
+		hi, known := statMost(cc)
+		if !known {
+			return 0, false
+		}
+		if hi >= most {
+			rows += rg.NumRows()
+		}
+	}
+	return rows, true
+}
+
+// parquetFooter reads the Parquet footer of r, of size bytes.
+func parquetFooter(r io.ReaderAt, size int64) (*metadata.FileMetaData, error) {
+	if size < 12 {
+		return nil, fmt.Errorf("a Parquet file of %d bytes", size)
+	}
+	tail := make([]byte, 8)
+	if _, err := r.ReadAt(tail, size-8); err != nil {
+		return nil, err
+	}
+	if string(tail[4:]) != "PAR1" {
+		return nil, errors.New("not a Parquet file")
+	}
+	n := int64(binary.LittleEndian.Uint32(tail))
+	if n+8 > size {
+		return nil, errors.New("a footer longer than its file")
+	}
+	buf := make([]byte, n)
+	if _, err := r.ReadAt(buf, size-8-n); err != nil {
+		return nil, err
+	}
+	return metadata.NewFileMetaData(buf, nil)
+}
+
+// statMost is the most value of a column chunk by its statistics: an
+// integer's, or a decimal's unscaled value.
+func statMost(cc *metadata.ColumnChunkMetaData) (float64, bool) {
+	if set, err := cc.StatsSet(); err != nil || !set {
+		return 0, false
+	}
+	st, err := cc.Statistics()
+	if err != nil || st == nil || !st.HasMinMax() {
+		return 0, false
+	}
+	switch s := st.(type) {
+	case *metadata.Int32Statistics:
+		return float64(s.Max()), true
+	case *metadata.Int64Statistics:
+		return float64(s.Max()), true
+	case *metadata.FixedLenByteArrayStatistics:
+		return bigEndianInt(s.Max())
+	case *metadata.ByteArrayStatistics:
+		return bigEndianInt(s.Max())
+	}
+	return 0, false
+}
+
+// bounds are the bounds of the columns every one of files data files had
+// bounds of, by lower-case name; nil if none.
+func (b *bounder) bounds(files int) map[string][2]float64 {
+	var out map[string][2]float64
+	for id, k := range b.kinds {
+		if files == 0 || b.seen[id] != files {
+			continue
+		}
+		if out == nil {
+			out = map[string][2]float64{}
+		}
+		out[k.name] = [2]float64{b.lo[id], b.hi[id]}
+	}
+	return out
 }
 
 // distinctCounts reads the distinct counts ANALYZE keeps in a table's

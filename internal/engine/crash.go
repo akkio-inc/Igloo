@@ -8,6 +8,7 @@ import (
 	"syscall"
 
 	"github.com/akkio-inc/igloo/internal/engine/terminate"
+	"github.com/akkio-inc/igloo/internal/logwriter"
 )
 
 // A C++ exception that escapes DuckDB or an extension ends every process
@@ -46,6 +47,7 @@ func ExitOnCrash(log *slog.Logger) {
 	go func() {
 		sig := <-c
 		log.Error("crashed outside Go code, in DuckDB or an extension; exiting", "signal", sig.String())
+		logwriter.FlushAll()
 		_ = pprof.Lookup("goroutine").WriteTo(os.Stderr, 2)
 		os.Exit(2)
 	}()

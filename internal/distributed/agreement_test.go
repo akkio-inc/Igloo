@@ -3,6 +3,7 @@ package distributed
 import (
 	"context"
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
 	"slices"
@@ -13,9 +14,10 @@ import (
 )
 
 // agreementModes are the ways TestAgreement runs each query on workers: forced on
-// with the planner's own choice of joins, forced on with every join partitioned, and
-// in auto mode.
-var agreementModes = []string{"on", "partitioned", "auto"}
+// with the planner's own choice of joins, forced on with every join partitioned,
+// forced on with partial results written a row at a time wherever they may be (see
+// rowSpec), and in auto mode.
+var agreementModes = []string{"on", "partitioned", "rows", "auto"}
 
 // agreement is what one query came to in each mode: ran distributed, or why not.
 type agreement struct {
@@ -37,13 +39,15 @@ func agree(t *testing.T, h *harness, name, query string) agreement {
 		t.Fatalf("%s on one machine: %v", name, err)
 	}
 	broadcast := h.co.maxBroadcast
-	defer func() { h.co.maxBroadcast = broadcast }()
+	defer func() { h.co.maxBroadcast, h.co.partialRows = broadcast, "" }()
 	for _, mode := range agreementModes {
-		h.co.maxBroadcast = broadcast
+		h.co.maxBroadcast, h.co.partialRows = broadcast, ""
 		m := ModeOn
 		switch mode {
 		case "partitioned":
 			h.co.maxBroadcast = 1
+		case "rows":
+			h.co.partialRows = partialsByRow
 		case "auto":
 			m = ModeAuto
 		}
@@ -150,6 +154,38 @@ func TestAgreement(t *testing.T) {
 		}
 		if _, n := report(t, "TPC-DS", all); n < 70 {
 			t.Errorf("only %d of 99 TPC-DS queries ran on workers when forced", n)
+		}
+	})
+	t.Run("bucketed", func(t *testing.T) {
+		t.Parallel()
+		// TPC-H's joins and aggregations over orders and lines bucketed by order
+		// key, in counts that divide each other and that do not, and lines of
+		// NULL orders (see bucketHarness): bucketing reads them by bucket, and
+		// is never a reason to run on one machine.
+		h := bucketHarness(t)
+		queries := map[string]string{
+			"shipping priority": `SELECT l_orderkey, sum(l_extendedprice * (1 - l_discount)) AS revenue, o_orderdate, o_shippriority
+				FROM orders16, lineitem8 WHERE o_orderpriority = '1-URGENT' AND l_orderkey = o_orderkey
+				AND o_orderdate < DATE '1995-03-15' AND l_shipdate > DATE '1995-03-15'
+				GROUP BY l_orderkey, o_orderdate, o_shippriority ORDER BY revenue DESC, o_orderdate, l_orderkey LIMIT 10`,
+			"shipping modes": `SELECT l_shipmode, sum(CASE WHEN o_orderpriority IN ('1-URGENT', '2-HIGH') THEN 1 ELSE 0 END) AS high,
+				sum(CASE WHEN o_orderpriority NOT IN ('1-URGENT', '2-HIGH') THEN 1 ELSE 0 END) AS low
+				FROM orders16 JOIN lineitem8 ON o_orderkey = l_orderkey WHERE l_shipmode IN ('MAIL', 'SHIP')
+				AND l_commitdate < l_receiptdate AND l_shipdate < l_commitdate GROUP BY l_shipmode ORDER BY l_shipmode`,
+			"large orders": `SELECT o_orderkey, o_totalprice, sum(l_quantity) AS q FROM orders16 JOIN lineitem8 ON o_orderkey = l_orderkey
+				WHERE o_orderkey IN (SELECT l_orderkey FROM lineitem8 GROUP BY l_orderkey HAVING sum(l_quantity) > 200)
+				GROUP BY o_orderkey, o_totalprice ORDER BY o_totalprice DESC, o_orderkey LIMIT 100`,
+			"counts that do not divide": `SELECT count(*), sum(l_quantity) FROM orders12 JOIN lineitem8 ON o_orderkey = l_orderkey`,
+			"lines of no order":         `SELECT count(*), count(o_orderkey), sum(l_quantity) FROM lines4 LEFT JOIN orders16 ON l_orderkey = o_orderkey`,
+			"distinct orders a day": `SELECT o_orderdate, count(DISTINCT l_orderkey) AS n FROM orders16 JOIN lineitem8 ON o_orderkey = l_orderkey
+				GROUP BY o_orderdate ORDER BY o_orderdate`,
+		}
+		var all []agreement
+		for _, name := range slices.Sorted(maps.Keys(queries)) {
+			all = append(all, agree(t, h, name, queries[name]))
+		}
+		if _, n := report(t, "bucketed", all); n < len(queries) {
+			t.Errorf("only %d of %d queries over bucketed tables ran on workers when forced", n, len(queries))
 		}
 	})
 }

@@ -98,9 +98,9 @@ type Config struct {
 	// auto for DefaultStatementReservations, the default, a fraction up to
 	// 4, or off).
 	StatementReservations float64
-	// HeavyInBackground runs heavy reads in a second DuckDB of the process,
-	// whose threads give way to the first's
-	// (IGLOO_HEAVY_IN_BACKGROUND, true by default).
+	// HeavyInBackground runs clients' heavy statements, not only jobs', in a
+	// second DuckDB of the process whose threads give way to the first's
+	// (IGLOO_HEAVY_IN_BACKGROUND, false by default).
 	HeavyInBackground bool
 	// ResultCacheSize is the memory the results Igloo keeps of queries may
 	// take, to send them again to the same query while no table changes
@@ -675,7 +675,7 @@ func Load(lookup func(string) (string, bool)) (Config, error) {
 		cfg.StatementReservations = f
 	}
 
-	switch v := get("IGLOO_HEAVY_IN_BACKGROUND", "true"); strings.ToLower(v) {
+	switch v := get("IGLOO_HEAVY_IN_BACKGROUND", "false"); strings.ToLower(v) {
 	case "true", "on", "1":
 		cfg.HeavyInBackground = true
 	case "false", "off", "0":

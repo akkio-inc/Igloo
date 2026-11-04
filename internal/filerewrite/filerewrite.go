@@ -170,9 +170,8 @@ func Plan(budget, rowBytes, fixed, maxRowGroup int64) (Layout, error) {
 
 // RowGroupRows is how many rows a rewrite of tasks' files writes to a row
 // group, before its memory budget (see Plan): the table's
-// write.parquet.row-group-limit if it sets one, and otherwise as many as
-// make TargetRowGroupBytes at the files' compressed bytes a row, between
-// DefaultRowGroupRows and MaxRowGroupRows.
+// write.parquet.row-group-limit if it sets one, and otherwise TargetRows at
+// the files' compressed bytes a row.
 func RowGroupRows(props iceberg.Properties, tasks []table.FileScanTask) int64 {
 	if n, err := strconv.ParseInt(props[table.ParquetRowGroupLimitKey], 10, 64); err == nil && n > 0 {
 		return n
@@ -185,16 +184,20 @@ func RowGroupRows(props iceberg.Properties, tasks []table.FileScanTask) int64 {
 	return TargetRows(size, rows)
 }
 
-// TargetRows is how many rows make a row group of TargetRowGroupBytes, or
-// of a TableRowGroups-th of a smaller table, at size bytes for rows rows,
-// between DefaultRowGroupRows and MaxRowGroupRows.
+// TargetRows is how many rows make a row group of TargetRowGroupBytes at
+// size bytes for rows rows, up to MaxRowGroupRows: or of a
+// TableRowGroups-th of a smaller table, but no fewer than
+// DefaultRowGroupRows for that. Rows wider than TargetRowGroupBytes over
+// DefaultRowGroupRows, 137 bytes, get fewer than DuckDB's 122,880 a group,
+// down to one: at DuckDB's, rows of bitmaps of 2.5 MB each made a row group
+// of 2 GB, which a reader then had to hold at once.
 func TargetRows(size, rows int64) int64 {
 	if size <= 0 || rows <= 0 {
 		return DefaultRowGroupRows
 	}
-	target := min(TargetRowGroupBytes, size/TableRowGroups)
-	n := int64(float64(target) * float64(rows) / float64(size))
-	return min(max(n, DefaultRowGroupRows), MaxRowGroupRows)
+	perRow := float64(rows) / float64(size)
+	n := min(int64(float64(TargetRowGroupBytes)*perRow), max(int64(float64(size/TableRowGroups)*perRow), DefaultRowGroupRows))
+	return min(max(n, 1), MaxRowGroupRows)
 }
 
 // RowGroups counts the row groups of the file at path.

@@ -993,6 +993,22 @@ and a second round of tasks. Exactness is unchanged: each partial
 aggregate is combined once, sums of integers and decimals stay exact, and
 counts are cast back to `BIGINT`.
 
+Grouping before an exchange saves rows only when the groups are fewer than
+the rows. Grouped by an id, or by an id and a day of exploded rows, they
+are about as many, and grouping costs a hash table of every row, which
+spills: a report's stage over 10.6 billion exploded rows took 212 s to
+group them into as many groups, against 132 s to write them as they were.
+So a stage that writes partial results for a second stage, whose
+aggregates have a result over one row (`min`, `max`, `sum`, `count`,
+`count_if`, `avg` as its sum and count, `bool_*`, `bit_*`, `any_value`, with
+or without `FILTER`), counts each group's rows as it groups, and a worker
+whose task found every group to be one row runs the stage's other tasks a
+row at a time: each row's own partial results, cast to the grouped ones'
+types, with no `GROUP BY`. The second stage combines either kind the same.
+A stage over one table whose group columns' distinct counts (by `ANALYZE`
+or the table's sketches) multiply to half its rows or more starts a row at
+a time (`internal/distributed/rowpartials.go`).
+
 ## Multi-stage plans
 
 Reports are built in steps: common table expressions that define cohorts,

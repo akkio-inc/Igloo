@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -19,6 +20,8 @@ import (
 
 	"github.com/akkio-inc/igloo/internal/audit"
 	"github.com/akkio-inc/igloo/internal/auth"
+	"github.com/akkio-inc/igloo/internal/config"
+	"github.com/akkio-inc/igloo/internal/distributed"
 	"github.com/akkio-inc/igloo/internal/engine"
 	"github.com/akkio-inc/igloo/internal/sqllex"
 	"github.com/akkio-inc/igloo/internal/workload"
@@ -58,6 +61,9 @@ type workloadState struct {
 	// apart says it is known to be heavy and runs in the second DuckDB (see
 	// workload.Limits.Apart).
 	apart bool
+	// sample says to sample what it holds whatever it reserves (see
+	// workload.Limits.Sample).
+	sample bool
 	// shape is the statement's text with its literals masked, by which the
 	// controller estimates what it reserves (see statementShape); "" for
 	// none.
@@ -65,6 +71,10 @@ type workloadState struct {
 	// exact is the statement's text with its literals, as a key like shape's;
 	// see workload.Controller.Alike.
 	exact string
+	// planned estimates, for the statement about to run when nothing like it has
+	// run here, what it holds by its plan (see Server.planned); nil where nothing
+	// can say.
+	planned func(context.Context) (int64, bool)
 	// elsewhere gives back what the running statement holds of this replica, once it
 	// runs on workers (see workload.Limits.Elsewhere); nil for none.
 	elsewhere func()
@@ -72,10 +82,13 @@ type workloadState struct {
 	// a statement whose thread parked (see Server.statementThread); nil for none.
 	admitted func()
 	// peak is the most memory the latest statement was seen holding while
-	// it ran, and sampled says a sample fell within its run (see
-	// workload.Controller.SampleMemory).
+	// it ran, in any of its runs (see keepPeak), and sampled says a sample
+	// fell within one (see workload.Controller.SampleMemory).
 	peak    int64
 	sampled bool
+	// reserved is the memory the latest statement reserved as it started,
+	// zero for none.
+	reserved int64
 	// meter reads what each statement used; nil without one.
 	meter *engine.Meter
 	// backgroundUsed is what the latest statement used, if it ran in the
@@ -85,6 +98,16 @@ type workloadState struct {
 	ranInBackground bool
 	// controller holds statements back for their limits.
 	controller *workload.Controller
+}
+
+// keepPeak keeps peak, a run's sampled peak if sampled, if it is the most a
+// run of the statement held: a statement that ran out of memory and ran
+// again alone (see runAgainAlone) reserves for the larger of its runs, so
+// that one that failed big and finished small reserves for the big one.
+func (w *workloadState) keepPeak(peak int64, sampled bool) {
+	if sampled && (!w.sampled || peak > w.peak) {
+		w.peak, w.sampled = peak, true
+	}
 }
 
 // queryTag is the tag the session's statements run under.
@@ -155,12 +178,47 @@ func (sess *session) onWorkers() {
 	sess.mu.Unlock()
 }
 
+// planned estimates what st, about to run, holds on this replica, as auto mode
+// does: from DuckDB's plan of it and the tables it reads (distributed.WorkingSet).
+// One that nothing like has run of and that holds too little of the memory to
+// count (workload.Controller.Slight) starts at once, as known ones that hold as
+// little do, rather than wait while another nothing is known of runs: a
+// dashboard's tiles, or a small query, the first time. ok is false where the plan
+// cannot say, as for a statement that reads no catalog table: it may hold anything.
+func (s *Server) planned(ctx context.Context, sess *session, st *statement) (memory int64, ok bool) {
+	text := scanText(st.stmtType, st.query)
+	if s.scanner == nil || text == "" {
+		return 0, false
+	}
+	resolver, err := s.scanResolver(ctx, sess)
+	if err != nil {
+		return 0, false
+	}
+	env := &scanEnv{sessionEnv: &sessionEnv{s: s, sess: sess, user: sess.currentUser(), st: st}}
+	env.resolver = resolver
+	scans, err := s.scanner.Resolve(ctx, text, env)
+	if err != nil {
+		return 0, false
+	}
+	plan, err := env.Explain(ctx, text)
+	if err != nil {
+		return 0, false
+	}
+	threads, err := settingValue(ctx, sess.conn, "threads")
+	if err != nil {
+		return 0, false
+	}
+	n, _ := strconv.Atoi(threads)
+	return distributed.WorkingSet(plan, scans.Tables(ctx), n)
+}
+
 // admit waits until the session's limits let a statement start, and
 // returns the function to call when it ends.
 func (sess *session) admit(ctx context.Context) (release, leave func(), err error) {
 	l := sess.wl.limits
 	l.Counted = sess.wl.counted
 	l.Apart = sess.wl.apart
+	l.Sample = sess.wl.sample
 	var elsewhere func()
 	l.Elsewhere = &elsewhere
 	if controller := sess.wl.controller; l.Counted {
@@ -173,16 +231,23 @@ func (sess *session) admit(ctx context.Context) (release, leave func(), err erro
 			// What statements like it held, when its role reserves nothing.
 			var seen bool
 			l.Memory, seen = controller.Reserve(sess.wl.exact, sess.wl.shape)
-			l.Estimated, l.Unseen = true, !seen
+			// One nothing like has run of is estimated by its plan only when it would
+			// wait: planning a dashboard's statements took up to 11 s on a busy replica.
+			l.Estimated, l.Unseen = true, !seen && !(controller.Crowded() && controller.Slight(func() (int64, bool) {
+				if sess.wl.planned == nil {
+					return 0, false
+				}
+				return sess.wl.planned(ctx)
+			}))
 		}
 	}
 	done, waited, err := sess.wl.controller.Admit(ctx, l)
 	sess.wl.queued = waited
-	sess.wl.peak, sess.wl.sampled = 0, false
+	sess.wl.peak, sess.wl.sampled, sess.wl.reserved = 0, false, l.Memory
 	if err == nil {
 		sess.wl.elsewhere, sess.wl.admitted = elsewhere, func() { done() }
 		return func() {
-			sess.wl.peak, sess.wl.sampled = done()
+			sess.wl.keepPeak(done())
 			sess.wl.elsewhere, sess.wl.admitted = nil, nil
 		}, func() { done() }, nil
 	}
@@ -210,6 +275,52 @@ func (sess *session) admit(ctx context.Context) (release, leave func(), err erro
 	}
 	return nil, nil, pgerror.WithCode(fmt.Errorf("canceling statement due to %s: it waited %s to start, behind %s",
 		why, waited.Round(time.Millisecond), strings.Join(behind, " and ")), codes.QueryCanceled)
+}
+
+// observeUnfinished records what a run of a statement of shape and exact that
+// ended before its end with err, after running for ran, held (see
+// workload.Controller.ObserveUnfinished): what it was seen holding, peak, if
+// sampled, or all the memory if it ran a while, as it may then have held any of
+// what the statements beside it were charged with; and, if DuckDB ran out of
+// memory for it, at least what it had allocated and the block it could not get.
+// Refreshes of a materialized view that asked for a block of 2.3 GiB with 43.4
+// of 44.2 GiB used recorded nothing, as nothing sampled them, and the refreshes
+// after them reserved nothing either.
+func (s *Server) observeUnfinished(shape, exact string, peak int64, sampled bool, ran time.Duration, allocated int64, err error) {
+	block, short := failedBlock(err)
+	if !sampled && !short {
+		return
+	}
+	held := int64(0)
+	if sampled {
+		held = peak
+		if ran >= workload.LongUnfinished {
+			held = max(held, s.queryMemory)
+		}
+	}
+	if short {
+		held = max(held, allocated+block)
+	}
+	s.workload.ObserveUnfinished(shape, held)
+	s.workload.ObserveUnfinished(exact, held)
+}
+
+// outOfMemoryBlock matches the size of what DuckDB could not allocate or pin
+// in its out-of-memory errors: "failed to allocate data of size 8.0 KiB",
+// "could not allocate block of size 2.3 GiB".
+var outOfMemoryBlock = regexp.MustCompile(`of size ([0-9.]+ ?[A-Za-z]*)`)
+
+// failedBlock returns the block DuckDB could not allocate when err says it ran
+// out of memory, and short true; a size it does not say is zero.
+func failedBlock(err error) (block int64, short bool) {
+	var de *duckdb.Error
+	if !errors.As(err, &de) || de.Type != duckdb.ErrorTypeOutOfMemory {
+		return 0, false
+	}
+	if m := outOfMemoryBlock.FindStringSubmatch(de.Msg); m != nil {
+		block, _ = config.ParseSize(m[1])
+	}
+	return block, true
 }
 
 // numberLiteral is a number in SQL code, not part of a name.
@@ -294,6 +405,16 @@ func statementShape(text string) string {
 	}
 	sum := sha256.Sum256([]byte(strings.Join(strings.Fields(b.String()), " ")))
 	return string(sum[:])
+}
+
+// operatorRows are the operators of a statement's run, as the coordinator
+// learns from them.
+func operatorRows(o engine.Operator) distributed.OperatorRows {
+	out := distributed.OperatorRows{Name: o.Name, Rows: o.Rows}
+	for _, c := range o.Children {
+		out.Children = append(out.Children, operatorRows(c))
+	}
+	return out
 }
 
 // measure returns what DuckDB measured of st, which just ran.

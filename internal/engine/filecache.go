@@ -24,8 +24,9 @@ package engine
 // back reads it as it would have, and the restore skips it. The restore
 // takes at most restoreShare of DuckDB's memory, as the ranges are buffers
 // DuckDB drops first when queries need the room, and stops early when DuckDB
-// has none to spare. Nothing is saved until it ends, so a stop in the middle
-// keeps the manifest it started from.
+// has none to spare, or the process none to be plentiful (see restoreRoom).
+// Nothing is saved until it ends, so a stop in the middle keeps the manifest
+// it started from.
 //
 // Emptying the cache (EmptyCache, as erasure requests do) stops a restore
 // under way and deletes the manifest, so no range DuckDB dropped comes back.
@@ -40,6 +41,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"slices"
 	"sort"
 	"strings"
@@ -48,8 +50,10 @@ import (
 	"time"
 
 	"github.com/duckdb/duckdb-go/v2"
+	"golang.org/x/sync/semaphore"
 
 	"github.com/akkio-inc/igloo/internal/lockorder"
+	"github.com/akkio-inc/igloo/internal/memlimit"
 	"github.com/akkio-inc/igloo/internal/prefetch"
 )
 
@@ -62,19 +66,42 @@ const (
 	// to know which ranges queries read first.
 	fileCacheSaveEvery = 30 * time.Second
 	fileCacheLookEvery = 2 * time.Second
-	// restoreShare bounds a restore to this share of DuckDB's memory.
-	restoreShare = 0.75
+	// restoreShare bounds a restore to this share of DuckDB's memory. A
+	// mixed window of dashboards, a heavy report and ELT read in its first
+	// 10 minutes 4.1 GB of a list of 22 GB, 18%, and held 5.6 GB in all. On a
+	// replica of 36 GiB, with that load from the moment it was ready, a
+	// quarter's 7.0 GB came back in 2.6 s and the first minute's dashboards
+	// took 0.84 s at the median and 4.0 s at p95; three quarters' 18.4 GB, 1.17
+	// and 4.9 s; none, 0.93 and 4.4 s. On a machine of 60 GiB, 32.6 GB read
+	// back over 50 s as users arrived left 4.1 GiB, and DuckDB's limit was cut
+	// to half and raised back as statements started.
+	restoreShare = 0.25
 	// restoreRequest is the most a request of a restore reads, of ranges of
 	// one file, and restoreGap the most bytes between two ranges it reads
 	// across rather than make two requests: TPC-H's 24 GB at scale 100 are
 	// 54,000 ranges, a median of 200 KB, which this makes 6,900 requests.
 	restoreRequest = 8 << 20
 	restoreGap     = 1 << 20
-	// restoreConcurrency is how many requests a restore keeps in flight. A
-	// c7g.16xlarge restored those 24 GB in 16.7 s with 64 requests of up
-	// to 16 MiB in flight, and in 7.3 s, at its network's 3.6 GB/s, with
-	// 256 of up to 8 MiB.
-	restoreConcurrency = 256
+	// restoreConcurrency is how many requests a restore keeps in flight, as
+	// many of restoreRequest as restoreInFlight holds. A c7g.16xlarge
+	// restored those 24 GB in 16.7 s with 64 requests of up to 16 MiB in
+	// flight, and in 7.3 s, at its network's 3.6 GB/s, with 256 of up to
+	// 8 MiB.
+	restoreConcurrency = restoreInFlight / restoreRequest
+	// restoreInFlight bounds the bytes a restore's requests hold at once,
+	// whatever its ranges are, and restoreRangeMost is the largest range it
+	// reads back. A range in flight is held three times: read into Go,
+	// copied into DuckDB's argument, and copied into the cache. DuckDB had
+	// kept a view's column chunks of device bitmaps whole, ranges of up to
+	// 2.7 GiB, 88 GiB in 36 of them; read back at once, as many as the
+	// restore's share of DuckDB's memory took, they took a machine of 60 GiB
+	// to 63 GB of anonymous memory 25 s into every start, until the kernel
+	// killed the process, 16 times in a row.
+	restoreInFlight  = 1 << 30
+	restoreRangeMost = 64 << 20
+	// fileCacheRestoring marks a restore under way, beside the manifest
+	// (see restoreFileCache).
+	fileCacheRestoring = "memory.json.restoring"
 )
 
 // manifest is what DuckDB held of table files: the files, with their
@@ -400,6 +427,19 @@ func (f *fileCache) readManifest() (manifest, error) {
 	return m, nil
 }
 
+// restoreRoom says the process has memory to spare for more of a restore:
+// what it can still allocate is above twice memlimit.High, where
+// memlimit.Adapt takes memory for plentiful. Restores of 34 GB, three
+// quarters of DuckDB's memory on a machine of 60 GiB, went on as the first
+// statements after starts came in, and the memory watch canceled a report
+// 40 s into each: what is read back costs only a read, what was canceled
+// was a user's. A variable, for tests.
+var restoreRoom = func() bool {
+	total := processMemory()
+	left, ok := memlimit.Available()
+	return total <= 0 || !ok || left > 2*memlimit.High(total)
+}
+
 // restoreRead is one request of a restore: ranges of one file that lie
 // close together, read at once.
 type restoreRead struct {
@@ -413,7 +453,8 @@ type restoreRead struct {
 
 // restoreReads groups each file's ranges into requests (see restoreRequest
 // and restoreGap) and orders them by the earliest range each holds, as many
-// as budget bytes of ranges allow, taken in the manifest's order.
+// as budget bytes of ranges allow, taken in the manifest's order. Ranges over
+// restoreRangeMost are left out.
 func restoreReads(m *manifest, budget int64) []restoreRead {
 	type item struct {
 		offset, length int64
@@ -423,7 +464,7 @@ func restoreReads(m *manifest, budget int64) []restoreRead {
 	var total int64
 	for i, r := range m.Ranges {
 		f := &m.Files[r[0]]
-		if r[2] <= 0 || r[1] < 0 || r[1]+r[2] > f.Size {
+		if r[2] <= 0 || r[2] > restoreRangeMost || r[1] < 0 || r[1]+r[2] > f.Size {
 			continue
 		}
 		if total+r[2] > budget {
@@ -457,6 +498,18 @@ func restoreReads(m *manifest, budget int64) []restoreRead {
 // (see above).
 func (e *Engine) restoreFileCache(ctx context.Context, log *slog.Logger) {
 	f := e.fileCache
+	// A restore marks that it is under way, and clears the mark when it ends.
+	// A start that finds the mark died during one: it starts without the
+	// manifest, rather than die again on every start, as the kernel killed a
+	// replica 16 times in a row 25 s into its restore.
+	mark := filepath.Join(filepath.Dir(f.path), fileCacheRestoring)
+	if _, err := os.Stat(mark); err == nil {
+		log.Warn("a start ended during the read-back of what DuckDB held in memory; starting without it")
+		if err := errors.Join(os.Remove(f.path), os.Remove(mark)); err != nil && !errors.Is(err, os.ErrNotExist) {
+			log.Warn("could not delete the list of what DuckDB held in memory", "err", err)
+		}
+		return
+	}
 	m, err := f.readManifest()
 	if err != nil {
 		log.Warn("could not read the list of what DuckDB held in memory; starting without it", "err", err)
@@ -465,6 +518,11 @@ func (e *Engine) restoreFileCache(ctx context.Context, log *slog.Logger) {
 	if len(m.Ranges) == 0 {
 		return
 	}
+	if err := os.WriteFile(mark, nil, 0o600); err != nil {
+		log.Warn("could not mark the read-back of what DuckDB held in memory; starting without it", "err", err)
+		return
+	}
+	defer os.Remove(mark) //nolint:errcheck
 	// Ranges keep their places in the order across the restart.
 	f.mu.Lock()
 	for _, r := range m.Ranges {
@@ -482,9 +540,11 @@ func (e *Engine) restoreFileCache(ctx context.Context, log *slog.Logger) {
 	began := time.Now()
 	var restored, skipped, failed atomic.Int64
 	// full says DuckDB had no memory to spare for a range: the rest would
-	// only evict what queries use.
-	var full atomic.Bool
+	// only evict what queries use; short that the process had none to
+	// spare (see restoreRoom).
+	var full, short atomic.Bool
 	var opens sync.Map // path -> *restoreObject
+	inFlight := semaphore.NewWeighted(restoreInFlight)
 	work := make(chan restoreRead)
 	var wg sync.WaitGroup
 	for range restoreConcurrency {
@@ -499,8 +559,14 @@ func (e *Engine) restoreFileCache(ctx context.Context, log *slog.Logger) {
 			}
 			defer c.Close() //nolint:errcheck
 			conn := c.(*duckdb.Conn)
+			// One buffer of up to restoreRequest, reused, as DuckDB copies
+			// what it is handed: with one a request, Go's heap held 6 GiB of
+			// them for 80 s past a restore of 19 GB, until its next
+			// collection, most of what DuckDB's limit leaves the process. A
+			// longer range has a buffer of its own, which goes as it ends.
+			var kept []byte
 			for r := range work {
-				if ctx.Err() != nil || full.Load() {
+				if ctx.Err() != nil || full.Load() || short.Load() {
 					continue
 				}
 				obj, err := openOnce(ctx, &opens, r.file.Path, f.open).get()
@@ -508,8 +574,21 @@ func (e *Engine) restoreFileCache(ctx context.Context, log *slog.Logger) {
 					skipped.Add(int64(len(r.ranges)))
 					continue
 				}
-				buf := make([]byte, r.end-r.start)
+				n := r.end - r.start
+				if inFlight.Acquire(ctx, n) != nil {
+					continue
+				}
+				buf := kept
+				switch {
+				case n > restoreRequest:
+					buf = make([]byte, n)
+				case int64(cap(kept)) < n:
+					kept = make([]byte, n)
+					buf = kept
+				}
+				buf = buf[:n]
 				if _, err := obj.ReadAt(buf, r.start); err != nil && !(errors.Is(err, io.EOF) && r.end == r.file.Size) {
+					inFlight.Release(n)
 					failed.Add(int64(len(r.ranges)))
 					continue
 				}
@@ -526,11 +605,16 @@ func (e *Engine) restoreFileCache(ctx context.Context, log *slog.Logger) {
 						skipped.Add(1)
 					}
 				}
+				inFlight.Release(n)
 			}
 		}()
 	}
 	for _, r := range reads {
 		if ctx.Err() != nil || full.Load() {
+			break
+		}
+		if !restoreRoom() {
+			short.Store(true)
 			break
 		}
 		select {
@@ -540,12 +624,15 @@ func (e *Engine) restoreFileCache(ctx context.Context, log *slog.Logger) {
 	}
 	close(work)
 	wg.Wait()
+	// The buffers go back to the system now, not at Go's next collection,
+	// which nothing may call for a while: the memory is DuckDB's to use.
+	debug.FreeOSMemory()
 	if ctx.Err() != nil {
 		return
 	}
 	log.Info("restored what DuckDB held in memory from object storage", "bytes", restored.Load(), "requests", len(reads),
 		"took", time.Since(began).Round(time.Millisecond), "ranges_skipped", skipped.Load(), "ranges_failed", failed.Load(),
-		"memory_full", full.Load())
+		"memory_full", full.Load(), "memory_short", short.Load())
 }
 
 // restoreObject opens a file once for every request of a restore.

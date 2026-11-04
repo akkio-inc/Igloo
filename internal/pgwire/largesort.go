@@ -71,8 +71,6 @@ const (
 	// about half of the memory limit.
 	largeSortFileShare = 8
 	largeSortRowsShare = 4
-	// largeSortRowGroup is the rows of a row group of an unsorted file.
-	largeSortRowGroup = 122_880
 )
 
 // sortKeyColumn is the column of a sort key that orders a read's runs.
@@ -244,9 +242,10 @@ func orderedByOther(e map[string]any) bool {
 // largeSort is a read of a query's rows in order, to sort in runs.
 type largeSort struct {
 	ordered *orderedQuery
-	// fileBytes and fileRowGroups bound an unsorted file.
-	fileBytes, fileRowGroups int64
-	estimate                 int64
+	// fileBytes and fileRowGroups bound an unsorted file, of row groups of
+	// rowGroup rows.
+	fileBytes, fileRowGroups, rowGroup int64
+	estimate                           int64
 }
 
 // memoryLimit is DuckDB's memory limit, or 0 when it is not known.
@@ -306,12 +305,30 @@ func (s *Server) largeSortOf(ctx context.Context, sess *session, st *statement, 
 	if budget := s.sortSpillBudget(ctx, sess); budget <= 0 || estimate > budget {
 		return nil
 	}
+	rowGroup := distributed.RowGroupRows(width)
 	return &largeSort{
 		ordered:       o,
 		fileBytes:     max(limit/largeSortFileShare, 1<<20),
-		fileRowGroups: max(limit/largeSortRowsShare/width/largeSortRowGroup, 1),
+		fileRowGroups: max(limit/largeSortRowsShare/width/rowGroup, 1),
+		rowGroup:      rowGroup,
 		estimate:      estimate,
 	}
+}
+
+// runRowGroup is the rows of a row group of the run of the unsorted file f:
+// as many as take distributed.RowGroupBytes at the file's bytes a row,
+// uncompressed as it is.
+func runRowGroup(ctx context.Context, conn *duckdb.Conn, f string) (int64, error) {
+	info, err := os.Stat(f)
+	if err != nil {
+		return 0, err
+	}
+	rows, err := queryRows(ctx, conn, "SELECT num_rows FROM parquet_file_metadata("+quoteLiteral(f)+")")
+	if err != nil || len(rows) == 0 {
+		return 0, fmt.Errorf("rows of %s: %w", f, err)
+	}
+	n, _ := rows[0][0].(int64)
+	return distributed.RowGroupRows(info.Size() / max(n, 1)), nil
 }
 
 // runLargeSort runs st, when its rows in order are more than memory holds,
@@ -354,7 +371,7 @@ func (s *Server) runLargeSort(ctx context.Context, sess *session, st *statement,
 
 	// 1. The rows, in files small enough to sort well within memory.
 	if err := exec("COPY (\n"+l.ordered.query+"\n) TO "+quoteLiteral(files)+" (FORMAT parquet, COMPRESSION uncompressed, ROW_GROUP_SIZE "+
-		strconv.Itoa(largeSortRowGroup)+", FILE_SIZE_BYTES "+strconv.FormatInt(l.fileBytes, 10)+
+		strconv.FormatInt(l.rowGroup, 10)+", FILE_SIZE_BYTES "+strconv.FormatInt(l.fileBytes, 10)+
 		", ROW_GROUPS_PER_FILE "+strconv.FormatInt(l.fileRowGroups, 10)+")", args); err != nil {
 		return asWritten("files", err)
 	}
@@ -371,12 +388,18 @@ func (s *Server) runLargeSort(ctx context.Context, sess *session, st *statement,
 	slices.Sort(unsorted)
 	s.log.Debug("wrote a read's rows to files, to sort in runs", "files", len(unsorted), "seconds", time.Since(start).Seconds())
 
-	// 2. Each sorted into a run, the file going as its run comes.
+	// 2. Each sorted into a run, the file going as its run comes, in row
+	// groups of as many rows as take distributed.RowGroupBytes at the
+	// file's bytes a row.
 	var runs []string
 	for i, f := range unsorted {
 		run := filepath.Join(dir, fmt.Sprintf("run-%d.parquet", i))
+		rowGroup, err := runRowGroup(ctx, sess.conn, f)
+		if err != nil {
+			return asWritten("runs", err)
+		}
 		if err := exec("COPY (SELECT * FROM read_parquet("+quoteLiteral(f)+") ORDER BY "+l.ordered.orderBy()+") TO "+
-			quoteLiteral(run)+" (FORMAT parquet)", nil); err != nil {
+			quoteLiteral(run)+" (FORMAT parquet, ROW_GROUP_SIZE "+strconv.FormatInt(rowGroup, 10)+")", nil); err != nil {
 			return asWritten("runs", err)
 		}
 		_ = os.Remove(f)

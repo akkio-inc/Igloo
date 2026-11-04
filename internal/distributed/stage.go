@@ -77,6 +77,11 @@ type Stage struct {
 	// task's rows of the result: its tasks write them, where the statement
 	// has a target (see writes.go).
 	writeSQL string
+	// rows, for a stage that writes an aggregation's partial results, is how
+	// it may write them a row at a time, and rowSQL the fragment that does
+	// (see rowSpec).
+	rows   *rowSpec
+	rowSQL string
 }
 
 // Input is a relation a stage's fragment reads under a view name: a
@@ -142,6 +147,12 @@ func (s *Stage) String() string {
 		fmt.Fprintf(&b, " to exchange %d (%s)", s.Out.ID, s.Out.purpose)
 		if s.Out.Buckets > 0 {
 			fmt.Fprintf(&b, " by bucket[%d]", s.Out.Buckets)
+		}
+		switch {
+		case s.rowSQL != "" && s.rows.first:
+			b.WriteString(", partial results a row at a time")
+		case s.rowSQL != "":
+			b.WriteString(", partial results a row at a time once a task's groups are single rows")
 		}
 	} else {
 		b.WriteString(" to the coordinator")
@@ -260,8 +271,11 @@ type execution struct {
 	// erased is the latest deletion of erasure requests the coordinator
 	// knew of when the statement began, which its tasks carry.
 	erased int64
-	force  bool
-	sp     *spool
+	// background says its statement runs in the background, which its tasks
+	// carry (see WithBackground).
+	background bool
+	force      bool
+	sp         *spool
 	// parts is how many partitions every exchange has.
 	parts int
 	// smaller is how many times the statement ran again because a task ran
@@ -270,6 +284,9 @@ type execution struct {
 	// it has (see retryShape); 0 means 1.
 	smaller int
 	slots   int
+	// places are its places on its workers, which its stages' tasks take
+	// (see places); nil sends each task at once.
+	places *places
 	// roots are the statement's directories in object storage for
 	// exchanges (see spreadRoots).
 	roots     []string
@@ -298,8 +315,6 @@ type execution struct {
 	holders   map[string]bool
 	watching  context.Context
 	stopWatch context.CancelFunc
-	// writtenAgain counts the tasks written again, which change what exchanges hold.
-	writtenAgain atomic.Int64
 }
 
 // exchangeRun is an exchange while its producers run.
@@ -321,8 +336,10 @@ type exchangeRun struct {
 	bytes     int64
 	partBytes []int64
 	tasks     int
-	// ran are the tasks whose files are on workers' disks (see repair.go).
-	ran []*ranTask
+	// ran are the tasks whose files are on workers' disks (see repair.go), and
+	// again counts the times one of them ran again, which changed its files.
+	ran   []*ranTask
+	again int64
 }
 
 // jobResult is where a coordinator-bound stage's partial results are.
@@ -424,6 +441,9 @@ func (p piece) split() bool { return p.k > 1 }
 
 // pieceIndex spaces the directories of pieces from their tasks' (see index).
 const pieceIndex = 100000
+
+// tasksPerStage numbers a stage's tasks: task i of stage s is s*tasksPerStage + i.
+const tasksPerStage = 10000
 
 // index names p's directories and files: its task's number, or one of its own above
 // all tasks', so that what an attempt of the undivided task leaves is never read.
@@ -592,7 +612,8 @@ func (e *execution) stage(ctx context.Context, s *Stage) error {
 	e.co.log.Debug("running a stage", "query", e.qid, "stage", s.String(), "tasks", tasks, "partitions", e.parts)
 
 	// What every task reads in full, and its bytes: as it is when a task is
-	// made, as a worker's files may have been written again by then.
+	// made, as a worker's files may have been written again by then, by this run
+	// or by another that wrote the exchange (see runProbing).
 	used := e.prefetchUsed(ctx, s)
 	var wholeMu sync.Mutex
 	var whole map[string]viewDef
@@ -601,7 +622,15 @@ func (e *execution) stage(ctx context.Context, s *Stage) error {
 	wholeViews := func() (map[string]viewDef, int64) {
 		wholeMu.Lock()
 		defer wholeMu.Unlock()
-		at := e.writtenAgain.Load()
+		at := int64(0)
+		for _, in := range s.Inputs {
+			if in.Exchange != nil && !in.Partitioned {
+				x := e.exchanges[in.Exchange.ID]
+				x.mu.Lock()
+				at += x.again
+				x.mu.Unlock()
+			}
+		}
 		if at == wholeAt {
 			return whole, wholeBytes
 		}
@@ -665,7 +694,8 @@ func (e *execution) stage(ctx context.Context, s *Stage) error {
 	request := func(p piece, round int) (*taskRequest, int64) {
 		i := p.i
 		whole, wholeBytes := wholeViews()
-		task := &taskRequest{Query: e.qid, Task: s.ID*10000 + i, Version: e.co.opts.Version, Settings: e.settings, Erased: e.erased}
+		task := &taskRequest{Query: e.qid, Task: s.ID*tasksPerStage + i, Version: e.co.opts.Version, Settings: e.settings, Erased: e.erased,
+			Sorted: len(s.merge) > 0, Background: e.background}
 		if e.slots > 1 {
 			task.Slots = e.slots
 		}
@@ -722,6 +752,11 @@ func (e *execution) stage(ctx context.Context, s *Stage) error {
 			task.SQL, task.Columns = s.SQL, s.Columns
 		} else {
 			task.SQL = exchangeSQL(s, e.parts)
+			if s.rowSQL != "" {
+				byRow := *s
+				byRow.SQL = s.rowSQL
+				task.RowSQL, task.RowsFirst = exchangeSQL(&byRow, e.parts), s.rows.first
+			}
 			task.Shuffle = e.rootOf(s.ID, i) + "/s" + strconv.Itoa(s.ID) + "/" + idx
 			task.Partitions = e.parts
 			if e.local {
@@ -755,7 +790,7 @@ func (e *execution) stage(ctx context.Context, s *Stage) error {
 	run = func(p piece, first, round int) ([]ranPiece, error) {
 		task, bytes := request(p, round)
 		task.splittable = !p.split() && units(p.i) > 1
-		w, head, err := e.co.dispatch(tctx, task, e.targets(), first, outOf(p), sp)
+		w, head, err := e.dispatchPlaced(tctx, task, first, outOf(p), sp)
 		// A worker lost with files the task reads: once what they held is
 		// written again, the task runs on what is there now (see repair).
 		rounds := round
@@ -763,7 +798,7 @@ func (e *execution) stage(ctx context.Context, s *Stage) error {
 			rounds++
 			task, bytes = request(p, rounds)
 			task.splittable = !p.split() && units(p.i) > 1
-			w, head, err = e.co.dispatch(tctx, task, e.targets(), first, outOf(p), sp)
+			w, head, err = e.dispatchPlaced(tctx, task, first, outOf(p), sp)
 		}
 		var lost *taskLostError
 		if errors.As(err, &lost) && tctx.Err() == nil {
@@ -771,7 +806,7 @@ func (e *execution) stage(ctx context.Context, s *Stage) error {
 			if k < 2 {
 				// Not worth dividing after all: as one task, on the others.
 				task.splittable = false
-				w, head, err = e.co.dispatch(tctx, task, e.targets(), first+1, outOf(p), sp)
+				w, head, err = e.dispatchPlaced(tctx, task, first+1, outOf(p), sp)
 			} else {
 				e.co.log.Warn("a worker was lost while it ran a task; running the task as smaller ones on the others", "query", e.qid,
 					"stage", s.ID, "task", p.i, "worker", lost.worker, "tasks", k)
@@ -826,11 +861,10 @@ func (e *execution) stage(ctx context.Context, s *Stage) error {
 				e.mu.Unlock()
 				switch {
 				case s.Out != nil:
-					if err := e.received(s, r.task, r.head, r.w); err != nil {
+					if err := e.receivedRan(tctx, &ranTask{run: e, stage: s, piece: r.p, units: units(i), first: r.first, request: request,
+						task: r.task, head: r.head, worker: r.w.addr, rounds: r.rounds}); err != nil {
 						return err
 					}
-					e.ranOn(&ranTask{run: e, stage: s, piece: r.p, units: units(i), first: r.first, request: request, task: r.task, head: r.head,
-						worker: r.w.addr, rounds: r.rounds})
 				case writes:
 					if err := e.writtenBy(r.task, r.head, r.w); err != nil {
 						return err
@@ -879,6 +913,21 @@ func (e *execution) stage(ctx context.Context, s *Stage) error {
 	return nil
 }
 
+// dispatchPlaced runs task as dispatch does, on the statement's workers, once
+// one has a place for it, worker first first (see places).
+func (e *execution) dispatchPlaced(ctx context.Context, task *taskRequest, first int, path string, sp *spool) (*worker, *taskResult, error) {
+	ws := e.targets()
+	if e.places == nil || len(ws) == 0 {
+		return e.co.dispatch(ctx, task, ws, first, path, sp)
+	}
+	at, release, err := e.places.take(ctx, ws, first%len(ws))
+	if err != nil {
+		return nil, nil, err
+	}
+	defer release()
+	return e.co.dispatch(ctx, task, ws, at, path, sp)
+}
+
 // describe says what each exchange held: rows and files by partition.
 func (e *execution) describe() string {
 	ids := slices.Sorted(maps.Keys(e.exchanges))
@@ -911,15 +960,8 @@ func (e *execution) overfull() []string {
 	return out
 }
 
-// received records the files a task wrote to its stage's exchange.
-func (e *execution) received(s *Stage, task *taskRequest, head *taskResult, w *worker) error {
-	x := e.exchanges[s.Out.ID]
-	x.mu.Lock()
-	defer x.mu.Unlock()
-	return e.receivedLocked(x, task, head, w)
-}
-
-// receivedLocked is received, into x, whose lock the caller holds.
+// receivedLocked records the files a task wrote to x, its stage's exchange,
+// whose lock the caller holds (see receivedRan).
 func (e *execution) receivedLocked(x *exchangeRun, task *taskRequest, head *taskResult, w *worker) error {
 	x.rows += head.Rows
 	x.tasks++

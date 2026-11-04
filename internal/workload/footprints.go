@@ -283,21 +283,22 @@ func (c *Controller) ObserveTook(shape string, took time.Duration) {
 }
 
 // Took is how long statements of shape take on this replica, the median of
-// its latest completed runs, the lower one of two; ok is false when none of
-// its shape has completed here.
-func (c *Controller) Took(shape string) (took time.Duration, ok bool) {
+// its latest completed runs, the lower one of two, and longest the longest of
+// them: a shape's literals make some of its runs cheap and others heavy. ok is
+// false when none of its shape has completed here.
+func (c *Controller) Took(shape string) (took, longest time.Duration, ok bool) {
 	if c == nil || shape == "" {
-		return 0, false
+		return 0, 0, false
 	}
 	k := &c.took
 	k.mu.Lock()
 	defer k.mu.Unlock()
 	runs := k.runs[shape]
 	if len(runs) == 0 {
-		return 0, false
+		return 0, 0, false
 	}
 	sorted := slices.Sorted(slices.Values(runs))
-	return sorted[(len(sorted)-1)/2], true
+	return sorted[(len(sorted)-1)/2], sorted[len(sorted)-1], true
 }
 
 // ObserveUnfinished records what a statement of shape was seen holding in a

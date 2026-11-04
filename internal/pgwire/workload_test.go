@@ -4,6 +4,7 @@ import (
 	"context"
 	"io"
 	"log/slog"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -13,6 +14,8 @@ import (
 
 	"github.com/akkio-inc/igloo/internal/audit"
 	"github.com/akkio-inc/igloo/internal/auth"
+	"github.com/akkio-inc/igloo/internal/catalog"
+	"github.com/akkio-inc/igloo/internal/distributed"
 	"github.com/akkio-inc/igloo/internal/workload"
 )
 
@@ -337,6 +340,104 @@ func TestMemoryReservations(t *testing.T) {
 	release, _, _ = ctl.Admit(ctx, workload.Limits{Memory: 1 << 40})
 	defer release()
 	mustExec(t, cs.admin, "SELECT 2")
+}
+
+// TestUnseenSlightStartsAtOnce checks that a statement nothing like has run of
+// starts at once beside another such when its plan says it holds little, as a
+// dashboard's tile does, and that one whose plan says it may hold much waits.
+func TestUnseenSlightStartsAtOnce(t *testing.T) {
+	t.Parallel()
+	vc := newViewCatalog(t)
+	ctx := context.Background()
+	cat, err := catalog.Open(ctx, vc.cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	scanner, err := distributed.NewScanner(distributed.NewIceberg(cat))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = scanner.Close() })
+	// Sixteen times what its plan says it holds must be under a sixteenth of 64
+	// MiB: a distinct count of 300,000 strings is over, a sum of a few rows holds
+	// next to nothing.
+	ctl := workload.NewController(64 << 20)
+	ctl.LimitReplica(8)
+	r := vc.replica(t, func(o *Options) { o.Scanner, o.Workload = scanner, ctl })
+	admin := r.admin(t, pgx.QueryExecModeSimpleProtocol)
+	for _, q := range []string{
+		"CREATE SCHEMA IF NOT EXISTS lake.public",
+		"CREATE TABLE lake.public.tiles AS SELECT i AS day, i * 2 AS clicks FROM range(30) r(i)",
+		"CREATE TABLE lake.public.people AS SELECT md5(CAST(i AS VARCHAR)) AS person FROM range(300000) r(i)",
+	} {
+		mustExec(t, admin, q)
+	}
+	// Another statement nothing is known of runs.
+	release, _, err := ctl.Admit(ctx, workload.Limits{Counted: true, Unseen: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+	mustExec(t, admin, "SET statement_queued_timeout = '2s'")
+	start := time.Now()
+	expectRows(t, admin, "SELECT CAST(sum(clicks) AS BIGINT) FROM lake.public.tiles WHERE day < 7", "42")
+	if took := time.Since(start); took > time.Second {
+		t.Errorf("a slight statement took %s beside an unseen one", took)
+	}
+	if _, err := admin.Exec(ctx, "SELECT count(DISTINCT person) FROM lake.public.people"); pgCode(err) != "57014" || !strings.Contains(err.Error(), "waited") {
+		t.Errorf("a statement that may hold much, beside an unseen one: %v", err)
+	}
+	// Once the other has ended, it starts.
+	release()
+	expectRows(t, admin, "SELECT count(DISTINCT person) FROM lake.public.people", "300000")
+}
+
+// TestWorkloadKeysAcrossFlattenForms runs a statement in Snowflake's dialect whose
+// FLATTEN takes one form, then the other (see flattenForm), and checks that its runs
+// share one shape and one exact key, as the same statement from the client does: by
+// DuckDB's text they were new again, and waited as statements nothing is known of do.
+func TestWorkloadKeysAcrossFlattenForms(t *testing.T) {
+	t.Parallel()
+	vc := newViewCatalog(t)
+	store := audit.NewMemoryStore(1000, 1000)
+	r := vc.replica(t, func(o *Options) {
+		o.Audit = audit.New(store, audit.Options{}, slog.New(slog.DiscardHandler))
+	})
+	sf := r.admin(t, pgx.QueryExecModeSimpleProtocol)
+	mustExec(t, sf, "SET sql_dialect = 'snowflake'")
+	mustExec(t, sf, "create table lake.public.fl (a array)")
+	mustExec(t, sf, "insert into lake.public.fl select array_construct('x', 'y', 'z')")
+	for range 3 {
+		if got := rawTexts(t, sf, "select f.value::string from lake.public.fl as t, lateral flatten(input => t.a) as f order by 1"); !slices.Equal(got, []string{"x", "y", "z"}) {
+			t.Fatalf("got %q", got)
+		}
+	}
+	shapes, exacts, forms := map[string]bool{}, map[string]bool{}, map[bool]bool{}
+	for deadline := time.Now().Add(10 * time.Second); time.Now().Before(deadline); time.Sleep(50 * time.Millisecond) {
+		qs, err := store.Queries(context.Background(), audit.Viewer{All: true}, audit.Page{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		clear(shapes)
+		clear(exacts)
+		clear(forms)
+		runs := 0
+		for _, q := range qs {
+			if q.FlattenKey != "" {
+				runs++
+				shapes[q.Shape], exacts[q.Exact], forms[q.FlattenLists] = true, true, true
+			}
+		}
+		if runs >= 3 {
+			break
+		}
+	}
+	if len(forms) != 2 {
+		t.Fatalf("the FLATTEN took forms %v in 3 runs, not both", forms)
+	}
+	if len(shapes) != 1 || len(exacts) != 1 {
+		t.Errorf("in both forms: %d shapes, %d exact keys", len(shapes), len(exacts))
+	}
 }
 
 // TestStatementShape checks the shapes that reservations learn by: the same

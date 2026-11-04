@@ -1,7 +1,7 @@
 // Package terminate ends the process at once when a C++ exception escapes
-// DuckDB or one of its extensions on a thread no statement of a session's runs
-// on, rather than abort it; on a session's statement's thread, it parks the
-// thread and ends only the statement and its session.
+// DuckDB or one of its extensions, rather than abort it; on a thread in a call
+// a statement guards (see Statement), it parks the thread and ends only that
+// statement and its session.
 //
 // C++ calls std::terminate for an exception that nothing catches: one
 // thrown on a thread DuckDB started that its code lets out, or one thrown
@@ -17,14 +17,14 @@
 // The handler here writes to standard error what escaped (its type and its
 // message) and the frames of the thread it escaped on, with nothing that
 // could wait on a lock or allocate: no stack unwinding, no Go code, no signal.
-// On any thread but a statement's (see Statement) it then calls _exit(134), the
-// status of a process aborted by SIGABRT, and whatever runs the process
-// restarts it.
+// On any thread but one in a call a statement guards (see Statement) it then
+// calls _exit(134), the status of a process aborted by SIGABRT, and whatever
+// runs the process restarts it.
 //
-// A thread a session's statement runs on holds what that statement does and
-// nothing of anyone else's: the exception stopped in DuckDB's code there, and
-// unwound what it had begun beneath, as an Out of Memory error thrown out of
-// the iceberg extension's destructor of a scan's manifest tasks did, in the
+// A thread in a statement's call into DuckDB holds what that statement does
+// and nothing of anyone else's: the exception stopped in DuckDB's code there,
+// and unwound what it had begun beneath, as an Out of Memory error thrown out
+// of the iceberg extension's destructor of a scan's manifest tasks did, in the
 // optimizer of a statement bound again at a replica's memory limit. So that
 // thread waits for good instead, and says so (see Watch), and Go ends its
 // statement and session: what those held of Igloo's, it lets go of, and the
@@ -85,10 +85,19 @@ func Watch(n func(what string, known bool)) {
 	notify = n
 }
 
-// Statement runs fn, a statement's work in DuckDB, on the thread it is called
-// on, and nothing else on that thread meanwhile: an exception that escapes
-// DuckDB there, which nothing can catch, parks the thread for good, and ends
-// calls ended with what escaped. Calls within fn's run use the outer's end.
+// Statement runs fn, a statement's call into DuckDB, on the thread it is
+// called on, and nothing else on that thread meanwhile: an exception that
+// escapes DuckDB there, which nothing can catch, parks the thread for good,
+// and ends calls ended with what escaped. Calls within fn's run use the
+// outer's end.
+//
+// fn must not switch to or from a coroutine (iter.Pull) made outside it: Go
+// requires every switch to one to be on the thread, and under the thread
+// locks, it was made with, and Statement locks the goroutine to its thread
+// for fn. Guarding each call, not a client's whole command, keeps that: a
+// portal read a few rows at a time resumes in each command the coroutine its
+// first read made, and with commands guarded whole, JDBC's fetch size ended
+// the process.
 func Statement(ended func(what string), fn func()) {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()

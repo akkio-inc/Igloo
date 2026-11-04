@@ -2,6 +2,7 @@ package pgwire
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"testing"
@@ -58,5 +59,55 @@ func TestRefreshLeavesTheCatalog(t *testing.T) {
 	}
 	if action, _, _, _ := viewRefresh(t, admin, "public.slow_view"); action != "FULL" {
 		t.Errorf("last refresh: %s", action)
+	}
+}
+
+// TestRefreshPlansAlongsideSharedHolds checks that planning a refresh, which
+// resolves its query's tables and reads their columns and the query's, finishes
+// while another holder keeps the catalog lock shared, as binds do: it binds, and
+// walks nothing. Listing the columns from information_schema walked the
+// catalog, and held the lock alone for up to 13 s of a refresh beside BI
+// tools' listings.
+func TestRefreshPlansAlongsideSharedHolds(t *testing.T) {
+	env := startRefreshServer(t)
+	mustExec(t, env.admin, "CREATE TABLE f (g VARCHAR, x INTEGER)")
+	mustExec(t, env.admin, "INSERT INTO f VALUES ('a', 1)")
+	ctx := context.Background()
+	owner, err := env.srv.users.Get(ctx, "igloo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A session that made no temporary objects, as a refresh's is while it
+	// plans (see RunJob), and CREATE MATERIALIZED VIEW's usually is.
+	conn := env.testServer.admin(t, pgx.QueryExecModeSimpleProtocol)
+	env.srv.sessions.mu.Lock()
+	sess := env.srv.sessions.byPID[int32(conn.PgConn().PID())]
+	env.srv.sessions.mu.Unlock()
+	query := "SELECT g, sum(x) AS sx, count(*) AS n FROM f GROUP BY g"
+	plan := func() error {
+		reason, err := env.srv.refreshReason(ctx, sess, owner, query)
+		if err == nil && reason != "" {
+			err = errors.New(reason)
+		}
+		return err
+	}
+	// The first plan lists the schema's tables as it binds f, which takes the
+	// lock alone; later binds find f listed.
+	if err := plan(); err != nil {
+		t.Fatal(err)
+	}
+	release := env.srv.engine.CatalogShare()
+	done := make(chan error, 1)
+	go func() { done <- plan() }()
+	select {
+	case err := <-done:
+		release()
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(20 * time.Second):
+		release()
+		<-done
+		t.Fatal("planning a refresh waited for the catalog lock while it was held shared")
 	}
 }

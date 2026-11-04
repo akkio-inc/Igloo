@@ -29,12 +29,7 @@ func serveGateway() error {
 	if err := level.UnmarshalText([]byte(os.Getenv("IGLOO_LOG_LEVEL"))); err != nil && os.Getenv("IGLOO_LOG_LEVEL") != "" {
 		return fmt.Errorf("IGLOO_LOG_LEVEL: %w", err)
 	}
-	var log *slog.Logger
-	if os.Getenv("IGLOO_LOG_FORMAT") == "json" {
-		log = slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: level}))
-	} else {
-		log = slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level}))
-	}
+	log := logTo(os.Getenv("IGLOO_LOG_FORMAT"), level)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -44,7 +39,7 @@ func serveGateway() error {
 	}
 
 	reg := prometheus.NewRegistry()
-	reg.MustRegister(collectors.NewGoCollector(), collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))
+	reg.MustRegister(collectors.NewGoCollector(), collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}), logDropped())
 	gw := gateway.New(gateway.Options{
 		Backend:          cfg.Backend,
 		ConsoleBackend:   cfg.ConsoleBackend,

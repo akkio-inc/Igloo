@@ -1,0 +1,34 @@
+Tear an Iceberg scan down without throwing.
+
+The scan state's destructor waits for its manifest-reading tasks, and threw
+what they threw. A destructor that throws ends the process (std::terminate).
+At DuckDB's memory limit a task throws Out of Memory; the task executor keeps
+that error, the scan's next call (TryGetNextBatch, FinishScanTasks) throws it
+and the statement fails, and then the scan's teardown threw it again and took
+every session of the process with it. The scan's calls surface the error; the
+destructor now waits without throwing.
+
+diff --git a/src/planning/iceberg_multi_file_list.cpp b/src/planning/iceberg_multi_file_list.cpp
+index 7a9d57827..00b11e472 100644
+--- a/src/planning/iceberg_multi_file_list.cpp
++++ b/src/planning/iceberg_multi_file_list.cpp
+@@ -125,8 +125,17 @@ IcebergMultiFileListSharedState::IcebergMultiFileListSharedState(ClientContext &
+ 
+ IcebergMultiFileListSharedState::~IcebergMultiFileListSharedState() {
+ 	if (data_manifest_read_state) {
+-		//! FIXME: this could throw, if the tasks encountered an error
+-		data_manifest_read_state->executor.WorkOnTasks();
++		//! Igloo: wait for the manifest-reading tasks, which use this state, without throwing what
++		//! they threw. A destructor that throws ends the process (std::terminate). At DuckDB's memory
++		//! limit a task throws Out of Memory; the executor keeps that error, and the scan's next call
++		//! (TryGetNextBatch, FinishScanTasks) throws it, failing the statement. Tearing the scan down
++		//! after that, or after the statement failed or was canceled anyway, waited here and threw
++		//! the kept error again, taking every session with it. The error belongs to the scan's calls,
++		//! which surface it; here there is nothing left to fail.
++		try {
++			data_manifest_read_state->executor.WorkOnTasks();
++		} catch (...) {
++		}
+ 	}
+ }
+ 

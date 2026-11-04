@@ -13,6 +13,20 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
 
 ### SQL and tables
 
+- A start no longer dies reading back what DuckDB held in memory. A list of 88
+  GiB in ranges of up to 2.7 GiB, a view's column chunks that DuckDB kept whole,
+  was read back all at once, and the kernel killed Igloo 25 s into each of 16
+  starts in a row on a machine of 60 GiB. The read-back now holds at most 1 GiB
+  of requests at once and leaves out ranges over 64 MiB. A start that finds the
+  one before was killed during its read-back starts without the list.
+
+- A start reads back at most a quarter of DuckDB's memory, not three quarters. A
+  mixed load's first 10 minutes read 18% of a list of 22 GB, and with that load
+  from the moment the replica was ready, its first minute's dashboards took 0.84 s
+  at the median after a quarter came back, 1.17 s after three quarters and 0.93 s
+  after none. On a machine of 60 GiB, 32.6 GB read back as users arrived had
+  DuckDB's limit cut to half and raised back.
+
 - Reads of the read cache start no threads of their own. The extension started one
   for each block of each read, warm or cold, and with dashboards, ELT and reports
   beside each other a replica of 16 cores reached 20,394 threads and a load of 240,
@@ -27,12 +41,15 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   row groups of about a sixteenth of it, of at least 122,880 rows.
 
 - A dashboard's first run, with no history, no longer runs its heavy statements
-  together. Statements of shapes not seen yet that have waited a minute for the
-  memory start one at a time, not one every 30 s, and a statement whose text with
-  its literals has not run goes by the most a run alike took, not the median, of
-  which runs over values with no rows had been most. Its 324 queries at ten times
-  the data, on 8 cores, took 3,145 s rather than 3,928, and none ran past its
-  timeout, where three had.
+  together. A statement of a shape not seen yet that would wait is first estimated
+  from DuckDB's plan and the tables it reads, as auto mode estimates it: one that
+  holds under a 256th of the memory, such as a tile or a small query, starts at
+  once, and any other waits while another such runs, for at most a minute in which
+  none starts or ends. A statement whose text with its literals has not run goes by
+  the most a run alike took, not the median, of which runs over values with no rows
+  had been most. Its 324 queries at ten times the data, on 8 cores, took 1,787 s
+  rather than 3,928, and none ran past its timeout, where three had; they used
+  14,100 CPU-seconds, as after a run, where running together they used 29,400.
 
 - A canceled statement holds nobody up. Statements behind one waited until DuckDB
   had stopped it, for its slots and its memory, and a statement of a shape not seen
@@ -587,6 +604,86 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   `igloo.alert_history`.
 
 ### Distributed execution
+
+- A commit no longer makes the next statements over its table wait to plan. The
+  table's metadata loads again in the background as it changes, where the next
+  lookup of it waited 0.3 to 1.2 s for that load, and dashboards' cheap statements
+  gave up planning for workers and ran on the replica: 17 of 19 such give-ups in a
+  mixed window came within 4.4 s of a commit of the ELT.
+- A slow worker no longer holds up every stage. The coordinator sends a stage's
+  tasks to workers as they have room, rather than all at once, so a slow or busy
+  worker runs fewer of them. A report on 16 workers took 573.9 s at the median
+  against 677.7 s; with one worker at half speed, 626.2 s against 1,048.1 s; and a
+  worker powered off cost it 1.4% against 3.5%.
+- Refreshes, pipes' loads and heavy statements give way to dashboards on workers.
+  Beside a full refresh on all 16 workers, 40 to 140 s at a time, dashboards'
+  statements on workers took 9.7 s at the median and 42 s at the 95th percentile,
+  against 6.6 and 23 s while none ran. A statement in the background now gets a
+  quarter of a worker's slots before other tasks, and one whenever none of its tasks
+  has started there for 10 seconds, so that it always finishes, and more only once
+  no other statement's task has run or waited there for 2 seconds.
+  Materialized views' and dynamic tables' refreshes and pipes run so, and
+  statements whose shape held the workers 8 times as long as the others there. Their `placement` ends with `in the background`.
+- TPC-DS q09, q10, q16, q32, q35, q69, q92 and q94 run on workers, where they stayed on
+  one machine. A scalar subquery in the columns of a statement that does not group, one
+  aggregate of all the rows of a large table, is a relation of one row that the workers
+  compute. An `OR` of `EXISTS` subqueries correlated by the same columns is one semi
+  join to the union of their keys. An `EXISTS` or `NOT EXISTS` may also compare its
+  columns to the statement's otherwise (`ws1.ws_warehouse_sk <> ws2.ws_warehouse_sk`),
+  which the join checks beside its keys. A correlated subquery, and a `LEFT JOIN`, of
+  a statement that joins several tables divide its rows by the table the condition
+  reads.
+- Auto mode estimates a statement's time on one machine by what each of its
+  operators takes, not by its hash tables' rows alone: scans by their rows and
+  width, joins by the rows probed, built on and made, aggregates by their rows,
+  groups and distinct or median-like aggregates, sorts and windows by their rows'
+  order, and UNNEST by the rows it makes, a microsecond and more each where the
+  statement writes the list, as FLATTEN of a row's object does. Of the estimate
+  corpus's statements that took 2 s or more alone, 58% are now estimated within
+  twice what they took on a first run, where 8% were; a report's profile of an
+  audience, which FLATTENs people's objects and took 7 s alone, is estimated at
+  3.7 s, where it was at 1.9.
+
+- Auto mode no longer takes a statement for short of memory on the replica by
+  what its stages exchange where DuckDB's plan says its working set fits. A
+  report whose stages read 30.7 GB of a lookup for exchanges, three times that
+  over the replica's 30.8 GB share, held 19 to 20 GB, as its plan said (15.3
+  GB), and ran in 23.5 s on the replica beside dashboards. Taken for short of
+  memory, it went to 4 workers and took 166.5 s.
+
+- Auto mode estimates a join to a lookup's latest version, `ver = (SELECT max(ver)
+  FROM versions)`, by the rows of the row groups that hold that version: Iceberg's
+  bounds name the few files that reach it, and their Parquet footers the row
+  groups. A lookup of 1.41 billion rows over versions 0 to 2 had 189,400 rows of
+  version 2, in 2 files of 19.7 million rows and row groups of 384,204. Taking a
+  third of its rows, by the versions' distinct count, put a report's working set
+  at 191 GB where it held 19 to 20 GB; it is now estimated at 15 GB. Columns of
+  `DECIMAL(p,0)`, as a Snowflake `NUMBER` of integers arrives, have bounds as
+  integer columns do.
+
+- Auto mode carries a statement's run on one number of workers over to others by
+  its fixed costs first and its work after. TPC-DS q95 at a hundred times the data
+  took 4.8 s on 16 workers; scaling its whole estimate by that run made 8 workers
+  look as fast for less, and it took 14.7 s there. The estimates' fixed costs (8 s
+  to start, 5 s a level) are what they overstate most for such statements. Carried
+  over this way, two reports' runs on 16 workers predict their runs on 8, 4, 2 and
+  1 within a factor of 1.18 at the root mean square, against 1.25 before, and q95
+  stays on 16.
+
+- Auto mode estimates what workers read for parts that write no exchange, which
+  send their rows or partial aggregates to the replica, at the replica's cold rate
+  per core, not 0.4 of it. On 16 workers just started, their disks empty, a
+  dashboard's first four tiles of 16 GB took 12 to 15 s at once. Auto mode had
+  estimated such a tile at 72 s on workers against 99 s on one machine, and kept
+  its first run on the replica for 42 s and 844 CPU-s. It now estimates the tile
+  at about 50 s and runs it on workers.
+
+- Auto mode no longer gives up planning a statement for workers while its session
+  waits for the catalog lock. A refresh beside a fleet's dashboards took the lock
+  alone 12 times for up to 13 s, and 275 dashboard statements counted that wait
+  as planning that made no progress and ran on one machine: a tile that took 10
+  to 14 s on workers took 75 to 88 s there, and loaded the coordinator for
+  everything else. `planned a statement` logs the wait.
 
 - Statements that masking and row access policies apply to run on workers and in the
   replica's second DuckDB, for every user, where they ran only in the first DuckDB of
@@ -1913,16 +2010,34 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
 
 ### Performance and cost
 
-- With no workers, a replica runs statements known to be heavy (their shape last
-  used 5 seconds of all its cores) in a second DuckDB of its process, whose
-  threads give way to the first's, and a read not yet known to be heavy starts
-  again there when it runs long beside others. Beside one analyst's long reports
-  a dashboard's statement had little more than its own thread. Over a billion
-  rows on 12 cores dashboards take 3.0 s at the median and 8.1 s at p95 beside them,
-  47 statements a minute, as they do alone, where they took 13.7 s, 74 s and 10 a
-  minute. Nothing needs setting, and
-  `IGLOO_HEAVY_IN_BACKGROUND=false` runs everything in the first (see [heavy
-  statements beside short ones](docs/workload-management.md#heavy-statements-beside-short-ones)).
+- A dashboard's own heavy statements stay in the first DuckDB. With nothing set,
+  only tasks' heavy statements run in the second DuckDB, whose threads give way
+  to the first's, and clients' do only with `IGLOO_HEAVY_IN_BACKGROUND=true`,
+  no longer the default. In the second DuckDB, beside the dashboard's other
+  statements, a dashboard's FLATTEN statement at ten times its data took 57 to
+  78 s, against 22 s in the first, and the dashboard waited for it. Its 96
+  queries took 2 to 9% less time on 8 cores and 22 GB, and 3% less on 16
+  cores. Set it where long reports run beside dashboards on a replica without
+  workers (see [heavy statements beside short
+  ones](docs/workload-management.md#heavy-statements-beside-short-ones)).
+
+- Three or more common table expressions of one statement that group the same
+  rows the same way, as reports count one join several ways, are grouped once, in
+  a common table expression marked `MATERIALIZED` that each reads (see [SQL](docs/sql.md)):
+  DuckDB scanned, joined and grouped the rows once for each. A dashboard's two
+  reports of six such took 480 to 488 CPU-seconds rather than 781 to 898 at ten
+  times its data on 8 cores and 22 GB, and its 324 queries 1,684 s rather than 1,808.
+
+- With no workers, a replica runs tasks' statements known to be heavy (their shape
+  last used 5 seconds of all its cores) in a second DuckDB of its process, whose
+  threads give way to the first's, and with `IGLOO_HEAVY_IN_BACKGROUND=true`
+  clients' too, where a read not yet known to be heavy starts again there when it
+  runs long beside others. Beside one analyst's long reports a dashboard's
+  statement had little more than its own thread. Over a billion rows on 12 cores,
+  with the setting on, dashboards take 3.0 s at the median and 8.1 s at p95 beside
+  them, 47 statements a minute, as they do alone, where they took 13.7 s, 74 s and
+  10 a minute (see [heavy statements beside short
+  ones](docs/workload-management.md#heavy-statements-beside-short-ones)).
 - The result cache sends a dashboard's repeated queries again more often:
   it compares statements without their comments and spacing, which BI
   tools vary per run; shares a result between users when no policy
@@ -2017,6 +2132,10 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
 - A replica keeps the forms of `FLATTEN`s through a restart, from the query
   history, rather than try them again: a dashboard's first build after one took
   half as long again as the next.
+- A statement whose `FLATTEN`s Igloo runs in either form keeps one history of its
+  memory and time, by the text the client sent. By the text DuckDB ran, which
+  differs between the forms, a dashboard's statements were new again in its second
+  run, and waited for one another as statements nothing is known of do.
 - A heavy statement in the second DuckDB gets the memory of the first's caches
   when statements wait in line behind it and none runs in the first: a dashboard's
   heavy statements, held to what those caches left them, spilled while the rest
@@ -2076,9 +2195,16 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   line](docs/workload-management.md#the-line)). The slowest tenth of a dashboard's
   96 queries at ten times the data took 94 s rather than 102.
 - A `FLATTEN` of a column takes the form DuckDB's estimates point to, then
-  whichever form its shape's latest runs took the less CPU time in at best (see
-  [Snowflake SQL](docs/snowflake-sql.md)): two dashboard queries over tens
-  of millions of rows took 88 seconds and take 56 and 40.
+  whichever form its shape's latest runs took the less of the replica in at best,
+  the more of their CPU time over its cores and of their memory over its memory
+  limit for as long as they ran (see [Snowflake SQL](docs/snowflake-sql.md)): two
+  dashboard queries over tens of millions of rows took 88 seconds and take 56
+  and 40. Judged by CPU time alone, a dashboard query at ten times its data, on
+  16 cores, took the form that ran 40 s rather than 22 and allocated 82 GB rather
+  than 63, and the slowest of the dashboard's first minute took 73 to 76 s; it
+  takes 56 to 64. A statement that runs on workers is judged by what it took of
+  them, its time on each: the replica measures none of their work, so the form
+  tried second was never judged, and was tried again after each start.
 - A statement's shape includes the session's search path and database, so
   the same text over another schema, another client's or the same data at
   ten times the size, learns its own memory and `FLATTEN` form: the first
@@ -2435,6 +2561,15 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
 
 - Statement timeouts, connection limits, health and readiness endpoints,
   Prometheus metrics, and text or JSON logs.
+- Logging never holds a statement up. A log line went straight to stderr,
+  and waited while whatever read it did not keep up: with stderr a pipe
+  nobody read, statements logging at debug level stopped once its buffer
+  was full, 167 of 300 in a test, and the rest waited for good. Lines now go
+  to a buffer of 4 MiB that a goroutine writes out; when it is full, lines
+  are dropped, counted in `igloo_log_lines_dropped_total`, and a warning says
+  how many, at most once a minute. The same 300 statements took 0.84 s, as
+  with the log discarded. A worker whose disk is short of room for a task's
+  exchange warns at most once a minute, not for each task.
 - Docker Compose for one machine, with the bundled object store or Amazon S3
   through the machine's IAM role.
 - A Helm chart for any Kubernetes cluster, with the web console and
@@ -2482,6 +2617,152 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   message and the stack it was thrown from.
 
 ### Fixed
+
+- A cancel always stops the statement. A statement is prepared, readied
+  and run in steps, and a cancel request, the console's cancel, the client
+  going or the memory watch stopped the step running then. It was lost as a
+  step ended, between two steps as the statement waited for the catalog's
+  lock, and after it ran out of memory, before it ran again, and the
+  statement ran to its end: a test's ran for 30 minutes. The cancel now ends
+  the statement's next step too.
+
+- A statement that runs out of memory runs again rather than fail. DuckDB
+  fails whichever statement asks for memory the others hold. In auto mode
+  the statement runs again on workers, on those already running if auto
+  mode had not planned it for them. Otherwise it runs again here beside the
+  others, once a reservation of what it held and the block it failed to get
+  is free; if it runs out again, it runs alone, and then on half DuckDB's
+  threads, and so on down to one, since some operators hold memory for each
+  thread: TPC-DS q67's ROLLUP at scale 10 in 700 MB ran out alone on 16, 8
+  and 4 threads and finished on 2 in 8 s. One statement at a time waits to
+  run alone, and holds nobody back as it waits: statements that fit start
+  beside it. Another that comes to that step fails, saying so, as does the
+  one waiting when the replica has no moment free of others in 5 minutes.
+  Six statements that ran out of memory at once had each waited in line for
+  all of it, and nothing started on the replica for 150 s; in a test of
+  that, 1,660 statements of a dashboard's load started in 3 s, against 88
+  and then none. A prepare that runs out of memory is prepared again alone. On a replica of 1.8 GiB with two dozen
+  sessions of joins, aggregates and commits, 404 statements failed so in
+  three minutes, and 10 with this: 8 were one aggregate whose states need
+  more memory than the replica has, on any number of threads, and 2 ran out
+  as they were prepared, which now waits too. A statement runs again only
+  before it sent a row, outside a transaction block, and when it changes
+  nothing until it commits. One that runs out alone on one thread fails
+  with what happened and what would let it finish: a higher memory limit,
+  or workers, when its session turned distributed execution off.
+
+- Refreshes of materialized views and dynamic tables, and COPY INTO, a
+  pipe's or a client's, run again alone when they run out of memory, as a
+  client's statement does, rather than fail. Beside a mixed load on a
+  replica of 44.2 GiB, 9 of 11 refreshes had failed, out of memory at
+  43.4 GiB, and none ran again. A failed refresh leaves nothing a run from
+  its start trips on, and a COPY INTO that runs out loads none of its files.
+  COPY INTO now holds the catalog's lock only while it runs, not while it
+  waits its turn. A statement that ran again keeps the larger of its runs'
+  peaks for the next like it, so one that failed big and finished small
+  reserves for the big one. Tasks and alerts had this already.
+
+- A full refresh of a view that later refreshes go on from runs its query on
+  workers where auto mode would run a read of it there; it computed its
+  groups' partial aggregates on the replica. The log says where each of a
+  refresh's queries ran, and the history where its query did.
+
+- A view counting distinct values refreshes in full, its query on workers,
+  wherever auto mode would run that query there, and keeps no bitmaps; it goes
+  on incrementally, from a bitmap of each group's values, only where workers
+  would not run it. Beside a mixed load on 16 workers, full refreshes of the
+  reach of 1.5 billion impressions by advertiser and channel took 41 to 140 s,
+  with the dashboards at their best rate; incremental ones on the replica took
+  64 to 385 s and cost the dashboards 13 to 36% of theirs. Where it goes on
+  incrementally, its state is written in row groups of about 8 MB, not one row
+  group of every group's bitmap, as DuckDB puts a vector of rows, up to 2,048,
+  in each at least: 800 bitmaps, 2 GB, took more than 1 GB at once to read
+  back. Alone, such a refresh after 8 million new impressions takes 8 to 9 s.
+
+- A refresh writes a state of bitmaps in a few files, rather than a file for
+  each 8 MB row group, each a request of its own to object storage. Writing
+  5 GB of state, 650 bitmaps of 7.7 MB, took 93 s a file each and takes 15.5 s
+  in 11 files; it was most of the 145 s an incremental refresh of a view of
+  distinct devices over 1.55 billion impressions took after 4 million new ones.
+
+- Igloo's other Parquet files keep their row groups near 8 MB too, and tables of
+  wide rows get fewer rows a row group. A task's result was written in DuckDB's
+  row groups of 122,880 rows, 250 MB for rows of 2 KB; it is now cut
+  at 8 MB where its rows have no order to keep. Sorted results, a large sort's
+  runs and a sorted write's ranges, which DuckDB bounds by rows only, take as
+  many rows as their width makes 8 MB, and a merge's file ends a row group at
+  8 MB. Tables aim at 16 MiB a row group, as before, now also where rows are
+  wider than 137 bytes, which stayed at 122,880 rows: a table of 2 KB rows in
+  one row group of 40 MB gets row groups of up to 16 MiB once maintenance
+  rewrites it, and its inserts are sized the same. DuckDB puts a vector of rows,
+  up to 2,048, in each row group it writes, so rows past 4 KB make larger ones.
+
+- A statement that runs out of DuckDB's memory has Igloo log what held it:
+  DuckDB's limit and its memory by tag, what the workload controller reserved
+  and last saw held, and the five running statements that reserved the most.
+  DuckDB's error says only what the statement failed to get. Statements that
+  run out within 10 s of each other share one line.
+
+- A replica no longer cancels its first statements for memory while it reads back,
+  after a start, the parts of files DuckDB held. The read-back took a new buffer for
+  each request, which Go's heap kept after it ended, until Go's next collection;
+  and when memory ran low, Igloo lowered DuckDB's limit a step at a time from the
+  limit, not from what DuckDB held, so its first steps freed nothing. On a machine
+  of 60 GiB, a report was canceled 40 s after each of two starts. The read-back now
+  reuses its buffers, returns them when it ends, and stops when what Igloo can still
+  allocate falls below a quarter of its memory. A replica now lowers DuckDB's limit
+  from what DuckDB holds, so DuckDB drops those parts first; a worker, whose DuckDB
+  holds its tasks' work, lowers it from the limit as before. In a replica of 36 GiB, with
+  16 dashboard users and a heavy report starting during a read-back of 19 GB, the
+  least memory left rose from 2.0 GiB, under the 2.25 GiB at which Igloo cancels
+  statements, to 5.1 GiB. Go held 0.1 GiB once the read-back ended, not 5.4 GiB.
+
+- A long statement no longer starts again in the second DuckDB because a
+  monitoring poll ran beside it. A read not yet known to be heavy started
+  again there when another statement was running at a moment Igloo looked,
+  once a second, after 5 s for each statement beside it; a poll of a few
+  milliseconds counted, and TPC-DS q67 at scale 100, alone apart from a
+  sampler polling once a second, started again after 23.5 s of its 115 s.
+  Only statements that have run for a second now count. Beside a 0.3 s poll
+  once a second, a statement that ran 43 s in the second DuckDB now ran 32 s
+  where it started.
+
+- Reads of object storage reuse their connections. DuckDB opened one for
+  each file it read and closed it after, and each closed connection holds
+  a local port for a minute. A replica of 1.8 GiB whose two dozen sessions
+  read a table of 300 manifests beside commits to it held 28,403 such
+  ports, every one it had, and 260 to 550 of its statements in three
+  minutes failed with "Could not connect to server". With the
+  connections kept and reused, it held 29, and none failed so.
+
+- Igloo builds DuckDB's Iceberg extension itself (`extensions/iceberg`):
+  DuckDB-Iceberg at the commit DuckDB 1.5.6 ships, with Igloo's patches,
+  loaded as the rb extension is, checked against the SHA-256 the image
+  build recorded. The patches fix two ways the official extension ended
+  the process:
+  - An Iceberg scan torn down after one of its manifest-reading tasks ran
+    out of memory threw that error again from a destructor, and C++ ended
+    the process with every session on it. The statement now fails with the
+    error, and the process goes on.
+  - The extension's in-memory set of a schema's tables, which every
+    connection shares, was erased from without its lock when a drop or
+    rename committed. A bind could also free entries a listing was still
+    reading. Either segfaulted the process or left a later listing looping
+    forever, and Igloo had to serialize listings and DDL against every bind
+    with its catalog lock. The set is now safe on its own. Erases take its
+    lock, an entry lives as long as any transaction holds it, and listings
+    walk a copy. In a stress test of the extension alone (24 connections
+    binding, listing, renaming, dropping and swapping tables dbt's way for
+    10 minutes against a catalog 25 ms away, in two schemas), the official
+    extension segfaulted 3 times in 3 runs, within 3 to 66 s; the patched
+    one ran 50,000 statements with no crash, also under AddressSanitizer.
+  - Binds no longer queue behind each other's requests to the catalog.
+    The extension held the set's lock while it loaded a table or listed a
+    schema, so a schema's binds took turns one round trip each. They now
+    load side by side, up to 18 at once in the stress test, and bind 5.4
+    times as fast.
+  - A rename whose commit had landed no longer fails with "already created
+    by a different transaction" when a listing saw the new name first.
 
 - The coordinator merges workers' sorted rows on several cores and copies
   them into DuckDB a column at a time: rows of a table sorted on workers

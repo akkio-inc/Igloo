@@ -65,7 +65,7 @@ func serveWorker() error {
 	cancel()
 
 	reg := prometheus.NewRegistry()
-	reg.MustRegister(collectors.NewGoCollector(), collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))
+	reg.MustRegister(collectors.NewGoCollector(), collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}), logDropped())
 	reg.MustRegister(eng.Metrics()...)
 	locations := append([]string{cfg.Storage.Root()}, cfg.Storage.AllowedLocations...)
 	opts := distributed.WorkerOptions{
@@ -105,7 +105,9 @@ func serveWorker() error {
 	// task on it; its statement fails as out of memory.
 	if plan.Total > 0 {
 		go memlimit.Watch(ctx, plan.Total, w.ShedMemory)
-		go memlimit.Adapt(ctx, plan.Total, plan.DuckDB, func(n int64) error { return eng.SetMemoryLimit(ctx, n) }, log)
+		// From the limit, not from what DuckDB holds: its tasks' work (see
+		// memlimit.Adapt).
+		go memlimit.Adapt(ctx, plan.Total, plan.DuckDB, func(n int64) error { return eng.SetMemoryLimit(ctx, n) }, nil, log)
 		log.Info("memory watch is on", "cancels_below", memlimit.Format(memlimit.Low(plan.Total)),
 			"spills_more_below", memlimit.Format(memlimit.High(plan.Total)))
 	}
@@ -299,7 +301,8 @@ func workerWriteCredentials(ctx context.Context, cfg config.Config, log *slog.Lo
 type footprints interface {
 	Observe(shape string, footprint int64)
 	ObserveUnfinished(shape string, held int64)
-	ObserveForm(key string, lists bool, cpu time.Duration)
+	ObserveForm(key string, lists bool, cpu time.Duration, footprint int64, ran time.Duration)
+	ObserveFormOnWorkers(key string, lists bool, took time.Duration, workers int)
 	ObserveCost(shape string, cpu time.Duration)
 	ObserveTook(shape string, took time.Duration)
 	ObserveEmpty(shape string)
@@ -346,9 +349,13 @@ func seedHistory(ctx context.Context, seed func([]distributed.Run), fp footprint
 	}
 	var fs []footprint
 	type form struct {
-		key   string
-		lists bool
-		cpu   time.Duration
+		key       string
+		lists     bool
+		cpu       time.Duration
+		footprint int64
+		ran       time.Duration
+		// workers ran it, if any (see ObserveFormOnWorkers).
+		workers int
 	}
 	var forms []form
 	for read := 0; read < most; read += pageSize {
@@ -359,14 +366,19 @@ func seedHistory(ctx context.Context, seed func([]distributed.Run), fp footprint
 		}
 		for _, q := range qs {
 			empty := q.Resources != nil && workload.ReadNothing(q.Resources.BytesRead, q.Resources.CPUTime)
-			if q.FlattenKey != "" && q.Outcome == audit.OutcomeOK && q.Resources != nil && q.Workers == 0 && !empty {
-				forms = append(forms, form{q.FlattenKey, q.FlattenLists, q.Resources.CPUTime})
+			switch {
+			case q.FlattenKey == "" || q.Outcome != audit.OutcomeOK:
+			case q.Workers > 0:
+				forms = append(forms, form{key: q.FlattenKey, lists: q.FlattenLists, ran: q.Duration - q.Queued, workers: q.Workers})
+			case q.Resources != nil && !empty:
+				forms = append(forms, form{q.FlattenKey, q.FlattenLists, q.Resources.CPUTime,
+					workload.FootprintOf(q.Resources.MemoryAllocated, q.Peak, q.Peak > 0), q.Duration - q.Queued, 0})
 			}
 			switch {
 			case q.PlanKey == "":
 			case q.Outcome == audit.OutcomeOK:
 				rs = append(rs, distributed.Run{Key: q.PlanKey, Workers: q.Workers, Large: distributed.OnLarge(q.Placement), Duration: q.Duration,
-					Memory: q.Memory})
+					Memory: q.Memory, Peak: q.Peak})
 			case q.Workers > 0 && q.Outcome == audit.OutcomeError:
 				// It failed on workers, as when one ran out of memory.
 				rs = append(rs, distributed.Run{Key: q.PlanKey, Workers: q.Workers, Large: distributed.OnLarge(q.Placement), Duration: q.Duration,
@@ -409,7 +421,11 @@ func seedHistory(ctx context.Context, seed func([]distributed.Run), fp footprint
 	slices.Reverse(fs)
 	slices.Reverse(forms)
 	for _, f := range forms {
-		fp.ObserveForm(f.key, f.lists, f.cpu)
+		if f.workers > 0 {
+			fp.ObserveFormOnWorkers(f.key, f.lists, f.ran, f.workers)
+		} else {
+			fp.ObserveForm(f.key, f.lists, f.cpu, f.footprint, f.ran)
+		}
 	}
 	if seed != nil {
 		seed(rs)

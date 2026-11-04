@@ -267,7 +267,8 @@ func (r *recordReader) Next() bool {
 		r.err = r.ctx.Err()
 		return false
 	default:
-		chunk := mapping.FetchChunk(r.res)
+		var chunk mapping.DataChunk
+		r.rows.guard(func() { chunk = mapping.FetchChunk(r.res) })
 		if chunk.Ptr == nil {
 			return false
 		}

@@ -97,7 +97,7 @@ func (s *Server) statementRows(ctx context.Context, sess *session, query string)
 	if err != nil || len(reads.tables) == 0 {
 		return 0, false
 	}
-	if err := s.meta.RefreshMetadata(ctx); err != nil {
+	if err := readMetadata(ctx, s, sess, s.meta); err != nil {
 		s.log.Debug("could not read the catalog's metadata to estimate a statement's rows", "err", err)
 	}
 	return tableRows(s.meta.Metadata(), reads.tables)
@@ -213,7 +213,7 @@ func (s *Server) rerunWithoutBitmaps(ctx context.Context, sess *session, st *sta
 		_ = old.Close()
 		return run()
 	}
-	release := s.holdCatalog(sess)
+	release := s.shareCatalog(sess)
 	err := st.reprepare(ctx, sess.conn)
 	release()
 	if err != nil {

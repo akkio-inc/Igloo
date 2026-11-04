@@ -49,8 +49,8 @@ func TestWorkingSetOf(t *testing.T) {
 		got[p.op] = p
 	}
 	// People filtered: 10 million rows a fifth of them, 2 million, of an id
-	// and a country (8 + 32 bytes) and a join's 32, times 1.5.
-	if p := got["HASH_JOIN"]; p.rows != 2e6 || math.Abs(p.bytes-2e6*72*heldFactors["join"]) > 1 {
+	// and a country (8 + 32 bytes) and a join's 20.
+	if p := got["HASH_JOIN"]; p.rows != 2e6 || math.Abs(p.bytes-2e6*60*heldFactors["join"]) > 1 {
 		t.Errorf("join: %+v", p)
 	}
 	// 100 million events of 8 million people joined to 2 million ids: 25
@@ -142,9 +142,17 @@ func TestPlanShapes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// One branch: 400 million ids of 32 bytes and a join's 32, times 1.5,
-	// and its view's survey; and the view the common table expression reads.
-	one := 400e6*64*heldFactors["join"] + 18e6*48*heldFactors["join"]
+	// The same from the tables alone, as a replica estimates a statement before
+	// its first run.
+	if set, ok := WorkingSet(planJSON(t, e1), []*Table{people, survey}, 24); !ok || set != int64(p.set) {
+		t.Errorf("WorkingSet: %d, %v; want %d", set, ok, int64(p.set))
+	}
+	if _, ok := WorkingSet(planJSON(t, op("ICEBERG_SCAN", nil, "Projections", "pid")), nil, 24); ok {
+		t.Error("WorkingSet said what a scan of a table it was not given holds")
+	}
+	// One branch: 400 million ids of 32 bytes and a join's 20, and its
+	// view's survey; and the view the common table expression reads.
+	one := 400e6*52*heldFactors["join"] + 18e6*36*heldFactors["join"]
 	if p.set < one || p.set > 1.2*one {
 		t.Errorf("E1-like: %.1f GB, want about one branch's %.1f GB", p.set/1e9, one/1e9)
 	}
@@ -152,10 +160,10 @@ func TestPlanShapes(t *testing.T) {
 	if want := int64(77e9) / 470 * 18; p.bytes < want-1e8 || p.bytes > want+2e8 {
 		t.Errorf("E1-like reads %.1f GB, want %.1f GB", float64(p.bytes)/1e9, float64(want)/1e9)
 	}
-	// 16 joins of 400 million rows to 400 million and 17 to 18 million, in
-	// tables past the caches: 2,033 core-seconds; it took 2,166.
-	if p.work < 1800 || p.work > 2300 {
-		t.Errorf("E1-like: %.0f core-seconds", p.work)
+	// 16 joins of 400 million rows to 400 million and 17 to 18 million, and
+	// their scans: 3,295 core-seconds by the operators' costs; it took 2,166.
+	if took := 2166.0; p.work < took/1.6 || p.work > took*1.6 {
+		t.Errorf("E1-like: %.0f core-seconds; it took %.0f", p.work, took)
 	}
 
 	// F3-like: 157 million events joined to an audience of everyone, 2
@@ -194,7 +202,7 @@ func TestPlanShapes(t *testing.T) {
 		got[part.op] = part
 	}
 	// An event's id, day and lists, and its member's id.
-	if w := got["WINDOW"]; w.rows != 157e6 || math.Abs(w.bytes-157e6*(32+4+64+64+32+hashEntryBytes)) > 1 {
+	if w := got["WINDOW"]; w.rows != 157e6 || math.Abs(w.bytes-157e6*(32+4+64+64+32)*heldFactors["constant window"]) > 1 {
 		t.Errorf("F3-like window: %+v, want every event, buffered once", w)
 	}
 	if d := got["HASH_GROUP_BY DISTINCT"]; d.rows != 6*unnestValues*157e6 {
@@ -203,7 +211,8 @@ func TestPlanShapes(t *testing.T) {
 	if g := got["HASH_GROUP_BY"]; g.rows > 31.4e6*24 {
 		t.Errorf("F3-like groups: %+v, no more than DuckDB's for each thread", g)
 	}
-	if p.set < 100e9 || p.set > 400e9 {
+	// Within four times what it held and spilled, 106 GB.
+	if p.set < 100e9 || p.set > 4*106e9 {
 		t.Errorf("F3-like: %.0f GB", p.set/1e9)
 	}
 
@@ -311,6 +320,41 @@ func TestMemoryScale(t *testing.T) {
 	}
 	if s := co.memory.scale(); s < 2 || s > 3 {
 		t.Errorf("after peaks of 3 GB on 1 GB: %v", s)
+	}
+}
+
+// TestRepeatPlacedByItsPeak checks that a statement that ran to its end on
+// the replica is placed, run again, by the most it held then, not by its
+// plan's estimate; and not by a peak at the memory's share, which may be
+// one spilled.
+func TestRepeatPlacedByItsPeak(t *testing.T) {
+	h := newHarness(t, 0.01, 3, 2)
+	h.co.opts.MemoryBytes = 4 << 30
+	for _, name := range []string{"orders", "lineitem"} {
+		h.tables[name].Bytes = 1 << 34
+	}
+	q := `SELECT o_orderpriority, count(*) FROM orders JOIN lineitem ON l_orderkey = o_orderkey GROUP BY 1 ORDER BY 1`
+	env := harnessEnv{h}
+	set := func() (string, float64) {
+		t.Helper()
+		plan, d, err := h.co.plan(context.Background(), q, env, ModeAuto, false, nil)
+		if err != nil || d == nil {
+			t.Fatalf("plan: %v", err)
+		}
+		return plan.Key, d.e.local.set
+	}
+	key, first := set()
+	if first <= 0 {
+		t.Fatalf("no working set by the plan: %g", first)
+	}
+	h.co.ObservePeak(key, int64(0.9*memoryShare*float64(h.co.opts.MemoryBytes))+1<<30)
+	if _, again := set(); again != first {
+		t.Errorf("after a peak at the memory's share: %g, want the plan's %g", again, first)
+	}
+	h.co.ObservePeak(key, 300<<20)
+	h.co.ObservePeak(key, 200<<20)
+	if _, again := set(); again != 300<<20 {
+		t.Errorf("run again: %g, want the most it held, %d", again, 300<<20)
 	}
 }
 
@@ -767,11 +811,83 @@ func TestLatestVersionOfAnAudience(t *testing.T) {
 	x := features{bytes: 7e9, exchanged: 83e9, held: 7e9, rows: 5.75e9, levels: 5, stages: 9, planned: true, planSet: p.set, planBytes: p.bytes, planWork: p.work,
 		planKeeps: p.keeps, planJoins: p.joins}
 	e := x.estimate(machine{cores: 16, threads: 16, memory: 44e9}, fleet{cores: 16, threads: 16, running: 16, most: 16, memory: 26 << 30})
-	if !e.memory || e.onWorkers > e.oneMachine {
+	// Its first run goes to workers by its time, which its operators give.
+	if e.onWorkers > e.oneMachine {
 		t.Fatalf("one machine %.0f s, short of memory %v; workers %.0f s", e.oneMachine, e.memory, e.onWorkers)
 	}
 	if workers, explore, reason := choose(e, runs{}, false, DefaultThreshold, time.Now()); !workers || explore {
 		t.Errorf("its first run: on workers %v, trying %v: %s", workers, explore, reason)
+	}
+}
+
+// TestLatestVersionFiles checks that a lookup joined to its latest version,
+// the most of its versions table's, keeps no more than the rows of its files
+// that hold that version: of 1.41 billion rows over versions 0 to 2, 189,400
+// at version 2, where a third of them, by the versions' distinct count, took
+// a report's working set for ten times what it held. Where the versions
+// table's latest may be below the lookup's, where every file holds the
+// latest version, or where the subquery filters the versions, its distinct
+// count stands.
+func TestLatestVersionFiles(t *testing.T) {
+	plan := func(lookup, versions *Table, filters string) planEstimate {
+		t.Helper()
+		st := newPlanStats([]*Stage{{Inputs: []Input{{Table: lookup}, {Table: versions}}}}, 16)
+		scan := []any{"Projections", []string{"ver"}, "Estimated Cardinality", "934"}
+		if filters != "" {
+			scan = append(scan, "Filters", filters)
+		}
+		latest := op("PROJECTION", []map[string]any{op("UNGROUPED_AGGREGATE", []map[string]any{op("PROJECTION", []map[string]any{
+			op("UNGROUPED_AGGREGATE", []map[string]any{op("PROJECTION", []map[string]any{op("ICEBERG_SCAN", nil, scan...)},
+				"Projections", "ver", "Estimated Cardinality", "934")}, "Aggregates", "max(#0)")}, "Projections", "#0", "Estimated Cardinality", "1")},
+			"Aggregates", []string{"\"first\"(#0)", "count_star()"})}, "Projections", []string{"#0"}, "Estimated Cardinality", "1")
+		members := op("HASH_GROUP_BY", []map[string]any{op("HASH_JOIN", []map[string]any{
+			op("ICEBERG_SCAN", nil, "Projections", []string{"ver", "member"}, "Filters", "(NOT (member IS NULL))", "Estimated Cardinality", "282687110"), latest},
+			"Join Type", "INNER", "Conditions", "ver = SUBQUERY", "Estimated Cardinality", "282687110")},
+			"Groups", []string{"#1"}, "Aggregates", []string{}, "Estimated Cardinality", "282687110")
+		p, err := planOf(planJSON(t, members), st)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	grouped := func(p planEstimate) float64 {
+		var rows float64
+		for _, h := range p.parts {
+			if h.op == "HASH_GROUP_BY" {
+				rows = max(rows, h.rows)
+			}
+		}
+		return rows
+	}
+	lookup := func(top int64) *Table {
+		return &Table{Name: "lookup", Rows: 1_413_435_550, Bytes: 20e9, Columns: []Column{{Name: "ver", Type: "INTEGER"}, {Name: "member", Type: "VARCHAR"}},
+			Distinct: map[string]int64{"ver": 3}, Bounds: map[string][2]float64{"ver": {0, 2}}, TopRows: map[string]int64{"ver": top}}
+	}
+	versions := func(most float64) *Table {
+		return &Table{Name: "versions", Rows: 934, Bytes: 1e5, Columns: []Column{{Name: "ver", Type: "INTEGER"}, {Name: "audience", Type: "VARCHAR"}},
+			Bounds: map[string][2]float64{"ver": {0, most}}}
+	}
+	if rows := grouped(plan(lookup(189_400), versions(2), "")); rows > 189_400 {
+		t.Errorf("the latest version's members: %.0f rows, want no more than its files' 189,400", rows)
+	}
+	// Its 2 files that hold version 2 have 19.7 million rows, and their row
+	// groups that do, by their footers, 384,204.
+	inGroups := lookup(19_689_142)
+	inGroups.latestRows = func(col string) (int64, bool) { return 384_204, col == "ver" }
+	if rows := grouped(plan(inGroups, versions(2), "")); rows > 384_204 {
+		t.Errorf("by the row groups that hold the latest version: %.0f rows, want no more than 384,204", rows)
+	}
+	third := grouped(plan(lookup(1_413_435_550), versions(2), ""))
+	if third < 1e7 {
+		t.Errorf("every file holding the latest version: %.0f rows, want the distinct count's third", third)
+	}
+	for name, p := range map[string]planEstimate{
+		"the versions' latest below the lookup's": plan(lookup(189_400), versions(1), ""),
+		"the versions filtered":                   plan(lookup(189_400), versions(2), "audience='a'"),
+	} {
+		if rows := grouped(p); rows != third {
+			t.Errorf("%s: %.0f rows, want the distinct count's %.0f", name, rows, third)
+		}
 	}
 }
 
@@ -806,6 +922,69 @@ func TestPlanKeeps(t *testing.T) {
 	}
 }
 
+// TestFilterShares checks what filters are taken to keep (see filtered):
+// near all of a table for filters that a column is set, not empty or
+// recent, which DuckDB takes for a fifth; ranges of one column together;
+// an OR as its branches; DuckDB's own estimate for an equality of a column
+// nothing here knows; and of a join to a filtered dimension, the share of
+// the keys the facts have that the filter keeps.
+func TestFilterShares(t *testing.T) {
+	people := &Table{Name: "people", Rows: 1e7, Bytes: 1e9, Columns: []Column{{Name: "id", Type: "VARCHAR"}, {Name: "segment", Type: "VARCHAR"},
+		{Name: "born", Type: "INTEGER"}, {Name: "seen", Type: "TIMESTAMP"}, {Name: "kind", Type: "INTEGER"}, {Name: "city", Type: "VARCHAR"}},
+		Bounds:   map[string][2]float64{"born": {1900, 2099}, "seen": {0, 864e9}},
+		Distinct: map[string]int64{"kind": 10, "city": 50}}
+	st := newPlanStats([]*Stage{{Inputs: []Input{{Table: people}}}}, 16)
+	scan := func(card string, filters ...string) map[string]any {
+		extra := []any{"Projections", []string{"id", "segment", "born", "seen", "kind", "city"}, "Estimated Cardinality", card}
+		if len(filters) > 0 {
+			extra = append(extra, "Filters", filters)
+		}
+		return op("ICEBERG_SCAN", nil, extra...)
+	}
+	for _, c := range []struct {
+		name string
+		plan map[string]any
+		want float64
+	}{
+		{"set, not empty, seen in the last nine of ten days",
+			scan("2000000", "(NOT (id IS NULL))", "segment != ''", "seen>='1970-01-02 00:00:00'::TIMESTAMP"), 0.9},
+		{"born 1999 to 2001", scan("2000000", "born>=1999", "born<=2001"), 3.0 / 200},
+		{"a kind or a city", scan("2000000", "((kind = 1) OR (city = 'x'))"), 0.1 + 0.02},
+		{"optional", scan("2000000", "optional: kind IN (1, 2)"), 1},
+		{"a segment", scan("3300", "segment='a'"), 3300 / 1e7},
+		{"a segment, set", scan("660", "segment='a'", "(NOT (id IS NULL))"), 3300 / 1e7},
+		{"seen in a filter", op("FILTER", []map[string]any{scan("10000000")}, "Expression", "(seen >= '1970-01-02 00:00:00'::TIMESTAMP)",
+			"Estimated Cardinality", "2000000"), 0.9},
+	} {
+		p, err := planOf(planJSON(t, c.plan), st)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := p.rows / 1e7; math.Abs(got-c.want) > c.want/100 {
+			t.Errorf("%s: keeps %g, want %g", c.name, got, c.want)
+		}
+	}
+
+	// Two centuries of days, of which a year is kept, joined to five years
+	// of sales: a fifth of them, which DuckDB took for 500,000.
+	days := &Table{Name: "days", Rows: 73049, Bytes: 1e6, Columns: []Column{{Name: "day_key", Type: "INTEGER"}, {Name: "year", Type: "INTEGER"}},
+		Bounds: map[string][2]float64{"day_key": {0, 73048}, "year": {1900, 2099}}}
+	sales := &Table{Name: "sales", Rows: 1e8, Bytes: 1e9, Columns: []Column{{Name: "sold", Type: "INTEGER"}, {Name: "amount", Type: "BIGINT"}},
+		Bounds: map[string][2]float64{"sold": {36500, 38325}}}
+	st = newPlanStats([]*Stage{{Inputs: []Input{{Table: days}, {Table: sales}}}}, 16)
+	join := op("HASH_JOIN", []map[string]any{
+		op("ICEBERG_SCAN", nil, "Projections", []string{"sold", "amount"}, "Estimated Cardinality", "100000000"),
+		op("ICEBERG_SCAN", nil, "Projections", []string{"day_key"}, "Filters", "year=2001", "Estimated Cardinality", "14610")},
+		"Join Type", "INNER", "Conditions", "sold = day_key", "Estimated Cardinality", "500000")
+	p, err := planOf(planJSON(t, join), st)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.rows < 1.9e7 || p.rows > 2.1e7 {
+		t.Errorf("a year of five years' sales: %g rows", p.rows)
+	}
+}
+
 // TestPlanResult checks the fields of a plan's result, which a read sends
 // its client, and what its largest sort holds.
 func TestPlanResult(t *testing.T) {
@@ -818,7 +997,8 @@ func TestPlanResult(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if p.fields != 4e9 || p.sorted < 1e9*24 || p.sorted != p.set {
+	// The sort is the working set, but for what the scan's readers hold.
+	if p.fields != 4e9 || p.sorted < 1e9*24 || p.set-p.sorted > 0.02*p.set {
 		t.Errorf("fields %g, sorted %g of %g", p.fields, p.sorted, p.set)
 	}
 

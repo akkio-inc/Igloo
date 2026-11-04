@@ -1,0 +1,1 @@
+SELECT id, v FROM facts ORDER BY v DESC LIMIT 10;

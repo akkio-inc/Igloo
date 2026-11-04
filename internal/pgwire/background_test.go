@@ -16,12 +16,15 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
+
+	"github.com/akkio-inc/igloo/internal/tasks"
 )
 
 // backgroundReplica is a replica on an Iceberg catalog, with no workers,
-// that runs heavy statements in the background, whatever took more than cpu
-// of CPU being heavy; and a table of rows rows to read.
-func backgroundReplica(t *testing.T, rows string, cpu time.Duration) (*viewReplica, *pgx.Conn, *Metrics) {
+// that runs heavy statements in the background, clients' too unless an
+// option says otherwise, whatever took more than cpu of CPU being heavy; and a
+// table of rows rows to read.
+func backgroundReplica(t *testing.T, rows string, cpu time.Duration, opts ...func(*Options)) (*viewReplica, *pgx.Conn, *Metrics) {
 	t.Helper()
 	if runtime.GOOS != "linux" {
 		t.Skip("threads have priorities of their own only on Linux")
@@ -32,6 +35,9 @@ func backgroundReplica(t *testing.T, rows string, cpu time.Duration) (*viewRepli
 		o.HeavyInBackground = true
 		o.Metrics = metrics
 		o.QueryMemory = 1 << 40
+		for _, opt := range opts {
+			opt(o)
+		}
 	})
 	r.srv.heavy.cpu, r.srv.heavy.factor = cpu, 0
 	admin := r.admin(t, pgx.QueryExecModeSimpleProtocol)
@@ -177,6 +183,35 @@ func TestHeavyStatementsRunInBackground(t *testing.T) {
 	// An erasure request's emptying of the caches reaches both.
 	if err := r.eng.EmptyCache(ctx); err != nil {
 		t.Errorf("emptying the caches: %v", err)
+	}
+}
+
+// TestHeavyJobsRunInBackground checks whose heavy statements run in the second
+// DuckDB without IGLOO_HEAVY_IN_BACKGROUND: a client's stay in the first, and
+// a task's run there from their second run on.
+func TestHeavyJobsRunInBackground(t *testing.T) {
+	t.Parallel()
+	r, admin, m := backgroundReplica(t, "200000", time.Nanosecond, func(o *Options) { o.HeavyInBackground = false })
+	const q = "SELECT v, count(*) AS n, sum(id) AS s FROM lake.public.visits GROUP BY v ORDER BY v"
+	first := sortedTexts(t, admin, q)
+	for range 2 {
+		if got := sortedTexts(t, admin, q); !slices.Equal(got, first) {
+			t.Errorf("again: %q, want %q", got[:3], first[:3])
+		}
+	}
+	if n := backgrounds(m); n != 0 {
+		t.Errorf("%v of a client's heavy statements ran in the background", n)
+	}
+	ctx := context.Background()
+	for i := range 2 {
+		n, err := r.srv.RunJob(ctx, tasks.Job{Kind: tasks.KindTask, Name: "report", Owner: "igloo",
+			Statement: "SELECT grp, count(*) AS n FROM lake.public.visits GROUP BY grp"})
+		if err != nil || n == 0 {
+			t.Fatalf("run %d of the task: %d rows, %v", i+1, n, err)
+		}
+	}
+	if n := backgrounds(m); n != 1 {
+		t.Errorf("%v of a task's heavy statements ran in the background, want 1", n)
 	}
 }
 
@@ -590,5 +625,25 @@ func TestOutOfSpillSpace(t *testing.T) {
 	}
 	if outOfSpillSpace(errors.New("Out of Memory Error: could not allocate block")) || outOfSpillSpace(nil) {
 		t.Error("something else taken for a full disk")
+	}
+}
+
+// TestOthersRunningFor checks that a statement counts as running beside another
+// only once it has run for the time asked: a monitoring poll of a few
+// milliseconds once a second does not move a statement to the background.
+func TestOthersRunningFor(t *testing.T) {
+	s := &Server{sessions: newRegistry()}
+	me, poll, report := &session{pid: 1}, &session{pid: 2}, &session{pid: 3}
+	now := time.Now()
+	poll.statement, poll.started = "SELECT * FROM duckdb_memory()", now.Add(-5*time.Millisecond)
+	report.statement, report.started = "SELECT 1", now.Add(-3*time.Second)
+	for _, sess := range []*session{me, poll, report} {
+		s.sessions.byPID[sess.pid] = sess
+	}
+	if n := s.othersRunning(me); n != 2 {
+		t.Errorf("running: %d, want 2", n)
+	}
+	if n := s.othersRunningFor(me, besideFor); n != 1 {
+		t.Errorf("running for %s: %d, want 1", besideFor, n)
 	}
 }

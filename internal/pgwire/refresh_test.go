@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"math/rand/v2"
 	"os"
+	"path/filepath"
 	"regexp"
 	"slices"
 	"strconv"
@@ -14,14 +15,19 @@ import (
 	"testing"
 	"time"
 
+	"github.com/duckdb/duckdb-go/v2"
 	"github.com/jackc/pgx/v5"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 
+	"github.com/akkio-inc/igloo/internal/audit"
 	"github.com/akkio-inc/igloo/internal/catalog"
 	"github.com/akkio-inc/igloo/internal/config"
 	"github.com/akkio-inc/igloo/internal/ddl"
 	"github.com/akkio-inc/igloo/internal/engine"
 	"github.com/akkio-inc/igloo/internal/icebergtest"
 	"github.com/akkio-inc/igloo/internal/tasks"
+	"github.com/akkio-inc/igloo/internal/workload"
 )
 
 // refreshEnv is a server on an Iceberg catalog, with the scheduler's store
@@ -388,6 +394,212 @@ func TestRefreshFallsBack(t *testing.T) {
 // by position, where a full refresh would apply every deletion in its
 // scan; and that a small delete from a table that holds many deletions,
 // which both would apply, refreshes in full.
+// TestRefreshWaitsItsTurn checks that a materialized view's refresh waits
+// behind the replica's limit of statements at once as a statement does, and
+// is sampled as it runs: its history row has its shape, for what it holds to
+// be reserved next time. Its refreshes, 5 GB each, ran unannounced beside a
+// burst of dashboards, which then ran out of memory.
+func TestRefreshWaitsItsTurn(t *testing.T) {
+	t.Parallel()
+	ctl := workload.NewController(1 << 30)
+	ctl.LimitReplica(1)
+	history := audit.NewMemoryStore(1000, 1000)
+	env := startRefreshServer(t, func(o *Options) {
+		o.Workload = ctl
+		o.Audit = audit.New(history, audit.Options{}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	})
+	admin := env.admin
+	mustExec(t, admin, "CREATE TABLE spend (g VARCHAR, x INTEGER)")
+	mustExec(t, admin, "INSERT INTO spend SELECT 'g' || (i % 4), i FROM range(1000) AS r(i)")
+	mustExec(t, admin, "CREATE MATERIALIZED VIEW spend_sums AS SELECT g, sum(x) AS sx FROM spend GROUP BY g")
+	mustExec(t, admin, "INSERT INTO spend VALUES ('g9', 1)")
+
+	// Another statement runs, the one the replica lets run at once.
+	release, _, err := ctl.Admit(context.Background(), workload.Limits{Counted: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		_, err := admin.Exec(context.Background(), "REFRESH MATERIALIZED VIEW spend_sums")
+		done <- err
+	}()
+	// Once the refresh waits in line, it is let go after held, so that it has
+	// queued at least that long however long it took to get in line.
+	var waiting prometheus.Gauge
+	for _, m := range ctl.Metrics() {
+		if g, ok := m.(prometheus.Gauge); ok {
+			waiting = g
+		}
+	}
+	const held = 150 * time.Millisecond
+	for deadline := time.Now().Add(30 * time.Second); testutil.ToFloat64(waiting) == 0; {
+		select {
+		case err := <-done:
+			release()
+			t.Fatalf("the refresh ran beside a statement the replica's limit holds it behind: %v", err)
+		case <-time.After(10 * time.Millisecond):
+		}
+		if time.Now().After(deadline) {
+			release()
+			t.Fatal("the refresh never waited behind the statement running")
+		}
+	}
+	time.Sleep(held)
+	release()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("the refresh did not start once the other statement ended")
+	}
+	if n := count(t, admin, "SELECT count(*) FROM spend_sums"); n != 5 {
+		t.Errorf("%d groups after the refresh, want 5", n)
+	}
+	qs, err := history.Queries(context.Background(), audit.Viewer{All: true}, audit.Page{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, q := range qs {
+		if strings.HasPrefix(q.Text, `REFRESH MATERIALIZED VIEW "public"."spend_sums"`) {
+			if q.Shape == "" || q.Queued < held {
+				t.Errorf("the refresh's history: shape %q, queued %s", q.Shape, q.Queued)
+			}
+			return
+		}
+	}
+	t.Error("no refresh in the history")
+}
+
+// TestUnfinishedOutOfMemory checks what a run that DuckDB ran out of memory for
+// leaves its shape: at least what it allocated and the block it could not get,
+// sampled or not; what it was seen holding if more; all the memory if it was
+// seen running a while; and nothing for an unsampled run that failed otherwise.
+func TestUnfinishedOutOfMemory(t *testing.T) {
+	const gib = int64(1) << 30
+	oom := &duckdb.Error{Type: duckdb.ErrorTypeOutOfMemory,
+		Msg: "Out of Memory Error: could not allocate block of size 2.3 GiB (43.4 GiB/44.2 GiB used)"}
+	block, _ := config.ParseSize("2.3 GiB")
+	for _, c := range []struct {
+		name    string
+		peak    int64
+		sampled bool
+		ran     time.Duration
+		err     error
+		want    int64
+		ok      bool
+	}{
+		{"unsampled, out of memory", 0, false, 30 * time.Second, oom, gib/5 + block, true},
+		{"seen holding more", 4 * gib, true, time.Second, oom, 4 * gib, true},
+		{"seen holding less", gib, true, time.Second, oom, gib/5 + block, true},
+		{"seen running a while", gib, true, 30 * time.Second, oom, 40 * gib, true},
+		{"unsampled, canceled", 0, false, 30 * time.Second, context.Canceled, 0, false},
+		{"sampled, canceled", gib, true, time.Second, context.Canceled, gib, true},
+	} {
+		ctl := workload.NewController(44 * gib)
+		s := &Server{workload: ctl, queryMemory: 40 * gib}
+		s.observeUnfinished("shape", "exact", c.peak, c.sampled, c.ran, gib/5, c.err)
+		for _, key := range []string{"shape", "exact"} {
+			if got, ok := ctl.Footprint(key); ok != c.ok || got != c.want {
+				t.Errorf("%s: %s's footprint %d (%v), want %d (%v)", c.name, key, got, ok, c.want, c.ok)
+			}
+		}
+	}
+	for msg, want := range map[string]int64{
+		"Out of Memory Error: failed to allocate data of size 8.0 KiB (44.8 GiB/44.2 GiB used)":  8 << 10,
+		"Out of Memory Error: failed to pin block of size 36.0 KiB (41.1 GiB/44.2 GiB used)":     36 << 10,
+		"Out of Memory Error: could not allocate block of size 2.3 GiB (43.4 GiB/44.2 GiB used)": block,
+		"Out of Memory Error: something else":                                                    0,
+	} {
+		if got, ok := failedBlock(&duckdb.Error{Type: duckdb.ErrorTypeOutOfMemory, Msg: msg}); !ok || got != want {
+			t.Errorf("%q: block %d (%v), want %d", msg, got, ok, want)
+		}
+	}
+}
+
+// TestObserveRefresh checks what a refresh's run leaves for the next: what it
+// held where it ran here, and that it ran on workers where its query did, so
+// that the next reserves nothing here, as a statement's run does.
+func TestObserveRefresh(t *testing.T) {
+	const gib = int64(1) << 30
+	ctl := workload.NewController(44 * gib)
+	s := &Server{workload: ctl, queryMemory: 40 * gib}
+	here := refreshResult{used: audit.Resources{CPUTime: 900 * time.Second, BytesRead: 15 * gib, MemoryAllocated: 6 * gib}}
+	s.observeRefresh("shape", "exact", here, 0, false, 140*time.Second, nil)
+	if got, _ := ctl.Footprint("shape"); got != workload.FootprintOf(6*gib, 0, false) || ctl.RunsOnWorkers("exact", "shape") {
+		t.Errorf("a refresh that ran here: footprint %d, on workers %v", got, ctl.RunsOnWorkers("exact", "shape"))
+	}
+	there := refreshResult{used: audit.Resources{CPUTime: time.Second, BytesRead: gib}, parts: distParts{workers: 16}}
+	s.observeRefresh("shape", "exact", there, 0, false, 10*time.Second, context.Canceled)
+	if ctl.RunsOnWorkers("exact", "shape") {
+		t.Error("a refresh that failed on workers counts as one that ran there")
+	}
+	s.observeRefresh("shape", "exact", there, 0, false, 10*time.Second, nil)
+	if !ctl.RunsOnWorkers("exact", "shape") {
+		t.Error("a refresh whose query ran on workers does not count as one that ran there")
+	}
+}
+
+// TestStateRowGroupsByBytes checks that the files of a refresh's state that
+// keeps bitmaps hold about as many bytes of them as the server sets in each row
+// group, in a full refresh and in an incremental one, rather than 122,880 rows:
+// here a few kilobytes, so one bitmap a row group, all in one file rather than
+// a file each. The view keeps its query's rows.
+func TestStateRowGroupsByBytes(t *testing.T) {
+	t.Parallel()
+	if os.Getenv("IGLOO_TEST_RB_EXTENSION") == "" {
+		t.Skip("IGLOO_TEST_RB_EXTENSION not set")
+	}
+	env := startRefreshServer(t, func(o *Options) { o.stateRowGroupBytes = 4 << 10 })
+	admin := env.admin
+	mustExec(t, admin, "CREATE TABLE visits AS SELECT i % 5 AS g, i AS person FROM range(200000) AS r(i)")
+	const query = "SELECT g, count(DISTINCT person) AS people, count(*) AS n FROM visits GROUP BY g"
+	mustExec(t, admin, "CREATE MATERIALIZED VIEW reach AS "+query)
+	// rowGroups returns the state's files written since since, the row groups
+	// they hold, and the most rows one of them holds.
+	rowGroups := func(since time.Time) (written, groups, most int) {
+		t.Helper()
+		files, err := filepath.Glob(filepath.Join(env.dir, "*", "data", "*.parquet"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, f := range files {
+			info, err := os.Stat(f)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if info.ModTime().Before(since) {
+				continue
+			}
+			got := texts(t, admin, "SELECT count(*) || '|' || coalesce(max(row_group_num_rows), 0) FROM parquet_metadata('"+f+"') WHERE path_in_schema = '__c1'")
+			n, rows, _ := strings.Cut(got[0], "|")
+			k, _ := strconv.Atoi(n)
+			m, _ := strconv.Atoi(rows)
+			if k > 0 {
+				written++
+			}
+			groups, most = groups+k, max(most, m)
+		}
+		return written, groups, most
+	}
+	for _, step := range []struct{ what, action string }{{"full", actionFull}, {"incremental", actionIncremental}} {
+		since := time.Now()
+		mustExec(t, admin, "REFRESH MATERIALIZED VIEW reach")
+		if action, detail, _, reason := viewRefresh(t, admin, "public.reach"); action != step.action {
+			t.Fatalf("the %s refresh: %s: %s (%s)", step.what, action, detail, reason)
+		}
+		if written, groups, most := rowGroups(since); written != 1 || groups != 5 || most != 1 {
+			t.Errorf("the %s refresh wrote the state in %d files of %d row groups of up to %d rows, want one file of one a bitmap", step.what, written, groups, most)
+		}
+		if got, want := texts(t, admin, "SELECT * FROM reach ORDER BY ALL"), texts(t, admin, query+" ORDER BY ALL"); !slices.Equal(got, want) {
+			t.Errorf("after the %s refresh: %q, want %q", step.what, got, want)
+		}
+		mustExec(t, admin, "INSERT INTO visits SELECT i % 5, i FROM range(200000, 210000) AS r(i)")
+	}
+}
+
 func TestRefreshCost(t *testing.T) {
 	t.Parallel()
 	env := startRefreshServer(t)

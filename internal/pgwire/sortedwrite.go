@@ -19,6 +19,7 @@ import (
 	"github.com/duckdb/duckdb-go/v2"
 	wire "github.com/jeroenrinzema/psql-wire"
 
+	"github.com/akkio-inc/igloo/internal/distributed"
 	"github.com/akkio-inc/igloo/internal/engine"
 )
 
@@ -648,7 +649,8 @@ func (s *Server) runSortedWrite(ctx context.Context, sess *session, w *sortedWri
 	// 2. The rows, divided into the ranges.
 	divide := "COPY (SELECT * EXCLUDE (" + sortKeyCol + "), " + rangeOf(sortKeyCol, bounds, 0) + " AS " + sortRangeCol +
 		" FROM (SELECT " + sortSource + ".*, " + w.sortKey() + " AS " + sortKeyCol + " FROM (\n" + w.query + "\n) AS " + sortSource + "))" +
-		" TO " + quoteLiteral(dir) + " (FORMAT parquet, COMPRESSION zstd, PARTITION_BY (" + sortRangeCol + "))"
+		" TO " + quoteLiteral(dir) + " (FORMAT parquet, COMPRESSION zstd, PARTITION_BY (" + sortRangeCol + "), ROW_GROUP_SIZE " +
+		strconv.FormatInt(distributed.RowGroupRows(width), 10) + ")"
 	if _, err := exec(divide); err != nil {
 		return unsorted("divide", err)
 	}

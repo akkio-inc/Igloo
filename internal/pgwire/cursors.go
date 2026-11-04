@@ -122,9 +122,9 @@ func (s *Server) declareCursor(ctx context.Context, sess *session, user auth.Use
 		if err != nil {
 			return pgerror.WithCode(err, codes.InvalidTextRepresentation)
 		}
-		// Rechecking and preparing the cursor's own statement both read and
-		// fill in the catalog's set (see holdCatalog).
-		relist := s.holdCatalog(sess)
+		// Rechecking and preparing the cursor's own statement both look the
+		// catalog's tables up (see holdCatalog).
+		relist := s.shareCatalog(sess)
 		err = s.recheck(ctx, sess, st)
 		var own *statement
 		if err == nil {

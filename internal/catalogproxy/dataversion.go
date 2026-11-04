@@ -203,6 +203,18 @@ func (p *Proxy) TablesVersion(loads []Load) uint64 {
 	return binary.LittleEndian.Uint64(sum[:8])
 }
 
+// TableVersion is the version of the table name of namespace schema, which
+// goes up whenever it may have changed, as TablesVersion's does.
+func (p *Proxy) TableVersion(schema, name string) uint64 {
+	if p == nil {
+		return 0
+	}
+	d := &p.data
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.epoch + d.tables[tableKey([]string{schema}, name)]
+}
+
 // bump raises every table's version.
 func (d *dataVersion) bump() {
 	d.mu.Lock()

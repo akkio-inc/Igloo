@@ -36,11 +36,12 @@ func testRB(t *testing.T) string {
 	return p
 }
 
-// imageLayout writes data where an image keeps the rb extension, under a new
-// extension directory, and returns that directory and the file's hash. With
-// official, the directory also links to the official extensions the tests
-// install (IGLOO_TEST_EXTENSION_DIR), which Open loads from it.
-func imageLayout(t *testing.T, data []byte, official bool) (string, string) {
+// imageLayout writes data where an image keeps one of Igloo's extensions
+// (file, such as rbFile), under a new extension directory, and returns that
+// directory and the file's hash. With official, the directory also links to
+// the official extensions the tests install (IGLOO_TEST_EXTENSION_DIR),
+// which Open loads from it.
+func imageLayout(t *testing.T, file string, data []byte, official bool) (string, string) {
 	t.Helper()
 	dir := t.TempDir()
 	if official {
@@ -64,19 +65,20 @@ func imageLayout(t *testing.T, data []byte, official bool) (string, string) {
 	if err := os.MkdirAll(filepath.Join(dir, "igloo"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(dir, rbFile), data, 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, file), data, 0o644); err != nil {
 		t.Fatal(err)
 	}
 	sum := sha256.Sum256(data)
 	return dir, hex.EncodeToString(sum[:])
 }
 
-// withHash makes this test's igloo a build with the given rb hash.
-func withHash(t *testing.T, sha string) {
+// withHash makes this test's igloo a build with the given hash of one of its
+// extensions (hash, such as &rbSHA256).
+func withHash(t *testing.T, hash *string, sha string) {
 	t.Helper()
-	old := rbSHA256
-	rbSHA256 = sha
-	t.Cleanup(func() { rbSHA256 = old })
+	old := *hash
+	*hash = sha
+	t.Cleanup(func() { *hash = old })
 }
 
 func quietLog() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard, nil)) }
@@ -116,8 +118,8 @@ func TestRBNotLoadedWithoutExtension(t *testing.T) {
 }
 
 func TestRBRefusesAFileOtherThanTheBuilds(t *testing.T) {
-	dir, _ := imageLayout(t, append([]byte("not the extension this igloo was built with"), make([]byte, 512)...), false)
-	withHash(t, strings.Repeat("ab", 32))
+	dir, _ := imageLayout(t, rbFile, append([]byte("not the extension this igloo was built with"), make([]byte, 512)...), false)
+	withHash(t, &rbSHA256, strings.Repeat("ab", 32))
 	_, err := Open(context.Background(), config.Config{DuckDB: config.DuckDB{ExtensionDir: dir}}, quietLog())
 	if err == nil || !strings.Contains(err.Error(), "SHA-256") {
 		t.Fatalf("got %v, want a SHA-256 mismatch", err)
@@ -132,11 +134,45 @@ func TestRBRefusesAnotherDuckDB(t *testing.T) {
 	// rewrite the footer's DuckDB version (the third field, stored sixth)
 	at := len(data) - 512 + 5*32
 	copy(data[at:at+32], append([]byte("v1.5.5"), make([]byte, 26)...))
-	dir, sha := imageLayout(t, data, false)
-	withHash(t, sha)
+	dir, sha := imageLayout(t, rbFile, data, false)
+	withHash(t, &rbSHA256, sha)
 	_, err = Open(context.Background(), config.Config{DuckDB: config.DuckDB{ExtensionDir: dir}}, quietLog())
 	if err == nil || !strings.Contains(err.Error(), "built for DuckDB v1.5.5") {
 		t.Fatalf("got %v, want a DuckDB version mismatch", err)
+	}
+}
+
+// TestIcebergExtensionIsIgloos checks that an image's igloo loads its own
+// build of the iceberg extension (extensions/iceberg), checked against the
+// build's hash, so that the iceberg DuckDB attaches the catalog with is
+// that one and not the official one in DuckDB's tree, and refuses another
+// file in its place.
+func TestIcebergExtensionIsIgloos(t *testing.T) {
+	p := os.Getenv("IGLOO_TEST_ICEBERG_EXTENSION")
+	if p == "" {
+		if os.Getenv("CI") != "" {
+			t.Fatal("IGLOO_TEST_ICEBERG_EXTENSION is not set: CI builds the iceberg extension (extensions/iceberg/build.sh)")
+		}
+		t.Skip("IGLOO_TEST_ICEBERG_EXTENSION is not set; build the extension with extensions/iceberg/build.sh")
+	}
+	data, err := os.ReadFile(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir, sha := imageLayout(t, "igloo/iceberg.duckdb_extension", data, true)
+	withHash(t, &icebergSHA256, sha)
+	e, err := Open(context.Background(), config.Config{DuckDB: config.DuckDB{ExtensionDir: dir}}, quietLog())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer e.Close() //nolint:errcheck
+	if !e.icebergOwn {
+		t.Fatal("Igloo's iceberg extension did not load")
+	}
+	withHash(t, &icebergSHA256, strings.Repeat("cd", 32))
+	if _, err := Open(context.Background(), config.Config{DuckDB: config.DuckDB{ExtensionDir: dir}}, quietLog()); err == nil ||
+		!strings.Contains(err.Error(), "SHA-256") {
+		t.Fatalf("got %v, want a SHA-256 mismatch", err)
 	}
 }
 
@@ -148,8 +184,8 @@ func openWithRB(t *testing.T) (*Engine, string) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	dir, sha := imageLayout(t, data, true)
-	withHash(t, sha)
+	dir, sha := imageLayout(t, rbFile, data, true)
+	withHash(t, &rbSHA256, sha)
 	e, err := Open(context.Background(), config.Config{DuckDB: config.DuckDB{ExtensionDir: dir}}, quietLog())
 	if err != nil {
 		t.Fatal(err)

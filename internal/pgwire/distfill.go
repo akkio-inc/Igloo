@@ -48,12 +48,7 @@ func (s *Server) fillSource(ctx context.Context, sess *session, st *statement, q
 		}
 		return nil
 	}
-	var src *statement
-	err := s.runBound(sess, nil, func() error {
-		var err error
-		src, err = prepare(ctx, sess.conn, query, nil)
-		return err
-	})
+	src, err := prepare(ctx, sess.conn, query, nil)
 	if err != nil {
 		return nil
 	}
@@ -80,20 +75,23 @@ func (s *Server) fillSource(ctx context.Context, sess *session, st *statement, q
 // histories.
 func (s *Server) fillOn(f *stagedFill, src *statement, here func(context.Context) (int64, error),
 	from func(ctx context.Context, source string) (int64, error)) (rows int64, parts distParts, again bool, err error) {
-	if src == nil {
-		rows, err = here(f.ctx)
-		return rows, parts, err != nil && f.again(err), err
-	}
-	defer src.close() //nolint:errcheck
 	if fail := s.failFill; fail != nil {
-		run := here
+		run, query := here, ""
+		if src != nil {
+			query = src.query
+		}
 		here = func(ctx context.Context) (int64, error) {
-			if err := fail(ctx, src.query); err != nil {
+			if err := fail(ctx, query); err != nil {
 				return 0, err
 			}
 			return run(ctx)
 		}
 	}
+	if src == nil {
+		rows, err = here(f.ctx)
+		return rows, parts, err != nil && f.again(err), err
+	}
+	defer src.close() //nolint:errcheck
 	sess, user := f.sess, f.sess.currentUser()
 	n, p, done, err := s.fillOnWorkers(f.ctx, sess, src, sessionMode(sess, user), from)
 	if done {
@@ -229,12 +227,7 @@ var errFillColumns = errors.New("the combined result does not match the query's 
 func (s *Server) fillFrom(ctx context.Context, sess *session, src *statement, r *distRun,
 	from func(ctx context.Context, source string) (int64, error)) (int64, error) {
 	ctx = distributed.WithMerged(ctx, r.ex.Merged())
-	var fin *statement
-	err := s.runBound(sess, nil, func() error {
-		var err error
-		fin, err = prepare(ctx, sess.conn, r.ex.SQL, nil)
-		return err
-	})
+	fin, err := prepare(ctx, sess.conn, r.ex.SQL, nil)
 	if err != nil {
 		return 0, err
 	}
@@ -245,13 +238,7 @@ func (s *Server) fillFrom(ctx context.Context, sess *session, src *statement, r 
 	if !same {
 		return 0, errFillColumns
 	}
-	var rows int64
-	err = s.runBound(sess, nil, func() error {
-		var err error
-		rows, err = from(ctx, r.ex.SQL)
-		return err
-	})
-	return rows, err
+	return from(ctx, r.ex.SQL)
 }
 
 // insertParsed reads an INSERT of a query's rows, with a list of columns or

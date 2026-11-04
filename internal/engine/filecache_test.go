@@ -3,29 +3,37 @@ package engine
 import (
 	"bytes"
 	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/duckdb/duckdb-go/v2"
+
+	"github.com/akkio-inc/igloo/internal/prefetch"
 )
 
 func TestRestoreReads(t *testing.T) {
 	m := manifest{
-		Files: []manifestFile{{Path: "s3://b/w/a.parquet", Size: 100 << 20}, {Path: "s3://b/w/b.parquet", Size: 10 << 20}},
+		Files: []manifestFile{{Path: "s3://b/w/a.parquet", Size: 200 << 20}, {Path: "s3://b/w/b.parquet", Size: 10 << 20}},
 		Ranges: [][3]int64{
-			{1, 0, 1 << 20},                  // first used: b's head
-			{0, 50 << 20, 1 << 20},           // a, far from the rest of a
-			{0, 0, 1 << 20},                  // a's head
-			{0, 1<<20 + 100, 1 << 20},        // close after a's head: same request
-			{1, 9 << 20, 2 << 20},            // past b's end: dropped
-			{0, 2<<20 + 200, restoreRequest}, // would make a's head request too long
+			{1, 0, 1 << 20},                     // first used: b's head
+			{0, 50 << 20, 1 << 20},              // a, far from the rest of a
+			{0, 0, 1 << 20},                     // a's head
+			{0, 1<<20 + 100, 1 << 20},           // close after a's head: same request
+			{1, 9 << 20, 2 << 20},               // past b's end: dropped
+			{0, 2<<20 + 200, restoreRequest},    // would make a's head request too long
+			{0, 60 << 20, restoreRangeMost + 1}, // too long to read back: left out
 		},
 	}
 	reads := restoreReads(&m, 1<<40)
@@ -52,6 +60,97 @@ func TestRestoreReads(t *testing.T) {
 	reads = restoreReads(&m, 2<<20)
 	if len(reads) != 2 || reads[0].file.Path != "s3://b/w/b.parquet" || reads[1].start != 50<<20 {
 		t.Fatalf("with a budget of two ranges: %+v", reads)
+	}
+}
+
+// countingObject is an object of zeros a restore reads, which counts the
+// bytes its reads hold at once, inFlight, and the most they held, most.
+type countingObject struct {
+	inFlight, most *atomic.Int64
+}
+
+func (o countingObject) ReadAt(p []byte, off int64) (int, error) {
+	n := o.inFlight.Add(int64(len(p)))
+	defer o.inFlight.Add(-int64(len(p)))
+	for {
+		m := o.most.Load()
+		if n <= m || o.most.CompareAndSwap(m, n) {
+			break
+		}
+	}
+	time.Sleep(time.Millisecond)
+	clear(p)
+	return len(p), nil
+}
+func (countingObject) Close() error { return nil }
+func (countingObject) ETag() string { return "" }
+
+// TestRestoreBounds checks that a restore holds at most restoreInFlight bytes
+// of requests at once, whatever its ranges, and that a start that ended
+// during a restore leaves a mark from which the next start goes on without
+// the manifest.
+func TestRestoreBounds(t *testing.T) {
+	ctx := context.Background()
+	connector, err := duckdb.NewConnector("", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer connector.Close() //nolint:errcheck
+	c, err := connector.Connect(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close() //nolint:errcheck
+	// A budget of three quarters of 64 GiB takes every range.
+	if _, err := c.(*duckdb.Conn).ExecContext(ctx, "SET memory_limit = '64GiB'", nil); err != nil {
+		t.Fatal(err)
+	}
+	room := restoreRoom
+	restoreRoom = func() bool { return true }
+	defer func() { restoreRoom = room }()
+	dir := t.TempDir()
+	var inFlight, most, opened atomic.Int64
+	f := &fileCache{path: filepath.Join(dir, fileCacheManifest), first: map[rangeKey]int64{},
+		open: func(context.Context, string) (prefetch.Object, error) {
+			opened.Add(1)
+			return countingObject{inFlight: &inFlight, most: &most}, nil
+		}}
+	e := &Engine{connector: connector, fileCache: f}
+	// 200 ranges of 32 MiB, 6.25 GiB, each a request of its own.
+	m := manifest{Files: []manifestFile{{Path: "s3://b/w/big.parquet", Size: 1 << 40}}}
+	for i := range 200 {
+		m.Ranges = append(m.Ranges, [3]int64{0, int64(i) * 64 << 20, 32 << 20})
+	}
+	data, err := json.Marshal(m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(f.path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	e.restoreFileCache(ctx, slog.New(slog.DiscardHandler))
+	if got := most.Load(); got == 0 || got > restoreInFlight {
+		t.Errorf("a restore held %d bytes in flight at most, want some and no more than %d", got, int64(restoreInFlight))
+	}
+	mark := filepath.Join(dir, fileCacheRestoring)
+	if _, err := os.Stat(mark); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("a restore that ended left its mark: %v", err)
+	}
+
+	// A start that ended during a restore left the mark: the next goes on
+	// without the manifest, and deletes both.
+	if err := os.WriteFile(mark, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	opened.Store(0)
+	e.restoreFileCache(ctx, slog.New(slog.DiscardHandler))
+	if n := opened.Load(); n != 0 {
+		t.Errorf("a start after one that ended during a restore opened %d files to restore", n)
+	}
+	for _, p := range []string{f.path, mark} {
+		if _, err := os.Stat(p); !errors.Is(err, os.ErrNotExist) {
+			t.Errorf("%s is left: %v", filepath.Base(p), err)
+		}
 	}
 }
 
@@ -105,6 +204,83 @@ func TestSameETag(t *testing.T) {
 	}
 }
 
+// TestExternalFileCacheGivesWay fills DuckDB's external file cache with
+// files read from a stand-in for object storage, to most of DuckDB's memory
+// limit, and then runs statements that need that memory: one large hash
+// table, a single block of 512 MiB, and many groups, many small blocks.
+// DuckDB drops the cached ranges for each, as it did for a single block of 2
+// GiB with 5.3 of 6 GB cached, alone and beside scans filling it again.
+func TestExternalFileCacheGivesWay(t *testing.T) {
+	ext := os.Getenv("IGLOO_TEST_EXTENSION_DIR")
+	if ext == "" {
+		t.Skip("IGLOO_TEST_EXTENSION_DIR not set")
+	}
+	ctx := context.Background()
+	connector, err := duckdb.NewConnector("", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer connector.Close() //nolint:errcheck
+	c, err := connector.Connect(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close() //nolint:errcheck
+	conn := c.(*duckdb.Conn)
+	exec := func(q string) error {
+		_, err := conn.ExecContext(ctx, q, nil)
+		return err
+	}
+	dir := t.TempDir()
+	for i := range 4 {
+		f := filepath.Join(dir, fmt.Sprintf("t%d.parquet", i))
+		q := fmt.Sprintf("COPY (SELECT range AS a, hash(range) AS b, hash(range + 1) AS c FROM range(%d, %d)) TO %s (FORMAT parquet)",
+			i*20_000_000, (i+1)*20_000_000, literal(f))
+		if err := exec(q); err != nil {
+			t.Fatal(err)
+		}
+	}
+	srv := httptest.NewServer(http.FileServer(http.Dir(dir)))
+	defer srv.Close()
+	for _, q := range []string{
+		"SET extension_directory = " + literal(ext), "LOAD httpfs", "SET threads = 4", "SET memory_limit = '1200MB'",
+		"SET enable_external_file_cache = true",
+	} {
+		if err := exec(q); err != nil {
+			t.Fatalf("%s: %v", q, err)
+		}
+	}
+	cached := func() int64 {
+		t.Helper()
+		v, err := queryString(ctx, conn, "SELECT coalesce(sum(memory_usage_bytes), 0)::VARCHAR FROM duckdb_memory() WHERE tag = 'EXTERNAL_FILE_CACHE'")
+		if err != nil {
+			t.Fatal(err)
+		}
+		n, _ := strconv.ParseInt(v, 10, 64)
+		return n
+	}
+	fill := func() {
+		t.Helper()
+		for i := range 4 {
+			if err := exec(fmt.Sprintf("SELECT sum(a), sum(b), sum(c) FROM read_parquet('%s/t%d.parquet')", srv.URL, i)); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if n := cached(); n < 800<<20 {
+			t.Fatalf("the cache holds %d MiB, want most of 1,200", n>>20)
+		}
+	}
+	for _, s := range []struct{ name, q string }{
+		{"a large hash table", "SELECT count(*) FROM range(25000000) a(i) JOIN range(25000000) b(j) ON i = j"},
+		{"many groups", "SELECT count(*) FROM (SELECT i % 10000000 AS k, sum(i) FROM range(30000000) t(i) GROUP BY 1)"},
+	} {
+		fill()
+		if err := exec(s.q); err != nil {
+			t.Errorf("%s, beside %d MiB cached: %v", s.name, cached()>>20, err)
+		}
+	}
+}
+
 // The rb extension lists DuckDB's external file cache and puts ranges back
 // into it, where queries read them: a file in a stand-in for object storage
 // is read, its ranges listed, the cache emptied and the ranges put back, and
@@ -117,7 +293,7 @@ func TestRBFileCacheRoundTrip(t *testing.T) {
 		t.Skip("IGLOO_TEST_EXTENSION_DIR not set")
 	}
 	ctx := context.Background()
-	connector, err := duckdb.NewConnector(rbDSN("", &rbExtension{path: rb}), nil)
+	connector, err := duckdb.NewConnector(unsignedDSN("", []extensionFile{{name: "rb", path: rb}}), nil)
 	if err != nil {
 		t.Fatal(err)
 	}

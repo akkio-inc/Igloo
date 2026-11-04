@@ -501,7 +501,12 @@ func (g *governance) externalFiles(prefix string) bool {
 // concern, worked out from the protected tables and the definitions of the
 // session's views and macros. Names are lower-cased.
 type sensitivity struct {
-	policyGen, catalogGen uint64
+	// snap is the policies it was worked out under, and catalogGen the
+	// catalog's views, macros, functions and connections (resultGeneration).
+	// A snapshot is replaced whenever the policies change, those of Igloo's
+	// own tables included, which leave the policies' generation as it was.
+	snap       *policy.Snapshot
+	catalogGen uint64
 	// names are the protected tables', and those of views and macros that
 	// read them, directly or through others.
 	names map[string]bool
@@ -656,17 +661,31 @@ func (s *Server) checkPath(path string, allowWarehouse bool) error {
 }
 
 // sensitivity returns the session's, working it out again when the
-// policies or the catalog's views, macros, functions or connections
+// policies, snap, or the catalog's views, macros, functions or connections
 // changed (resultGeneration): what it lists. A table's DDL changes none of
 // them, and the rollups of ELT beside dashboards, replacing tables every
-// minute, had every session list them again after each.
+// minute, had every session list them again after each. Sessions with no
+// temporary views or macros of their own list the same, and share what the
+// first of them listed: each listing walks the catalog, holding the catalog
+// lock alone, and after each change every dashboard's session took it in
+// turn.
 func (s *Server) sensitivity(ctx context.Context, sess *session, snap *policy.Snapshot) (*sensitivity, bool, error) {
-	pg, cg := s.gov.gen.Load(), s.resultGeneration()
-	if c := sess.sens; c != nil && c.policyGen == pg && c.catalogGen == cg {
+	cg := s.resultGeneration()
+	if c := sess.sens; c != nil && c.snap == snap && c.catalogGen == cg {
 		return c, false, nil
 	}
-	// The listing walks the catalog's in-memory set (see policyRewrite).
-	defer s.holdCatalog(sess)()
+	shared := !sess.temps && !sess.tempMacros
+	if shared {
+		s.sharedSens.mu.Lock()
+		c := s.sharedSens.sens
+		s.sharedSens.mu.Unlock()
+		if c != nil && c.snap == snap && c.catalogGen == cg {
+			sess.sens = c
+			return c, false, nil
+		}
+	}
+	// The listing looks the catalog's tables up (see policyRewrite).
+	defer s.shareCatalog(sess)()
 	rows, err := sess.conn.QueryContext(ctx, `SELECT 'view', database_name, schema_name, view_name, sql
 			FROM system.main.duckdb_views() WHERE NOT internal
 		UNION ALL SELECT 'macro', database_name, schema_name, function_name, coalesce(macro_definition, '')
@@ -681,7 +700,7 @@ func (s *Server) sensitivity(ctx context.Context, sess *session, snap *policy.Sn
 		toks            defTokens
 	}
 	var defs []def
-	sens := &sensitivity{policyGen: pg, catalogGen: cg, names: map[string]bool{}, risky: map[string]bool{},
+	sens := &sensitivity{snap: snap, catalogGen: cg, names: map[string]bool{}, risky: map[string]bool{},
 		viewProtected: map[string]bool{}, viewRisky: map[string]bool{}, macroProtected: map[string]bool{},
 		macroRisky: map[string]bool{}, macros: map[string]bool{}, unsafeFns: map[string]bool{}}
 	dest := make([]driver.Value, 5)
@@ -773,6 +792,11 @@ func (s *Server) sensitivity(ctx context.Context, sess *session, snap *policy.Sn
 		}
 	}
 	sess.sens = sens
+	if shared {
+		s.sharedSens.mu.Lock()
+		s.sharedSens.sens = sens
+		s.sharedSens.mu.Unlock()
+	}
 	return sens, true, nil
 }
 
@@ -1013,19 +1037,17 @@ func (s *Server) policyRewrite(ctx context.Context, sess *session, user auth.Use
 	ddl := t == duckdb.STATEMENT_TYPE_DROP || t == duckdb.STATEMENT_TYPE_ALTER || t == duckdb.STATEMENT_TYPE_CREATE
 	if !ddl && snap.Empty() {
 		// Nothing to apply and nothing to read of the catalog. Holding it
-		// exclusively here, as below, had every query prepared under the
-		// shared lock wait for the others' to end and hold up the next ones:
-		// of 60 s that a dashboard's 136 prepares took, 50 s went here.
+		// exclusively here had every query prepared under the shared lock wait
+		// for the others' to end and hold up the next ones: of 60 s that a
+		// dashboard's 136 prepares took, 50 s went here.
 		return query, g, false, nil
 	}
-	// Applying policies resolves names and runs DESCRIBE, which walk the
-	// catalog's in-memory set; so do the checks of DDL, and listing what
-	// policies concern (see sensitivity). Each holds the exclusive side so
-	// none of it runs while a table is renamed or dropped on this instance
-	// (reentrant; see holdCatalog). A query that names nothing policies
-	// concern, as a dashboard's, needs none of it once the session's
-	// listing is made: holding it for every query, prepared under the
-	// shared lock, queued them all behind each other.
+	// Applying policies resolves names and runs DESCRIBE, which look the
+	// catalog's tables up, and so do listing what policies concern (see
+	// sensitivity) and the checks of DDL: they hold the lock shared, and DDL's
+	// exclusively (reentrant; see holdCatalog). A query that names nothing
+	// policies concern, as a dashboard's, needs none of it once the session's
+	// listing is made.
 	if ddl {
 		defer s.holdCatalog(sess)()
 	}
@@ -1083,7 +1105,7 @@ func (s *Server) policyRewrite(ctx context.Context, sess *session, user auth.Use
 		return query, g, ran, nil
 	}
 	if !ddl {
-		defer s.holdCatalog(sess)()
+		defer s.shareCatalog(sess)()
 	}
 	ran = true
 	privs, err := s.privileges(ctx, sess, user)
@@ -1428,10 +1450,9 @@ func (s *Server) catalogTarget(ctx context.Context, sess *session, parts []strin
 		}
 		return auth.Object{Schema: parts[0], Table: parts[1]}, true, nil
 	case 1:
-		// isTemporary lists with duckdb_tables()/duckdb_views(), which walk
-		// the catalog's in-memory set; hold the exclusive side (reentrant;
-		// see holdCatalog).
-		release := s.holdCatalog(sess)
+		// isTemporary lists with duckdb_tables()/duckdb_views(), which look
+		// the catalog's tables up (see holdCatalog).
+		release := s.shareCatalog(sess)
 		temp, err := isTemporary(ctx, sess.conn, parts[0])
 		release()
 		if err != nil || temp {

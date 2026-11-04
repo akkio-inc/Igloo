@@ -96,7 +96,8 @@ func TestDataVersion(t *testing.T) {
 	step("Invalidate", p.Invalidate, true)
 }
 
-// TestTablesVersion checks that a table's version changes with changes to
+// TestTablesVersion checks that a table's version, as of its loads and by its
+// name, changes with changes to
 // it, however they reach the catalog, and with loads that find it
 // elsewhere, and not with changes to other tables or scans' metrics;
 // changes the proxy cannot tell the tables of change every table's.
@@ -130,10 +131,13 @@ func TestTablesVersion(t *testing.T) {
 	}
 	step := func(what string, do func(), up bool) {
 		t.Helper()
-		before := p.TablesVersion(carts)
+		before, one := p.TablesVersion(carts), p.TableVersion("sales", "carts")
 		do()
 		if after := p.TablesVersion(carts); (after != before) != up {
 			t.Errorf("%s: carts's version %d, then %d", what, before, after)
+		}
+		if after := p.TableVersion("sales", "carts"); (after != one) != up {
+			t.Errorf("%s: carts's own version %d, then %d", what, one, after)
 		}
 	}
 	step("a commit to another table", func() { send(http.MethodPost, "namespaces/sales/tables/orders", `{"updates": []}`) }, false)

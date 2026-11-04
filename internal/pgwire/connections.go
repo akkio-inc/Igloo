@@ -309,10 +309,9 @@ func (s *Server) runConnectionCommand(ctx context.Context, sess *session, c *con
 		}
 	case c.refresh:
 		// Refreshing lists every database's tables with duckdb_tables() on a
-		// connection of its own, which walks the catalog's in-memory set
-		// too; hold the catalog lock exclusively so that does not run while
-		// a table is renamed or dropped on this instance (see holdCatalog).
-		release := s.holdCatalog(sess)
+		// connection of its own, which looks the catalog's tables up too:
+		// hold the catalog lock shared (see holdCatalog).
+		release := s.shareCatalog(sess)
 		err = s.fed.Refresh(ctx, c.name)
 		release()
 	case c.verb == "ALTER":
@@ -384,10 +383,8 @@ func (s *Server) createConnection(ctx context.Context, sess *session, me auth.Us
 // the databases DuckDB has and the catalog. It fails with an
 // InvalidError when the catalog has a schema called name.
 func (s *Server) takenNames(ctx context.Context, sess *session, name string) ([]string, error) {
-	// Listing the catalog's schemas walks a set a table's drop looks up
-	// without DuckDB-Iceberg's lock; hold the catalog lock exclusively
-	// (reentrant; see holdCatalog).
-	defer s.holdCatalog(sess)()
+	// Listing the catalog's schemas looks them up (see holdCatalog).
+	defer s.shareCatalog(sess)()
 	taken, err := queryStrings(ctx, sess, "SELECT database_name FROM system.main.duckdb_databases()")
 	if err != nil {
 		return nil, err

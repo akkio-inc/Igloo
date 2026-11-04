@@ -3,6 +3,7 @@ package pgwire
 import (
 	"context"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -117,6 +118,62 @@ func TestQueryBesidePoliciesTakesCatalogShared(t *testing.T) {
 			var code string
 			if err := rita.QueryRow(ctx, "SELECT code FROM lake.public.secrets LIMIT 1").Scan(&code); err != nil || code != "***" {
 				t.Errorf("the protected column read %q, %v", code, err)
+			}
+		})
+	}
+}
+
+// TestDescribeTakesCatalogShared describes a table while another holder keeps the
+// catalog lock shared: it finishes, a bind as a query's, where it waited to hold the
+// lock alone as a listing. One of a table that does not exist still says so.
+func TestDescribeTakesCatalogShared(t *testing.T) {
+	t.Parallel()
+	cs := startCatalogServer(t)
+	mustExec(t, cs.admin, "CREATE TABLE lake.main.described (id INTEGER, name VARCHAR)")
+	for name, mode := range modes {
+		t.Run(name, func(t *testing.T) {
+			conn := cs.user(t, "dee_"+name, auth.RoleAdmin, mode)
+			ctx := context.Background()
+			columns := func() ([]string, error) {
+				rows, err := conn.Query(ctx, "DESCRIBE lake.main.described")
+				if err != nil {
+					return nil, err
+				}
+				defer rows.Close()
+				var out []string
+				for rows.Next() {
+					vals, err := rows.Values()
+					if err != nil {
+						return nil, err
+					}
+					out = append(out, fmt.Sprint(vals[0], " ", vals[1]))
+				}
+				return out, rows.Err()
+			}
+			if _, err := columns(); err != nil {
+				t.Fatal(err)
+			}
+			release := cs.srv.engine.CatalogShare()
+			done := make(chan error, 1)
+			var got []string
+			go func() {
+				var err error
+				got, err = columns()
+				done <- err
+			}()
+			select {
+			case err := <-done:
+				release()
+				if err != nil || len(got) != 2 || got[0] != "id INTEGER" || got[1] != "name VARCHAR" {
+					t.Fatalf("%v, %v", got, err)
+				}
+			case <-time.After(20 * time.Second):
+				release()
+				<-done
+				t.Fatal("DESCRIBE waited for the catalog lock while it was held shared")
+			}
+			if _, err := conn.Exec(ctx, "DESCRIBE lake.main.not_described"); err == nil || !strings.Contains(err.Error(), "not_described") {
+				t.Errorf("DESCRIBE of a missing table: %v", err)
 			}
 		})
 	}

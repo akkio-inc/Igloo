@@ -27,6 +27,13 @@ import (
 // in a second DuckDB of this process whose threads give way to the first's.
 // Alone, they run as fast as they would have in the first.
 //
+// Whose heavy statements run there (see backgroundFor): a job's, as a task's,
+// always, and a client's only with IGLOO_HEAVY_IN_BACKGROUND. A dashboard's own
+// heavy statement is part of what its user waits for: at ten times its data on 16
+// cores, the dashboard's heavy FLATTEN statement ran 22 s alone in the first
+// DuckDB and 57 to 78 s in the second, beside its tiles, and the burst waited
+// for it.
+//
 // A statement is heavy if statements of its shape, its text with the
 // literals masked, lately took heavySeconds of all the machine's cores and
 // heavyFactor times what the replica's others of some size do (see
@@ -53,6 +60,11 @@ import (
 // second had a tenth of what the others left of the cores, and ran past 15 minutes
 // until they timed out, the two DuckDBs each spilling what the other wanted, and
 // those moved there threw away what they had done.
+//
+// On workers, a statement is heavy by how long statements of its shape held
+// them, against the other statements there, as heavyHistory measures CPU here
+// (see Server.heavyOnWorkers): its tasks give way to the others' on each worker
+// (see distributed.WithBackground), as refreshes' and pipes' loads do.
 //
 // A write of the catalog's tables known to be heavy (INSERT, UPDATE, DELETE,
 // MERGE and the fill of CREATE TABLE ... AS) runs there too, under the same
@@ -102,6 +114,10 @@ const maxHeavyShapes = 4096
 // cost it more than it is likely to cost the others.
 var heavyMoveWithin = 60 * time.Second
 
+// besideFor is how long another statement must have run for a statement in the
+// first DuckDB to count as running beside it (see runPlaced).
+const besideFor = time.Second
+
 // heavyHistory is what statements of each shape took.
 type heavyHistory struct {
 	mu     lockorder.Mutex
@@ -138,8 +154,13 @@ func (r *shapeRuns) sorted() []time.Duration {
 }
 
 func newHeavyHistory() *heavyHistory {
-	return &heavyHistory{shapes: map[string]*shapeRuns{}, cpu: heavySeconds * time.Second * time.Duration(runtime.GOMAXPROCS(0)),
-		factor: heavyFactor, after: heavySeconds * time.Second, now: time.Now}
+	return newHeavyHistoryOf(heavySeconds * time.Second * time.Duration(runtime.GOMAXPROCS(0)))
+}
+
+// newHeavyHistoryOf returns a heavyHistory whose statements are heavy from cpu
+// of what it measures at the least.
+func newHeavyHistoryOf(cpu time.Duration) *heavyHistory {
+	return &heavyHistory{shapes: map[string]*shapeRuns{}, cpu: cpu, factor: heavyFactor, after: heavySeconds * time.Second, now: time.Now}
 }
 
 // line is how much CPU makes shape heavy: at least h.cpu, and heavyFactor times
@@ -424,6 +445,9 @@ func (s *Server) backgroundConnOf(ctx context.Context, sess *session, eng *engin
 			return nil, err
 		}
 		conn.SetBindHold(eng.CatalogShare)
+		// A C++ exception that escapes DuckDB in one of its calls ends the
+		// session, as on the session's own connection (see openSession).
+		conn.SetCallGuard(sess.callGuard)
 		for _, stmt := range sessionCatalogSetup(sess.user.Name, false, s.version, eng.BitmapsLoaded()) {
 			// The macros. Views of Igloo's own relations have no place here,
 			// and one macro that cannot be defined fails only the statements
@@ -461,10 +485,17 @@ func (s *Server) mayRunInBackground(sess *session, st *statement, tw *tagWriter,
 	return s.readInBackground(sess, st) && parts.local == 0 && tw.Written() == 0
 }
 
+// backgroundFor says whether sess's heavy statements may run in the second
+// DuckDB: a job's, and with IGLOO_HEAVY_IN_BACKGROUND a client's too (see the
+// top of this file).
+func (s *Server) backgroundFor(sess *session) bool {
+	return s.heavy != nil && (sess.job != "" || s.heavyClients)
+}
+
 // readInBackground says whether st is a read that could run in the second
 // DuckDB, whatever comes of its turn.
 func (s *Server) readInBackground(sess *session, st *statement) bool {
-	return s.heavy != nil && sess.wl.shape != "" && st.stmtType == duckdb.STATEMENT_TYPE_SELECT && st.kind == returnsRows &&
+	return s.backgroundFor(sess) && sess.wl.shape != "" && st.stmtType == duckdb.STATEMENT_TYPE_SELECT && st.kind == returnsRows &&
 		!sess.inTx && len(st.loads) > 0 && !st.ai && len(st.indexPins) == 0 && st.idCounts == nil && policyReason(st) == ""
 }
 
@@ -487,7 +518,7 @@ func (s *Server) sameInBackground(ctx context.Context, sess *session, st *statem
 		// Only DDL makes temporary objects (see names).
 		return true
 	}
-	release := s.holdCatalog(sess)
+	release := s.shareCatalog(sess)
 	defer release()
 	temp, err := queryStrings(ctx, sess, `SELECT system.main.lower(table_name) FROM system.main.duckdb_tables() WHERE temporary AND NOT internal
 		UNION ALL SELECT system.main.lower(view_name) FROM system.main.duckdb_views() WHERE temporary AND NOT internal`)
@@ -523,10 +554,13 @@ func (s *Server) runPlaced(ctx, outer context.Context, sess *session, st *statem
 	if !mayMove {
 		return s.runHere(ctx, sess, st, args, tw)
 	}
-	// It may turn out heavy, beside others.
+	// It may turn out heavy, beside others: those that have run for a while,
+	// and so hold cores or memory worth giving way to. A monitoring poll of a
+	// few milliseconds, once a second, does not: beside one, TPC-DS q67 alone
+	// started again in the background after 23.5 s, and threw that away.
 	start := time.Now()
 	guard := guardLocalBy(ctx, func() time.Duration {
-		others := s.othersRunning(sess)
+		others := s.othersRunningFor(sess, besideFor)
 		if others == 0 || time.Since(start) > heavyMoveWithin || s.besideIsHeavy(sess) {
 			return time.Hour
 		}
@@ -559,7 +593,7 @@ func (s *Server) foregroundRead(st *statement) {
 // the second DuckDB: if statements of its shape are known to be heavy, and it
 // would write and read the same there.
 func (s *Server) writesInBackground(ctx context.Context, sess *session, st *statement) bool {
-	return s.heavy != nil && sess.wl.shape != "" && s.heavy.heavy(sess.wl.shape) && !sess.inTx && st.ids == nil && !st.ai &&
+	return s.backgroundFor(sess) && sess.wl.shape != "" && s.heavy.heavy(sess.wl.shape) && !sess.inTx && st.ids == nil && !st.ai &&
 		policyReason(st) == "" && s.sameInBackground(ctx, sess, st)
 }
 

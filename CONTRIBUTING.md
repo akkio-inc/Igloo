@@ -81,6 +81,7 @@ same ones to check chart or module changes locally.
 cmd/igloo/               server entry point and subcommands
 internal/                server packages: configuration, DuckDB engine, Postgres wire protocol
 extensions/rb/           Igloo's DuckDB extension (C++): exact distinct counts in roaring bitmaps
+extensions/iceberg/      DuckDB's Iceberg extension, built from source with Igloo's patches
 third_party/             patched or vendored dependencies (duckdb-go, iceberg-go, psql-wire, CRoaring)
 deploy/single-vm/        Docker Compose stack for one machine
 deploy/helm/igloo/       Helm chart

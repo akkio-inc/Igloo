@@ -1052,7 +1052,7 @@ type localRunEnv struct {
 	took time.Duration
 }
 
-func (e localRunEnv) LocalRun() (time.Duration, bool) { return e.took, true }
+func (e localRunEnv) LocalRun() (took, longest time.Duration, ok bool) { return e.took, e.took, true }
 
 // A statement that ran here with no plan key to keep its time by, as with
 // distributed_execution off, is not guessed at: what it took stands where its

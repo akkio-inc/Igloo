@@ -285,13 +285,10 @@ func (f *stagedFill) fillAt(ctx context.Context, q string) (n int64, err error) 
 			return n, err
 		}
 	}
-	err = f.s.runBound(f.sess, nil, func() error {
-		res, err := f.sess.conn.QueryContext(ctx, q, nil)
-		if err == nil {
-			n, err = countOf(res)
-		}
-		return err
-	})
+	res, err := f.sess.conn.QueryContext(ctx, q, nil)
+	if err == nil {
+		n, err = countOf(res)
+	}
 	if used := f.sess.wl.meter.Last(q); used != nil && err == nil {
 		f.cpu += used.CPUTime
 	}
@@ -308,7 +305,7 @@ func (f *stagedFill) again(err error) bool {
 	if f.ctx.Err() == nil {
 		return isOutOfMemory(err)
 	}
-	if f.sess.outer == nil || !f.sess.ranOutOfMemory(f.ctx, err) {
+	if f.sess.outer == nil || !f.sess.ranOutOfMemory(f.ctx, err) || f.sess.wasCanceled() {
 		return false
 	}
 	ctx, end := f.sess.rearm(f.sess.outer, f.ctx)
@@ -513,7 +510,7 @@ func (s *Server) runStagedCreate(ctx context.Context, sess *session, st *stateme
 
 // relationExists reports whether the catalog has a table or view named o,
 // matching names as DuckDB does, whatever their case. The caller holds the
-// catalog lock exclusively: it lists the catalog's set.
+// catalog lock: it lists the catalog's tables.
 func (s *Server) relationExists(ctx context.Context, sess *session, o auth.Object) (bool, error) {
 	if s.ddl != nil && s.ddl.IsView(o.Schema, o.Table) {
 		return true, nil
@@ -577,23 +574,21 @@ func (s *Server) runStatement(ctx context.Context, sess *session, st *statement,
 	}
 	written := int64(-1)
 	run := func(ctx context.Context) error {
-		return s.runBound(sess, w, func() error {
-			return runWithCommitRetry(ctx, sess, st, func() error {
-				if err := st.freshForRun(ctx, sess.conn); err != nil {
+		return runWithCommitRetry(ctx, sess, st, func() error {
+			if err := st.freshForRun(ctx, sess.conn); err != nil {
+				return err
+			}
+			return sess.profiled(ctx, st, func() error {
+				// An INSERT into a member table writes the ids it can.
+				done, n, err := s.runWithIDs(ctx, sess, st, args, w)
+				if done {
+					written = n
 					return err
 				}
-				return sess.profiled(ctx, st, func() error {
-					// An INSERT into a member table writes the ids it can.
-					done, n, err := s.runWithIDs(ctx, sess, st, args, w)
-					if done {
-						written = n
-						return err
-					}
-					if ran, err := s.runWriteInBackground(ctx, sess, st, args, w); ran {
-						return err
-					}
-					return st.run(ctx, args, w)
-				})
+				if ran, err := s.runWriteInBackground(ctx, sess, st, args, w); ran {
+					return err
+				}
+				return st.run(ctx, args, w)
 			})
 		})
 	}

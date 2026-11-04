@@ -220,15 +220,16 @@ others run beside it, rather than three times it (see [beside other
 statements](distributed-execution.md#when)). `IGLOO_WORKER_THRESHOLD`
 sets how long a statement must take for workers to be worth it.
 
-Without workers, nothing needs setting either, on Linux. DuckDB runs every
-statement on one pool of threads, and a thread stays with a statement's
-pipeline until that ends, so beside one session's long reports a dashboard's
-statement had little more than its own thread. The operating system can
-prefer one thread to another, though, so a heavy statement runs in a second
-DuckDB of the replica's process, opened at the first heavy statement, whose
-threads give way to the first's (a nice value of 10). Alone it takes about
-what it takes in the first; beside others it gets the cores they leave idle,
-and about a tenth of those they use.
+Without workers, on Linux, a task's heavy statements give way to clients'
+with nothing set, and `IGLOO_HEAVY_IN_BACKGROUND=true` has clients' heavy
+statements give way too. DuckDB runs every statement on one pool of threads,
+and a thread stays with a statement's pipeline until that ends, so beside one
+session's long reports a dashboard's statement had little more than its own
+thread. The operating system can prefer one thread to another, though, so a
+heavy statement runs in a second DuckDB of the replica's process, opened at
+the first heavy statement, whose threads give way to the first's (a nice value
+of 10). Alone it takes about what it takes in the first; beside others it gets
+the cores they leave idle, and about a tenth of those they use.
 
 Measured on 12 cores with `bench/mixed.py`, its statements' results not cached,
 beside one session's reports:
@@ -241,6 +242,14 @@ beside one session's reports:
 Those dashboards use all the cores they can have, and the longest report over a
 billion rows took 567 s beside them where it took 436 s in one DuckDB, with the
 dashboards at a fifth of the statements, and 267 s to 294 s alone in either.
+
+That is what standalone reports beside dashboards want, and what a
+dashboard's own heavy statements do not: at ten times its data on 16 cores, a
+dashboard's FLATTEN statement took 22 s alone in the first DuckDB and 57 to 78
+s in the second beside the dashboard's other statements, and the dashboard
+waited for it. So a client's heavy statements stay in the first unless
+`IGLOO_HEAVY_IN_BACKGROUND` is `true`; set it where long reports run beside
+dashboards on a replica without workers.
 
 The two share the memory limit. A heavy statement alone may use it all, the
 first's caches giving way to it. While the first reads tables it keeps what
@@ -278,9 +287,13 @@ first. `placement` in the history says which reads ran there, and
 the first while most of what runs there or waits to is of some size itself, known to take
 5 seconds of all the cores alone or having run for a while, since there is
 nothing short for it to give way to.
-`IGLOO_HEAVY_IN_BACKGROUND=false` runs everything in the first. Without
+With `IGLOO_HEAVY_IN_BACKGROUND=false`, the default, only tasks' heavy
+statements run in the second. Without
 workers, the replica's limit below and roles' limits hold back heavy
-statements beyond that.
+statements beyond that. On workers, a statement is heavy by how long its shape
+held them against the other statements there, and its tasks give way to theirs
+on each worker, as refreshes' do (see [distributed
+execution](distributed-execution.md#when)).
 
 ### The replica's limit
 
@@ -317,19 +330,32 @@ therefore goes before a long one that came just before it, and a long one before
 a short one that comes after it would have ended, so nothing starves. A shape
 that took under a second of CPU in one of those runs does not wait at all: it
 neither counts against the replica's limit nor reserves memory. A statement of a
-shape not seen yet, of which nothing is known, waits while DuckDB holds three
-quarters of the memory for the statements running, each such statement counting
-for a quarter of the memory until it has run 30 seconds or ended, so that a
-dashboard's heavy statements do not start together on its first run. It waits for
-the memory for at most a minute, as what holds the memory may run for hours, and
-those that have then start one at a time, the next once the one before has ended. A statement that was canceled
+shape not seen yet, of which nothing is known, has what it will hold estimated
+before it starts, as auto mode estimates it for this replica, from DuckDB's plan of
+it and the tables it reads (see [when](distributed-execution.md#when)). One the
+plan says holds under a 256th of the memory, such as a dashboard's tile or a small
+query, starts as a known statement that holds as little does: plans of joins and
+distinct counts ran up to 45 times short of what DuckDB held. Any other
+waits while another such runs, or while DuckDB holds, or statements reserved,
+three quarters of the memory, and beside it only statements that reserve a quarter
+of the memory or less start, so that a dashboard's heavy statements run one after
+another on its first run rather than fill the memory together and spill. It waits
+for at most a minute in which no other such starts or ends, as what holds the
+memory may run for hours, and those that have then start one at a time, the next
+once the one before has ended. A statement that was canceled
 or passed its timeout, or whose client went away, holds nobody up, even while DuckDB
 has yet to stop it.
 
 On a dashboard's 96 queries at ten times the data, on 8 cores, the slowest tenth
 took 94 s rather than 102 and the slowest hundredth 127 s rather than 135, and
 they ran 2,800 s in all rather than 3,370, without its build taking longer (224 s
-rather than 230); at the data's size its median took 1.1 s, as before.
+rather than 230); at the data's size its median took 1.1 s, as before. On another's
+324 queries at ten times the data, on 8 cores and 22 GB, with no history, the build
+took 1,787 s rather than 3,145, and its statements 14,100 CPU-seconds, as many as
+with history, where up to three statements nothing was known of starting together
+used 29,400. Eight users' dashboards beside a heavy report over a billion rows, with
+no history, finished 105 to 112 statements in their first minute rather than 71, at
+a median of 2.6 to 5.3 s rather than 12 to 14 s.
 
 ### Reservations from history
 
@@ -339,7 +365,8 @@ a fixed limit, though, holds back the light statements with the heavy ones.
 Igloo instead learns what each statement holds at once, by its shape (its
 text with string and number literals masked, which a dashboard sends again
 with other audiences, dates and limits, though `LIMIT 0` has a shape of its
-own), and the next statement of that
+own; a statement in Snowflake's dialect whose FLATTEN Igloo can translate two ways
+goes by the text the client sent, whichever way it ran), and the next statement of that
 shape reserves `IGLOO_STATEMENT_RESERVATIONS` of it (`auto`, the default,
 is all of it) of the replica's memory before it starts, as a role's
 `memory_limit` reserves (see [role limits](#role-limits)). A statement whose

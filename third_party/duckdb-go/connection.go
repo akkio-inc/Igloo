@@ -26,6 +26,9 @@ type Conn struct {
 	tx bool
 	// Igloo patch: called around each bind step (see SetBindHold).
 	bindHold func() (release func())
+	// Igloo patch: runs each call that binds, runs or drops a plan (see
+	// SetCallGuard).
+	callGuard func(call func())
 }
 
 func newConn(conn mapping.Connection, ctxStore *contextStore) *Conn {
@@ -205,12 +208,17 @@ func (conn *Conn) prepareExtractedStmt(ctx context.Context, extractedStmts mappi
 	}
 
 	var stmt mapping.PreparedStatement
-	release := conn.holdBind()
-	state := mapping.PrepareExtractedStatement(conn.conn, extractedStmts, i, &stmt)
-	release()
-	if state == mapping.StateError {
-		err := getDuckDBError(mapping.PrepareError(stmt))
-		mapping.DestroyPrepare(&stmt)
+	var err error
+	conn.guard(func() {
+		release := conn.holdBind()
+		state := mapping.PrepareExtractedStatement(conn.conn, extractedStmts, i, &stmt)
+		release()
+		if state == mapping.StateError {
+			err = getDuckDBError(mapping.PrepareError(stmt))
+			mapping.DestroyPrepare(&stmt)
+		}
+	})
+	if err != nil {
 		return nil, err
 	}
 	return &Stmt{conn: conn, preparedStmt: &stmt}, nil

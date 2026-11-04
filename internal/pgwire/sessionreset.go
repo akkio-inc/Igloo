@@ -166,8 +166,8 @@ const tempObjects = `SELECT kind, name FROM (
 // ones every session starts with (see sessionCatalogSetup), as a new
 // session has them.
 func (s *Server) discardTemp(ctx context.Context, sess *session) error {
-	// These walk every attached database (see names).
-	release := s.holdCatalog(sess)
+	// These list every attached database's tables (see names).
+	release := s.shareCatalog(sess)
 	objects, err := queryRows(ctx, sess.conn, tempObjects)
 	release()
 	if err != nil {

@@ -156,7 +156,8 @@ type estimate struct {
 	workers               int
 	large                 bool
 	// memory says the working set is over memoryShare of the coordinator's
-	// memory, by workingSetFactor, and spills that it is by heldFactor, as
+	// memory, by workingSetFactor and, where DuckDB's plan says what it
+	// holds, by that too; and spills that it is by heldFactor, as
 	// local says, whose oom says it should run out of memory there;
 	// farBeyond that the working set by DuckDB's plan, or else by the
 	// stages, is past farBeyondRatio times the room (see Plan.FitsHere).
@@ -243,22 +244,23 @@ type Footprints interface {
 
 // LocalRuns is an Env whose session knows how long statements of the shape of
 // the one being planned took on this replica, in runs they completed:
-// LocalRun returns that, and ok is false when none has. Auto mode's history
+// LocalRun returns the median of them and the longest, and ok is false when
+// none has. Auto mode's history
 // keeps such times by plan key, which a statement has only if it was planned
 // for workers; with distributed_execution off, or where planning gave up, one
 // ran here and its time said nothing to the next. That key's own runs here
 // come first, as of tables of its sizes. A report that took 714 s here so went
 // on being estimated at 15 s, and was tried there again.
 type LocalRuns interface {
-	LocalRun() (took time.Duration, ok bool)
+	LocalRun() (took, longest time.Duration, ok bool)
 }
 
 // localRun is what env says of LocalRuns, if it says.
-func localRun(env Env) (time.Duration, bool) {
+func localRun(env Env) (took, longest time.Duration, ok bool) {
 	if lr, ok := env.(LocalRuns); ok {
 		return lr.LocalRun()
 	}
-	return 0, false
+	return 0, 0, false
 }
 
 // fleet is what the coordinator knows of its workers for an estimate.
@@ -293,11 +295,12 @@ func estimateTimes(stages []*Stage, m machine, f fleet) estimate {
 // features are what a plan's estimates are made of.
 type features struct {
 	// bytes are what its stages read of tables, as selective filters leave
-	// them (see filtersSelectively); exchanged what the stages that write
-	// exchanges read of tables in full, and held as selective filters leave
-	// it.
-	bytes, exchanged int64
-	held             float64
+	// them (see filtersSelectively), and direct those of them of tables no
+	// stage that writes an exchange reads; exchanged what the stages that
+	// write exchanges read of tables in full, and held as selective filters
+	// leave it.
+	bytes, direct, exchanged int64
+	held                     float64
 	// rows are the rows its stages go through (see rowWork); levels its
 	// stages' longest chain, and stages how many there are.
 	rows           float64
@@ -306,7 +309,7 @@ type features struct {
 	// where planned says the session could plan it, and planParts what each
 	// of its operators holds (see workingSetOf); planBytes is what one
 	// machine reads of tables by the plan, zero where it does not say, and
-	// planWork the core-seconds its hash tables take (see planEstimate).
+	// planWork the core-seconds its operators take (see operatorWork).
 	planSet   float64
 	planned   bool
 	planParts []heldPart
@@ -728,6 +731,9 @@ func planFeatures(stages []*Stage) features {
 			b = int64(float64(b) * filterSelectivity)
 		}
 		x.bytes += b
+		if _, ok := exchanged[k]; !ok {
+			x.direct += b
+		}
 	}
 	for k, cols := range exchanged {
 		b := cols.bytes(tables[k])
@@ -777,7 +783,7 @@ func (x features) estimate(m machine, f fleet) estimate {
 	// What it reads, or what it computes over the rows, whichever takes
 	// longer: a report that reads 2 GB of a table but joins its 400 million
 	// rows to themselves 16 times is no 1-second statement. By the plan,
-	// its hash tables' rows, at hashMissRate where they outgrow the caches.
+	// what its operators take of the cores (see operatorWork).
 	e.oneMachine = max(e.oneMachine, e.rows/(cores*rowRate), x.planWork/cores)
 	// Short of memory, it takes longer, spilling, as much as its working
 	// set is over its share of memory (see spillOn): heldFactor times what
@@ -808,6 +814,15 @@ func (x features) estimate(m machine, f fleet) estimate {
 		e.local.factor = max(e.local.factor, spillOn(set+held, m.memory).factor)
 	}
 	e.spills = e.local.factor > 1
+	if x.planned {
+		// Short of memory where DuckDB's plan says its working set is, not
+		// by what its stages exchange alone: a report whose stages read 30.7
+		// GB of a lookup for exchanges, three times that over a replica's
+		// 30.8 GB share, held 19 to 20 GB, as its plan said (15.3 GB), and
+		// ran in 23.5 s there beside dashboards. Taken for short of memory,
+		// it went to 4 workers and took 166.5 s.
+		e.memory = e.memory && (e.spills || e.local.oom)
+	}
 	e.oneMachine *= e.local.factor
 	// A fill's rows, written here wherever the query runs; a read's, sent
 	// to the client, from here or from the workers' merge alike.

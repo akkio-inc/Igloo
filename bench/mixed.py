@@ -27,6 +27,10 @@ against a synthetic ad-impressions schema:
   one after another with their result cache off, as an analyst's session
   beside the dashboards. With `--dashboard-users 0 --elt-streams 0`, what
   they take alone.
+- **Listings.** `--listing-streams` sessions, each browsing the catalog
+  one listing after another, as a BI tool's schema browser does: the
+  schema's tables, their columns, a table's description and its columns
+  from `pg_catalog`, a second apart.
 - **Probes.** `--probes` runs one statement a second of each kind in
   `PROBES`, their result cache off, to tell where a dashboard waits: `ping`
   takes Igloo's path and no DuckDB task, `cpu` only DuckDB's threads, and
@@ -184,6 +188,16 @@ HEAVY = {
     "first_touch": "SELECT c.channel, avg(n) AS impressions_after_first FROM (SELECT i.campaign_id, row_number() OVER "
     "(PARTITION BY i.device_id ORDER BY i.ts, i.campaign_id) AS n FROM {s}.impressions i) t JOIN {s}.campaigns c "
     "ON c.campaign_id = t.campaign_id GROUP BY 1 ORDER BY 1",
+}
+
+# What a BI tool's schema browser lists, one after another.
+LISTINGS = {
+    "tables": "SELECT table_name, table_type FROM information_schema.tables WHERE table_schema = '{s}' ORDER BY 1",
+    "columns": "SELECT table_name, column_name, data_type FROM information_schema.columns WHERE table_schema = '{s}' "
+    "ORDER BY table_name, ordinal_position",
+    "describe": "DESCRIBE {s}.daily_delivery",
+    "attributes": "SELECT a.attname FROM pg_catalog.pg_attribute a JOIN pg_catalog.pg_class c ON c.oid = a.attrelid "
+    "WHERE c.relname = 'campaigns' AND a.attnum > 0",
 }
 
 # Where a statement waits: see the module's doc.
@@ -381,11 +395,11 @@ class WorkerSampler(threading.Thread):
 # --- Running ----------------------------------------------------------------
 
 
-def dashboard_user(uid: int, args, connect, rec: Recorder, until: float, seed: int):
-    """One BI user: opens dashboards with think time between, each
-    dashboard's tiles at once."""
+def dashboard_user(uid: int, args, conns: list, rec: Recorder, until: float, seed: int):
+    """One BI user, on its own connections (opened before the window
+    starts): opens dashboards with think time between, each dashboard's
+    tiles at once."""
     rng = random.Random(seed * 1000 + uid)
-    conns = [connect("dashboard") for _ in range(args.tile_concurrency)]
     names = sorted(DASHBOARDS)
     try:
         while time.time() < until:
@@ -450,6 +464,23 @@ def probe_session(name: str, args, connect, rec: Recorder, until: float):
             text = f"/* mixed {args.run_id} probe {name} */ " + PROBES[name].format(s=args.schema)
             run_one(conn, text, rec, "probe", name)
             time.sleep(max(1 - (time.time() - start), 0))
+    finally:
+        conn.close()
+
+
+def listing_session(k: int, args, connect, rec: Recorder, until: float):
+    """Browses the catalog, one listing of LISTINGS after another, a second
+    apart, until the window ends."""
+    conn = connect("listing")
+    names = sorted(LISTINGS)
+    try:
+        i = k
+        while time.time() < until:
+            name = names[i % len(names)]
+            i += 1
+            text = f"/* mixed {args.run_id} listing {name} */ " + LISTINGS[name].format(s=args.schema)
+            run_one(conn, text, rec, "listing", name)
+            time.sleep(1)
     finally:
         conn.close()
 
@@ -525,15 +556,24 @@ def run(args, connect, sampler: WorkerSampler | None = None) -> dict:
         if "ingest" in args.elt_jobs.split(",") and args.elt_streams:
             cur.execute(f"SELECT coalesce(max(batch_id), 0) FROM {args.schema}.impressions")
             first_batch = int(cur.fetchone()[0])
+    # Every BI user logs in before the clock starts: logins slow under load
+    # (43 s in one window), and a window that counted them would measure fewer
+    # dashboards a minute than the replica served.
+    began = time.time()
+    conns = connect_all(connect, "dashboard", args.dashboard_users * args.tile_concurrency)
+    logins = time.time() - began
     start = time.time()
     t0, until = start + args.warmup, start + args.warmup + args.duration
-    threads = [threading.Thread(target=dashboard_user, args=(u, args, connect, rec, until, args.seed), daemon=True)
+    k = args.tile_concurrency
+    threads = [threading.Thread(target=dashboard_user, args=(u, args, conns[u * k:(u + 1) * k], rec, until, args.seed), daemon=True)
                for u in range(args.dashboard_users)]
     elt = ELT(args, connect, rec, until, first_batch) if args.elt_streams else None
     if elt:
         threads += [threading.Thread(target=elt.stream, args=(k,), daemon=True) for k in range(args.elt_streams)]
     threads += [threading.Thread(target=heavy_session, args=(k, args, connect, rec, until), daemon=True)
                 for k in range(args.heavy_sessions)]
+    threads += [threading.Thread(target=listing_session, args=(k, args, connect, rec, until), daemon=True)
+                for k in range(args.listing_streams)]
     if args.probes:
         threads += [threading.Thread(target=probe_session, args=(name, args, connect, rec, until), daemon=True) for name in sorted(PROBES)]
     if sampler:
@@ -550,7 +590,31 @@ def run(args, connect, sampler: WorkerSampler | None = None) -> dict:
     if sampler:
         sampler.stop.set()
         sampler.join()
-    return {"records": rec.records, "t0": t0, "t1": t1, "end": end, "skipped": elt.skipped if elt else {}}
+    return {"records": rec.records, "t0": t0, "t1": t1, "end": end, "skipped": elt.skipped if elt else {},
+            "login_seconds": logins}
+
+
+def connect_all(connect, cls: str, n: int) -> list:
+    """n connections of class cls, opened at once; the first error raised."""
+    conns, errs = [None] * n, []
+
+    def one(i):
+        try:
+            conns[i] = connect(cls)
+        except Exception as e:  # raised below, once every attempt is done
+            errs.append(e)
+
+    ths = [threading.Thread(target=one, args=(i,)) for i in range(n)]
+    for th in ths:
+        th.start()
+    for th in ths:
+        th.join()
+    if errs:
+        for c in conns:
+            if c is not None:
+                c.close()
+        raise errs[0]
+    return conns
 
 
 def collect_history(conn, run_id: str, t0: float, t1: float, wait: float = 15.0) -> list[tuple]:
@@ -591,9 +655,10 @@ def report(res: dict, hist: list[tuple], args, coord_price: float, worker_price:
         "label": args.label,
         "config": {k: getattr(args, k) for k in ("schema", "rows", "batch_rows", "duration", "warmup", "dashboard_users",
                                                   "tile_concurrency", "think", "param_pool", "elt_streams", "elt_every",
-                                                  "elt_jobs", "heavy_sessions", "probes", "seed", "coordinator", "worker",
+                                                  "elt_jobs", "heavy_sessions", "listing_streams", "probes", "seed", "coordinator", "worker",
                                                   "spot_factor")},
         "window_seconds": round(window, 1),
+        "login_seconds": round(res.get("login_seconds", 0), 1),
         "classes": summarize(res["records"], res["t0"], res["t1"]),
         "history": hs,
         "elt_skipped": res["skipped"],
@@ -605,7 +670,7 @@ def report(res: dict, hist: list[tuple], args, coord_price: float, worker_price:
 
 
 def print_report(out: dict):
-    print(f"\nrun {out['run_id']} {out['label']}: {out['window_seconds']:.0f} s window")
+    print(f"\nrun {out['run_id']} {out['label']}: {out['window_seconds']:.0f} s window, after the users' logins took {out.get('login_seconds', 0):.1f} s")
     print(f"{'class':<34} {'stmts':>6} {'err':>4} {'/min':>8} {'p50 s':>8} {'p95 s':>8} {'p99 s':>8} {'queue p95':>9} {'on wkrs':>7}")
     for key, v in out["classes"].items():
         h = out["history"].get(key, {})
@@ -644,6 +709,7 @@ def parse(argv=None):
     r.add_argument("--elt-jobs", default=",".join(ELT_JOBS))
     r.add_argument("--batch-rows", type=int, default=200_000, help="impressions each ingest appends")
     r.add_argument("--heavy-sessions", type=int, default=0, help="sessions running long reports one after another")
+    r.add_argument("--listing-streams", type=int, default=0, help="sessions browsing the catalog, as a BI tool's schema browser")
     r.add_argument("--probes", action="store_true", help="run a probe of each kind in PROBES once a second")
     r.add_argument("--seed", type=int, default=1)
     r.add_argument("--metrics-url", help="Igloo's /metrics, to bill workers for the seconds they ran")

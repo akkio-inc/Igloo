@@ -106,9 +106,24 @@ func (s *Server) refreshMetadata(ctx context.Context, sess *session) {
 	if s.meta == nil {
 		return
 	}
-	if err := s.meta.RefreshMetadata(ctx); err != nil {
+	if err := readMetadata(ctx, s, sess, s.meta); err != nil {
 		s.log.Warn("could not read the catalog's metadata", "err", err)
 	}
+}
+
+// readMetadata has meta, the catalog's metadata, read for a statement of sess
+// (see MetadataSource.RefreshMetadata). The first read loads every table's
+// metadata, and sess lets go of the catalog lock while it waits for it (see
+// withoutCatalog): a statement being prepared holds the lock shared, and DDL
+// waiting for it holds up every statement after it. Right after a catalog load's
+// setup made 64 namespaces of tables, its first listings waited 8.5 s for that
+// read, and every other statement, of every stream, waited with them.
+func readMetadata(ctx context.Context, s *Server, sess *session, meta MetadataSource) (err error) {
+	if meta.Metadata() != nil {
+		return meta.RefreshMetadata(ctx)
+	}
+	s.withoutCatalog(sess, func() { err = meta.RefreshMetadata(ctx) })
+	return err
 }
 
 const (
@@ -197,13 +212,12 @@ func (s *Server) listConnectionTables(ctx context.Context, sess *session) {
 var remoteSystemSchemas = []string{"information_schema", "pg_catalog", "mysql", "performance_schema", "sys"}
 
 // readConnectionTables lists the tables of the connections catalogs, with
-// their columns, as DuckDB has them. duckdb_columns() walks every attached
-// database's tables, the Iceberg catalog's in-memory set too, whatever the
-// filter, so this holds the catalog lock exclusively (see
-// engine.Engine.CatalogLock); it runs off any session, which holds no lock
-// for it.
+// their columns, as DuckDB has them. duckdb_columns() looks up every attached
+// database's tables, the Iceberg catalog's too, whatever the filter, so this
+// holds the catalog lock shared (see engine.Engine.CatalogLock); it runs off
+// any session, which holds no lock for it.
 func (s *Server) readConnectionTables(ctx context.Context, catalogs map[string]string) ([]catalog.TableMeta, error) {
-	defer s.engine.CatalogLock()()
+	defer s.engine.CatalogShare()()
 	conn, err := s.engine.Connect(ctx)
 	if err != nil {
 		return nil, err

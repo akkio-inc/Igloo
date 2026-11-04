@@ -93,7 +93,7 @@ func TestSeedHistory(t *testing.T) {
 	// i's, cancelled, nor c's, on another memory, or d's, which does not say.
 	wantTook := map[string]time.Duration{"a": time.Second, "e": time.Minute, "g": time.Minute, "f": time.Minute}
 	for _, shape := range []string{"a", "b", "c", "d", "e", "f", "g", "h", "i"} {
-		got, ok := footprints.Took(shape)
+		got, _, ok := footprints.Took(shape)
 		if w, learned := wantTook[shape]; ok != learned || got != w {
 			t.Errorf("seeded time of %s %s (%v), want %s", shape, got, ok, w)
 		}
@@ -105,7 +105,7 @@ func TestSeedHistory(t *testing.T) {
 		t.Fatal(err)
 	}
 	seedHistory(context.Background(), nil, queued, 22*gb, queuedStore, slog.New(slog.DiscardHandler))
-	if got, ok := queued.Took("j"); !ok || got != 700*time.Second {
+	if got, _, ok := queued.Took("j"); !ok || got != 700*time.Second {
 		t.Errorf("seeded time past its wait: %s (%v)", got, ok)
 	}
 	// What the guard learned of a run it moved, by the placement of that run on
@@ -136,12 +136,19 @@ func TestSeedHistory(t *testing.T) {
 			Resources: &audit.Resources{BytesRead: 1, CPUTime: time.Second}},
 		{ID: "4", Start: now.Add(-time.Second), Outcome: audit.OutcomeOK, FlattenKey: "k", Workers: 2,
 			Resources: &audit.Resources{BytesRead: 1, CPUTime: time.Second}},
+		// Runs on workers, judged by the workers' time: 16 for 10 minutes, and for 8.
+		{ID: "5", Start: now.Add(-3 * time.Minute), Outcome: audit.OutcomeOK, FlattenKey: "w", Workers: 16, Duration: 10 * time.Minute},
+		{ID: "6", Start: now.Add(-2 * time.Minute), Outcome: audit.OutcomeOK, FlattenKey: "w", FlattenLists: true, Workers: 16,
+			Duration: 9 * time.Minute, Queued: time.Minute},
 	}); err != nil {
 		t.Fatal(err)
 	}
 	seedHistory(context.Background(), nil, forms, 22*gb, formStore, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if !forms.ChooseForm("k", func() bool { t.Error("asked DuckDB of a shape in the history"); return false }) {
 		t.Error("seeded forms: not the faster")
+	}
+	if !forms.ChooseForm("w", func() bool { t.Error("asked DuckDB of a shape in the history"); return false }) {
+		t.Error("seeded forms of runs on workers: not the faster")
 	}
 	// Without a coordinator, footprints all the same.
 	footprints = workload.NewController(22 * gb)

@@ -998,7 +998,7 @@ func mergeSorted(ctx context.Context, files []string, keys []resolvedKey, out st
 		return err
 	}
 	for r.Next() {
-		if err := w.WriteBuffered(r.RecordBatch()); err != nil {
+		if err := writeRowGroups(w, r.RecordBatch()); err != nil {
 			return err
 		}
 	}
@@ -1006,4 +1006,54 @@ func mergeSorted(ctx context.Context, files []string, keys []resolvedKey, out st
 		return err
 	}
 	return w.Close()
+}
+
+// writeRowGroups writes rec to w, a writer of buffered row groups, in row
+// groups of as many rows as take about RowGroupBytes at rec's bytes a row,
+// or of mergeRowGroup rows, whichever is fewer: a merge of rows of bitmaps
+// of megabytes each otherwise held 122,880 of them in its row group.
+func writeRowGroups(w *pqarrow.FileWriter, rec arrow.RecordBatch) error {
+	n := rec.NumRows()
+	if n == 0 {
+		return nil
+	}
+	var size int64
+	for _, col := range rec.Columns() {
+		size += recordBytes(col.Data())
+	}
+	fit := int64(RowGroupBytes) / max(size/n, 1)
+	for lo := int64(0); lo < n; {
+		held, err := w.RowGroupNumRows()
+		if err != nil {
+			return err
+		}
+		room := fit - int64(held)
+		if held > 0 && room <= 0 {
+			w.NewBufferedRowGroup()
+			continue
+		}
+		hi := min(lo+max(room, 1), n)
+		s := rec.NewSlice(lo, hi)
+		err = w.WriteBuffered(s)
+		s.Release()
+		if err != nil {
+			return err
+		}
+		lo = hi
+	}
+	return nil
+}
+
+// recordBytes is the bytes of an array's buffers and its children's.
+func recordBytes(d arrow.ArrayData) int64 {
+	var n int64
+	for _, b := range d.Buffers() {
+		if b != nil {
+			n += int64(b.Len())
+		}
+	}
+	for _, c := range d.Children() {
+		n += recordBytes(c)
+	}
+	return n
 }

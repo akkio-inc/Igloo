@@ -25,7 +25,10 @@ import (
 // the rows are at most Options.Memory over Options.Threads rows as wide as
 // the schema's types make them (filerewrite.RowWidth). Maintenance records
 // the size it set in rowGroupsProperty, after "auto:", and leaves alone a
-// size it did not set, a user's. The proxy records its first size there too
+// size it did not set, a user's. Wide rows get fewer rows than DuckDB's own
+// (see filerewrite.TargetRows), though DuckDB puts a vector of rows, up to
+// 2,048, in a row group whatever the size, so rows past 8 KiB make larger
+// ones until a rewrite writes them as aimed. The proxy records its first size there too
 // (see catalogproxy's firstRowGroups), which maintenance then corrects.
 const (
 	rowGroupsProperty = "igloo.row-groups"

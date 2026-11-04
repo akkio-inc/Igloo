@@ -203,12 +203,12 @@ func startWriteServerWith(t *testing.T, coordinate func(*distributed.Options), c
 }
 
 // writeWorkers says what workers a writeEnv has: of cores, taking their memory
-// for memory, and with a DuckDB of limit, if set; and what size every table
-// claims, if set.
+// for memory, with a DuckDB of limit, if set, loading the rb extension at rb,
+// if set; and what size every table claims, if set.
 type writeWorkers struct {
 	cores         int
 	memory, claim int64
-	limit         string
+	limit, rb     string
 }
 
 // startWriteServerOn is startWriteServerWith on such workers.
@@ -234,7 +234,7 @@ func startWriteServerOn(t *testing.T, workers writeWorkers, coordinate func(*dis
 	}
 	var addrs []string
 	for i := range 2 {
-		addr, _, _ := startTestWorkerLimited(t, dir, i, env.gate, "", workers.cores, workers.memory, workers.limit)
+		addr, _, _ := startTestWorkerLimited(t, dir, i, env.gate, workers.rb, workers.cores, workers.memory, workers.limit)
 		f := &writeFault{target: addr, client: &http.Transport{TLSClientConfig: clientTLS, ForceAttemptHTTP2: true}}
 		srv := httptest.NewUnstartedServer(f)
 		srv.TLS = serverTLS.Clone()
@@ -361,6 +361,56 @@ func (e *writeEnv) local(t *testing.T, query string) string {
 	return strings.Join(texts(t, e.admin, query), "\n")
 }
 
+// TestFullRefreshOnWorkers checks where refreshes run under auto mode, as reads
+// of their queries would. A view of sums that later refreshes go on from runs
+// its full refresh's partial aggregates on workers, and the next refresh, after
+// a write, goes on from the state they leave. A view counting distinct values,
+// whose state would keep them in bitmaps merged here, runs its query whole on
+// workers each time, and keeps no state. Each has its query's rows.
+func TestFullRefreshOnWorkers(t *testing.T) {
+	t.Parallel()
+	rb := os.Getenv("IGLOO_TEST_RB_EXTENSION")
+	if rb == "" {
+		if os.Getenv("CI") != "" {
+			t.Fatal("IGLOO_TEST_RB_EXTENSION is not set: CI builds the rb extension (extensions/rb/build.sh)")
+		}
+		t.Skip("IGLOO_TEST_RB_EXTENSION is not set; build the rb extension with extensions/rb/build.sh")
+	}
+	env := startWriteServerOn(t, writeWorkers{cores: 8, memory: 4 << 30, claim: 300 << 20, rb: rb}, nil)
+	admin := env.admin
+	sums := "SELECT g, count(*) AS n, sum(x) AS s FROM lake.public.src GROUP BY g"
+	reach := "SELECT g, count(DISTINCT id) AS d, count(*) AS n, sum(x) AS s FROM lake.public.src GROUP BY g"
+	mustExec(t, admin, "CREATE MATERIALIZED VIEW sums_mv AS "+sums)
+	mustExec(t, admin, "CREATE MATERIALIZED VIEW reach_mv AS "+reach)
+	same := func(what, view, query string) {
+		t.Helper()
+		if got, want := env.local(t, "SELECT * FROM "+view+" ORDER BY ALL"), env.local(t, query+" ORDER BY ALL"); got != want {
+			t.Errorf("%s, %s:\n%s\nwant:\n%s", what, view, got, want)
+		}
+	}
+	for _, step := range []struct{ what, sums, reach string }{
+		{"the first refresh", actionFull, actionFull},
+		{"the refresh after a write", actionIncremental, actionFull},
+	} {
+		mustExec(t, admin, "REFRESH MATERIALIZED VIEW sums_mv")
+		mustExec(t, admin, "REFRESH MATERIALIZED VIEW reach_mv")
+		onWorkers := func(detail string) bool {
+			return strings.Contains(detail, "its query ran on") && strings.Contains(detail, "in the background")
+		}
+		action, detail, _, reason := viewRefresh(t, admin, "public.sums_mv")
+		if action != step.sums || reason != "" || action == actionFull && !onWorkers(detail) {
+			t.Errorf("%s of the sums: %s: %s (%s)", step.what, action, detail, reason)
+		}
+		action, detail, _, reason = viewRefresh(t, admin, "public.reach_mv")
+		if action != step.reach || reason != bitmapsOnWorkers || !onWorkers(detail) {
+			t.Errorf("%s of the reach: %s: %s (%s)", step.what, action, detail, reason)
+		}
+		same(step.what, "sums_mv", sums)
+		same(step.what, "reach_mv", reach)
+		mustExec(t, admin, "INSERT INTO src SELECT i, i % 7, i * 2, 'more', TIMESTAMP '2026-02-01' FROM range(40000, 40100) AS r(i)")
+	}
+}
+
 // TestWorkersWrite checks that the tasks of a fill write the table's files,
 // and that it holds the rows this replica would compute, on each way a table
 // is filled from a query: CREATE TABLE ... AS, CREATE OR REPLACE, dbt's
@@ -480,9 +530,9 @@ func TestWorkersWrite(t *testing.T) {
 
 // TestWorkersWritePartitions checks that workers write partitioned tables:
 // one file per partition per task, each in its partition, which readers prune
-// by; and that NULLs and values no path could hold are fine. A table
-// partitioned by bucket, whose values a file's bounds do not give, is written
-// here.
+// by; and that NULLs and values no path could hold are fine. Workers write
+// tables partitioned by bucket too, each file of one bucket; a bucket of
+// strings, whose Parquet bounds may be cut short, is written here.
 func TestWorkersWritePartitions(t *testing.T) {
 	t.Parallel()
 	env := startWriteServer(t)
@@ -511,7 +561,11 @@ func TestWorkersWritePartitions(t *testing.T) {
 		{"truncate string", "truncate(3, name)", "left(name, 3)", true},
 		{"two", "g, day(ts)", "", true},
 		{"identity decimal", "price", "", false},
-		{"bucket", "bucket(4, g)", "", false},
+		{"bucket", "bucket(4, g)", "iceberg_bucket(4, g)", true},
+		{"bucket int32", "bucket(3, small)", "iceberg_bucket(3, small)", true},
+		{"bucket date", "bucket(8, day)", "iceberg_bucket(8, day)", true},
+		{"bucket timestamp", "bucket(5, ts)", "iceberg_bucket(5, ts)", true},
+		{"bucket string", "bucket(4, name)", "", false},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			table := "w_p_" + strings.ReplaceAll(c.name, " ", "_")

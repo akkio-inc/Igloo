@@ -62,7 +62,8 @@ func (r *rows) Next(dst []driver.Value) error {
 			r.chunk.close()
 			r.closeChunk = false
 		}
-		chunk := mapping.FetchChunk(r.res)
+		var chunk mapping.DataChunk
+		r.guard(func() { chunk = mapping.FetchChunk(r.res) })
 		if chunk.Ptr == nil {
 			return io.EOF
 		}
@@ -170,7 +171,7 @@ func (r *rows) Close() error {
 	if r.closeChunk {
 		r.chunk.close()
 	}
-	mapping.DestroyResult(&r.res)
+	r.guard(func() { mapping.DestroyResult(&r.res) })
 
 	var err error
 	if r.stmt != nil {

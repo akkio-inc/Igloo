@@ -49,6 +49,7 @@ import (
 	"github.com/akkio-inc/igloo/internal/erasure"
 	"github.com/akkio-inc/igloo/internal/flightsql"
 	"github.com/akkio-inc/igloo/internal/iddomain"
+	"github.com/akkio-inc/igloo/internal/logwriter"
 	"github.com/akkio-inc/igloo/internal/maintenance"
 	"github.com/akkio-inc/igloo/internal/memlimit"
 	"github.com/akkio-inc/igloo/internal/models"
@@ -120,6 +121,8 @@ func main() {
 	default:
 		err = serve()
 	}
+	// What was logged last, before the process ends.
+	logwriter.FlushAll()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "igloo:", err)
 		os.Exit(1)
@@ -280,7 +283,7 @@ func serve() error {
 	cancel()
 
 	reg := prometheus.NewRegistry()
-	reg.MustRegister(collectors.NewGoCollector(), collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))
+	reg.MustRegister(collectors.NewGoCollector(), collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}), logDropped())
 	reg.MustRegister(eng.Metrics()...)
 	work := activity.New()
 
@@ -362,12 +365,17 @@ func serve() error {
 	var tables *distributed.Iceberg
 	if cat != nil {
 		tables = distributed.NewIceberg(cat)
+		tables.SetVersions(eng.TableVersion)
+		// A table written here or elsewhere loads again as it changes, not
+		// as the next statement looks it up.
+		go tables.WatchChanges(ctx, eng.DataVersion)
 	}
 
 	// Reading ahead for statements lists their scans as distributed
-	// execution plans them.
+	// execution plans them, and so does estimating what a statement nothing
+	// like has run of holds before it starts.
 	var scanner *distributed.Scanner
-	if cfg.Prefetch.Enabled && tables != nil && eng.Prefetcher() != nil {
+	if tables != nil {
 		if scanner, err = distributed.NewScanner(tables); err != nil {
 			return err
 		}
@@ -578,7 +586,8 @@ func serve() error {
 	// uses besides (see memlimit.Adapt).
 	if memory.Total > 0 {
 		go memlimit.Watch(ctx, memory.Total, srv.ShedMemory)
-		go memlimit.Adapt(ctx, memory.Total, memory.DuckDB, func(n int64) error { return eng.SetMemoryLimit(ctx, n) }, log)
+		go memlimit.Adapt(ctx, memory.Total, memory.DuckDB, func(n int64) error { return eng.SetMemoryLimit(ctx, n) },
+			func() (int64, bool) { return eng.HeldMemory(ctx) }, log)
 		log.Info("memory watch is on", "cancels_below", memlimit.Format(memlimit.Low(memory.Total)),
 			"spills_more_below", memlimit.Format(memlimit.High(memory.Total)))
 	}
@@ -1240,11 +1249,36 @@ func limitMemory(duckdb int64, log *slog.Logger) memlimit.Plan {
 }
 
 func newLogger(cfg config.Config) *slog.Logger {
-	opts := &slog.HandlerOptions{Level: cfg.LogLevel}
-	if cfg.LogFormat == "json" {
-		return slog.New(slog.NewJSONHandler(os.Stderr, opts))
+	return logTo(cfg.LogFormat, cfg.LogLevel)
+}
+
+// logOut is the process's log output, written without holding up the code
+// that logs (see logwriter).
+var logOut = logwriter.New(os.Stderr, logwriter.DefaultMax)
+
+// logTo returns the process's logger, of format (json or text) at level, to
+// logOut, which warns through it when it drops lines.
+func logTo(format string, level slog.Leveler) *slog.Logger {
+	opts := &slog.HandlerOptions{Level: level}
+	var log *slog.Logger
+	if format == "json" {
+		log = slog.New(slog.NewJSONHandler(logOut, opts))
+	} else {
+		log = slog.New(slog.NewTextHandler(logOut, opts))
 	}
-	return slog.New(slog.NewTextHandler(os.Stderr, opts))
+	logOut.OnDrop(func(n uint64) {
+		log.Warn("the log's output did not keep up, and lines were dropped rather than hold up what logged them",
+			"dropped", n, "dropped_total", logOut.Dropped())
+	})
+	return log
+}
+
+// logDropped is the metric of the lines logOut dropped.
+func logDropped() prometheus.Collector {
+	return prometheus.NewCounterFunc(prometheus.CounterOpts{
+		Name: "igloo_log_lines_dropped_total",
+		Help: "Log lines dropped because the log's output (stderr, and whatever reads it) did not keep up; logging never waits for it.",
+	}, func() float64 { return float64(logOut.Dropped()) })
 }
 
 func loadTLS(certFile, keyFile string) (*tls.Config, error) {

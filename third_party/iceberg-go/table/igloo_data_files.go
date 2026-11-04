@@ -46,7 +46,10 @@ func (t *Transaction) DataFiles(ctx context.Context, paths []string) ([]iceberg.
 // DataFilesFrom is DataFiles of files another engine wrote as it could, reading
 // their footers from fsys, for a caller that checks what its parser is to read. A
 // column the table requires may be optional in a file, as COPY writes them all: the
-// caller is to check that the file's null counts for it are none.
+// caller is to check that the file's null counts for it are none. The caller wrote
+// each file to hold the rows of one partition, so a transform that does not keep
+// order, bucket's, gives its partition from its lowest value, which its highest
+// must agree with (see PartitionValueOfOne).
 func (t *Transaction) DataFilesFrom(ctx context.Context, fsys iceio.IO, paths []string) ([]iceberg.DataFile, error) {
 	spec, err := t.meta.CurrentSpec()
 	if err != nil || spec == nil {
@@ -58,7 +61,7 @@ func (t *Transaction) DataFilesFrom(ctx context.Context, fsys iceio.IO, paths []
 		fields[i] = optionalField(fields[i])
 	}
 
-	return filesToDataFilesOf(ctx, fsys, iceberg.NewSchema(schema.ID, fields...), *spec, t.meta.defaultSortOrderID, t.meta.props, paths, runtime.GOMAXPROCS(0))
+	return filesToDataFilesOf(ctx, fsys, iceberg.NewSchema(schema.ID, fields...), *spec, t.meta.defaultSortOrderID, t.meta.props, paths, runtime.GOMAXPROCS(0), true)
 }
 
 // optionalField is field with it and all it holds optional.

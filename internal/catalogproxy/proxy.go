@@ -150,9 +150,6 @@ type Proxy struct {
 	lists *listings
 	// names are how the catalog spells its tables' names (see names.go).
 	names *names
-	// sharedHold refuses listings and drops while the catalog lock is
-	// held shared (see holds.go).
-	sharedHold
 	// data goes up whenever a table may have changed (see DataVersion).
 	data dataVersion
 	// pending are the notes of staged creates (see pending.go).
@@ -298,7 +295,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	p.notePrefix(rest)
-	if p.refuseShared(w, r, rest) || p.forgotten(w, r, rest) {
+	if p.forgotten(w, r, rest) {
 		return
 	}
 	switch r.Method {
@@ -358,14 +355,19 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if p.takeCommit(w, r, rest, body) {
 		return
 	}
-	// A change makes the listings kept stale: forgotten before it, so no
-	// listing begun before it is kept, and after it, so none answered
-	// while it was under way is. So does it the versions of the tables it
-	// changes.
+	// A change that may make, drop or rename a name makes the listings of its
+	// namespaces stale (see staleListings): forgotten before it, so no listing
+	// begun before it is kept, and after it, so none answered while it was
+	// under way is. A change raises the versions of the tables it changes.
 	tables, known, none := changedTables(r.Method, rest, body)
+	scopes, all := staleListings(r.Method, rest, body)
 	changed := func() {
-		if !none {
+		if all {
 			p.lists.forget()
+		} else {
+			p.lists.forgetSome(scopes)
+		}
+		if !none {
 			p.data.bumpTables(tables, known)
 		}
 	}

@@ -182,17 +182,32 @@ type Limits struct {
 	// Apart says it is to run in the replica's second DuckDB, whose memory
 	// SampleMemory does not read. It is the statement's, not the user's.
 	Apart bool
-	// Unseen says no statement of its shape has run here, so that nothing is
-	// known of what it holds (see Controller.full). It is the statement's,
-	// not the user's.
+	// Unseen says no statement like it has run here, so that nothing is known
+	// of what it holds, and its plan does not say it holds little (see
+	// Controller.full and Controller.Slight). It is the statement's, not the
+	// user's.
 	Unseen bool
 	// Estimated says Memory is what statements like it held, not what its role or
 	// user set. It is the statement's, not the user's.
 	Estimated bool
+	// Sample says to sample what it holds as it runs (see SampleMemory), though
+	// nothing holds it back: a refresh of a materialized view, whose runs that
+	// ran out of memory must say what they held. It is the statement's, not the
+	// user's.
+	Sample bool
 	// Elsewhere, if set, receives once the statement is admitted what to call if
 	// it goes on to run on workers (see Controller.elsewhere). It is the
 	// statement's, not the user's.
 	Elsewhere *func()
+	// Alone says the statement is to run alone: it starts once no other
+	// statement holds a reservation and DuckDB holds little, as a reservation
+	// of all the memory does, but it holds nobody back as it waits: those
+	// behind it start whenever they fit. One statement at a time waits or
+	// runs so; Admit refuses another with ErrAloneTaken. It is the
+	// statement's, not the user's.
+	Alone bool
+	// yields says it holds nobody back as it waits (see Alone).
+	yields bool
 }
 
 // Slots is a limit on statements running at once, shared by everyone

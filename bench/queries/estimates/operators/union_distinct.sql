@@ -1,0 +1,1 @@
+SELECT count(*) FROM (SELECT k1 AS x FROM facts UNION SELECT k2 FROM facts);
