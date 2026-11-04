@@ -634,9 +634,12 @@ estimate corpus: a scan's row and byte, a hash join's row probed, built on
 and made, an aggregate's row and group and its distinct and median-like
 aggregates, a sort's or window's rows times their logarithm, and an
 UNNEST's row, a microsecond and more where the statement writes the list,
-as FLATTEN of a row's object does. Of the corpus's statements that took 2 s
-or more alone, it puts 58% within twice what they took on a first run,
-where hash tables' rows alone put 8%. Workers also take
+as FLATTEN of a row's object does. Over the corpus's 450 statements, it
+puts 70% within twice what they took on a first run and 14 more than four
+times short, where hash tables' rows alone put 47% and 97; of the 26 that
+took 2 s or more alone, 58% and 5, where they put 8% and 18. On the
+holdout (see below), 59% and 41 of all, and 48% and 6 of the 31 of 2 s or
+more. Workers also take
 about 8 seconds to start a statement and 5 for each level of its stages
 (stages that read what another wrote wait for it; those of one level run
 at once), plus the time to start workers that are stopped. Against the
@@ -725,10 +728,15 @@ does, where DuckDB keeps every row, unless its scan is filtered so already,
 as one audience's rows of a lookup are, which DuckDB counted; where that
 row is the most value of a column over a table, unfiltered, it keeps no
 more than the rows of the row groups that hold the most value, read from
-the footers of the few files whose Iceberg bounds reach it (a lookup of
-1.41 billion rows had 189,400 of its latest version, in row groups of
-384,204, where a third of its rows by the versions' distinct count took a
-report for 191 GB, ten times what it held; it is now taken for 15 GB); one group by
+the footers of the files whose Iceberg bounds reach it, up to 16, once a
+snapshot and only when such a join is estimated (a lookup of 1.41 billion
+rows had 189,400 of its latest version, in 2 files of 19.7 million rows
+and row groups of 384,204, where a third of its rows by the versions'
+distinct count took a report for 191 GB, ten times what it held; it is
+now taken for 15 GB; at a hundred times the data, the version is in 8 of
+1,483 files, 76.3 million rows, and row groups of 2.05 million); integer
+columns stored as `DECIMAL(p,0)`, as a Snowflake `NUMBER` arrives, have
+bounds as integer columns do; one group by
 DuckDB's estimate of keys nothing knows is not one row; a `TOP_N` keeps what
 it says; a cross product with a small source of
 its own, as `FLATTEN` over a list of objects becomes, makes a row for each
@@ -784,9 +792,16 @@ plan of each, the rows each operator made, and the peak of what DuckDB held
 for it, sampled every few milliseconds; `TestEstimateCorpus` replays the
 estimate over them (`internal/distributed/testdata/estimates`) and fails if
 it gets worse. Over 450 statements, the estimate on a first run is within
-twice what they held for 67% of them, and more than four times short for 2,
-where it was 50% and 43; with DuckDB's estimates of each operator's rows
-replaced by the rows it made, 86% and 2, where it was 49% and 67. What it
+twice what they held for 69% of them, and more than four times short for
+none, where it was 50% and 43; with their tables analyzed, 80% and 1; as
+they run again, having learned from their own runs, 78% and 1; and with
+DuckDB's estimates of each operator's rows replaced by the rows it made,
+86% and 2, where it was 49% and 67. A holdout, a second capture of the same
+statements with their tables analyzed, which the costs were not fitted on,
+puts 80% within twice on a first run and as they run again, 4 more than
+four times short, and 82% and 4 by the rows made. Two captures of a
+statement agree within twice on what it held 93% of the time, and on how
+long it took 88%: no estimate can do much better than that. What it
 counts besides each operator's rows: what a scan's readers hold, about three
 times the part of a row group the columns it reads take, compressed, on each
 thread (Iceberg's manifests give the columns' sizes), which held 100 to 300
@@ -796,7 +811,7 @@ or `LATERAL` subquery's join, which materializes its input whole and, as
 list has values; aggregates that keep their values (`list`, `string_agg`);
 and distinct aggregates sized by their pairs of groups and values where
 their distinct counts are known. The bounds Iceberg's manifests keep of
-columns of integer types, dates and timestamps bound how many distinct
+columns of integer types (`DECIMAL(p,0)` among them), dates and timestamps bound how many distinct
 values they have, and so how many groups a grouping by them makes
 (`date_trunc` and casts of timestamps to dates included), and how many rows a
 join of them makes at least. And what operators made in statements that ran
@@ -924,7 +939,10 @@ So a statement that took 127 s on 16 workers, estimated at 89, is taken
 to need 153 s on 8, and one that then took 112 s on 8 runs on 8 next. A
 TPC-DS statement of seven levels at a hundred times the data that took 4.8
 s on 16 workers stays there: scaled whole by its run over its estimate,
-8 workers looked as fast for less, and took 14.7 s. A statement that
+8 workers looked as fast for less, and took 14.7 s. Carried over so, two
+reports' runs on 16 workers at ten times the data predict their runs on
+8, 4, 2 and 1 within a factor of 1.18 at the root mean square of the
+logarithms, where scaling the whole estimate was within 1.25. A statement that
 failed on a number of workers, or on the large worker, in the last day (a
 worker out of memory, a read that failed) is taken to need one and a half
 times as long as it ran there before it failed, so that other ways weigh
