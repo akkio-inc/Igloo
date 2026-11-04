@@ -294,11 +294,12 @@ func estimateTimes(stages []*Stage, m machine, f fleet) estimate {
 // features are what a plan's estimates are made of.
 type features struct {
 	// bytes are what its stages read of tables, as selective filters leave
-	// them (see filtersSelectively); exchanged what the stages that write
-	// exchanges read of tables in full, and held as selective filters leave
-	// it.
-	bytes, exchanged int64
-	held             float64
+	// them (see filtersSelectively), and direct those of them of tables no
+	// stage that writes an exchange reads; exchanged what the stages that
+	// write exchanges read of tables in full, and held as selective filters
+	// leave it.
+	bytes, direct, exchanged int64
+	held                     float64
 	// rows are the rows its stages go through (see rowWork); levels its
 	// stages' longest chain, and stages how many there are.
 	rows           float64
@@ -729,6 +730,9 @@ func planFeatures(stages []*Stage) features {
 			b = int64(float64(b) * filterSelectivity)
 		}
 		x.bytes += b
+		if _, ok := exchanged[k]; !ok {
+			x.direct += b
+		}
 	}
 	for k, cols := range exchanged {
 		b := cols.bytes(tables[k])

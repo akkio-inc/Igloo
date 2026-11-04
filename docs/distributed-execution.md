@@ -618,7 +618,10 @@ what it reads from object storage cold per core (about 9 MB/s at one and a
 half threads a core, 16 MB/s at four; its read cache holds what it read
 lately, which a statement's first run seldom has), and the workers', at
 0.4 of that rate for their cores and threads, as their tasks read column
-chunks in parts and write and read exchanges; each no less than the rows
+chunks in parts and write and read exchanges, and at the full rate what
+parts that write no exchange read, sending their rows or partial
+aggregates to the replica (a dashboard's tiles of 16 GB took 12 to 15 s
+on 16 workers just started, their disks empty); each no less than the rows
 its parts go through take at 150 million rows a second per core, once for
 the scan and again for each join and grouping (a hundredth of a table's
 rows where a part filters it so), for a statement that reads little but

@@ -92,6 +92,16 @@ const (
 	// s on 4 and 127 s on 16 (see TestFleetCalibration).
 	levelCost       = 5.0
 	workerReadShare = 0.4
+	// directReadShare is workerReadShare for what stages read that write
+	// no exchange, sending their rows or partial aggregates to the
+	// coordinator: a worker's core reads those at one machine's cold rate.
+	// On 16 workers of 8 cores and 12 threads just started, their disks
+	// empty, a dashboard's first four tiles' stages of 15.9 to 16.7 GB took
+	// 11.9 to 14.9 s at once, 8.8 to 11 MB/s a core each, where the cold rate
+	// is 8.9 at their threads and workerReadShare of it 3.6. With their disks
+	// warm, one such tile, estimated at 72 s on workers, ran on one machine
+	// for 42 s and 844 CPU-s, where workers took 1 to 16 s for it after.
+	directReadShare = 1.0
 	// largeStageCost is what a level of stages takes on the large worker,
 	// where its exchanges, if any, stay on its own disk: at ten times the
 	// data, stages exchanging through workers' disks ran three to eight
@@ -241,7 +251,8 @@ func threadsPerCore(threads, cores int) float64 {
 
 // onFleet estimates the plan's time on n of f's workers: a statement's own
 // start, each level of its stages' round of tasks (levelCost), and what
-// its stages read, at workerReadShare of one machine's cold rate, or the
+// its stages read, at workerReadShare of one machine's cold rate, or at
+// directReadShare of it what stages that write no exchange read, or the
 // rows they go through, whichever takes longer, on n workers' cores at
 // their threads a core; and the start of the workers that do not run.
 //
@@ -265,8 +276,9 @@ func (x features) onFleet(n int, f fleet) option {
 		}
 	}
 	cores := float64(n * max(f.cores, 1))
-	rate := coldRateAt(threadsPerCore(f.threads, f.cores)) * workerReadShare
-	work := max(float64(x.bytes)/(cores*rate), x.rows/(cores*rowRate))
+	rate := coldRateAt(threadsPerCore(f.threads, f.cores))
+	read := float64(x.bytes-x.direct)/workerReadShare + float64(x.direct)/directReadShare
+	work := max(read/(cores*rate), x.rows/(cores*rowRate))
 	o.estimate = startCost + float64(max(x.levels, 1))*levelCost + work*o.spill.factor + x.onWorkersWrite(n*max(f.cores, 1))
 	if n > f.running {
 		o.estimate += f.start.Seconds()

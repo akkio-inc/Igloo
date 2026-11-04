@@ -146,6 +146,38 @@ func TestChoose(t *testing.T) {
 	}
 }
 
+// TestDirectReads checks that what stages that write no exchange read counts
+// apart (features.direct), and that workers read it at one machine's cold rate
+// a core, not workerReadShare of it: on 16 workers of 8 cores and 12 threads
+// just started, their disks empty, a dashboard's first four tiles' stages of
+// 15.9 to 16.7 GB, sending partial aggregates to the coordinator, took 11.9 to
+// 14.9 s at once.
+func TestDirectReads(t *testing.T) {
+	impressions := &Table{Schema: "main", Name: "impressions", Bytes: 16.7e9, Columns: []Column{{Name: "k", Type: "VARCHAR"}}}
+	audience := &Table{Schema: "main", Name: "audience", Bytes: 1e9, Columns: []Column{{Name: "k", Type: "VARCHAR"}}}
+	x := &Exchange{ID: 0}
+	tile := []*Stage{{Inputs: []Input{{Table: impressions, Split: true}}}}
+	report := []*Stage{
+		{Inputs: []Input{{Table: audience, Split: true}}, Out: x},
+		{Inputs: []Input{{Exchange: x, Partitioned: true}, {Table: impressions}}},
+	}
+	if f := planFeatures(tile); f.direct != 16.7e9 || f.bytes != 16.7e9 {
+		t.Errorf("a stage to the coordinator: direct %d of %d bytes", f.direct, f.bytes)
+	}
+	if f := planFeatures(report); f.direct != 16.7e9 || f.bytes != 17.7e9 {
+		t.Errorf("a report whose last stage reads a table: direct %d of %d bytes", f.direct, f.bytes)
+	}
+	work := func(f features) float64 { return f.onFleet(16, benchWorkers).estimate - startCost - levelCost }
+	if w := work(planFeatures(tile)); w < 11.9/1.25 || w > 14.9*1.25 {
+		t.Errorf("the tile's reading on 16 workers: %.1f s; its stages took 11.9 to 14.9 s", w)
+	}
+	f := planFeatures(tile)
+	f.direct = 0
+	if slower, w := work(f), work(planFeatures(tile)); slower < 2*w {
+		t.Errorf("read by a stage that writes an exchange: %.1f s, want at least twice %.1f s", slower, w)
+	}
+}
+
 // TestEstimateTimes checks the estimates of a plan: one machine's from
 // the coordinator's cores and threads, reading cold, longer short of
 // memory; the workers' from their start, their stages and their cores and

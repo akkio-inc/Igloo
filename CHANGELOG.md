@@ -625,6 +625,14 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   audience, which FLATTENs people's objects and took 7 s alone, is estimated at
   3.7 s, where it was at 1.9.
 
+- Auto mode estimates what workers read for parts that write no exchange, which
+  send their rows or partial aggregates to the replica, at the replica's cold rate
+  per core, not 0.4 of it. On 16 workers just started, their disks empty, a
+  dashboard's first four tiles of 16 GB took 12 to 15 s at once. Auto mode had
+  estimated such a tile at 72 s on workers against 99 s on one machine, and kept
+  its first run on the replica for 42 s and 844 CPU-s. It now estimates the tile
+  at about 50 s and runs it on workers.
+
 - Auto mode no longer gives up planning a statement for workers while its session
   waits for the catalog lock. A refresh beside a fleet's dashboards took the lock
   alone 12 times for up to 13 s, and 275 dashboard statements counted that wait
