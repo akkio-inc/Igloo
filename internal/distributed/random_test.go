@@ -268,10 +268,13 @@ func (g *gen) orderAll(cols []string) string {
 // of their own, grouped by section, ranked within each, and filtered on the section
 // from outside, which leaves out of the plan the branches the filter rejects (see
 // pruneBranches). Read twice, ranked over every section, grouped in more than one
-// grouping set, limited or filtered together with another column, they stay.
+// grouping set or not by section, filtered together with another column, under a
+// LIMIT, DISTINCT ON, QUALIFY, SAMPLE, a volatile function, INTERSECT or EXCEPT, they
+// stay: each is a place a filter must stop, and a change that lets it pass one of
+// them returns other rows than one machine.
 func (g *gen) sections() string {
 	// The sections' tags, of one type, a few alike, one NULL; and filters on them.
-	tags := []string{"'ash'", "'Birch'", "'CEDAR'", "CAST(NULL AS VARCHAR)", "'elm'", "'ash'"}
+	tags, typ := []string{"'ash'", "'Birch'", "'CEDAR'", "CAST(NULL AS VARCHAR)", "'elm'", "'ash'"}, "VARCHAR"
 	filters := []string{
 		"upper(%[1]s) IN ('ASH', 'CEDAR')", "%[1]s IN ('ash', 'Birch')", "%[1]s NOT IN ('ash', 'elm')",
 		"%[1]s NOT IN ('ash', NULL)", "%[1]s IS NULL", "%[1]s IS NOT NULL", "CAST(%[1]s AS VARCHAR(10)) = 'Birch'",
@@ -279,7 +282,7 @@ func (g *gen) sections() string {
 		"NOT (upper(%[1]s) = 'ASH')", "length(%[1]s) > 3", "%[1]s > 'B'", "upper(%[1]s) = upper('birch')",
 	}
 	if g.chance(0.3) {
-		tags = []string{"1", "2", "3", "CAST(NULL AS INTEGER)", "CAST(4 AS BIGINT)", "2"}
+		tags, typ = []string{"1", "2", "3", "CAST(NULL AS INTEGER)", "CAST(4 AS BIGINT)", "2"}, "BIGINT"
 		filters = []string{"%[1]s IN (1, 3)", "%[1]s NOT IN (2)", "%[1]s IS NULL", "CAST(%[1]s AS VARCHAR) IN ('1', '4')",
 			"%[1]s + 1 > 2", "%[1]s BETWEEN 2 AND 3", "coalesce(%[1]s, 0) = 0"}
 	}
@@ -292,13 +295,47 @@ func (g *gen) sections() string {
 	// branch reads a source for a section; the union's first names the columns.
 	branch := func(tag, name string) string {
 		src := sources[g.r.IntN(len(sources))]
-		b := fmt.Sprintf("SELECT %s AS %s, %s AS c, %s AS x FROM %s", tag, name, src.c, src.x, src.from)
+		where := ""
 		if g.chance(0.5) {
-			b += " WHERE " + g.pred("t")
+			where = " WHERE " + g.pred("t")
 		}
-		return b
+		// Or sections of each row by a CASE over a key, as Snowflake's FLATTEN
+		// translated makes them: of the section itself, or of a struct's field
+		// through stars and an unnest, with an arm of NULL.
+		var arms []string
+		for i := range g.n(2, 3) {
+			arms = append(arms, fmt.Sprintf("WHEN k.i = %d THEN %%s", i))
+		}
+		armed := func(value func(tag string) string) string {
+			var b strings.Builder
+			b.WriteString("CASE")
+			for _, a := range arms {
+				b.WriteString(" " + fmt.Sprintf(a, value(tags[g.r.IntN(len(tags))])))
+			}
+			b.WriteString(" ELSE " + value("NULL") + " END")
+			return b.String()
+		}
+		switch g.n(0, 5) {
+		case 0:
+			return fmt.Sprintf("SELECT %s AS %s, %s AS c, %s AS x FROM %s CROSS JOIN range(%d) AS k(i)%s",
+				armed(func(tag string) string { return tag }), name, src.c, src.x, src.from, len(arms)+1, where)
+		case 1:
+			kind := armed(func(tag string) string {
+				if tag == "NULL" {
+					return g.pick("NULL", "struct_pack(sec := CAST(NULL AS "+typ+"), w := B.c)")
+				}
+				return "struct_pack(sec := CAST(" + tag + " AS " + typ + "), w := " + g.pick("1", "B.c") + ")"
+			})
+			inner := fmt.Sprintf("SELECT B.*, %s AS s FROM (SELECT %s AS c, %s AS x FROM %s%s) AS B CROSS JOIN range(%d) AS k(i)",
+				kind, src.c, src.x, src.from, where, len(arms)+1)
+			if g.chance(0.5) {
+				inner = "SELECT B.*, unnest([1, 2]) AS e FROM (" + inner + ") AS B"
+			}
+			return fmt.Sprintf("SELECT q.s.sec AS %s, q.c AS c, q.x AS x FROM (%s) AS q", name, inner)
+		}
+		return fmt.Sprintf("SELECT %s AS %s, %s AS c, %s AS x FROM %s%s", tag, name, src.c, src.x, src.from, where)
 	}
-	op := g.pick("UNION ALL", "UNION ALL", "UNION")
+	op := g.pick("UNION ALL", "UNION ALL", "UNION ALL", "UNION", "INTERSECT", "EXCEPT ALL")
 	var ctes, branches []string
 	for i := range g.n(2, 5) {
 		tag, name := tags[g.r.IntN(len(tags))], "sec"
@@ -326,8 +363,15 @@ func (g *gen) sections() string {
 	// Grouped by section, in one grouping set or more; gc tells a rollup's rows
 	// from groups whose c is NULL, so that the ranking's order is total.
 	agg := "SELECT sec, c, count(*) AS n, sum(x) AS sx, 0 AS gc FROM items GROUP BY sec, c"
-	if g.chance(0.15) {
+	switch g.n(0, 9) {
+	case 0, 1:
 		agg = "SELECT sec, c, count(*) AS n, sum(x) AS sx, grouping(c) AS gc FROM items GROUP BY GROUPING SETS ((sec, c), (sec))"
+	case 2:
+		// A section of groups not of sections.
+		agg = "SELECT min(sec) AS sec, c, count(*) AS n, sum(x) AS sx, 0 AS gc FROM items GROUP BY c"
+	case 3:
+		// Groups of every section, whose section is NULL.
+		agg = "SELECT sec, c, count(*) AS n, sum(x) AS sx, grouping(sec) AS gc FROM items GROUP BY GROUPING SETS ((sec, c), (c))"
 	}
 	ctes = append(ctes, "agg AS ("+agg+")")
 	win := g.pick("row_number() OVER (PARTITION BY sec ORDER BY n DESC, gc, c NULLS FIRST)", "rank() OVER (PARTITION BY sec, c ORDER BY n DESC)",
@@ -346,12 +390,23 @@ func (g *gen) sections() string {
 		return q + "SELECT * FROM ranked WHERE " + fmt.Sprintf(filter, "sec", "n") + " AND " + cut
 	}
 	inner := "SELECT sec, c, n, sx, gc, r FROM ranked"
-	switch {
-	case g.chance(0.15):
+	switch g.n(0, 10) {
+	case 0:
 		// Every row, so that the result is the same whichever it keeps.
 		inner += " ORDER BY sec, c LIMIT 100000"
-	case g.chance(0.4):
+	case 1, 2, 3:
 		inner += " ORDER BY sec"
+	case 4:
+		// Some rows, of every section: (sec, c, gc) is unique.
+		inner += fmt.Sprintf(" ORDER BY sec NULLS FIRST, c NULLS FIRST, gc, n LIMIT %d", g.n(2, 30))
+	case 5:
+		inner = "SELECT DISTINCT ON (c) sec, c, n, sx, gc, r FROM ranked ORDER BY c NULLS FIRST, sec NULLS FIRST, gc"
+	case 6:
+		inner += fmt.Sprintf(" QUALIFY row_number() OVER (ORDER BY n DESC, sec NULLS FIRST, c NULLS FIRST, gc) <= %d", g.n(2, 30))
+	case 7:
+		inner += " USING SAMPLE 100 PERCENT (bernoulli)"
+	case 8:
+		inner += " WHERE gen_random_uuid() IS NOT NULL"
 	}
 	other := ""
 	if g.chance(0.15) {
@@ -537,7 +592,7 @@ func TestRandomAgreement(t *testing.T) {
 	ctx := context.Background()
 	broadcast := h.co.maxBroadcast
 	// cut counts runs whose stages kept only some rows early, by QUALIFY or LIMIT,
-	// and pruned those that left out union branches a filter rejects.
+	// and pruned those that left out branches of unions or arms of CASE a filter rejects.
 	ran, invalid, failed, cut, pruned := 0, 0, 0, 0, 0
 	for i := range len(randomFound) + queries {
 		q, name := "", ""
@@ -601,7 +656,7 @@ func TestRandomAgreement(t *testing.T) {
 	}
 	h.co.maxBroadcast, h.co.partialRows = broadcast, ""
 	total := len(randomFound) + queries
-	t.Logf("seed %d: %d queries, %d not valid SQL, %d ran on workers, %d runs cut rows early, %d left out union branches, %d results differed",
+	t.Logf("seed %d: %d queries, %d not valid SQL, %d ran on workers, %d runs cut rows early, %d left out branches or arms, %d results differed",
 		seed, total, invalid, ran, cut, pruned, failed)
 	if valid := total - invalid; valid > 0 && ran*2 < valid {
 		t.Errorf("only %d of %d valid queries ran on workers", ran, valid)

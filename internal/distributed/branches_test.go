@@ -65,6 +65,49 @@ func TestPrunedBranches(t *testing.T) {
 	}
 }
 
+// TestPrunedArms checks that a filter on a column of kinds made by a CASE over a
+// key, as a FLATTEN translated makes them, followed through a ranking over each
+// kind, a GROUP BY of it, a struct's field, stars and an unnest, keeps only the
+// rows of the kinds it keeps where the CASE is computed, and the statement's rows
+// as one machine's; and that it does not where the filter reads other columns.
+func TestPrunedArms(t *testing.T) {
+	h := newHarness(t, 0.01, 2, 1)
+	h.tables["lineitem"].Bytes = 1 << 34
+	report := func(filter string) string {
+		return `WITH kinds AS (SELECT q.s.kind AS kind, q.k AS k, q.v AS v FROM (SELECT B.*, unnest([1, 2]) AS e FROM (
+				SELECT B.*, CASE WHEN r.i = 0 THEN struct_pack(kind := 'overall', w := 1) WHEN r.i = 1 THEN struct_pack(kind := 'parts', w := 2)
+					ELSE struct_pack(kind := 'orders', w := 3) END AS s
+				FROM (SELECT l_partkey AS k, l_quantity AS v FROM lineitem) AS B CROSS JOIN range(3) AS r(i)) AS B) AS q),
+			agg AS (SELECT kind, k % 10 AS g, count(*) AS n, sum(v) AS a FROM kinds GROUP BY kind, k % 10),
+			ranked AS (SELECT kind, g, n, a, CASE WHEN kind = 'overall' THEN 0 ELSE row_number() OVER (PARTITION BY kind ORDER BY n DESC, g) END AS r FROM agg)
+			SELECT t0.* FROM (SELECT * FROM ranked) AS t0 WHERE ` + filter
+	}
+	for _, c := range []struct {
+		filter string
+		pruned int
+	}{
+		{"upper(t0.kind) != 'OVERALL' AND t0.r <= 3", 1},
+		{"t0.kind IN ('parts') AND t0.r <= 3", 2},
+		{"t0.n > 0 AND t0.r <= 3", 0},
+	} {
+		q := report(c.filter)
+		want, _, err := h.query(t.Context(), q)
+		if err != nil {
+			t.Fatalf("%s: %v", c.filter, err)
+		}
+		got, _, plan, _, err := h.run(t.Context(), q, ModeOn)
+		if err != nil {
+			t.Fatalf("%s: %v", c.filter, err)
+		}
+		if msg := compareRows(want, got, false); msg != "" {
+			t.Errorf("%s: %s\n%s", c.filter, msg, plan.describe())
+		}
+		if plan.pruned != c.pruned {
+			t.Errorf("%s: left out %d, want %d\n%s", c.filter, plan.pruned, c.pruned, plan.describe())
+		}
+	}
+}
+
 // TestBranchesStayUnderDistinctOn checks that a filter on a union's constant
 // column leaves its branches be under a DISTINCT ON of other columns, which picks
 // a row of each group that the filter may then reject: one machine returns none

@@ -92,7 +92,7 @@ func (co *Coordinator) Explain(ctx context.Context, query string, env Env, mode 
 		rows = append(rows, [2]string{"buckets", b})
 	}
 	if plan.pruned > 0 {
-		rows = append(rows, [2]string{"left out", fmt.Sprintf("%d union branches a filter around them rejects", plan.pruned)})
+		rows = append(rows, [2]string{"left out", fmt.Sprintf("%d branches of unions and arms of CASE a filter around them rejects", plan.pruned)})
 	}
 	for _, u := range plan.uncertain {
 		how := u.name + ": written and measured first, then read whole if every task can hold it, or by partition as planned"

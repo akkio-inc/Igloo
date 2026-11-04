@@ -237,8 +237,8 @@ type Plan struct {
 	// streamMerged says the session reads a merge of sorted rows as a
 	// stream (see StreamMerged).
 	streamMerged bool
-	// pruned counts the union branches left out of it, which a filter around
-	// them rejects (see pruneBranches).
+	// pruned counts the branches of unions and arms of CASE left out of it,
+	// which a filter around them rejects (see pruneBranches).
 	pruned int
 }
 

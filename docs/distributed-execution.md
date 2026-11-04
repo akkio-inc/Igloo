@@ -1325,7 +1325,11 @@ other manifests only with that port open between them, or say `object`.
   the replica's memory, but never moves one to workers by them. A stage
   that joins a table filtered by a constant to other rows, as an audience
   joins events, shows as a `semi-join estimate` of the share of rows it
-  keeps, which the estimates do not count yet. The query is checked as it
+  keeps, which the estimates do not count yet. `left out` counts the
+  branches of unions, and the arms of a CASE that makes kinds of each row
+  as a translated FLATTEN does, whose constant a filter around them rejects,
+  through GROUP BYs of its column and rankings over each of its values: the
+  stages compute none of their rows. The query is checked as it
   would be when run, grants and policies included, and the same rewrites
   apply: it is prepared again as its run prepares it, through ID domains'
   ids and bitmap indexes with the bitmaps it reads, and planned and checked
