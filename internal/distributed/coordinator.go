@@ -1180,7 +1180,6 @@ func (co *Coordinator) Execute(ctx context.Context, plan *Plan, settings []Setti
 				co: co, qid: id, dir: ex.dir, ws: ws, files: files, settings: settings, variables: vars, force: planned.force,
 				sp: &spool{limit: limit}, parts: parts, smaller: smaller, slots: slots, roots: spreadRoots(co.opts.Warehouse, id), local: local, erased: erased,
 				exchanges: map[int]*exchangeRun{}, results: map[int]*jobResult{}, used: map[string]bool{}, target: target,
-				places: newPlaces(ws, slots),
 			}
 			// The exchanges are read only by the stages: once they have run,
 			// the statement's rows need not wait for their removal.

@@ -249,9 +249,6 @@ func (e *execution) recover(ctx context.Context, addr string, err error, reader 
 		}
 		e.lost[addr] = true
 		e.mu.Unlock()
-		if e.places != nil {
-			e.places.leave(addr)
-		}
 	}
 	start := time.Now()
 	n, waited, rerr := e.writeAgain(ctx, addr)

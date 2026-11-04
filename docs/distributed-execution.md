@@ -1060,21 +1060,12 @@ with what each of its steps took. A table's metadata, which planning reads,
 loads again in the background as soon as a commit changes the table, so the
 statements after a commit find it loaded rather than wait for it.
 
-Stages that do not read each other's rows run side by side, and the
-coordinator sends a statement's tasks to a worker as it has room for them,
-as many as its slots run at once. Each task has a worker it goes to first
-(a scan's share of files, the worker whose read cache holds them from
-earlier statements; others, each worker in turn), and goes there when that
-worker has room; a worker with room that
-no waiting task goes to first takes the task that has waited longest. A slow
-or busy worker so runs fewer of a stage's tasks, and the others more, rather
-than hold up the stage until it has run a share as large as theirs: a report
-on 16 workers took 573.9 s at the median against 677.7 s, and 626.2 s against
-1,048.1 s with one worker at half speed. A worker
-runs as many tasks at once as it has slots, and gives the next free ones to
-a task that runs again what a lost worker held, then to the statement that
-has started the fewest tasks there, so that a short statement gets past a
-long one's, and among those, to the first task to come.
+A stage sends all of its tasks to the workers at once, and stages that do not
+read each other's rows run side by side. A worker runs as many tasks at once
+as it has slots, and gives the next free ones to a task that runs again what
+a lost worker held, then to the statement that has started the fewest tasks
+there, so that a short statement gets past a long one's, and among those,
+to the first task to come.
 
 ## Same results as one machine
 
