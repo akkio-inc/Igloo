@@ -545,8 +545,8 @@ func TestObserveRefresh(t *testing.T) {
 // TestStateRowGroupsByBytes checks that the files of a refresh's state that
 // keeps bitmaps hold about as many bytes of them as the server sets in each row
 // group, in a full refresh and in an incremental one, rather than 122,880 rows:
-// here a few kilobytes, so one bitmap a row group. The view keeps its query's
-// rows.
+// here a few kilobytes, so one bitmap a row group, all in one file rather than
+// a file each. The view keeps its query's rows.
 func TestStateRowGroupsByBytes(t *testing.T) {
 	t.Parallel()
 	if os.Getenv("IGLOO_TEST_RB_EXTENSION") == "" {
@@ -557,9 +557,9 @@ func TestStateRowGroupsByBytes(t *testing.T) {
 	mustExec(t, admin, "CREATE TABLE visits AS SELECT i % 5 AS g, i AS person FROM range(200000) AS r(i)")
 	const query = "SELECT g, count(DISTINCT person) AS people, count(*) AS n FROM visits GROUP BY g"
 	mustExec(t, admin, "CREATE MATERIALIZED VIEW reach AS "+query)
-	// rowGroups returns the row groups the state's files written since since
-	// hold, and the most rows one of them holds.
-	rowGroups := func(since time.Time) (groups, most int) {
+	// rowGroups returns the state's files written since since, the row groups
+	// they hold, and the most rows one of them holds.
+	rowGroups := func(since time.Time) (written, groups, most int) {
 		t.Helper()
 		files, err := filepath.Glob(filepath.Join(env.dir, "*", "data", "*.parquet"))
 		if err != nil {
@@ -577,9 +577,12 @@ func TestStateRowGroupsByBytes(t *testing.T) {
 			n, rows, _ := strings.Cut(got[0], "|")
 			k, _ := strconv.Atoi(n)
 			m, _ := strconv.Atoi(rows)
+			if k > 0 {
+				written++
+			}
 			groups, most = groups+k, max(most, m)
 		}
-		return groups, most
+		return written, groups, most
 	}
 	for _, step := range []struct{ what, action string }{{"full", actionFull}, {"incremental", actionIncremental}} {
 		since := time.Now()
@@ -587,8 +590,8 @@ func TestStateRowGroupsByBytes(t *testing.T) {
 		if action, detail, _, reason := viewRefresh(t, admin, "public.reach"); action != step.action {
 			t.Fatalf("the %s refresh: %s: %s (%s)", step.what, action, detail, reason)
 		}
-		if groups, most := rowGroups(since); groups != 5 || most != 1 {
-			t.Errorf("the %s refresh wrote the state in %d row groups of up to %d rows, want one a bitmap", step.what, groups, most)
+		if written, groups, most := rowGroups(since); written != 1 || groups != 5 || most != 1 {
+			t.Errorf("the %s refresh wrote the state in %d files of %d row groups of up to %d rows, want one file of one a bitmap", step.what, written, groups, most)
 		}
 		if got, want := texts(t, admin, "SELECT * FROM reach ORDER BY ALL"), texts(t, admin, query+" ORDER BY ALL"); !slices.Equal(got, want) {
 			t.Errorf("after the %s refresh: %q, want %q", step.what, got, want)

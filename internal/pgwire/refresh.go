@@ -339,8 +339,8 @@ const stateRowGroupBytes = distributed.RowGroupBytes
 // of a billion impressions' distinct devices by advertiser and channel, 2 GB,
 // were one row group, and reading them back took more than 1 GB at once, which
 // a replica busy with dashboards could not give. The refresh failed and ran
-// again, for minutes. Written a slice a statement, each is a row group of its
-// own; slices of 8 MB took 1.4 s for the 2 GB, and read back in 1 GB.
+// again, for minutes. Each slice is written as a row group of its own (see
+// stateInserts); slices of 8 MB read back in 1 GB.
 func (r *refresher) slices(ctx context.Context, rel string) ([][2]int64, error) {
 	var blobs []string
 	for _, c := range r.plan.StateColumns() {
@@ -365,6 +365,52 @@ func (r *refresher) slices(ctx context.Context, rel string) ([][2]int64, error) 
 		out = append(out, [2]int64{lo, lo + per})
 	}
 	return out, nil
+}
+
+// slicesAStatement is how many slices of a state one INSERT writes (see
+// stateInserts).
+const slicesAStatement = 64
+
+// stateInserts returns the INSERTs into state that write rows(slice) for
+// each of slices, slicesAStatement of them a statement, joined by UNION ALL.
+// Each slice reaches DuckDB's writer as a vector of its own, which the
+// state's row group size of one row (see sliceRowGroups) makes a row group of
+// its own. A statement a slice made a file a slice, which on object storage
+// is a request each: 650 bitmaps of 7.7 MB, 5 GB, took 93 s to write that
+// way, most of a refresh that took 145 s, and 15.5 s 64 a statement, in 11
+// files, which read back in 8 s rather than 4.
+func stateInserts(state string, slices [][2]int64, rows func(slice [2]int64) string) []string {
+	var out []string
+	for lo := 0; lo < len(slices); lo += slicesAStatement {
+		var parts []string
+		for _, slice := range slices[lo:min(lo+slicesAStatement, len(slices))] {
+			parts = append(parts, "("+rows(slice)+")")
+		}
+		out = append(out, "INSERT INTO "+state+" "+strings.Join(parts, " UNION ALL "))
+	}
+	return out
+}
+
+// sliceRowGroups gives the state table name a row group size of one row,
+// which ends a row group at each vector DuckDB's writer gets, where the state
+// is written in slices (see stateInserts), unless it has it.
+func (r *refresher) sliceRowGroups(ctx context.Context, name string, slices [][2]int64) error {
+	if r.s.ddl == nil || len(slices) == 0 || slices[0][0] < 0 {
+		return nil
+	}
+	tbl, err := r.s.ddl.LoadTable(ctx, refreshSchema, name)
+	if err != nil {
+		return err
+	}
+	if tbl.Properties()[rowGroupSizeProperty] == "1" {
+		return nil
+	}
+	if _, err := r.exec(ctx, "SELECT * FROM set_iceberg_table_properties("+quoteName([]string{r.s.catalogName(), refreshSchema, name})+
+		", {'"+rowGroupSizeProperty+"': '1'})"); err != nil {
+		return fmt.Errorf("size the row groups of the state table %s.%s: %w", refreshSchema, name, err)
+	}
+	r.s.ddl.TableChanged(refreshSchema, name)
+	return nil
 }
 
 // inSlice is the condition that a row of alias, of a temporary table, is in
@@ -864,9 +910,10 @@ func (r *refresher) mergeGroups(ctx context.Context, input, detail string) (refr
 	if err != nil {
 		return refreshResult{}, "", err
 	}
-	for _, slice := range slices {
-		stateStmts = append(stateStmts, "INSERT INTO "+state+" "+alive+inSlice("m", slice))
+	if err := r.sliceRowGroups(ctx, r.st.State, slices); err != nil {
+		return refreshResult{}, "", err
 	}
+	stateStmts = append(stateStmts, stateInserts(state, slices, func(slice [2]int64) string { return alive + inSlice("m", slice) })...)
 	var rows int64
 	if whole != "" {
 		rows, err = r.replaceRows(ctx, whole, stateStmts...)
@@ -963,11 +1010,12 @@ func (r *refresher) full(ctx context.Context, why string) (refreshResult, error)
 	if err != nil {
 		return refreshResult{}, err
 	}
-	var stateStmts []string
-	for _, slice := range slices {
-		stateStmts = append(stateStmts, "INSERT INTO "+state+" SELECT "+r.stateColumns()+" FROM ("+
-			p.StateRows("__igloo_full AS full_state WHERE true"+inSlice("full_state", slice))+") AS f")
+	if err := r.sliceRowGroups(ctx, name, slices); err != nil {
+		return refreshResult{}, err
 	}
+	stateStmts := stateInserts(state, slices, func(slice [2]int64) string {
+		return "SELECT " + r.stateColumns() + " FROM (" + p.StateRows("__igloo_full AS full_state WHERE true"+inSlice("full_state", slice)) + ") AS f"
+	})
 	n, err := r.replaceRows(ctx, final, stateStmts...)
 	if err != nil {
 		return refreshResult{}, err

@@ -2661,6 +2661,12 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   8 million new impressions takes 8 to 9 s, and writes 267 row groups of up
   to 9 MB.
 
+- A refresh writes a state of bitmaps in a few files, rather than a file for
+  each 8 MB row group, each a request of its own to object storage. Writing
+  5 GB of state, 650 bitmaps of 7.7 MB, took 93 s a file each and takes 15.5 s
+  in 11 files; it was most of the 145 s an incremental refresh of a view of
+  distinct devices over 1.55 billion impressions took after 4 million new ones.
+
 - Igloo's other Parquet files keep their row groups near 8 MB too, and tables of
   wide rows get fewer rows a row group. A task's result was written in DuckDB's
   row groups of 122,880 rows, 250 MB for rows of 2 KB; it is now cut
