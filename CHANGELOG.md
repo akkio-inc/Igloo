@@ -2502,6 +2502,14 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
 
 ### Fixed
 
+- A cancel always stops the statement. A statement is prepared, readied
+  and run in steps, and a cancel request, the console's cancel, the client
+  going or the memory watch stopped the step running then. It was lost as a
+  step ended, between two steps as the statement waited for the catalog's
+  lock, and after it ran out of memory, before it ran again, and the
+  statement ran to its end: a test's ran for 30 minutes. The cancel now ends
+  the statement's next step too.
+
 - A statement that runs out of memory runs again rather than fail. DuckDB
   fails whichever statement asks for memory the others hold, so the
   statement waits for all of the replica's memory and runs again alone; if

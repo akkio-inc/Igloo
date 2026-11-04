@@ -305,7 +305,7 @@ func (f *stagedFill) again(err error) bool {
 	if f.ctx.Err() == nil {
 		return isOutOfMemory(err)
 	}
-	if f.sess.outer == nil || !f.sess.ranOutOfMemory(f.ctx, err) {
+	if f.sess.outer == nil || !f.sess.ranOutOfMemory(f.ctx, err) || f.sess.wasCanceled() {
 		return false
 	}
 	ctx, end := f.sess.rearm(f.sess.outer, f.ctx)

@@ -545,6 +545,10 @@ type Server struct {
 	// starts to be prepared, with the context that ends its preparing (for
 	// tests).
 	beforePrepare func(ctx context.Context, text string)
+	// beforeRun, if set, runs as a client's statement (query) has the
+	// catalog lock it runs under, between the steps before its run and the
+	// run (for tests).
+	beforeRun func(sess *session, query string)
 	// heavy says which statements run in the second DuckDB (see
 	// background.go), and lane is that DuckDB; heavy is nil to run all in
 	// the first.
@@ -1114,6 +1118,12 @@ type session struct {
 	shed         bool
 	shedAt       time.Time
 	exiting      bool
+	// stepping counts the client's statements the session is in the steps
+	// of, and canceled says a cancel request, the console's cancel or the
+	// client going ended the one it runs, whether a step of it ran then or
+	// it was between two (see steps).
+	stepping int
+	canceled bool
 	// stuck, set for a client's session, lets the client go when its
 	// statement does not stop once canceled; watched is the context of the
 	// statement's run it watches (see watchStuck).
@@ -1463,7 +1473,9 @@ func (s *Server) runHere(ctx context.Context, sess *session, st *statement, args
 // rearm returns the context to run a statement again under after ctx, the
 // one runCancelable gave it, ended because the memory watch canceled it:
 // one under outer that a cancel request or the memory watch can end, with
-// what is left of the statement timeout. While ctx lasts, it is ctx.
+// what is left of the statement timeout. While ctx lasts, it is ctx. It is
+// ended already if a cancel request, the console's cancel or the client
+// going ended the statement too, which running it again would undo.
 func (sess *session) rearm(outer, ctx context.Context) (context.Context, context.CancelFunc) {
 	if ctx.Err() == nil {
 		return ctx, func() {}
@@ -1476,13 +1488,74 @@ func (sess *session) rearm(outer, ctx context.Context) (context.Context, context
 		again, cancel = context.WithCancel(outer)
 	}
 	sess.mu.Lock()
-	sess.running, sess.shed = cancel, false
+	sess.shed = false
+	sess.armLocked(cancel, false)
 	if sess.watched != nil {
 		// The stuck watch watches the run again (see watchStuck).
 		sess.watched = again
 	}
 	sess.mu.Unlock()
 	return again, cancel
+}
+
+// steps has sess in the steps of a client's statement from now until the
+// function it returns: what Igloo does for it under cancelable, and its run
+// under runCancelable. Between two of them, as the statement waits for the
+// catalog's lock, none runs, and a cancel request, the console's cancel or
+// the client going found nothing to end: the statement ran to its end. It
+// now ends the next step, which starts canceled (see armLocked).
+func (sess *session) steps() (end func()) {
+	sess.mu.Lock()
+	if sess.stepping == 0 {
+		sess.canceled = false
+	}
+	sess.stepping++
+	sess.mu.Unlock()
+	return func() {
+		sess.mu.Lock()
+		if sess.stepping--; sess.stepping == 0 {
+			sess.canceled = false
+		}
+		sess.mu.Unlock()
+	}
+}
+
+// armLocked, under sess.mu, makes cancel what a cancel request ends of the
+// statement sess runs: the step of it that starts now (see cancelable,
+// runCancelable and rearm). A step of a statement that was canceled starts
+// canceled. fresh says the step may start a statement, as one outside a
+// client's statement's steps does, which a cancel of the one before does not
+// end.
+func (sess *session) armLocked(cancel context.CancelFunc, fresh bool) {
+	if fresh && sess.stepping == 0 {
+		sess.canceled = false
+	}
+	sess.running = cancel
+	if sess.canceled {
+		cancel()
+	}
+}
+
+// cancelLocked ends, under sess.mu, the statement sess runs, for a cancel
+// request, the console's cancel or the client going: the step of it that
+// runs, and the steps after. It reports whether sess was running one.
+func (sess *session) cancelLocked() bool {
+	if sess.running == nil && sess.stepping == 0 {
+		return false
+	}
+	sess.canceled = true
+	if sess.running != nil {
+		sess.running()
+	}
+	return true
+}
+
+// wasCanceled says a cancel request, the console's cancel or the client
+// going ended the statement sess runs (see cancelLocked).
+func (sess *session) wasCanceled() bool {
+	sess.mu.Lock()
+	defer sess.mu.Unlock()
+	return sess.canceled
 }
 
 // cancelable returns a context that a cancel request, the session's
@@ -1498,11 +1571,16 @@ func (sess *session) cancelable(ctx context.Context, query string) (context.Cont
 		ctx, cancel = context.WithCancel(ctx)
 	}
 	sess.mu.Lock()
-	sess.running, sess.statement, sess.started, sess.shed = cancel, redactQuery(query), time.Now(), false
+	sess.statement, sess.started, sess.shed = redactQuery(query), time.Now(), false
+	sess.armLocked(cancel, true)
 	sess.mu.Unlock()
 	return ctx, func(err error) error {
-		ended := ctx.Err()
 		sess.mu.Lock()
+		// Read under mu, which a cancel holds as it ends the step: one that
+		// came as the step ended is seen here, or found no step to end. Read
+		// before, a memory-watch cancel in between was lost, and the
+		// statement ran to its end.
+		ended := ctx.Err()
 		shed, exiting := sess.shed, sess.exiting
 		sess.running, sess.statement, sess.started = nil, "", time.Time{}
 		sess.mu.Unlock()
@@ -1539,7 +1617,9 @@ func (sess *session) runCancelable(ctx context.Context, query string, fn func(co
 	sess.outer = ctx
 	ctx, cancel := context.WithCancel(ctx)
 	sess.mu.Lock()
-	sess.running, sess.statement, sess.started, sess.shed, sess.queued = cancel, redactQuery(query), time.Now(), false, true
+	sess.statement, sess.started, sess.shed, sess.queued = redactQuery(query), time.Now(), false, true
+	sess.armLocked(cancel, true)
+	canceled, exiting := sess.canceled, sess.exiting
 	sess.runShape = sess.wl.controller.Alike(sess.wl.exact, sess.wl.shape)
 	sess.mu.Unlock()
 
@@ -1550,6 +1630,13 @@ func (sess *session) runCancelable(ctx context.Context, query string, fn func(co
 		sess.mu.Unlock()
 		cancel()
 	}()
+	switch {
+	case canceled && exiting:
+		return errServerExiting
+	case canceled:
+		// Between its steps (see steps).
+		return errCanceledBeforeRun
+	}
 
 	queued, cancelQueued := ctx, context.CancelFunc(func() {})
 	if timeout := sess.queuedTimeout(); timeout > 0 {
@@ -1666,8 +1753,9 @@ func (s *Server) ShedMemory(available int64) bool {
 	s.orphans.reset()
 	longest.mu.Lock()
 	defer longest.mu.Unlock()
-	if longest.running == nil {
-		return false
+	if longest.running == nil || longest.queued {
+		// It ended the step it ran a moment ago, or waits in line for its run.
+		return acted
 	}
 	longest.shed, longest.shedAt = true, time.Now()
 	longest.running()
@@ -2135,6 +2223,9 @@ func (s *Server) preparedQuery(ctx context.Context, sess *session, user auth.Use
 			// Simple-protocol statements run once.
 			defer sess.release(ps) //nolint:errcheck
 		}
+		// A cancel between its steps, as it waits for an AI function's
+		// first calls or the catalog's lock, ends it too.
+		defer sess.steps()()
 
 		args, err := decodeParams(params, st.params)
 		if err != nil {
@@ -2253,6 +2344,9 @@ func (s *Server) preparedQuery(ctx context.Context, sess *session, user auth.Use
 		// the metrics and ownership bookkeeping below, to keep the exclusive
 		// window short (see catalogRunLock, holdCatalog).
 		releaseCatalog := s.catalogRunLock(sess, st)
+		if s.beforeRun != nil {
+			s.beforeRun(sess, q.Query)
+		}
 		outer := ctx
 		// A query or a change of data waits its turn behind the replica's
 		// limit of statements at once, if there is one.
@@ -3523,9 +3617,7 @@ func (r *registry) cancel(pid, secret int32) {
 		return
 	}
 	sess.mu.Lock()
-	if sess.running != nil {
-		sess.running()
-	}
+	sess.cancelLocked()
 	sess.mu.Unlock()
 }
 

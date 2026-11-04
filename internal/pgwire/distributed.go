@@ -657,6 +657,10 @@ func (s *Server) afterOutOfMemory(outer, ctx context.Context, sess *session, st 
 	s.dist.ObserveOutOfMemory(parts.key)
 	retry, release := sess.rearm(outer, ctx)
 	defer release()
+	if retry.Err() != nil && sess.wasCanceled() {
+		// A cancel came as it ran out (see rearm).
+		return errCanceledBeforeRun
+	}
 	s.log.Warn("a statement ran out of memory on this replica; running it on workers", "user", user.Name, "key", parts.key, "err", cause)
 	since := time.Now()
 	// As an admin's forced statement runs: auto mode chose this replica

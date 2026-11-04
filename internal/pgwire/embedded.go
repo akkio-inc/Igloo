@@ -515,10 +515,9 @@ func (s *Server) CancelStatement(pid int32, by string) bool {
 	}
 	sess.mu.Lock()
 	defer sess.mu.Unlock()
-	if sess.running == nil {
+	if !sess.cancelLocked() {
 		return false
 	}
-	sess.running()
 	s.log.Info("statement canceled", "user", sess.user.Name, "pid", pid, "by", by)
 	return true
 }

@@ -121,10 +121,9 @@ func TestShedMemoryGivesUpOnStuckStatements(t *testing.T) {
 	// memory critical with nothing running, see
 	// TestShedMemoryExitsForOrphanedWork).
 	behaved := run("SELECT count(*) FROM range(10000000000) a(i), range(1000) b(j) WHERE i + j < 0")
-	eventually("the statement did not start", running(1))
-	if !srv.ShedMemory(enough) {
-		t.Fatal("nothing shed")
-	}
+	// Running, it may be between two steps when the watch looks, with nothing
+	// to shed; the watch looks again a moment later.
+	eventually("nothing shed", func() bool { return running(1)() && srv.ShedMemory(enough) })
 	if err := <-behaved; pgCode(err) != "53200" {
 		t.Errorf("the canceled statement: %v", err)
 	}

@@ -128,11 +128,7 @@ func (e *EmbeddedSession) SetApplicationName(name string) { e.sess.setApplicatio
 func (e *EmbeddedSession) Cancel() bool {
 	e.sess.mu.Lock()
 	defer e.sess.mu.Unlock()
-	if e.sess.running == nil {
-		return false
-	}
-	e.sess.running()
-	return true
+	return e.sess.cancelLocked()
 }
 
 // PreparedStatement is a statement prepared in an embedded session to run

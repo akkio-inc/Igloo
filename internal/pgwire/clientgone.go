@@ -85,14 +85,14 @@ func (s *Server) cancelForGoneClients() {
 			continue
 		}
 		sess.mu.Lock()
-		cancel, first := sess.running, !sess.clientGone
+		first := !sess.clientGone
 		sess.clientGone = true
 		text, user, pid, started := sess.statement, sess.user.Name, sess.pid, sess.started
+		// Under mu, as the step it ends could otherwise end first, and the
+		// statement go on to its next.
+		canceled := sess.cancelLocked()
 		sess.mu.Unlock()
-		if cancel != nil {
-			cancel()
-		}
-		if first {
+		if first && canceled {
 			sum := sha256.Sum256([]byte(text))
 			s.log.Info("a client went away while its statement ran; canceled the statement", "pid", pid, "user", user,
 				"statement_sha256", hex.EncodeToString(sum[:8]), "running_for", time.Since(started).Round(time.Millisecond))

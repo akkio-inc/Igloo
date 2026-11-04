@@ -164,9 +164,10 @@ func (s *Server) failAndExit(stuck *session, all []*session) {
 			continue
 		}
 		sess.mu.Lock()
-		if sess.running != nil {
+		// Between two steps of its statement too (see steps).
+		if sess.running != nil || sess.stepping > 0 {
 			sess.exiting = true
-			sess.running()
+			sess.cancelLocked()
 			others = append(others, sess)
 		}
 		sess.mu.Unlock()
@@ -175,7 +176,7 @@ func (s *Server) failAndExit(stuck *session, all []*session) {
 		left := 0
 		for _, sess := range others {
 			sess.mu.Lock()
-			if sess.running != nil {
+			if sess.running != nil || sess.stepping > 0 {
 				left++
 			}
 			sess.mu.Unlock()

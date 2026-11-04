@@ -120,11 +120,19 @@ func (s *Server) rerunsAlone(sess *session, fn func(context.Context) error) func
 func (sess *session) runAgainAlone(outer, ctx context.Context, alone *runAlone, fn func(context.Context) error) error {
 	again, cancel := sess.rearm(outer, ctx)
 	defer cancel()
+	if again.Err() != nil && sess.wasCanceled() {
+		// A cancel came as it ran out (see rearm).
+		return errCanceledBeforeRun
+	}
 	l := sess.wl.limits
 	l.Memory, l.Estimated, l.Unseen = math.MaxInt64, false, false
 	l.Counted, l.Apart = sess.wl.counted, sess.wl.apart
 	done, _, err := sess.wl.controller.Admit(again, l)
 	if err != nil {
+		if sess.wasCanceled() {
+			// As it waited.
+			return errCanceledBeforeRun
+		}
 		return alone.cause
 	}
 	// Its history keeps the larger of what its runs held.
