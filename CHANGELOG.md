@@ -2556,8 +2556,9 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   limit, not from what DuckDB held, so its first steps freed nothing. On a machine
   of 60 GiB, a report was canceled 40 s after each of two starts. The read-back now
   reuses its buffers, returns them when it ends, and stops when what Igloo can still
-  allocate falls below a quarter of its memory. Igloo now lowers DuckDB's limit from
-  what DuckDB holds, so DuckDB drops those parts first. In a replica of 36 GiB, with
+  allocate falls below a quarter of its memory. A replica now lowers DuckDB's limit
+  from what DuckDB holds, so DuckDB drops those parts first; a worker, whose DuckDB
+  holds its tasks' work, lowers it from the limit as before. In a replica of 36 GiB, with
   16 dashboard users and a heavy report starting during a read-back of 19 GB, the
   least memory left rose from 2.0 GiB, under the 2.25 GiB at which Igloo cancels
   statements, to 5.1 GiB. Go held 0.1 GiB once the read-back ended, not 5.4 GiB.

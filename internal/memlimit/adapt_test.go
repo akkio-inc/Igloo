@@ -8,7 +8,8 @@ import (
 )
 
 // TestAdapt checks when Adapt changes DuckDB's memory limit: down at once
-// while memory is short, from what DuckDB holds where that is less, never
+// while memory is short, from what DuckDB holds where that is less and it
+// is told, as a replica is, and from the limit where not, as on a worker; never
 // below half the configured limit, and back up a step at a time, only after
 // memory has stayed plentiful.
 func TestAdapt(t *testing.T) {
@@ -50,6 +51,15 @@ func TestAdapt(t *testing.T) {
 	if len(sets) != 1 || sets[0] != 30<<30 {
 		t.Fatalf("holding 36 GiB, with 3 GiB left: %v, want [30 GiB]", sets)
 	}
+	// A worker, which is not told what its DuckDB holds, its tasks' work:
+	// down from the limit, whatever DuckDB holds.
+	told := a.held
+	a.limit, sets, a.held = base, nil, nil
+	step(time.Second)
+	if len(sets) != 1 || sets[0] != 42<<30 {
+		t.Fatalf("not told what it holds, with 3 GiB left: %v, want [42 GiB]", sets)
+	}
+	a.held = told
 	a.limit, sets, held, heldOK = base, nil, 0, false
 	// Still short, but it never goes below half of base.
 	left = 1 << 30

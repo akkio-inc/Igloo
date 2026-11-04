@@ -267,10 +267,11 @@ using all of its cores.
   second: what the container's memory limit leaves of its working set, and
   the machine's available memory. When that falls below an eighth of
   Igloo's memory (at least 512 MiB), Igloo first lowers DuckDB's memory
-  limit, down to half of `IGLOO_MEMORY_LIMIT` at most, and below what
-  DuckDB holds where that is less than its limit, so that DuckDB drops
-  the parts of files it keeps in memory and writes buffers to its spill
-  files, and gives their memory back at once: under
+  limit, down to half of `IGLOO_MEMORY_LIMIT` at most, and on a replica
+  below what DuckDB holds where that is less than its limit, so that DuckDB
+  drops the parts of files it keeps in memory and writes buffers to its
+  spill files, and gives their memory back at once (a worker, whose DuckDB
+  holds its tasks' work, lowers it from the limit): under
   heavy work DuckDB keeps its tracked memory at its limit and uses more
   besides, 8 GiB more for one statement on a 61 GiB machine. It raises the
   limit back a step at a time once memory has stayed plentiful for 30
