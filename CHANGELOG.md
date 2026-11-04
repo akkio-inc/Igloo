@@ -1934,6 +1934,13 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
 
 ### Performance and cost
 
+- Three or more common table expressions of one statement that group the same
+  rows the same way, as reports count one join several ways, are grouped once, in
+  a common table expression marked `MATERIALIZED` that each reads (see [SQL](docs/sql.md)):
+  DuckDB scanned, joined and grouped the rows once for each. A dashboard's two
+  reports of six such took 480 to 488 CPU-seconds rather than 781 to 898 at ten
+  times its data on 8 cores and 22 GB, and its 324 queries 1,684 s rather than 1,808.
+
 - With no workers, a replica runs statements known to be heavy (their shape last
   used 5 seconds of all its cores) in a second DuckDB of its process, whose
   threads give way to the first's, and a read not yet known to be heavy starts

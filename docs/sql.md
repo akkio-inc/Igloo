@@ -45,6 +45,22 @@ the statement as it runs; query history shows it as sent. A report that
 selected twice from one subquery of 17 common table expressions took 597 s
 on an 8-core machine and takes 128 s.
 
+Three or more common table expressions of one `WITH` that each group the
+same rows the same way, as reports write to count one join several ways (a
+`SELECT DISTINCT id, x`, a `count(DISTINCT day)` by `id, x` and a `count(*)`
+by `id, x`, all over the same `FROM` and `WHERE`), have DuckDB scan, join and
+group those rows once for each. Igloo groups them once, in either dialect, in
+a common table expression marked `MATERIALIZED` (named `_igloo_siblings_1`,
+...) with every aggregate they ask for, and each reads its columns from it.
+It does so where each is `SELECT [DISTINCT] ... FROM ... [WHERE ...] [GROUP
+BY ...]` and nothing else, with the same `FROM` and `WHERE` (compared as
+shared subqueries are) and the same groups, selects only its groups and
+`count`, `sum`, `min`, `max` and `avg` calls (no `FILTER` or `OVER`), names
+every column, and calls no volatile function. Keeping the groups costs about
+one grouping, so two stay as written. A report of two sets of three over 40
+million rows took 110 CPU-seconds rather than 224, and 11 s rather than 40 on
+16 cores.
+
 A `UNION ALL` whose branches select from the same rows, as reports write to
 compare several measures of one audience (`SELECT v.id, 'email' AS
 channel, ... FROM v JOIN g ON g.id = v.id UNION ALL SELECT v.id, 'video',

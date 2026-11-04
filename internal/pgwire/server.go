@@ -3165,6 +3165,9 @@ func (s *Server) prepareCheckedText(ctx context.Context, sess *session, user aut
 	if factored := s.factorUnions(ctx, sess, query); factored != "" {
 		query = factored
 	}
+	if merged := s.mergeSiblings(ctx, sess, query); merged != "" {
+		query = merged
+	}
 	shared := s.shareSubqueries(ctx, sess, query)
 	sharing()
 	preparing := sess.phase("duckdb_prepare")
@@ -3180,7 +3183,7 @@ func (s *Server) prepareCheckedText(ctx context.Context, sess *session, user aut
 	if st == nil {
 		st, err = prepare(ctx, sess.conn, query, oids)
 		if err != nil && query != written {
-			s.log.Debug("statement runs with its unions as written", "err", err)
+			s.log.Debug("statement runs with its unions and sibling aggregations as written", "err", err)
 			query = written
 			st, err = prepare(ctx, sess.conn, query, oids)
 		}

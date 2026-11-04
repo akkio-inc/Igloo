@@ -417,7 +417,7 @@ func (g *gen) sections() string {
 
 // query is a random query.
 func (g *gen) query() string {
-	switch g.n(0, 13) {
+	switch g.n(0, 14) {
 	case 0, 1:
 		// Groups kept to a ranking's first, by a later SELECT, through a projection
 		// that may have a window of its own.
@@ -538,6 +538,8 @@ func (g *gen) query() string {
 		return q
 	case 13:
 		return g.sections()
+	case 14:
+		return g.siblings()
 	case 8:
 		// Subqueries in WHERE.
 		q := "SELECT f.h, count(*), sum(f.v) FROM f WHERE " + g.subqueryPred("f")
@@ -560,6 +562,38 @@ func (g *gen) query() string {
 		return "SELECT * FROM (SELECT " + sel + ", " + g.rankFn(append(slices.Clone(cols), "src"), aggs) + " AS r FROM (" + u + ") x) y WHERE " +
 			fmt.Sprintf("r <= %d", g.n(1, 8))
 	}
+}
+
+// siblings is sibling aggregations over one join as Igloo merges them (see package
+// pgwire's siblings.go): one materialized grouping that each sibling reads its
+// columns of.
+func (g *gen) siblings() string {
+	from, t := g.from()
+	where := ""
+	if g.chance(0.7) {
+		where = " WHERE " + g.pred(t)
+	}
+	keys := g.groupCols(t)
+	var ks, kcols, names []string
+	for i, k := range keys {
+		ks = append(ks, fmt.Sprintf("%s AS _k%d", k, i+1))
+		kcols = append(kcols, fmt.Sprintf("_k%d", i+1))
+		names = append(names, fmt.Sprintf("c%d", i))
+	}
+	merged := fmt.Sprintf("SELECT %s, count(DISTINCT %s.h) AS _a1, count(*) AS _a2, sum(%s.v) AS _a3, max(%s.d) AS _a4 FROM %s%s GROUP BY %s",
+		strings.Join(ks, ", "), t, t, t, from, where, strings.Join(keys, ", "))
+	sel := func(cols ...string) string {
+		var out []string
+		for i, k := range kcols {
+			out = append(out, k+" AS "+names[i])
+		}
+		return strings.Join(append(out, cols...), ", ")
+	}
+	using := strings.Join(names, ", ")
+	return fmt.Sprintf("WITH _igloo_siblings_1 AS MATERIALIZED (%s), seen AS (SELECT %s FROM _igloo_siblings_1), "+
+		"days AS (SELECT %s FROM _igloo_siblings_1), views AS (SELECT %s FROM _igloo_siblings_1) "+
+		"SELECT count(*), sum(days.n), sum(views.n), sum(views.sv), max(views.md) FROM seen JOIN days USING (%s) JOIN views USING (%s)",
+		merged, sel(), sel("_a1 AS n"), sel("_a2 AS n", "_a3 AS sv", "_a4 AS md"), using, using)
 }
 
 // TestRandomAgreement runs randomFound and random queries (IGLOO_TEST_RANDOM_QUERIES,
