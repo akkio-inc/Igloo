@@ -66,8 +66,16 @@ const (
 	// to know which ranges queries read first.
 	fileCacheSaveEvery = 30 * time.Second
 	fileCacheLookEvery = 2 * time.Second
-	// restoreShare bounds a restore to this share of DuckDB's memory.
-	restoreShare = 0.75
+	// restoreShare bounds a restore to this share of DuckDB's memory. A
+	// mixed window of dashboards, a heavy report and ELT read in its first
+	// 10 minutes 4.1 GB of a list of 22 GB, 18%, and held 5.6 GB in all. On a
+	// replica of 36 GiB, with that load from the moment it was ready, a
+	// quarter's 7.0 GB came back in 2.6 s and the first minute's dashboards
+	// took 0.84 s at the median and 4.0 s at p95; three quarters' 18.4 GB, 1.17
+	// and 4.9 s; none, 0.93 and 4.4 s. On a machine of 60 GiB, 32.6 GB read
+	// back over 50 s as users arrived left 4.1 GiB, and DuckDB's limit was cut
+	// to half and raised back as statements started.
+	restoreShare = 0.25
 	// restoreRequest is the most a request of a restore reads, of ranges of
 	// one file, and restoreGap the most bytes between two ranges it reads
 	// across rather than make two requests: TPC-H's 24 GB at scale 100 are

@@ -20,6 +20,13 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   of requests at once and leaves out ranges over 64 MiB. A start that finds the
   one before was killed during its read-back starts without the list.
 
+- A start reads back at most a quarter of DuckDB's memory, not three quarters. A
+  mixed load's first 10 minutes read 18% of a list of 22 GB, and with that load
+  from the moment the replica was ready, its first minute's dashboards took 0.84 s
+  at the median after a quarter came back, 1.17 s after three quarters and 0.93 s
+  after none. On a machine of 60 GiB, 32.6 GB read back as users arrived had
+  DuckDB's limit cut to half and raised back.
+
 - Reads of the read cache start no threads of their own. The extension started one
   for each block of each read, warm or cold, and with dashboards, ELT and reports
   beside each other a replica of 16 cores reached 20,394 threads and a load of 240,

@@ -763,7 +763,10 @@ them back from there when it starts:
   the disk cache, and the restore skips it. On a c7g.16xlarge it read the
   24 GB back in 7 to 8 s, at its network's 3.6 GB/s, and the first run of
   the 22 queries took 22 s, against 58 s from the disk alone.
-- It takes at most three quarters of DuckDB's memory, and stops when
+- It takes at most a quarter of DuckDB's memory: a mixed load's first 10
+  minutes read 18% of a list of 22 GB, and its first minute's dashboards
+  were faster after a quarter came back than after three quarters, or none
+  (0.84 s at the median against 1.17 and 0.93 s). It stops when
   DuckDB has no memory to spare, the ranges being buffers DuckDB drops
   first when queries need the room, or when what Igloo can still allocate
   falls below a quarter of its memory, so that statements that start
