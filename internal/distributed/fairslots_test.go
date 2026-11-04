@@ -2,13 +2,18 @@ package distributed
 
 import (
 	"context"
+	"slices"
+	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 )
 
-// TestFairSlots checks who gets a worker's slots: the statement that has started the
-// fewest tasks, the first of them to come; that one that needs more than are free holds
+// TestFairSlots checks who gets a worker's slots: a task that runs again what a lost
+// worker held, before all others; then the statement that has started the
+// fewest tasks, its task of the highest level, the first of them to come; that one that
+// needs more than are free holds
 // up the rest; and that a task that gives up waiting takes nothing with it.
 func TestFairSlots(t *testing.T) {
 	ctx := context.Background()
@@ -22,7 +27,7 @@ func TestFairSlots(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if err := f.acquire(ctx, query, n); err != nil {
+			if err := f.acquire(ctx, query, n, slotOrder{}); err != nil {
 				t.Error(err)
 				return
 			}
@@ -38,7 +43,7 @@ func TestFairSlots(t *testing.T) {
 	}
 	// The report holds the slot, with three more tasks waiting, and then a
 	// dashboard's one comes, and another statement's two.
-	if err := f.acquire(ctx, "report", 1); err != nil {
+	if err := f.acquire(ctx, "report", 1, slotOrder{}); err != nil {
 		t.Fatal(err)
 	}
 	start("report", "report 2", 1)
@@ -65,16 +70,16 @@ func TestFairSlots(t *testing.T) {
 
 	// A task that needs both slots holds up one that needs one, once it is its turn.
 	f = newFairSlots(2)
-	if err := f.acquire(ctx, "a", 1); err != nil {
+	if err := f.acquire(ctx, "a", 1, slotOrder{}); err != nil {
 		t.Fatal(err)
 	}
 	both := make(chan error, 1)
-	go func() { both <- f.acquire(ctx, "b", 2) }()
+	go func() { both <- f.acquire(ctx, "b", 2, slotOrder{}) }()
 	for waitingCount(f) == 0 {
 		time.Sleep(time.Millisecond)
 	}
 	one := make(chan error, 1)
-	go func() { one <- f.acquire(ctx, "c", 1) }()
+	go func() { one <- f.acquire(ctx, "c", 1, slotOrder{}) }()
 	for waitingCount(f) == 1 {
 		time.Sleep(time.Millisecond)
 	}
@@ -95,14 +100,65 @@ func TestFairSlots(t *testing.T) {
 	}
 	f.release("c", 1)
 
+	// A task that runs again what a lost worker held goes before tasks that came
+	// before it, its own statement's and another's; and among a statement's tasks,
+	// those of stages further from its end go first.
+	queue := func(query, name string, o slotOrder) {
+		t.Helper()
+		before := waitingCount(f)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := f.acquire(ctx, query, 1, o); err != nil {
+				t.Error(err)
+				return
+			}
+			mu.Lock()
+			order = append(order, name)
+			mu.Unlock()
+			f.release(query, 1)
+		}()
+		for waitingCount(f) == before {
+			time.Sleep(time.Millisecond)
+		}
+	}
+	for _, c := range []struct {
+		queue []string
+		want  []string
+	}{
+		{[]string{"report 2", "dashboard", "report again"}, []string{"report again", "dashboard", "report 2"}},
+		{[]string{"report level 1", "report level 3", "report level 2"}, []string{"report level 3", "report level 2", "report level 1"}},
+	} {
+		f = newFairSlots(1)
+		if err := f.acquire(ctx, "report", 1, slotOrder{}); err != nil {
+			t.Fatal(err)
+		}
+		order = nil
+		for _, name := range c.queue {
+			query, o := "report", slotOrder{first: strings.HasSuffix(name, "again")}
+			if name == "dashboard" {
+				query = "dashboard"
+			}
+			if level, ok := strings.CutPrefix(name, "report level "); ok {
+				o.level, _ = strconv.Atoi(level)
+			}
+			queue(query, name, o)
+		}
+		f.release("report", 1)
+		wg.Wait()
+		if !slices.Equal(order, c.want) {
+			t.Errorf("%v, want %v", order, c.want)
+		}
+	}
+
 	// One that gives up waiting leaves things as they were.
 	f = newFairSlots(1)
-	if err := f.acquire(ctx, "a", 1); err != nil {
+	if err := f.acquire(ctx, "a", 1, slotOrder{}); err != nil {
 		t.Fatal(err)
 	}
 	gone, cancel := context.WithCancel(ctx)
 	failed := make(chan error, 1)
-	go func() { failed <- f.acquire(gone, "b", 1) }()
+	go func() { failed <- f.acquire(gone, "b", 1, slotOrder{}) }()
 	for waitingCount(f) == 0 {
 		time.Sleep(time.Millisecond)
 	}

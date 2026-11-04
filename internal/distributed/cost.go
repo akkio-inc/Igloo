@@ -1086,6 +1086,28 @@ func typeBytes(typ string) float64 {
 	return 8
 }
 
+// toEnd returns, by stage ID, each of stages' level: how many stages lead from
+// it to the statement's end, its own included, 1 for one whose rows no stage
+// among them reads. Stages come after those whose exchanges they read.
+// Workers run a statement's tasks of higher levels first (see fairSlots).
+func toEnd(stages []*Stage) map[int]int {
+	readers := map[int]int{}
+	out := make(map[int]int, len(stages))
+	for _, s := range slices.Backward(stages) {
+		l := 1
+		if s.Out != nil {
+			l += readers[s.Out.ID]
+		}
+		out[s.ID] = l
+		for _, in := range s.Inputs {
+			if in.Exchange != nil {
+				readers[in.Exchange.ID] = max(readers[in.Exchange.ID], l)
+			}
+		}
+	}
+	return out
+}
+
 // levels is the length of the longest chain of stages each of which reads
 // what the one before it wrote: the rounds of tasks a statement waits for.
 func levels(stages []*Stage) int {

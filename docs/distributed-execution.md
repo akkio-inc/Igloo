@@ -1005,6 +1005,14 @@ catalog lock when it takes a second or more. A lookup in the session that
 takes a quarter of a second or more logs `a lookup in the session took long`
 with what each of its steps took.
 
+A stage sends all of its tasks to the workers at once, and stages that do not
+read each other's rows run side by side. A worker runs as many tasks at once
+as it has slots, and gives the next free ones to a task that runs again what
+a lost worker held, then to the statement that has started the fewest tasks
+there, so that a short statement gets past a long one's, and among a
+statement's own tasks, to those of the stages that the most stages follow,
+which keeps its longest chain of stages going.
+
 ## Same results as one machine
 
 Workers run the same DuckDB as the coordinator, on the same snapshot of
@@ -1245,7 +1253,9 @@ other manifests only with that port open between them, or say `object`.
   task whose worker is lost while it runs it, runs as smaller tasks spread
   over the workers left, one each, divided by its files, buckets or
   partitions, so that a loss costs about a worker's share of a stage over
-  the workers left rather than all of it on one. A statement with `LIMIT`,
+  the workers left rather than all of it on one. They take the workers' next
+  free slots before any other task, the statement's own included, since its
+  readers wait for them. A statement with `LIMIT`,
   samples or a volatile function among those tasks could not mix two runs of
   them, and its parts all run again, once, as they do if a task writes other
   rows than it did. One that still answers as the same run was busy, and the

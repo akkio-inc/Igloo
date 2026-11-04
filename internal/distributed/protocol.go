@@ -58,6 +58,14 @@ type taskRequest struct {
 	// stage found each of its groups to be one row (see rowSpec).
 	RowSQL    string `json:"row_sql,omitempty"`
 	RowsFirst bool   `json:"rows_first,omitempty"`
+	// Repair says the task runs again what a lost worker held, which readers
+	// wait for: it takes the worker's next free slots before any other task
+	// (see fairSlots).
+	Repair bool `json:"repair,omitempty"`
+	// Level is how many stages lead from the task's stage to its statement's
+	// end, its own included: a worker runs a statement's tasks of higher levels
+	// first (see fairSlots).
+	Level int `json:"level,omitempty"`
 	// Columns, if set, rename the result's columns positionally.
 	Columns []string `json:"columns,omitempty"`
 	// Shuffle, if set, makes the task write its result to this directory
@@ -192,6 +200,8 @@ type taskResult struct {
 	// task wrote.
 	Files []shuffleFile `json:"files,omitempty"`
 	Error *taskErr      `json:"error,omitempty"`
+	// Waited is how long the task waited for the worker's slots, in seconds.
+	Waited float64 `json:"waited,omitempty"`
 	// groupRows, for a shuffle task that wrote an aggregation's partial
 	// results, is the most rows any of its groups had, or 0 if not known
 	// (see rowSpec).

@@ -297,11 +297,12 @@ type execution struct {
 	// stage, by ID.
 	used   map[string]bool
 	usedBy map[int]map[string]bool
-	// started are its stages, and finished those that ended, by ID; lost the
-	// workers it went on without, as they took their exchanges with them; see
-	// repair.go, which repairing keeps to one at a time.
+	// started are its stages, finished those that ended and levels their levels
+	// (see toEnd), by ID; lost the workers it went on without, as they took their
+	// exchanges with them; see repair.go, which repairing keeps to one at a time.
 	started   []*Stage
 	finished  map[int]bool
+	levels    map[int]int
 	lost      map[string]bool
 	repairing sync.Mutex
 	// holders are the workers watched for the exchange files they hold of the run,
@@ -309,8 +310,6 @@ type execution struct {
 	holders   map[string]bool
 	watching  context.Context
 	stopWatch context.CancelFunc
-	// writtenAgain counts the tasks written again, which change what exchanges hold.
-	writtenAgain atomic.Int64
 }
 
 // exchangeRun is an exchange while its producers run.
@@ -332,8 +331,10 @@ type exchangeRun struct {
 	bytes     int64
 	partBytes []int64
 	tasks     int
-	// ran are the tasks whose files are on workers' disks (see repair.go).
-	ran []*ranTask
+	// ran are the tasks whose files are on workers' disks (see repair.go), and
+	// again counts the times one of them ran again, which changed its files.
+	ran   []*ranTask
+	again int64
 }
 
 // jobResult is where a coordinator-bound stage's partial results are.
@@ -356,6 +357,10 @@ func (e *execution) run(ctx context.Context, stages []*Stage) error {
 func (e *execution) start(ctx context.Context, stages []*Stage) (wait func() error) {
 	e.mu.Lock()
 	e.started = append(e.started, stages...)
+	if e.levels == nil {
+		e.levels = map[int]int{}
+	}
+	maps.Copy(e.levels, toEnd(stages))
 	if e.watching == nil {
 		e.watching, e.stopWatch = context.WithCancel(ctx)
 	}
@@ -603,10 +608,14 @@ func (e *execution) stage(ctx context.Context, s *Stage) error {
 		groups = e.groups(s)
 		tasks = len(groups)
 	}
-	e.co.log.Debug("running a stage", "query", e.qid, "stage", s.String(), "tasks", tasks, "partitions", e.parts)
+	e.mu.Lock()
+	level := e.levels[s.ID]
+	e.mu.Unlock()
+	e.co.log.Debug("running a stage", "query", e.qid, "stage", s.String(), "tasks", tasks, "partitions", e.parts, "level", level)
 
 	// What every task reads in full, and its bytes: as it is when a task is
-	// made, as a worker's files may have been written again by then.
+	// made, as a worker's files may have been written again by then, by this run
+	// or by another that wrote the exchange (see runProbing).
 	used := e.prefetchUsed(ctx, s)
 	var wholeMu sync.Mutex
 	var whole map[string]viewDef
@@ -615,7 +624,15 @@ func (e *execution) stage(ctx context.Context, s *Stage) error {
 	wholeViews := func() (map[string]viewDef, int64) {
 		wholeMu.Lock()
 		defer wholeMu.Unlock()
-		at := e.writtenAgain.Load()
+		at := int64(0)
+		for _, in := range s.Inputs {
+			if in.Exchange != nil && !in.Partitioned {
+				x := e.exchanges[in.Exchange.ID]
+				x.mu.Lock()
+				at += x.again
+				x.mu.Unlock()
+			}
+		}
 		if at == wholeAt {
 			return whole, wholeBytes
 		}
@@ -725,7 +742,7 @@ func (e *execution) stage(ctx context.Context, s *Stage) error {
 				task.Views = append(task.Views, whole[in.View])
 			}
 		}
-		task.round = round
+		task.round, task.Level = round, level
 		idx := strconv.Itoa(p.index())
 		if writes {
 			task.SQL = writeSQL(s, e.target)
@@ -845,11 +862,10 @@ func (e *execution) stage(ctx context.Context, s *Stage) error {
 				e.mu.Unlock()
 				switch {
 				case s.Out != nil:
-					if err := e.received(s, r.task, r.head, r.w); err != nil {
+					if err := e.receivedRan(tctx, &ranTask{run: e, stage: s, piece: r.p, units: units(i), first: r.first, request: request,
+						task: r.task, head: r.head, worker: r.w.addr, rounds: r.rounds}); err != nil {
 						return err
 					}
-					e.ranOn(&ranTask{run: e, stage: s, piece: r.p, units: units(i), first: r.first, request: request, task: r.task, head: r.head,
-						worker: r.w.addr, rounds: r.rounds})
 				case writes:
 					if err := e.writtenBy(r.task, r.head, r.w); err != nil {
 						return err
@@ -930,15 +946,8 @@ func (e *execution) overfull() []string {
 	return out
 }
 
-// received records the files a task wrote to its stage's exchange.
-func (e *execution) received(s *Stage, task *taskRequest, head *taskResult, w *worker) error {
-	x := e.exchanges[s.Out.ID]
-	x.mu.Lock()
-	defer x.mu.Unlock()
-	return e.receivedLocked(x, task, head, w)
-}
-
-// receivedLocked is received, into x, whose lock the caller holds.
+// receivedLocked records the files a task wrote to x, its stage's exchange,
+// whose lock the caller holds (see receivedRan).
 func (e *execution) receivedLocked(x *exchangeRun, task *taskRequest, head *taskResult, w *worker) error {
 	x.rows += head.Rows
 	x.tasks++

@@ -484,11 +484,12 @@ func (w *Worker) serveTask(rw http.ResponseWriter, r *http.Request) {
 	// Wait for its slots (see taskSlots); the coordinator's task waits
 	// with it.
 	take := int64(w.taskSlots(req.Slots))
-	if err := w.slots.acquire(ctx, req.Query, take); err != nil {
+	if err := w.slots.acquire(ctx, req.Query, take, slotOrder{first: req.Repair, level: req.Level}); err != nil {
 		log.Debug("task canceled while it waited to run")
 		w.opts.Metrics.task("canceled", start)
 		return
 	}
+	waited := time.Since(start)
 	defer w.slots.release(req.Query, take)
 	done, err := w.admit(ctx, &runningTask{query: req.Query, task: req.Task, started: time.Now(), cancel: cancel, erased: req.Erased})
 	if err != nil {
@@ -504,6 +505,9 @@ func (w *Worker) serveTask(rw http.ResponseWriter, r *http.Request) {
 	defer done()
 	path, res, err := w.run(ctx, &req)
 	done()
+	if res != nil {
+		res.Waited = waited.Seconds()
+	}
 	if path != "" {
 		defer os.Remove(path) //nolint:errcheck
 	}
@@ -603,7 +607,7 @@ func (w *Worker) serveTask(rw http.ResponseWriter, r *http.Request) {
 		rw.Header().Set("Content-Length", strconv.Itoa(len(head)+1))
 		_, _ = rw.Write(append(head, '\n'))
 		w.opts.Metrics.task("ok", start)
-		log.Debug("shuffle task done", "rows", res.Rows, "files", len(res.Files), "seconds", time.Since(start).Seconds())
+		log.Debug("shuffle task done", "rows", res.Rows, "files", len(res.Files), "seconds", time.Since(start).Seconds(), "waited_seconds", res.Waited)
 		return
 	}
 
@@ -637,7 +641,7 @@ func (w *Worker) serveTask(rw http.ResponseWriter, r *http.Request) {
 	}
 	w.opts.Metrics.task("ok", start)
 	w.opts.Metrics.sent(n)
-	log.Debug("task done", "rows", res.Rows, "bytes", n, "seconds", time.Since(start).Seconds())
+	log.Debug("task done", "rows", res.Rows, "bytes", n, "seconds", time.Since(start).Seconds(), "waited_seconds", res.Waited)
 }
 
 func (w *Worker) fail(rw http.ResponseWriter, status int, te *taskErr) {

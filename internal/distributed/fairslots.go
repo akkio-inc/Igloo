@@ -12,6 +12,20 @@ import (
 // short statement past a long one's tasks at the cost of one task's wait, and has
 // long ones take turns. A task that needs more slots than are free holds up the
 // others until they are, or it might never run.
+//
+// A task that runs again what a lost worker held (taskRequest.Repair) goes before
+// all of them: its statement's readers wait for it, and as its statement's task it
+// came after every task the statement had sent here, and a stage sends all of its
+// tasks at once: one of 128 tasks puts 8 or 9 on each of 15 workers. With one of
+// 16 workers powered off during a report, the tasks it had held took 44 and 45 s
+// to run again.
+//
+// Among a statement's own tasks, those of stages further from its end go first
+// (taskRequest.Level): stages of branches that run side by side share the slots,
+// and in arrival order a report's longest branch, four stages deep, waited 55 s
+// on every worker behind three branches of three whose stages were sent before
+// its own, and 7 s in a run where its stage was sent before two of theirs; the
+// report took 594 s and 573 s.
 type fairSlots struct {
 	mu   sync.Mutex
 	free int64
@@ -29,10 +43,19 @@ type slotQuery struct {
 	tasks   int
 }
 
+// slotOrder is where a task goes among those waiting: first, before every task
+// that is not; then by its statement's fairness; then, before tasks of lower
+// level, its stage's level.
+type slotOrder struct {
+	first bool
+	level int
+}
+
 // slotWaiter is a task waiting for its slots.
 type slotWaiter struct {
 	query *slotQuery
 	n     int64
+	order slotOrder
 	ready chan struct{}
 }
 
@@ -41,7 +64,7 @@ func newFairSlots(n int64) *fairSlots {
 }
 
 // acquire waits for n slots for a task of query, or until ctx ends.
-func (f *fairSlots) acquire(ctx context.Context, query string, n int64) error {
+func (f *fairSlots) acquire(ctx context.Context, query string, n int64, order slotOrder) error {
 	f.mu.Lock()
 	q := f.queries[query]
 	if q == nil {
@@ -49,7 +72,7 @@ func (f *fairSlots) acquire(ctx context.Context, query string, n int64) error {
 		f.queries[query] = q
 	}
 	q.tasks++
-	w := &slotWaiter{query: q, n: n, ready: make(chan struct{})}
+	w := &slotWaiter{query: q, n: n, order: order, ready: make(chan struct{})}
 	f.waiting = append(f.waiting, w)
 	f.next()
 	f.mu.Unlock()
@@ -101,7 +124,17 @@ func (f *fairSlots) next() {
 	for len(f.waiting) > 0 {
 		pick := 0
 		for i, w := range f.waiting {
-			if w.query.started < f.waiting[pick].query.started {
+			p := f.waiting[pick]
+			switch {
+			case w.order.first != p.order.first:
+				if w.order.first {
+					pick = i
+				}
+			case w.query.started != p.query.started:
+				if w.query.started < p.query.started {
+					pick = i
+				}
+			case w.order.level > p.order.level:
 				pick = i
 			}
 		}
