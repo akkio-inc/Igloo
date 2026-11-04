@@ -3,6 +3,7 @@ package distributed
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
 
 	"github.com/duckdb/duckdb-go/v2"
@@ -25,8 +26,13 @@ func TestCacheRaceTasks(t *testing.T) {
 		h := newHarness(t, 0.01, 3, workers)
 		h.co.maxBroadcast = 1
 		h.co.opts.Metrics = NewMetrics(prometheus.NewRegistry())
+		// Tasks run at once on the workers, so the count of failures is
+		// shared.
+		var mu sync.Mutex
 		var failures int
 		taskFault = func(*taskRequest) error {
+			mu.Lock()
+			defer mu.Unlock()
 			if failures < 3 {
 				failures++
 				return &duckdb.Error{Type: duckdb.ErrorTypeIO, Msg: blockRace}
