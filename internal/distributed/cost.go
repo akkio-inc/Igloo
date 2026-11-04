@@ -105,15 +105,6 @@ const (
 	// be for that to be worth a try.
 	exploreEvery = 24 * time.Hour
 	exploreUnder = 10 * time.Minute
-	// replicaRetryAfter is how long after its last run on one machine a
-	// statement measured on both sides, and faster on workers, is tried on
-	// one machine again, under whatever load: once, as the replica's run
-	// then replaces that one (see history.observeAt). Under a dashboard's
-	// load, a tile's first runs here, seven at once beside 24 to 29 other
-	// statements, took 35 to 41 s, against 3 to 14 s in another window; on
-	// workers it took 4 to 9 s, and stayed there for the window at a median
-	// of 7.8 s, where the replica ran it at 5.7 s.
-	replicaRetryAfter = 2 * time.Minute
 	// exploreWithin is how many times what a statement took on one side
 	// the other side's estimate may be for that side to be worth a try:
 	// at ten times the data, a report that took 57 s on workers was tried
@@ -1215,17 +1206,7 @@ func chooseShared(e estimate, r runs, found bool, threshold time.Duration, now t
 		// machine at 178 s.
 		return true, true, fmt.Sprintf("it ran in %.0f s on %d workers; trying %d once, estimated at %.0f s", r.dist, r.distWorkers, e.workers, e.onWorkers)
 	case found && r.local > 0 && r.dist > 0:
-		// Its run here, which this replica saw end, or its last try here,
-		// is replicaRetryAfter old.
-		lastHere := r.localAt
-		if r.explored.After(lastHere) {
-			lastHere = r.explored
-		}
-		stale := !r.localAt.IsZero() && now.Sub(lastHere) >= replicaRetryAfter
 		switch {
-		case r.dist < r.local*share && stale && !e.memory && !e.spills && !r.heavy && !e.risky:
-			return false, true, fmt.Sprintf("it ran in %.0f s on workers and %.0f s on one machine, %.0f s or more ago; trying one machine again",
-				r.dist, r.local, replicaRetryAfter.Seconds())
 		case r.dist < r.local*share:
 			return true, false, fmt.Sprintf("it ran in %.0f s on workers and %.0f s on one machine", r.dist, r.local)
 		case e.risky && r.dist <= riskyWithin*r.local*share:

@@ -84,9 +84,6 @@ type runs struct {
 	// the large worker's on it; zero when not known. Runs under other
 	// conditions are not compared (see comparable).
 	localMemory, distMemory, largeMemory int64
-	// localAt is when its last run on one machine ended, for trying it
-	// there again (see replicaRetryAfter).
-	localAt time.Time
 }
 
 // failure is a statement's run on workers that failed after seconds, at.
@@ -146,18 +143,10 @@ func (h *history) update(key string, fn func(*runs)) {
 }
 
 // observe records a run of key on workers workers, on the large worker if
-// large, or on one machine if neither, that took seconds, ending now (see
-// observeAt).
+// large, or on one machine if neither, that took seconds. Runs on workers
+// average only with runs on about as many, by fleetBucket: twice the
+// workers or half make another statement of it.
 func (h *history) observe(key string, workers int, large bool, seconds float64, memory int64) {
-	h.observeAt(key, workers, large, seconds, memory, time.Now())
-}
-
-// observeAt is observe of a run that ended at at. Runs on workers average
-// only with runs on about as many, by fleetBucket: twice the workers or
-// half make another statement of it. A run on one machine replaces one
-// there replicaRetryAfter or more before it rather than averaging with it:
-// that one ran under another load.
-func (h *history) observeAt(key string, workers int, large bool, seconds float64, memory int64, at time.Time) {
 	h.update(key, func(r *runs) {
 		var avg *float64
 		switch {
@@ -181,14 +170,8 @@ func (h *history) observeAt(key string, workers int, large bool, seconds float64
 			if !alike(memory, r.localMemory) {
 				r.local, r.guarded = 0, false
 			}
-			if at.Sub(r.localAt) >= replicaRetryAfter {
-				r.local = 0
-			}
 			avg = &r.local
 			r.outOfMemory, r.localMemory = false, memory
-			if at.After(r.localAt) {
-				r.localAt = at
-			}
 		}
 		*avg = mean(*avg, seconds)
 	})
@@ -443,7 +426,7 @@ func (co *Coordinator) Seed(rs []Run) {
 		case r.OutOfMemory:
 			co.observeOutOfMemory(r.Key, r.Memory)
 		case r.Duration > 0:
-			co.history.observeAt(r.Key, r.Workers, r.Large, r.Duration.Seconds(), r.Memory, r.At)
+			co.history.observe(r.Key, r.Workers, r.Large, r.Duration.Seconds(), r.Memory)
 			if r.Workers == 0 && !r.Large && alike(r.Memory, co.opts.MemoryBytes) {
 				co.ObservePeak(r.Key, r.Peak)
 			}

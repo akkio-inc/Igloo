@@ -605,12 +605,6 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
 
 ### Distributed execution
 
-- Auto mode tries a statement on the replica again, once, two minutes after its
-  last run there, where it ran faster on workers, and that run replaces the old
-  one. A dashboard tile's first copies on the replica, seven at once beside 24 to
-  29 other statements, took 12 to 34 s, and it stayed on workers for the window
-  at a median of 7.8 s, where another window ran it on the replica at 5.7 s.
-
 - A commit no longer makes the next statements over its table wait to plan. The
   table's metadata loads again in the background as it changes, where the next
   lookup of it waited 0.3 to 1.2 s for that load, and dashboards' cheap statements

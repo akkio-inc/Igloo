@@ -888,13 +888,7 @@ replica's limit or the smallest worker's, within a quarter of what it is
 now, which the history keeps (runs from before it kept it are not read):
 runs on a replica of 14 GB with workers of 6 GB beside it, read back on one
 of 22 GB with workers of their own, had kept a dashboard's statements on
-workers. A statement that ran both ways runs where it was faster. Where
-that is workers, it is tried on the replica again once two minutes after
-its last run there, under whatever load, and that run replaces the old one
-rather than averaging with it: a dashboard tile whose first copies on the
-replica, seven at once beside 24 to 29 other statements, took 12 to 34 s
-stayed on workers for the window at a median of 7.8 s, where another
-window ran it on the replica at 5.7 s. One that ran only on the replica within the threshold stays there.
+workers. A statement that ran both ways runs where it was faster. One that ran only on the replica within the threshold stays there.
 One that ran only one way, in under ten minutes, is tried once the other
 way, at most once a day, so that runs come to be compared with runs, if
 the other way is estimated at no more than twice what it took, and, on the
