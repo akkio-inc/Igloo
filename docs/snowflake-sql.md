@@ -163,7 +163,8 @@ JSON and JSON text alike.
   latest runs took the less of the replica at best: the more of their CPU
   time over its cores and of their memory over its memory limit for as long
   as they ran, so that a form that takes less CPU but holds the memory other
-  statements wait for is not taken. Either way, conditions that read
+  statements wait for is not taken; a statement that runs on workers, by its
+  time on each of them. Either way, conditions that read
   nothing of the `FLATTEN` but its `VALUE` (`WHERE f.value <> 'unknown'`)
   filter the list it unnests (`list_filter`).
   `FLATTEN` of an array constant of `OBJECT_CONSTRUCT` and

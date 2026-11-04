@@ -111,7 +111,23 @@ func (c *Controller) ObserveForm(key string, lists bool, cpu time.Duration, foot
 	if c == nil || key == "" || cpu <= 0 {
 		return
 	}
-	took := c.machineTime(cpu, footprint, ran)
+	c.observeForm(key, lists, c.machineTime(cpu, footprint, ran))
+}
+
+// ObserveFormOnWorkers records a run of a statement of shape key in the form lists
+// says that ran on workers workers for took: what it took of them, took on each.
+// The replica measures nothing of their work, and a form that was tried there
+// and never judged was tried again after every start.
+func (c *Controller) ObserveFormOnWorkers(key string, lists bool, took time.Duration, workers int) {
+	if c == nil || key == "" || took <= 0 || workers <= 0 {
+		return
+	}
+	c.observeForm(key, lists, took*time.Duration(workers))
+}
+
+// observeForm records a run of a statement of shape key in the form lists says,
+// which took took of the replica or of its workers.
+func (c *Controller) observeForm(key string, lists bool, took time.Duration) {
 	f := &c.forms
 	f.mu.Lock()
 	defer f.mu.Unlock()

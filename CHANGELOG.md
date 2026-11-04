@@ -2115,7 +2115,9 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   and 40. Judged by CPU time alone, a dashboard query at ten times its data, on
   16 cores, took the form that ran 40 s rather than 22 and allocated 82 GB rather
   than 63, and the slowest of the dashboard's first minute took 73 to 76 s; it
-  takes 56 to 64.
+  takes 56 to 64. A statement that runs on workers is judged by what it took of
+  them, its time on each: the replica measures none of their work, so the form
+  tried second was never judged, and was tried again after each start.
 - A statement's shape includes the session's search path and database, so
   the same text over another schema, another client's or the same data at
   ten times the size, learns its own memory and `FLATTEN` form: the first

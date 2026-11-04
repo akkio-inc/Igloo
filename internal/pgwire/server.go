@@ -2528,6 +2528,11 @@ func (s *Server) preparedQuery(ctx context.Context, sess *session, user auth.Use
 		if err == nil && parts.key != "" {
 			// How long it took where it ran, for where it runs next time.
 			s.dist.ObserveOn(parts.key, parts.workers, parts.large, time.Since(cmp.Or(parts.since, start)))
+			if parts.workers > 0 && tr != nil && tr.flattenKey != "" {
+				// Its FLATTENs' form, by what it took of the workers, as the
+				// replica measured none of it (see ObserveFormOnWorkers).
+				s.workload.ObserveFormOnWorkers(tr.flattenKey, tr.flattenLists, time.Since(cmp.Or(parts.since, start)), parts.workers)
+			}
 			if parts.workers == 0 && peak > 0 {
 				// What it held here, against what its plan said it would.
 				s.dist.ObservePeak(parts.key, peak)

@@ -661,6 +661,32 @@ func TestFormsByMachineTime(t *testing.T) {
 	}
 }
 
+// TestFormsOnWorkers checks that runs on workers judge a shape's forms by what they
+// took of the workers, the time on each of them, and that a run of the other form,
+// tried, is judged so too.
+func TestFormsOnWorkers(t *testing.T) {
+	f := NewController(0)
+	estimate := func() bool { return false }
+	if f.ChooseForm("w", estimate) || !f.ChooseForm("w", estimate) {
+		t.Fatal("not the estimate's form, then the other")
+	}
+	f.ObserveFormOnWorkers("w", false, 10*time.Minute, 16)
+	f.ObserveFormOnWorkers("w", true, 9*time.Minute, 16)
+	if !f.ChooseForm("w", estimate) {
+		t.Error("not the form that took the workers less")
+	}
+	// On half the workers for the same time, the other.
+	f.ObserveFormOnWorkers("w", false, 10*time.Minute, 8)
+	if f.ChooseForm("w", estimate) {
+		t.Error("not the form that took the workers less")
+	}
+	f.ObserveFormOnWorkers("x", true, 0, 16)
+	f.ObserveFormOnWorkers("x", true, time.Minute, 0)
+	if f.ChooseForm("x", func() bool { return false }) {
+		t.Error("a run that says nothing set the form")
+	}
+}
+
 // TestControllerLineByExpected checks that statements wait in the order they
 // would end if each ran alone from when it came: a short one goes before a
 // long one that came just before it, a long one before a short one that comes
