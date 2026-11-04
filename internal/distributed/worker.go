@@ -487,7 +487,7 @@ func (w *Worker) serveTask(rw http.ResponseWriter, r *http.Request) {
 	// Wait for its slots (see taskSlots); the coordinator's task waits
 	// with it.
 	take := int64(w.taskSlots(req.Slots))
-	if err := w.slots.acquire(ctx, req.Query, take, req.Repair, req.Background); err != nil {
+	if err := w.slots.acquire(ctx, req.Query, take, req.Repair); err != nil {
 		log.Debug("task canceled while it waited to run")
 		w.opts.Metrics.task("canceled", start)
 		return

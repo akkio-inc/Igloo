@@ -562,9 +562,6 @@ type Server struct {
 	heavy        *heavyHistory
 	lane         backgroundLane
 	heavyClients bool
-	// heavyOnWorkers says which statements run on workers in the background,
-	// by the seconds statements of their shapes took there (see background.go).
-	heavyOnWorkers *heavyHistory
 	// beforeFill, if set, runs as a staged CREATE TABLE ... AS starts to
 	// fill its table, with the context that ends the fill (for tests).
 	beforeFill func(context.Context)
@@ -814,7 +811,6 @@ func New(engine Engine, opts Options, log *slog.Logger) (*Server, error) {
 	s.deleteTargets = deletefiles.NewTargets()
 	s.queryMemory = opts.QueryMemory
 	s.heavy, s.heavyClients = newHeavyHistory(), opts.HeavyInBackground
-	s.heavyOnWorkers = newHeavyHistoryOf(heavySeconds * time.Second)
 	if e, ok := s.engine.(interface{ WatchForeground(func() bool) }); ok {
 		e.WatchForeground(s.workload.HeldBehindSecond)
 	}
@@ -2498,10 +2494,6 @@ func (s *Server) preparedQuery(ctx context.Context, sess *session, user auth.Use
 			if err == nil {
 				s.workload.ObserveOnWorkers(shape)
 				s.workload.ObserveOnWorkers(exact)
-				if s.heavyOnWorkers != nil {
-					// Whether the next like it runs there in the background.
-					s.heavyOnWorkers.observe(shape, time.Since(start)-sess.wl.queued, false)
-				}
 			}
 		case measured:
 			// What it held here, for the next statement like it, and the next the same.

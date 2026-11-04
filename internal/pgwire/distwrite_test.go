@@ -395,7 +395,7 @@ func TestFullRefreshOnWorkers(t *testing.T) {
 		mustExec(t, admin, "REFRESH MATERIALIZED VIEW sums_mv")
 		mustExec(t, admin, "REFRESH MATERIALIZED VIEW reach_mv")
 		onWorkers := func(detail string) bool {
-			return strings.Contains(detail, "its query ran on") && strings.Contains(detail, "in the background")
+			return strings.Contains(detail, "its query ran on")
 		}
 		action, detail, _, reason := viewRefresh(t, admin, "public.sums_mv")
 		if action != step.sums || reason != "" || action == actionFull && !onWorkers(detail) {
