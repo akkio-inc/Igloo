@@ -102,6 +102,10 @@ const maxHeavyShapes = 4096
 // cost it more than it is likely to cost the others.
 var heavyMoveWithin = 60 * time.Second
 
+// besideFor is how long another statement must have run for a statement in the
+// first DuckDB to count as running beside it (see runPlaced).
+const besideFor = time.Second
+
 // heavyHistory is what statements of each shape took.
 type heavyHistory struct {
 	mu     lockorder.Mutex
@@ -526,10 +530,13 @@ func (s *Server) runPlaced(ctx, outer context.Context, sess *session, st *statem
 	if !mayMove {
 		return s.runHere(ctx, sess, st, args, tw)
 	}
-	// It may turn out heavy, beside others.
+	// It may turn out heavy, beside others: those that have run for a while,
+	// and so hold cores or memory worth giving way to. A monitoring poll of a
+	// few milliseconds, once a second, does not: beside one, TPC-DS q67 alone
+	// started again in the background after 23.5 s, and threw that away.
 	start := time.Now()
 	guard := guardLocalBy(ctx, func() time.Duration {
-		others := s.othersRunning(sess)
+		others := s.othersRunningFor(sess, besideFor)
 		if others == 0 || time.Since(start) > heavyMoveWithin || s.besideIsHeavy(sess) {
 			return time.Hour
 		}

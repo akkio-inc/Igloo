@@ -592,3 +592,23 @@ func TestOutOfSpillSpace(t *testing.T) {
 		t.Error("something else taken for a full disk")
 	}
 }
+
+// TestOthersRunningFor checks that a statement counts as running beside another
+// only once it has run for the time asked: a monitoring poll of a few
+// milliseconds once a second does not move a statement to the background.
+func TestOthersRunningFor(t *testing.T) {
+	s := &Server{sessions: newRegistry()}
+	me, poll, report := &session{pid: 1}, &session{pid: 2}, &session{pid: 3}
+	now := time.Now()
+	poll.statement, poll.started = "SELECT * FROM duckdb_memory()", now.Add(-5*time.Millisecond)
+	report.statement, report.started = "SELECT 1", now.Add(-3*time.Second)
+	for _, sess := range []*session{me, poll, report} {
+		s.sessions.byPID[sess.pid] = sess
+	}
+	if n := s.othersRunning(me); n != 2 {
+		t.Errorf("running: %d, want 2", n)
+	}
+	if n := s.othersRunningFor(me, besideFor); n != 1 {
+		t.Errorf("running for %s: %d, want 1", besideFor, n)
+	}
+}

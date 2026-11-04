@@ -2551,6 +2551,16 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   least memory left rose from 2.0 GiB, under the 2.25 GiB at which Igloo cancels
   statements, to 5.1 GiB. Go held 0.1 GiB once the read-back ended, not 5.4 GiB.
 
+- A long statement no longer starts again in the second DuckDB because a
+  monitoring poll ran beside it. A read not yet known to be heavy started
+  again there when another statement was running at a moment Igloo looked,
+  once a second, after 5 s for each statement beside it; a poll of a few
+  milliseconds counted, and TPC-DS q67 at scale 100, alone apart from a
+  sampler polling once a second, started again after 23.5 s of its 115 s.
+  Only statements that have run for a second now count. Beside a 0.3 s poll
+  once a second, a statement that ran 43 s in the second DuckDB now ran 32 s
+  where it started.
+
 - Reads of object storage reuse their connections. DuckDB opened one for
   each file it read and closed it after, and each closed connection holds
   a local port for a minute. A replica of 1.8 GiB whose two dozen sessions

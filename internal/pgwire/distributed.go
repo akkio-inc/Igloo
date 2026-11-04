@@ -516,6 +516,12 @@ var guardCheck = time.Second
 // sess's, which share its cores: its other sessions' that are past waiting
 // for their limits.
 func (s *Server) othersRunning(sess *session) int {
+	return s.othersRunningFor(sess, 0)
+}
+
+// othersRunningFor is othersRunning of the statements that have run for at
+// least d.
+func (s *Server) othersRunningFor(sess *session, d time.Duration) int {
 	r := s.sessions
 	r.mu.Lock()
 	all := make([]*session, 0, len(r.byPID))
@@ -528,7 +534,7 @@ func (s *Server) othersRunning(sess *session) int {
 	n := 0
 	for _, other := range all {
 		other.mu.Lock()
-		if other.statement != "" && !other.queued && !other.elsewhere {
+		if other.statement != "" && !other.queued && !other.elsewhere && time.Since(other.started) >= d {
 			n++
 		}
 		other.mu.Unlock()
