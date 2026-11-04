@@ -2474,6 +2474,15 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
 
 - Statement timeouts, connection limits, health and readiness endpoints,
   Prometheus metrics, and text or JSON logs.
+- Logging never holds a statement up. A log line went straight to stderr,
+  and waited while whatever read it did not keep up: with stderr a pipe
+  nobody read, statements logging at debug level stopped once its buffer
+  was full, 167 of 300 in a test, and the rest waited for good. Lines now go
+  to a buffer of 4 MiB that a goroutine writes out; when it is full, lines
+  are dropped, counted in `igloo_log_lines_dropped_total`, and a warning says
+  how many, at most once a minute. The same 300 statements took 0.84 s, as
+  with the log discarded. A worker whose disk is short of room for a task's
+  exchange warns at most once a minute, not for each task.
 - Docker Compose for one machine, with the bundled object store or Amazon S3
   through the machine's IAM role.
 - A Helm chart for any Kubernetes cluster, with the web console and

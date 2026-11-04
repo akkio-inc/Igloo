@@ -114,8 +114,11 @@ type Worker struct {
 	opts      WorkerOptions
 	transport *transport
 	log       *slog.Logger
-	activity  *activity.Tracker
-	srv       *http.Server
+	// shortWarned is when the worker last warned, in Unix nanoseconds, that its
+	// disk was short of room for a task's exchange (see shuffleLocal).
+	shortWarned atomic.Int64
+	activity    *activity.Tracker
+	srv         *http.Server
 	// beforeTask, if set, runs before each task; tests use it to make a
 	// worker fail or hang. r's context is the task's.
 	beforeTask func(rw http.ResponseWriter, r *http.Request) bool

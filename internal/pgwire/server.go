@@ -16,7 +16,6 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
-	"os"
 	"regexp"
 	"slices"
 	"strings"
@@ -49,6 +48,7 @@ import (
 	"github.com/akkio-inc/igloo/internal/federation"
 	"github.com/akkio-inc/igloo/internal/iddomain"
 	"github.com/akkio-inc/igloo/internal/lockorder"
+	"github.com/akkio-inc/igloo/internal/logwriter"
 	"github.com/akkio-inc/igloo/internal/memlimit"
 	"github.com/akkio-inc/igloo/internal/modelpack"
 	"github.com/akkio-inc/igloo/internal/models"
@@ -819,7 +819,8 @@ func New(engine Engine, opts Options, log *slog.Logger) (*Server, error) {
 	s.exitProcess = opts.exit
 	s.freeMemory = opts.FreeMemory
 	if s.exitProcess == nil {
-		s.exitProcess = os.Exit
+		// With the log written out first: it says why.
+		s.exitProcess = logwriter.Exit
 	}
 	s.rewriteMemory = opts.RewriteMemory
 	s.idFillRewriteRows = cmp.Or(opts.idFillRewriteRows, idFillRewriteRows)

@@ -65,7 +65,7 @@ func serveWorker() error {
 	cancel()
 
 	reg := prometheus.NewRegistry()
-	reg.MustRegister(collectors.NewGoCollector(), collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))
+	reg.MustRegister(collectors.NewGoCollector(), collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}), logDropped())
 	reg.MustRegister(eng.Metrics()...)
 	locations := append([]string{cfg.Storage.Root()}, cfg.Storage.AllowedLocations...)
 	opts := distributed.WorkerOptions{
