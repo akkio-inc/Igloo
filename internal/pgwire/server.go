@@ -2285,7 +2285,7 @@ func (s *Server) preparedQuery(ctx context.Context, sess *session, user auth.Use
 		if s.beforeRefresh != nil {
 			s.beforeRefresh(pctx)
 		}
-		readied := s.timePhases(ctx, sess, "statement readied to run")
+		readied := s.timePhases(ctx, sess, "statement readied to run", q.Query)
 		bitmaps := st.bitmaps
 		err = s.readyStatement(pctx, sess, st)
 		if err == nil && st.bitmaps != bitmaps {
@@ -2965,7 +2965,7 @@ func (s *Server) prepareHeld(ctx context.Context, sess *session, user auth.User,
 	// Preparing looks the tables the statement names up: DuckDB binds it,
 	// and Igloo resolves names, loads schemas and checks grants the same way
 	// (see sharedprepare.go).
-	defer s.timePhases(ctx, sess, "statement prepared")()
+	defer s.timePhases(ctx, sess, "statement prepared", text)()
 	locked := sess.phase("catalog_lock")
 	defer s.catalogHold(sess, mode)()
 	locked()
