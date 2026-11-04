@@ -907,10 +907,16 @@ if they are estimated at no more than half again the replica's estimate,
 which is then a floor. Runs on workers count with runs on about as many
 (1, 2 to 3, 4 to 7, 8 to 15 and so on), kept apart for each, and runs on the
 large worker apart from them: how many workers a statement runs on takes
-what it took on each before for that one's time, and the others' estimates
-times what the nearest it ran on took over its estimate, so a statement
-that took 127 s on 16 workers, estimated at 89, is taken to need 164 s on
-8, and one that then took 112 s on 8 runs on 8 next. A statement that
+what it took on each before for that one's time. The others' times come
+from the nearest it ran on: what that run took past its estimated work
+counts as fixed (the statement's start and its stages' rounds, which the
+estimates overstate most), and the work as estimated for the other number,
+scaled down as the run's was where it took less than its estimated work.
+So a statement that took 127 s on 16 workers, estimated at 89, is taken
+to need 153 s on 8, and one that then took 112 s on 8 runs on 8 next. A
+TPC-DS statement of seven levels at a hundred times the data that took 4.8
+s on 16 workers stays there: scaled whole by its run over its estimate,
+8 workers looked as fast for less, and took 14.7 s. A statement that
 failed on a number of workers, or on the large worker, in the last day (a
 worker out of memory, a read that failed) is taken to need one and a half
 times as long as it ran there before it failed, so that other ways weigh

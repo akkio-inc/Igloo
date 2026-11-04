@@ -449,6 +449,45 @@ func TestFleetCalibration(t *testing.T) {
 	}
 }
 
+// TestTransfer checks how a run on one number of workers carries over to
+// another (see transfer): the second scale runs' two reports, measured on
+// 16 workers, against what they took on 8, 4, 2 and 1, within a factor of
+// 1.2 at the root mean square of the logarithms, where scaling the whole
+// estimate by the run over it was within 1.25; and a statement of seven
+// levels that took 4.8 s on 16 workers at a hundred times the data, and
+// 14.7 s on 8, stays on 16.
+func TestTransfer(t *testing.T) {
+	took := map[string]map[int]float64{
+		"E2-like": {16: 44.0, 8: 74.6, 4: 120.0, 2: 265.4, 1: 552.1},
+		"F1-like": {16: 126.8, 8: 111.8, 4: 200.3, 2: 367.5, 1: 677.9},
+	}
+	reports := map[string]features{"E2-like": e2At10x, "F1-like": f1At10x}
+	var sum, whole float64
+	var n int
+	for name, runs := range took {
+		m := reports[name].onFleet(16, benchWorkers)
+		m.seconds = runs[16]
+		for _, w := range []int{8, 4, 2, 1} {
+			o := reports[name].onFleet(w, benchWorkers)
+			got := transfer(o, m)
+			d, dw := math.Log(got/runs[w]), math.Log(o.estimate*m.seconds/m.estimate/runs[w])
+			sum, whole, n = sum+d*d, whole+dw*dw, n+1
+			t.Logf("%s on %d: took %.0f s, carried over %.0f s, scaled whole %.0f s", name, w, runs[w], got, o.estimate*m.seconds/m.estimate)
+		}
+	}
+	rms, rmsWhole := math.Exp(math.Sqrt(sum/float64(n))), math.Exp(math.Sqrt(whole/float64(n)))
+	if rms > 1.2 || rms >= rmsWhole {
+		t.Errorf("carried over within a factor of %.2f at the root mean square, scaled whole %.2f", rms, rmsWhole)
+	}
+
+	q95 := features{bytes: 3e9, exchanged: 3e9, held: 3e9, rows: 1e9, levels: 7, stages: 7}
+	opts := q95.options(benchWorkers)
+	correctAt(opts, runs{fleets: map[int]float64{fleetBucket(16): 4.8}}, benchWorkers, time.Now())
+	if best, why, ok := pick(opts, true); !ok || best.workers != 16 {
+		t.Errorf("after 4.8 s on 16 workers: %s (%s; %s)", best, why, describeOptions(opts, true))
+	}
+}
+
 // TestFailedRuns checks that a statement's failures on a number of workers
 // steer how many it runs on: F3-like at a hundred times the data took 729
 // s on 16 workers, failed there after 2,078 s, a worker out of memory, and

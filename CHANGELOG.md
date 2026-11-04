@@ -630,6 +630,15 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   audience, which FLATTENs people's objects and took 7 s alone, is estimated at
   3.7 s, where it was at 1.9.
 
+- Auto mode carries a statement's run on one number of workers over to others by
+  its fixed costs first and its work after. TPC-DS q95 at a hundred times the data
+  took 4.8 s on 16 workers; scaling its whole estimate by that run made 8 workers
+  look as fast for less, and it took 14.7 s there. The estimates' fixed costs (8 s
+  to start, 5 s a level) are what they overstate most for such statements. Carried
+  over this way, two reports' runs on 16 workers predict their runs on 8, 4, 2 and
+  1 within a factor of 1.18 at the root mean square, against 1.25 before, and q95
+  stays on 16.
+
 - Auto mode estimates what workers read for parts that write no exchange, which
   send their rows or partial aggregates to the replica, at the replica's cold rate
   per core, not 0.4 of it. On 16 workers just started, their disks empty, a
