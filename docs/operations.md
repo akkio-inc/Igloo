@@ -756,8 +756,9 @@ them back from there when it starts:
   `memory.json` beside the cache's blocks: written every 30 seconds while
   they change, and when Igloo stops.
 - After a start, in the background, it reads the list's ranges from object
-  storage in that order, 256 requests of up to 8 MiB at a time, and hands
-  them to DuckDB, which uses them as if its queries had read them. A query
+  storage in that order, up to 1 GiB at a time in at most 128 requests of up
+  to 8 MiB, leaving out ranges over 64 MiB, and hands them to DuckDB, which
+  uses them as if its queries had read them. A query
   that reads a range before it is back reads it as it would have, from
   the disk cache, and the restore skips it. On a c7g.16xlarge it read the
   24 GB back in 7 to 8 s, at its network's 3.6 GB/s, and the first run of
@@ -771,6 +772,11 @@ them back from there when it starts:
   change, and other files only while their ETag is the one DuckDB had.
   Emptying the cache, as [erasure requests](#erasure-requests) do, deletes
   the list too.
+- It marks itself under way beside the list, in `memory.json.restoring`,
+  and clears the mark when it ends. A start that finds the mark, because
+  the one before was killed during its read-back, deletes the list and
+  starts without it, rather than die the same way at every start; the log
+  says `a start ended during the read-back of what DuckDB held in memory`.
 - It runs on the server, with `IGLOO_PREFETCH` on, as it is by default; the
   log says `restored what DuckDB held in memory from object storage`, with
   how much and how long it took.

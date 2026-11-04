@@ -50,6 +50,7 @@ import (
 	"time"
 
 	"github.com/duckdb/duckdb-go/v2"
+	"golang.org/x/sync/semaphore"
 
 	"github.com/akkio-inc/igloo/internal/lockorder"
 	"github.com/akkio-inc/igloo/internal/memlimit"
@@ -73,11 +74,26 @@ const (
 	// 54,000 ranges, a median of 200 KB, which this makes 6,900 requests.
 	restoreRequest = 8 << 20
 	restoreGap     = 1 << 20
-	// restoreConcurrency is how many requests a restore keeps in flight. A
-	// c7g.16xlarge restored those 24 GB in 16.7 s with 64 requests of up
-	// to 16 MiB in flight, and in 7.3 s, at its network's 3.6 GB/s, with
-	// 256 of up to 8 MiB.
-	restoreConcurrency = 256
+	// restoreConcurrency is how many requests a restore keeps in flight, as
+	// many of restoreRequest as restoreInFlight holds. A c7g.16xlarge
+	// restored those 24 GB in 16.7 s with 64 requests of up to 16 MiB in
+	// flight, and in 7.3 s, at its network's 3.6 GB/s, with 256 of up to
+	// 8 MiB.
+	restoreConcurrency = restoreInFlight / restoreRequest
+	// restoreInFlight bounds the bytes a restore's requests hold at once,
+	// whatever its ranges are, and restoreRangeMost is the largest range it
+	// reads back. A range in flight is held three times: read into Go,
+	// copied into DuckDB's argument, and copied into the cache. DuckDB had
+	// kept a view's column chunks of device bitmaps whole, ranges of up to
+	// 2.7 GiB, 88 GiB in 36 of them; read back at once, as many as the
+	// restore's share of DuckDB's memory took, they took a machine of 60 GiB
+	// to 63 GB of anonymous memory 25 s into every start, until the kernel
+	// killed the process, 16 times in a row.
+	restoreInFlight  = 1 << 30
+	restoreRangeMost = 64 << 20
+	// fileCacheRestoring marks a restore under way, beside the manifest
+	// (see restoreFileCache).
+	fileCacheRestoring = "memory.json.restoring"
 )
 
 // manifest is what DuckDB held of table files: the files, with their
@@ -429,7 +445,8 @@ type restoreRead struct {
 
 // restoreReads groups each file's ranges into requests (see restoreRequest
 // and restoreGap) and orders them by the earliest range each holds, as many
-// as budget bytes of ranges allow, taken in the manifest's order.
+// as budget bytes of ranges allow, taken in the manifest's order. Ranges over
+// restoreRangeMost are left out.
 func restoreReads(m *manifest, budget int64) []restoreRead {
 	type item struct {
 		offset, length int64
@@ -439,7 +456,7 @@ func restoreReads(m *manifest, budget int64) []restoreRead {
 	var total int64
 	for i, r := range m.Ranges {
 		f := &m.Files[r[0]]
-		if r[2] <= 0 || r[1] < 0 || r[1]+r[2] > f.Size {
+		if r[2] <= 0 || r[2] > restoreRangeMost || r[1] < 0 || r[1]+r[2] > f.Size {
 			continue
 		}
 		if total+r[2] > budget {
@@ -473,6 +490,18 @@ func restoreReads(m *manifest, budget int64) []restoreRead {
 // (see above).
 func (e *Engine) restoreFileCache(ctx context.Context, log *slog.Logger) {
 	f := e.fileCache
+	// A restore marks that it is under way, and clears the mark when it ends.
+	// A start that finds the mark died during one: it starts without the
+	// manifest, rather than die again on every start, as the kernel killed a
+	// replica 16 times in a row 25 s into its restore.
+	mark := filepath.Join(filepath.Dir(f.path), fileCacheRestoring)
+	if _, err := os.Stat(mark); err == nil {
+		log.Warn("a start ended during the read-back of what DuckDB held in memory; starting without it")
+		if err := errors.Join(os.Remove(f.path), os.Remove(mark)); err != nil && !errors.Is(err, os.ErrNotExist) {
+			log.Warn("could not delete the list of what DuckDB held in memory", "err", err)
+		}
+		return
+	}
 	m, err := f.readManifest()
 	if err != nil {
 		log.Warn("could not read the list of what DuckDB held in memory; starting without it", "err", err)
@@ -481,6 +510,11 @@ func (e *Engine) restoreFileCache(ctx context.Context, log *slog.Logger) {
 	if len(m.Ranges) == 0 {
 		return
 	}
+	if err := os.WriteFile(mark, nil, 0o600); err != nil {
+		log.Warn("could not mark the read-back of what DuckDB held in memory; starting without it", "err", err)
+		return
+	}
+	defer os.Remove(mark) //nolint:errcheck
 	// Ranges keep their places in the order across the restart.
 	f.mu.Lock()
 	for _, r := range m.Ranges {
@@ -502,6 +536,7 @@ func (e *Engine) restoreFileCache(ctx context.Context, log *slog.Logger) {
 	// spare (see restoreRoom).
 	var full, short atomic.Bool
 	var opens sync.Map // path -> *restoreObject
+	inFlight := semaphore.NewWeighted(restoreInFlight)
 	work := make(chan restoreRead)
 	var wg sync.WaitGroup
 	for range restoreConcurrency {
@@ -516,11 +551,12 @@ func (e *Engine) restoreFileCache(ctx context.Context, log *slog.Logger) {
 			}
 			defer c.Close() //nolint:errcheck
 			conn := c.(*duckdb.Conn)
-			// One buffer, reused, as DuckDB copies what it is handed: with
-			// one a request, Go's heap held 6 GiB of them for 80 s past a
-			// restore of 19 GB, until its next collection, most of what
-			// DuckDB's limit leaves the process.
-			var buf []byte
+			// One buffer of up to restoreRequest, reused, as DuckDB copies
+			// what it is handed: with one a request, Go's heap held 6 GiB of
+			// them for 80 s past a restore of 19 GB, until its next
+			// collection, most of what DuckDB's limit leaves the process. A
+			// longer range has a buffer of its own, which goes as it ends.
+			var kept []byte
 			for r := range work {
 				if ctx.Err() != nil || full.Load() || short.Load() {
 					continue
@@ -530,11 +566,21 @@ func (e *Engine) restoreFileCache(ctx context.Context, log *slog.Logger) {
 					skipped.Add(int64(len(r.ranges)))
 					continue
 				}
-				if n := int(r.end - r.start); cap(buf) < n {
-					buf = make([]byte, n)
+				n := r.end - r.start
+				if inFlight.Acquire(ctx, n) != nil {
+					continue
 				}
-				buf = buf[:r.end-r.start]
+				buf := kept
+				switch {
+				case n > restoreRequest:
+					buf = make([]byte, n)
+				case int64(cap(kept)) < n:
+					kept = make([]byte, n)
+					buf = kept
+				}
+				buf = buf[:n]
 				if _, err := obj.ReadAt(buf, r.start); err != nil && !(errors.Is(err, io.EOF) && r.end == r.file.Size) {
+					inFlight.Release(n)
 					failed.Add(int64(len(r.ranges)))
 					continue
 				}
@@ -551,6 +597,7 @@ func (e *Engine) restoreFileCache(ctx context.Context, log *slog.Logger) {
 						skipped.Add(1)
 					}
 				}
+				inFlight.Release(n)
 			}
 		}()
 	}

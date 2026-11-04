@@ -3,7 +3,10 @@ package engine
 import (
 	"bytes"
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -16,18 +19,21 @@ import (
 	"time"
 
 	"github.com/duckdb/duckdb-go/v2"
+
+	"github.com/akkio-inc/igloo/internal/prefetch"
 )
 
 func TestRestoreReads(t *testing.T) {
 	m := manifest{
-		Files: []manifestFile{{Path: "s3://b/w/a.parquet", Size: 100 << 20}, {Path: "s3://b/w/b.parquet", Size: 10 << 20}},
+		Files: []manifestFile{{Path: "s3://b/w/a.parquet", Size: 200 << 20}, {Path: "s3://b/w/b.parquet", Size: 10 << 20}},
 		Ranges: [][3]int64{
-			{1, 0, 1 << 20},                  // first used: b's head
-			{0, 50 << 20, 1 << 20},           // a, far from the rest of a
-			{0, 0, 1 << 20},                  // a's head
-			{0, 1<<20 + 100, 1 << 20},        // close after a's head: same request
-			{1, 9 << 20, 2 << 20},            // past b's end: dropped
-			{0, 2<<20 + 200, restoreRequest}, // would make a's head request too long
+			{1, 0, 1 << 20},                     // first used: b's head
+			{0, 50 << 20, 1 << 20},              // a, far from the rest of a
+			{0, 0, 1 << 20},                     // a's head
+			{0, 1<<20 + 100, 1 << 20},           // close after a's head: same request
+			{1, 9 << 20, 2 << 20},               // past b's end: dropped
+			{0, 2<<20 + 200, restoreRequest},    // would make a's head request too long
+			{0, 60 << 20, restoreRangeMost + 1}, // too long to read back: left out
 		},
 	}
 	reads := restoreReads(&m, 1<<40)
@@ -54,6 +60,97 @@ func TestRestoreReads(t *testing.T) {
 	reads = restoreReads(&m, 2<<20)
 	if len(reads) != 2 || reads[0].file.Path != "s3://b/w/b.parquet" || reads[1].start != 50<<20 {
 		t.Fatalf("with a budget of two ranges: %+v", reads)
+	}
+}
+
+// countingObject is an object of zeros a restore reads, which counts the
+// bytes its reads hold at once, inFlight, and the most they held, most.
+type countingObject struct {
+	inFlight, most *atomic.Int64
+}
+
+func (o countingObject) ReadAt(p []byte, off int64) (int, error) {
+	n := o.inFlight.Add(int64(len(p)))
+	defer o.inFlight.Add(-int64(len(p)))
+	for {
+		m := o.most.Load()
+		if n <= m || o.most.CompareAndSwap(m, n) {
+			break
+		}
+	}
+	time.Sleep(time.Millisecond)
+	clear(p)
+	return len(p), nil
+}
+func (countingObject) Close() error { return nil }
+func (countingObject) ETag() string { return "" }
+
+// TestRestoreBounds checks that a restore holds at most restoreInFlight bytes
+// of requests at once, whatever its ranges, and that a start that ended
+// during a restore leaves a mark from which the next start goes on without
+// the manifest.
+func TestRestoreBounds(t *testing.T) {
+	ctx := context.Background()
+	connector, err := duckdb.NewConnector("", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer connector.Close() //nolint:errcheck
+	c, err := connector.Connect(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close() //nolint:errcheck
+	// A budget of three quarters of 64 GiB takes every range.
+	if _, err := c.(*duckdb.Conn).ExecContext(ctx, "SET memory_limit = '64GiB'", nil); err != nil {
+		t.Fatal(err)
+	}
+	room := restoreRoom
+	restoreRoom = func() bool { return true }
+	defer func() { restoreRoom = room }()
+	dir := t.TempDir()
+	var inFlight, most, opened atomic.Int64
+	f := &fileCache{path: filepath.Join(dir, fileCacheManifest), first: map[rangeKey]int64{},
+		open: func(context.Context, string) (prefetch.Object, error) {
+			opened.Add(1)
+			return countingObject{inFlight: &inFlight, most: &most}, nil
+		}}
+	e := &Engine{connector: connector, fileCache: f}
+	// 200 ranges of 32 MiB, 6.25 GiB, each a request of its own.
+	m := manifest{Files: []manifestFile{{Path: "s3://b/w/big.parquet", Size: 1 << 40}}}
+	for i := range 200 {
+		m.Ranges = append(m.Ranges, [3]int64{0, int64(i) * 64 << 20, 32 << 20})
+	}
+	data, err := json.Marshal(m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(f.path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	e.restoreFileCache(ctx, slog.New(slog.DiscardHandler))
+	if got := most.Load(); got == 0 || got > restoreInFlight {
+		t.Errorf("a restore held %d bytes in flight at most, want some and no more than %d", got, int64(restoreInFlight))
+	}
+	mark := filepath.Join(dir, fileCacheRestoring)
+	if _, err := os.Stat(mark); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("a restore that ended left its mark: %v", err)
+	}
+
+	// A start that ended during a restore left the mark: the next goes on
+	// without the manifest, and deletes both.
+	if err := os.WriteFile(mark, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	opened.Store(0)
+	e.restoreFileCache(ctx, slog.New(slog.DiscardHandler))
+	if n := opened.Load(); n != 0 {
+		t.Errorf("a start after one that ended during a restore opened %d files to restore", n)
+	}
+	for _, p := range []string{f.path, mark} {
+		if _, err := os.Stat(p); !errors.Is(err, os.ErrNotExist) {
+			t.Errorf("%s is left: %v", filepath.Base(p), err)
+		}
 	}
 }
 

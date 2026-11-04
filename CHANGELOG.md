@@ -13,6 +13,13 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
 
 ### SQL and tables
 
+- A start no longer dies reading back what DuckDB held in memory. A list of 88
+  GiB in ranges of up to 2.7 GiB, a view's column chunks that DuckDB kept whole,
+  was read back all at once, and the kernel killed Igloo 25 s into each of 16
+  starts in a row on a machine of 60 GiB. The read-back now holds at most 1 GiB
+  of requests at once and leaves out ranges over 64 MiB. A start that finds the
+  one before was killed during its read-back starts without the list.
+
 - Reads of the read cache start no threads of their own. The extension started one
   for each block of each read, warm or cold, and with dashboards, ELT and reports
   beside each other a replica of 16 cores reached 20,394 threads and a load of 240,
