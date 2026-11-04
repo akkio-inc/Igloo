@@ -97,7 +97,9 @@ func TestShedMemoryGivesUpOnStuckStatements(t *testing.T) {
 			defer srv.sessions.mu.Unlock()
 			for _, sess := range srv.sessions.byPID {
 				sess.mu.Lock()
-				if sess.running != nil {
+				// Past waiting to start, as ShedMemory sheds only such: on a
+				// loaded run, one still waiting had nothing shed.
+				if sess.running != nil && !sess.queued {
 					got++
 				}
 				sess.mu.Unlock()
