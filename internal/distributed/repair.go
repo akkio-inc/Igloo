@@ -252,19 +252,23 @@ func (e *execution) recover(ctx context.Context, addr string, err error, reader 
 	}
 	start := time.Now()
 	n, waited, rerr := e.writeAgain(ctx, addr)
+	if rerr != nil {
+		if ctx.Err() == nil {
+			e.co.log.Warn("could not run again only what a lost worker held; the statement's parts run again", "query", e.qid, "worker", addr,
+				"found_by", by, "err", rerr)
+		}
+		// Its files are still listed, and stay on a worker of the run: a task
+		// made now finds them gone as lost, which ends the run as lost, where
+		// on a worker not the statement's they ended it as an error. Found by
+		// its heartbeat before any reader, it ends nothing itself.
+		return false
+	}
 	// Tasks may read its disk no more: what readers need of it is on the others.
 	// Until now they could, as a task made meanwhile still lists its files, and
 	// finds them gone as lost, rather than not the statement's.
 	e.mu.Lock()
 	e.ws = slices.DeleteFunc(slices.Clone(e.ws), func(w *worker) bool { return w.addr == addr })
 	e.mu.Unlock()
-	if rerr != nil {
-		if ctx.Err() == nil {
-			e.co.log.Warn("could not run again only what a lost worker held; the statement's parts run again", "query", e.qid, "worker", addr,
-				"found_by", by, "err", rerr)
-		}
-		return false
-	}
 	if n > 0 {
 		e.co.log.Warn("a worker holding exchanged rows on its disk was lost; ran again only its tasks that readers still need", "query", e.qid,
 			"worker", addr, "found_by", by, "tasks", n, "seconds", time.Since(start).Seconds(), "longest_slot_wait_seconds", waited)
