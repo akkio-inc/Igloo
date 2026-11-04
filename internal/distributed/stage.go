@@ -271,11 +271,8 @@ type execution struct {
 	// erased is the latest deletion of erasure requests the coordinator
 	// knew of when the statement began, which its tasks carry.
 	erased int64
-	// background says its statement runs in the background, which its tasks
-	// carry (see WithBackground).
-	background bool
-	force      bool
-	sp         *spool
+	force  bool
+	sp     *spool
 	// parts is how many partitions every exchange has.
 	parts int
 	// smaller is how many times the statement ran again because a task ran
@@ -695,7 +692,7 @@ func (e *execution) stage(ctx context.Context, s *Stage) error {
 		i := p.i
 		whole, wholeBytes := wholeViews()
 		task := &taskRequest{Query: e.qid, Task: s.ID*tasksPerStage + i, Version: e.co.opts.Version, Settings: e.settings, Erased: e.erased,
-			Sorted: len(s.merge) > 0, Background: e.background}
+			Sorted: len(s.merge) > 0}
 		if e.slots > 1 {
 			task.Slots = e.slots
 		}

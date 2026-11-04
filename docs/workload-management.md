@@ -290,10 +290,7 @@ nothing short for it to give way to.
 With `IGLOO_HEAVY_IN_BACKGROUND=false`, the default, only tasks' heavy
 statements run in the second. Without
 workers, the replica's limit below and roles' limits hold back heavy
-statements beyond that. On workers, a statement is heavy by how long its shape
-held them against the other statements there, and its tasks give way to theirs
-on each worker, as refreshes' do (see [distributed
-execution](distributed-execution.md#when)).
+statements beyond that.
 
 ### The replica's limit
 

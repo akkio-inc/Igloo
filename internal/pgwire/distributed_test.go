@@ -480,29 +480,6 @@ func TestDistributedStatements(t *testing.T) {
 	}
 }
 
-// TestHeavyOnWorkers checks that a statement whose shape held the workers
-// heavily, against the others there, runs there in the background once it is
-// known to: its tasks give way to the others' (see distributed.WithBackground).
-func TestHeavyOnWorkers(t *testing.T) {
-	t.Parallel()
-	ds := startDistServer(t, 2)
-	// Every run on workers is far over this line: one makes the shape heavy.
-	ds.srv.heavyOnWorkers = newHeavyHistoryOf(time.Nanosecond)
-	conn := ds.testServer.admin(t, pgx.QueryExecModeExec)
-	mustExec(t, conn, "SET search_path = 'lake.public,memory.main'")
-	mustExec(t, conn, "SET distributed_execution = on")
-	query := "SELECT amount, count(*) AS n FROM orders GROUP BY amount ORDER BY amount"
-	for run := range 3 {
-		if _, err := conn.Exec(context.Background(), query); err != nil {
-			t.Fatal(err)
-		}
-		q := lastRun(t, ds.history, query)
-		if background := strings.Contains(q.Placement, "in the background"); q.Workers == 0 || background != (run > 0) {
-			t.Errorf("run %d: %d workers, placement %q", run+1, q.Workers, q.Placement)
-		}
-	}
-}
-
 // Grants hold: a user reads through workers only what they may read.
 func TestDistributedGrants(t *testing.T) {
 	t.Parallel()

@@ -615,15 +615,6 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   worker runs fewer of them. A report on 16 workers took 573.9 s at the median
   against 677.7 s; with one worker at half speed, 626.2 s against 1,048.1 s; and a
   worker powered off cost it 1.4% against 3.5%.
-- Refreshes, pipes' loads and heavy statements give way to dashboards on workers.
-  Beside a full refresh on all 16 workers, 40 to 140 s at a time, dashboards'
-  statements on workers took 9.7 s at the median and 42 s at the 95th percentile,
-  against 6.6 and 23 s while none ran. A statement in the background now gets a
-  quarter of a worker's slots before other tasks, and one whenever none of its tasks
-  has started there for 10 seconds, so that it always finishes, and more only once
-  no other statement's task has run or waited there for 2 seconds.
-  Materialized views' and dynamic tables' refreshes and pipes run so, and
-  statements whose shape held the workers 8 times as long as the others there. Their `placement` ends with `in the background`.
 - TPC-DS q09, q10, q16, q32, q35, q69, q92 and q94 run on workers, where they stayed on
   one machine. A scalar subquery in the columns of a statement that does not group, one
   aggregate of all the rows of a large table, is a relation of one row that the workers
@@ -643,13 +634,6 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   twice what they took on a first run, where 8% were; a report's profile of an
   audience, which FLATTENs people's objects and took 7 s alone, is estimated at
   3.7 s, where it was at 1.9.
-
-- Auto mode no longer takes a statement for short of memory on the replica by
-  what its stages exchange where DuckDB's plan says its working set fits. A
-  report whose stages read 30.7 GB of a lookup for exchanges, three times that
-  over the replica's 30.8 GB share, held 19 to 20 GB, as its plan said (15.3
-  GB), and ran in 23.5 s on the replica beside dashboards. Taken for short of
-  memory, it went to 4 workers and took 166.5 s.
 
 - Auto mode estimates a join to a lookup's latest version, `ver = (SELECT max(ver)
   FROM versions)`, by the rows of the row groups that hold that version: Iceberg's
