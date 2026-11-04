@@ -2090,9 +2090,14 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   line](docs/workload-management.md#the-line)). The slowest tenth of a dashboard's
   96 queries at ten times the data took 94 s rather than 102.
 - A `FLATTEN` of a column takes the form DuckDB's estimates point to, then
-  whichever form its shape's latest runs took the less CPU time in at best (see
-  [Snowflake SQL](docs/snowflake-sql.md)): two dashboard queries over tens
-  of millions of rows took 88 seconds and take 56 and 40.
+  whichever form its shape's latest runs took the less of the replica in at best,
+  the more of their CPU time over its cores and of their memory over its memory
+  limit for as long as they ran (see [Snowflake SQL](docs/snowflake-sql.md)): two
+  dashboard queries over tens of millions of rows took 88 seconds and take 56
+  and 40. Judged by CPU time alone, a dashboard query at ten times its data, on
+  16 cores, took the form that ran 40 s rather than 22 and allocated 82 GB rather
+  than 63, and the slowest of the dashboard's first minute took 73 to 76 s; it
+  takes 56 to 64.
 - A statement's shape includes the session's search path and database, so
   the same text over another schema, another client's or the same data at
   ten times the size, learns its own memory and `FLATTEN` form: the first

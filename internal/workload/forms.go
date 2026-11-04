@@ -21,7 +21,7 @@ import (
 // shapeKey). The first statement of a shape takes the form DuckDB's
 // estimates point to (see pgwire's estimateFlattenLists), the next one the other
 // form, and from then on the shape takes the form whose latest runs took the
-// less CPU time at best.
+// less of the replica at best (see machineTime).
 
 // maxFlattenShapes bounds the shapes kept; they are forgotten all at once.
 const maxFlattenShapes = 4096
@@ -37,15 +37,16 @@ const formRuns = 4
 
 // flattenForm is one shape's: whether the estimate picked the FROM items'
 // lists, once made, or is being made; and for each form, the lateral one
-// first, the CPU times of its latest runs and whether a run of it was started.
+// first, how much of the replica its latest runs took (see machineTime) and
+// whether a run of it was started.
 type flattenForm struct {
 	estimated, estimating, lists bool
 	runs                         [2][]time.Duration
 	started                      [2]bool
 }
 
-// cost is the least CPU time of the form's latest runs, zero for none yet:
-// DuckDB counts time a thread waits for a core, so one run beside others
+// cost is the least of the replica the form's latest runs took, zero for none
+// yet: DuckDB counts time a thread waits for a core, so one run beside others
 // takes up to several times another alone, and a form judged by its latest
 // run alone went back and forth with what ran beside it.
 func (s *flattenForm) cost(form int) time.Duration {
@@ -100,15 +101,17 @@ func (c *Controller) ChooseForm(key string, estimate func() bool) bool {
 	return lists
 }
 
-// ObserveForm records the CPU time a statement of shape key took in the form
-// lists says. The server seeds them from the query history when it starts, so
-// that a restart does not try again what it knew: a dashboard's first build
-// after one took half as long again as the next, for two statements that took
-// 39 s and 52 s in the form they had settled on, and 86 s and 96 s in the other.
-func (c *Controller) ObserveForm(key string, lists bool, cpu time.Duration) {
+// ObserveForm records a run of a statement of shape key in the form lists says:
+// the CPU time it took, its footprint (see FootprintOf) and how long it ran. The
+// server seeds them from the query history when it starts, so that a restart
+// does not try again what it knew: a dashboard's first build after one took half
+// as long again as the next, for two statements that took 39 s and 52 s in the
+// form they had settled on, and 86 s and 96 s in the other.
+func (c *Controller) ObserveForm(key string, lists bool, cpu time.Duration, footprint int64, ran time.Duration) {
 	if c == nil || key == "" || cpu <= 0 {
 		return
 	}
+	took := c.machineTime(cpu, footprint, ran)
 	f := &c.forms
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -123,10 +126,30 @@ func (c *Controller) ObserveForm(key string, lists bool, cpu time.Duration) {
 	}
 	form := b2i(lists)
 	s.started[form] = true
-	s.runs[form] = append(s.runs[form], cpu)
+	s.runs[form] = append(s.runs[form], took)
 	if len(s.runs[form]) > formRuns {
 		s.runs[form] = s.runs[form][1:]
 	}
+}
+
+// machineTime is how much of the replica a run took: its CPU time over the
+// replica's cores or, if more, its footprint over the replica's memory for as
+// long as it ran; without the cores, its CPU time. Judged by CPU time alone, a
+// form held the memory the statements beside it waited for: of a dashboard
+// query's two forms at ten times its data, on 16 cores, the one that took 180
+// CPU-seconds rather than 250 ran 40 s rather than 25 to 31 and allocated 82 GB
+// rather than 63 to 69, which reserved more than the replica's 49 GB. Each time
+// it waited 33 to 43 s for the statements running to end, and the 8 to 10 that
+// came after it waited until it ended, with one statement running.
+func (c *Controller) machineTime(cpu time.Duration, footprint int64, ran time.Duration) time.Duration {
+	if c.costs.cores == 0 {
+		return cpu
+	}
+	took := cpu / time.Duration(c.costs.cores)
+	if c.budget > 0 && footprint > 0 && ran > 0 {
+		took = max(took, time.Duration(float64(ran)*float64(footprint)/float64(c.budget)))
+	}
+	return took
 }
 
 func b2i(b bool) int {

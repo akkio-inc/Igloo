@@ -300,7 +300,7 @@ func workerWriteCredentials(ctx context.Context, cfg config.Config, log *slog.Lo
 type footprints interface {
 	Observe(shape string, footprint int64)
 	ObserveUnfinished(shape string, held int64)
-	ObserveForm(key string, lists bool, cpu time.Duration)
+	ObserveForm(key string, lists bool, cpu time.Duration, footprint int64, ran time.Duration)
 	ObserveCost(shape string, cpu time.Duration)
 	ObserveTook(shape string, took time.Duration)
 	ObserveEmpty(shape string)
@@ -347,9 +347,11 @@ func seedHistory(ctx context.Context, seed func([]distributed.Run), fp footprint
 	}
 	var fs []footprint
 	type form struct {
-		key   string
-		lists bool
-		cpu   time.Duration
+		key       string
+		lists     bool
+		cpu       time.Duration
+		footprint int64
+		ran       time.Duration
 	}
 	var forms []form
 	for read := 0; read < most; read += pageSize {
@@ -361,7 +363,8 @@ func seedHistory(ctx context.Context, seed func([]distributed.Run), fp footprint
 		for _, q := range qs {
 			empty := q.Resources != nil && workload.ReadNothing(q.Resources.BytesRead, q.Resources.CPUTime)
 			if q.FlattenKey != "" && q.Outcome == audit.OutcomeOK && q.Resources != nil && q.Workers == 0 && !empty {
-				forms = append(forms, form{q.FlattenKey, q.FlattenLists, q.Resources.CPUTime})
+				forms = append(forms, form{q.FlattenKey, q.FlattenLists, q.Resources.CPUTime,
+					workload.FootprintOf(q.Resources.MemoryAllocated, q.Peak, q.Peak > 0), q.Duration - q.Queued})
 			}
 			switch {
 			case q.PlanKey == "":
@@ -410,7 +413,7 @@ func seedHistory(ctx context.Context, seed func([]distributed.Run), fp footprint
 	slices.Reverse(fs)
 	slices.Reverse(forms)
 	for _, f := range forms {
-		fp.ObserveForm(f.key, f.lists, f.cpu)
+		fp.ObserveForm(f.key, f.lists, f.cpu, f.footprint, f.ran)
 	}
 	if seed != nil {
 		seed(rs)

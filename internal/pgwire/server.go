@@ -2349,10 +2349,11 @@ func (s *Server) preparedQuery(ctx context.Context, sess *session, user auth.Use
 		// A run planned to no rows says nothing of others of its shape (see
 		// workload.ReadNothing).
 		measured := used != nil && !workload.ReadNothing(used.BytesRead, used.CPUTime)
-		if measured && tr != nil && tr.flattenKey != "" {
-			s.workload.ObserveForm(tr.flattenKey, tr.flattenLists, used.CPUTime)
-		}
 		peak, sampled := sess.wl.peak, sess.wl.sampled
+		if measured && tr != nil && tr.flattenKey != "" {
+			s.workload.ObserveForm(tr.flattenKey, tr.flattenLists, used.CPUTime,
+				workload.FootprintOf(used.MemoryAllocated, peak, sampled), time.Since(start)-sess.wl.queued)
+		}
 		if used != nil && parts.workers == 0 && s.heavy != nil && (measured || !s.heavy.known(shape)) {
 			// Which of this replica's DuckDBs the next like it runs in.
 			s.heavy.observe(shape, used.CPUTime, sess.wl.ranInBackground)

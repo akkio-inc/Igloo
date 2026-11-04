@@ -516,31 +516,31 @@ func TestFlattenForms(t *testing.T) {
 	if asked != 1 {
 		t.Errorf("asked DuckDB %d times", asked)
 	}
-	f.ObserveForm("a", false, 2*time.Second)
+	f.ObserveForm("a", false, 2*time.Second, 0, 0)
 	if f.ChooseForm("a", estimate) {
 		t.Error("with only the lateral form's run ended, not the lateral form")
 	}
-	f.ObserveForm("a", true, 5*time.Second)
+	f.ObserveForm("a", true, 5*time.Second, 0, 0)
 	if f.ChooseForm("a", estimate) {
 		t.Error("the slower form")
 	}
-	f.ObserveForm("a", true, time.Second)
+	f.ObserveForm("a", true, time.Second, 0, 0)
 	if !f.ChooseForm("a", estimate) {
 		t.Error("not the form that became faster")
 	}
 	// A run beside others takes longer: it changes nothing until the faster
 	// run is no longer among the latest.
-	f.ObserveForm("a", true, 5*time.Second)
+	f.ObserveForm("a", true, 5*time.Second, 0, 0)
 	if !f.ChooseForm("a", estimate) {
 		t.Error("a slower run of the faster form moved the shape off it")
 	}
 	for range formRuns {
-		f.ObserveForm("a", true, 5*time.Second)
+		f.ObserveForm("a", true, 5*time.Second, 0, 0)
 	}
 	if f.ChooseForm("a", estimate) {
 		t.Error("the form that became slower")
 	}
-	f.ObserveForm("unseen", true, time.Second)
+	f.ObserveForm("unseen", true, time.Second, 0, 0)
 	if f.ChooseForm("b", func() bool { return false }) || !f.ChooseForm("b", estimate) {
 		t.Error("another shape: not the estimate's, then the other form")
 	}
@@ -551,21 +551,47 @@ func TestFlattenForms(t *testing.T) {
 func TestFormsFromTheHistory(t *testing.T) {
 	never := func() bool { t.Error("asked DuckDB of a shape in the history"); return false }
 	f := NewController(0)
-	f.ObserveForm("both", false, 5*time.Second)
-	f.ObserveForm("both", true, 2*time.Second)
+	f.ObserveForm("both", false, 5*time.Second, 0, 0)
+	f.ObserveForm("both", true, 2*time.Second, 0, 0)
 	if !f.ChooseForm("both", never) {
 		t.Error("with both seen, not the faster")
 	}
-	f.ObserveForm("one", true, 2*time.Second)
+	f.ObserveForm("one", true, 2*time.Second, 0, 0)
 	if f.ChooseForm("one", never) {
 		t.Error("with one seen, not the other next")
 	}
-	f.ObserveForm("one", false, 5*time.Second)
+	f.ObserveForm("one", false, 5*time.Second, 0, 0)
 	if !f.ChooseForm("one", never) {
 		t.Error("with both seen by then, not the faster")
 	}
 	var none *Controller
-	none.ObserveForm("x", true, time.Second)
+	none.ObserveForm("x", true, time.Second, 0, 0)
+}
+
+// TestFormsByMachineTime checks that a form is judged by the more of its CPU time
+// over the cores and its footprint over the memory for as long as it ran: of two
+// forms of a dashboard query, the one that took less CPU but held more than the
+// replica's memory for longer is not taken, while for statements that hold little
+// CPU time decides as before.
+func TestFormsByMachineTime(t *testing.T) {
+	const gb = int64(1) << 30
+	never := func() bool { t.Error("asked DuckDB of a shape in the history"); return false }
+	f := NewController(49 * gb)
+	f.WeighCosts(16, LightCPU)
+	// 180 CPU-seconds, 54.5 GB for 40 s: 11 s of the cores, 44 s of the memory.
+	f.ObserveForm("heavy", false, 180*time.Second, 54*gb+gb/2, 40*time.Second)
+	// 250 CPU-seconds, 43 GB for 30 s: 16 s of the cores, 26 s of the memory.
+	f.ObserveForm("heavy", true, 250*time.Second, 43*gb, 30*time.Second)
+	if !f.ChooseForm("heavy", never) {
+		t.Error("the form that held the memory longer")
+	}
+	// A tile: 2 CPU-seconds and half a GB for half a second, against 3 and a
+	// third: the cores decide.
+	f.ObserveForm("tile", false, 2*time.Second, gb/2, time.Second/2)
+	f.ObserveForm("tile", true, 3*time.Second, gb/3, time.Second/2)
+	if f.ChooseForm("tile", never) {
+		t.Error("a tile's form that took more CPU time")
+	}
 }
 
 // TestControllerLineByExpected checks that statements wait in the order they
