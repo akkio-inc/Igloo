@@ -201,10 +201,11 @@ func splitOptions(s string) []string {
 type translation struct {
 	snowflake.Result
 	// flattenKey is the shape key of a statement whose FLATTENs of columns
-	// could take either form, and flattenLists the form they take (see
+	// could take either form, flattenExact its key with its literals, by its
+	// text in Snowflake's dialect, and flattenLists the form they take (see
 	// flattenForms).
-	flattenKey   string
-	flattenLists bool
+	flattenKey, flattenExact string
+	flattenLists             bool
 }
 
 // columns presents a translated statement's result columns as Snowflake
@@ -254,19 +255,20 @@ func (s *Server) translate(ctx context.Context, sess *session, text string, impl
 // picks that form for its shape, DuckDB's estimates of tr's plan first.
 func (s *Server) flattenForm(ctx context.Context, sess *session, source string, tr *translation) *translation {
 	key := s.workloadShape(ctx, sess, source)
+	exact := s.workloadExact(sess, source)
 	lateral := tr.SQL
 	if !s.workload.ChooseForm(key, func() bool { return estimateFlattenLists(ctx, sess, lateral) }) {
-		tr.flattenKey = key
+		tr.flattenKey, tr.flattenExact = key, exact
 		return tr
 	}
 	sess.flattenLists = true
 	ltr, err := s.translate(ctx, sess, source, false)
 	if err != nil || ltr.Command != "" || ltr.Untranslated {
 		sess.flattenLists = false
-		tr.flattenKey = key
+		tr.flattenKey, tr.flattenExact = key, exact
 		return tr
 	}
-	ltr.flattenKey, ltr.flattenLists = key, true
+	ltr.flattenKey, ltr.flattenExact, ltr.flattenLists = key, exact, true
 	return ltr
 }
 

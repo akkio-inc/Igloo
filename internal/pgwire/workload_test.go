@@ -4,6 +4,7 @@ import (
 	"context"
 	"io"
 	"log/slog"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -389,6 +390,54 @@ func TestUnseenSlightStartsAtOnce(t *testing.T) {
 	// Once the other has ended, it starts.
 	release()
 	expectRows(t, admin, "SELECT count(DISTINCT person) FROM lake.public.people", "300000")
+}
+
+// TestWorkloadKeysAcrossFlattenForms runs a statement in Snowflake's dialect whose
+// FLATTEN takes one form, then the other (see flattenForm), and checks that its runs
+// share one shape and one exact key, as the same statement from the client does: by
+// DuckDB's text they were new again, and waited as statements nothing is known of do.
+func TestWorkloadKeysAcrossFlattenForms(t *testing.T) {
+	t.Parallel()
+	vc := newViewCatalog(t)
+	store := audit.NewMemoryStore(1000, 1000)
+	r := vc.replica(t, func(o *Options) {
+		o.Audit = audit.New(store, audit.Options{}, slog.New(slog.DiscardHandler))
+	})
+	sf := r.admin(t, pgx.QueryExecModeSimpleProtocol)
+	mustExec(t, sf, "SET sql_dialect = 'snowflake'")
+	mustExec(t, sf, "create table lake.public.fl (a array)")
+	mustExec(t, sf, "insert into lake.public.fl select array_construct('x', 'y', 'z')")
+	for range 3 {
+		if got := rawTexts(t, sf, "select f.value::string from lake.public.fl as t, lateral flatten(input => t.a) as f order by 1"); !slices.Equal(got, []string{"x", "y", "z"}) {
+			t.Fatalf("got %q", got)
+		}
+	}
+	shapes, exacts, forms := map[string]bool{}, map[string]bool{}, map[bool]bool{}
+	for deadline := time.Now().Add(10 * time.Second); time.Now().Before(deadline); time.Sleep(50 * time.Millisecond) {
+		qs, err := store.Queries(context.Background(), audit.Viewer{All: true}, audit.Page{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		clear(shapes)
+		clear(exacts)
+		clear(forms)
+		runs := 0
+		for _, q := range qs {
+			if q.FlattenKey != "" {
+				runs++
+				shapes[q.Shape], exacts[q.Exact], forms[q.FlattenLists] = true, true, true
+			}
+		}
+		if runs >= 3 {
+			break
+		}
+	}
+	if len(forms) != 2 {
+		t.Fatalf("the FLATTEN took forms %v in 3 runs, not both", forms)
+	}
+	if len(shapes) != 1 || len(exacts) != 1 {
+		t.Errorf("in both forms: %d shapes, %d exact keys", len(shapes), len(exacts))
+	}
 }
 
 // TestStatementShape checks the shapes that reservations learn by: the same

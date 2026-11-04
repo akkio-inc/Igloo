@@ -2027,6 +2027,10 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
 - A replica keeps the forms of `FLATTEN`s through a restart, from the query
   history, rather than try them again: a dashboard's first build after one took
   half as long again as the next.
+- A statement whose `FLATTEN`s Igloo runs in either form keeps one history of its
+  memory and time, by the text the client sent. By the text DuckDB ran, which
+  differs between the forms, a dashboard's statements were new again in its second
+  run, and waited for one another as statements nothing is known of do.
 - A heavy statement in the second DuckDB gets the memory of the first's caches
   when statements wait in line behind it and none runs in the first: a dashboard's
   heavy statements, held to what those caches left them, spilled while the rest

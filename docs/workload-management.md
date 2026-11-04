@@ -352,7 +352,8 @@ a fixed limit, though, holds back the light statements with the heavy ones.
 Igloo instead learns what each statement holds at once, by its shape (its
 text with string and number literals masked, which a dashboard sends again
 with other audiences, dates and limits, though `LIMIT 0` has a shape of its
-own), and the next statement of that
+own; a statement in Snowflake's dialect whose FLATTEN Igloo can translate two ways
+goes by the text the client sent, whichever way it ran), and the next statement of that
 shape reserves `IGLOO_STATEMENT_RESERVATIONS` of it (`auto`, the default,
 is all of it) of the replica's memory before it starts, as a role's
 `memory_limit` reserves (see [role limits](#role-limits)). A statement whose

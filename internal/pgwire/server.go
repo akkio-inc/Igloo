@@ -2242,6 +2242,14 @@ func (s *Server) preparedQuery(ctx context.Context, sess *session, user auth.Use
 		if sess.wl.counted || st.staged != nil {
 			sess.wl.shape = s.workloadShape(ctx, sess, st.shapeText())
 			sess.wl.exact = s.workloadExact(sess, st.shapeText())
+			if tr != nil && tr.flattenKey != "" {
+				// Its FLATTENs take one form, then the other, then the faster
+				// (see flattenForm), which DuckDB's text says and the client's
+				// does not: by that text a dashboard's statements were new again
+				// in its second run, and waited for one another as statements
+				// nothing is known of do. The client's text keys them.
+				sess.wl.shape, sess.wl.exact = tr.flattenKey, tr.flattenExact
+			}
 		}
 		shape, exact := sess.wl.shape, sess.wl.exact
 		sess.wl.apart = s.runsApart(sess, st)
