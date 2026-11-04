@@ -1399,7 +1399,7 @@ func (pl *planner) from(ref node, splittable bool, ctes cteScope, sc *scope, rd 
 		}
 		conds := append(conjuncts(child(ref, "condition")), usingConds(ref, sc.items[items0:items], sc.items[items:])...)
 		if splittable {
-			sc.addOuterJoin(ref, rd, conds, [3]int{uses0, uses, len(rd.uses)}, [3]int{rels0, rels, len(rd.rels)})
+			sc.addOuterJoin(ref, rd, conds, [3]int{uses0, uses, len(rd.uses)}, [3]int{rels0, rels, len(rd.rels)}, sc.items[items0:items])
 		}
 		jt := str(ref["join_type"])
 		switch {

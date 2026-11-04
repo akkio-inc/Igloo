@@ -265,8 +265,7 @@ func (pl *planner) joinOn(sel node, kind, alias string, sub node, names []any, c
 }
 
 // innerItem reports whether the columns outer are all qualified by the name of
-// one table or subquery of FROM clause from, which inner and cross joins only
-// join to the others.
+// one table or subquery of FROM clause from that joinedInner finds.
 func innerItem(from node, outer []node) bool {
 	name := ""
 	for _, e := range outer {
@@ -276,6 +275,14 @@ func innerItem(from node, outer []node) bool {
 		}
 		name = parts[0]
 	}
+	return joinedInner(from, name)
+}
+
+// joinedInner reports whether FROM clause from has one table or subquery
+// called name, which inner and cross joins only join to the others, or which
+// is on the side of a LEFT, SEMI or ANTI join whose rows it keeps: each row
+// from makes has one row of it.
+func joinedInner(from node, name string) bool {
 	found := 0
 	var visit func(n node) bool
 	visit = func(n node) bool {
@@ -285,8 +292,9 @@ func innerItem(from node, outer []node) bool {
 			switch {
 			case rt != "REGULAR" && rt != "CROSS":
 				return false
-			case jt == "SEMI" || jt == "ANTI":
-				// Another EXISTS made a join: its rows are its left side's.
+			case jt == "SEMI" || jt == "ANTI" || jt == "LEFT":
+				// Its rows are its left side's, with or without rows of the
+				// right: another EXISTS made the join, or a scalar subquery.
 				return visit(child(n, "left"))
 			case jt != "INNER":
 				return false

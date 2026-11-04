@@ -95,3 +95,34 @@ func TestResidualCorrelations(t *testing.T) {
 		}
 	}
 }
+
+// TestScalarJoinOverJoins runs TPC-DS q32 and q92, which sum the discounts of
+// an item's sales above 1.3 times the item's average, its sales joined to the
+// items and dates, on workers, with the sales too large for every worker to
+// read: the average is a LEFT JOIN to the items' averages by the item's key,
+// read by partition with the sales of the items (see keyItem), and the rows
+// are one machine's.
+func TestScalarJoinOverJoins(t *testing.T) {
+	h := newTPCDSHarness(t, 0.01, 4, 3)
+	for _, name := range []string{"web_sales", "catalog_sales"} {
+		h.tables[name].Bytes = 1 << 36
+	}
+	for _, nr := range []string{"32", "92"} {
+		rows, _, err := h.query(context.Background(), "SELECT query FROM tpcds_queries() WHERE query_nr = "+nr)
+		if err != nil || len(rows) != 1 {
+			t.Fatalf("q%s: %v", nr, err)
+		}
+		q := rows[0][0].(string)
+		want, _, err := h.query(t.Context(), q)
+		if err != nil {
+			t.Fatalf("q%s on one machine: %v", nr, err)
+		}
+		got, _, plan, _, err := h.run(t.Context(), q, ModeOn)
+		if err != nil {
+			t.Fatalf("q%s: %v", nr, err)
+		}
+		if msg := compareRows(want, got, hasOrderBy(q)); msg != "" {
+			t.Errorf("q%s: %s\n%s", nr, msg, plan.describe())
+		}
+	}
+}

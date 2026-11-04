@@ -219,7 +219,11 @@ In detail, a part runs distributed when:
   count a `LEFT JOIN` to its groups, in `WHERE` or in a select list that does
   not group. An `EXISTS` or `NOT EXISTS` may also compare its columns to the
   statement's otherwise (TPC-DS q94's `ws1.ws_warehouse_sk <> ws2.ws_warehouse_sk`),
-  which its join checks beside the equal ones.
+  which its join checks beside the equal ones. Where the statement joins
+  several tables, its rows are divided by the one whose columns the subquery
+  reads, as TPC-DS q32's sales joined to their items and dates are by the
+  item, when inner joins are all that join it to the others. So is a `LEFT
+  JOIN` of several tables to a large one.
   A scalar subquery in the select list of a statement that does not group,
   one aggregate of all of its rows, that reads more than the coordinator
   would read itself (see [when](#when)) is a relation of one row that workers

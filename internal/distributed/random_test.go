@@ -157,7 +157,7 @@ func (g *gen) subqueryPred(t string) string {
 
 // from is a FROM clause over f as t, perhaps joined to dim or f2 (as o).
 func (g *gen) from() (string, string) {
-	switch g.n(0, 6) {
+	switch g.n(0, 7) {
 	case 0:
 		return "f t JOIN dim ON t.k = dim.k", "t"
 	case 1:
@@ -166,6 +166,9 @@ func (g *gen) from() (string, string) {
 		return "f t JOIN f2 o ON t.k = o.k AND t.h = o.h", "t"
 	case 3:
 		return fmt.Sprintf("f t FULL JOIN (SELECT * FROM dim WHERE w < %d) dim ON t.k = dim.k", g.n(5, 29)), "t"
+	case 4:
+		// A LEFT JOIN to f's rows joined to others, by f's key (see keyItem).
+		return "f t JOIN dim ON t.k = dim.k LEFT JOIN f2 o ON t.k = o.k AND t.h = o.h", "t"
 	default:
 		return "f t", "t"
 	}
@@ -553,8 +556,15 @@ func (g *gen) query() string {
 	case 8:
 		// Subqueries in WHERE, of f alone or joined to others, as TPC-DS q69's
 		// customers are to their addresses (see innerItem).
-		from := g.pick("f", "f", "f JOIN dim ON f.k = dim.k", "f CROSS JOIN (SELECT DISTINCT w FROM dim WHERE w < 3) AS d")
-		q := "SELECT f.h, count(*), sum(f.v) FROM " + from + " WHERE " + g.subqueryPred("f")
+		from := g.pick("f", "f", "f JOIN dim ON f.k = dim.k", "f CROSS JOIN (SELECT DISTINCT w FROM dim WHERE w < 3) AS d",
+			"f JOIN (SELECT DISTINCT k AS dk, name, w FROM dim) AS d ON f.k = d.dk")
+		pred := g.subqueryPred("f")
+		if strings.Contains(from, "dk") && g.chance(0.5) {
+			// A key its name alone names, of the item f is joined to, as TPC-DS
+			// q32 compares a sale to its item's average (see keyItem).
+			pred = fmt.Sprintf("f.v > (SELECT %s * avg(v) FROM f2 WHERE f2.k = dk%s)", g.pick("1.3", "1"), g.pick("", fmt.Sprintf(" AND f2.h < %d", g.n(1, 6))))
+		}
+		q := "SELECT f.h, count(*), sum(f.v) FROM " + from + " WHERE " + pred
 		if g.chance(0.5) {
 			q += " AND " + g.pred("f")
 		}
