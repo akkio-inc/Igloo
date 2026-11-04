@@ -2,9 +2,11 @@ package pgwire
 
 import (
 	"context"
+	"fmt"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -16,17 +18,19 @@ import (
 
 // TestOutOfMemoryRunsAgainAlone checks that a statement that runs out of
 // memory, before it sent a row, runs again rather than fail. Beside another
-// statement, it runs again once it holds the replica's whole memory, on as
-// many threads: its second run waits until the other statement's reservation
-// ends. Run out alone, it runs again on half the threads, and DuckDB's
-// threads are as they were after. In a transaction block, which running it
-// again would break, it fails as DuckDB failed it.
+// statement, it runs again on as many threads once what it failed to get is
+// free: its second run waits until the other statement, which holds most of
+// the memory, ends. Run out alone, it runs again on half the threads, and
+// DuckDB's threads are as they were after. In a transaction block, which
+// running it again would break, it fails as DuckDB failed it.
 func TestOutOfMemoryRunsAgainAlone(t *testing.T) {
 	t.Parallel()
 	ctl := workload.NewController(1 << 30)
 	cs := startCatalogServer(t, func(o *Options) { o.Workload = ctl })
 	ctx := context.Background()
 	oom := &duckdb.Error{Type: duckdb.ErrorTypeOutOfMemory, Msg: "Out of Memory Error: failed to allocate data of size 4.0 KiB (1.8 GiB/1.8 GiB used)"}
+	// Half the replica's memory: free once the other statement ends.
+	big := &duckdb.Error{Type: duckdb.ErrorTypeOutOfMemory, Msg: "Out of Memory Error: failed to allocate data of size 512.0 MiB (1.0 GiB/1.0 GiB used)"}
 	var mu sync.Mutex
 	var runs int
 	var threads []string
@@ -91,6 +95,9 @@ func TestOutOfMemoryRunsAgainAlone(t *testing.T) {
 			time.Sleep(200 * time.Millisecond)
 			otherEnds()
 		}()
+		if strings.Contains(st.query, "beside_marker") {
+			return big
+		}
 		return oom
 	}
 	holder := cs.testServer.admin(t, pgx.QueryExecModeSimpleProtocol)
@@ -159,6 +166,117 @@ func TestOutOfMemoryRunsAgainAlone(t *testing.T) {
 	}
 	if n, _ := seen(); n != 1 {
 		t.Errorf("in a transaction block it ran %d times, want 1", n)
+	}
+}
+
+// TestOutOfMemoryAtOnce checks that statements that run out of memory at
+// once, beside a dashboard's load and a statement that holds most of the
+// memory, stop nothing. The dashboard's statements, which reserve memory,
+// keep starting; one of the six waits to run alone, and runs once nothing else
+// holds memory; the others fail at once, saying another waits to run alone.
+// Each of the six waited in line for all of the memory, holding back every
+// statement behind it that reserved any, and on a replica of 42.2 GiB nothing
+// started for 150 s.
+func TestOutOfMemoryAtOnce(t *testing.T) {
+	t.Parallel()
+	ctl := workload.NewController(1 << 30)
+	cs := startCatalogServer(t, func(o *Options) { o.Workload = ctl })
+	ctx := context.Background()
+	// Seen once, they start together rather than one at a time, as statements
+	// nothing is known of do.
+	if n := count(t, cs.admin, "SELECT 0 AS oom_marker"); n != 0 {
+		t.Fatalf("got %d", n)
+	}
+	// A statement holds most of the memory, as a refresh did.
+	heavy, _, err := ctl.Admit(ctx, workload.Limits{Memory: 600 << 20})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { heavy() })
+	var mu sync.Mutex
+	failed := map[string]bool{}
+	cs.srv.failLocal = func(_ context.Context, st *statement) error {
+		if !strings.Contains(st.query, "oom_marker") {
+			return nil
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		if failed[st.query] {
+			return nil
+		}
+		failed[st.query] = true
+		return &duckdb.Error{Type: duckdb.ErrorTypeOutOfMemory, Msg: "Out of Memory Error: failed to allocate data of size 900.0 MiB (1.0 GiB/1.0 GiB used)"}
+	}
+	t.Cleanup(func() { cs.srv.failLocal = nil })
+
+	// A dashboard's load: statements of 64 MiB each, back to back, four at once.
+	stop := make(chan struct{})
+	var started, timedOut atomic.Int64
+	var load sync.WaitGroup
+	for range 4 {
+		load.Add(1)
+		go func() {
+			defer load.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				wctx, cancel := context.WithTimeout(ctx, time.Second)
+				r, _, err := ctl.Admit(wctx, workload.Limits{Memory: 64 << 20})
+				cancel()
+				if err != nil {
+					timedOut.Add(1)
+					continue
+				}
+				started.Add(1)
+				time.Sleep(10 * time.Millisecond)
+				r()
+			}
+		}()
+	}
+	stopLoad := sync.OnceFunc(func() {
+		close(stop)
+		load.Wait()
+	})
+	t.Cleanup(stopLoad)
+
+	const n = 6
+	errs := make(chan error, n)
+	for i := range n {
+		conn := cs.testServer.admin(t, pgx.QueryExecModeSimpleProtocol)
+		go func() {
+			_, err := conn.Exec(ctx, fmt.Sprintf("SELECT %d AS oom_marker", i+1))
+			errs <- err
+		}()
+	}
+	deadline := time.After(30 * time.Second)
+	for busy := 0; busy < n-1; busy++ {
+		select {
+		case err := <-errs:
+			if pgCode(err) != "53200" || !strings.Contains(err.Error(), "another was already waiting to run alone") {
+				t.Fatalf("a statement that could not run alone: %v", err)
+			}
+		case <-deadline:
+			t.Fatalf("%d of the %d statements that could not run alone failed in 30 s", busy, n-1)
+		}
+	}
+	before := started.Load()
+	time.Sleep(500 * time.Millisecond)
+	if got := started.Load() - before; got < 10 || timedOut.Load() > 0 {
+		t.Errorf("beside a statement waiting to run alone, %d of the dashboard's statements started in 0.5 s, and %d waited a second in vain",
+			got, timedOut.Load())
+	}
+	stopLoad()
+	heavy()
+	select {
+	case err := <-errs:
+		if err != nil {
+			t.Errorf("the statement that waited to run alone: %v", err)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("the statement waiting to run alone did not run once nothing else held memory")
 	}
 }
 

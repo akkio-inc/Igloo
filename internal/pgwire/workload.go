@@ -86,6 +86,9 @@ type workloadState struct {
 	// fell within one (see workload.Controller.SampleMemory).
 	peak    int64
 	sampled bool
+	// reserved is the memory the latest statement reserved as it started,
+	// zero for none.
+	reserved int64
 	// meter reads what each statement used; nil without one.
 	meter *engine.Meter
 	// backgroundUsed is what the latest statement used, if it ran in the
@@ -240,7 +243,7 @@ func (sess *session) admit(ctx context.Context) (release, leave func(), err erro
 	}
 	done, waited, err := sess.wl.controller.Admit(ctx, l)
 	sess.wl.queued = waited
-	sess.wl.peak, sess.wl.sampled = 0, false
+	sess.wl.peak, sess.wl.sampled, sess.wl.reserved = 0, false, l.Memory
 	if err == nil {
 		sess.wl.elsewhere, sess.wl.admitted = elsewhere, func() { done() }
 		return func() {

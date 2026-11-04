@@ -256,6 +256,62 @@ func TestControllerMemoryInArrivalOrder(t *testing.T) {
 	r()
 }
 
+// TestControllerAlone checks that a statement to run alone waits until nothing
+// is reserved, holding nobody back: a reservation that fits starts while it
+// waits. A second one is refused while the first waits, and runs once the
+// first has run.
+func TestControllerAlone(t *testing.T) {
+	c := NewController(10)
+	ctx := context.Background()
+	held, _, _ := c.Admit(ctx, Limits{Memory: 6})
+	alone := make(chan func() (int64, bool), 1)
+	go func() {
+		r, _, err := c.Admit(ctx, Limits{Alone: true})
+		if err != nil {
+			t.Error(err)
+		}
+		alone <- r
+	}()
+	for {
+		c.mu.Lock()
+		waiting := len(c.queue)
+		c.mu.Unlock()
+		if waiting == 1 {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if _, _, err := c.Admit(ctx, Limits{Alone: true}); !errors.Is(err, ErrAloneTaken) {
+		t.Errorf("a second statement to run alone: %v", err)
+	}
+	// A reservation that fits starts beside the one waiting.
+	ctx1, cancel := context.WithTimeout(ctx, time.Second)
+	defer cancel()
+	fits, waited, err := c.Admit(ctx1, Limits{Memory: 3})
+	if err != nil || waited > 0 {
+		t.Fatalf("a reservation that fits waited %v behind one waiting to run alone: %v", waited, err)
+	}
+	select {
+	case <-alone:
+		t.Fatal("ran alone beside reservations")
+	case <-time.After(20 * time.Millisecond):
+	}
+	fits()
+	held()
+	r := <-alone
+	ctx2, cancel2 := context.WithTimeout(ctx, 20*time.Millisecond)
+	defer cancel2()
+	if _, _, err := c.Admit(ctx2, Limits{Memory: 3}); err == nil {
+		t.Error("a reservation started beside a statement running alone")
+	}
+	r()
+	r, _, err = c.Admit(ctx, Limits{Alone: true})
+	if err != nil {
+		t.Fatalf("after the first ran alone: %v", err)
+	}
+	r()
+}
+
 func TestControllerWithoutLimits(t *testing.T) {
 	var c *Controller
 	r, waited, err := c.Admit(context.Background(), Limits{Slots: Slots{Key: "x", Max: 1}})

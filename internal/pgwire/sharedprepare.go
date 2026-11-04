@@ -2,7 +2,6 @@ package pgwire
 
 import (
 	"context"
-	"math"
 	"strings"
 
 	"github.com/akkio-inc/igloo/internal/auth"
@@ -36,7 +35,10 @@ func (s *Server) prepareChecked(ctx context.Context, sess *session, user auth.Us
 	if err == nil || !prepareAgainAlone(text, err) {
 		return st, err
 	}
-	done, _, aerr := sess.wl.controller.Admit(ctx, workload.Limits{Memory: math.MaxInt64})
+	// One at a time, holding nobody back as it waits (see runAloneTurn).
+	wait, stop := context.WithTimeout(ctx, aloneWait)
+	done, _, aerr := sess.wl.controller.Admit(wait, workload.Limits{Alone: true})
+	stop()
 	if aerr != nil {
 		return nil, err
 	}

@@ -199,6 +199,15 @@ type Limits struct {
 	// it goes on to run on workers (see Controller.elsewhere). It is the
 	// statement's, not the user's.
 	Elsewhere *func()
+	// Alone says the statement is to run alone: it starts once no other
+	// statement holds a reservation and DuckDB holds little, as a reservation
+	// of all the memory does, but it holds nobody back as it waits: those
+	// behind it start whenever they fit. One statement at a time waits or
+	// runs so; Admit refuses another with ErrAloneTaken. It is the
+	// statement's, not the user's.
+	Alone bool
+	// yields says it holds nobody back as it waits (see Alone).
+	yields bool
 }
 
 // Slots is a limit on statements running at once, shared by everyone

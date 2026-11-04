@@ -4,7 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"math"
+	"log/slog"
+	"regexp"
 	"strconv"
 	"time"
 
@@ -12,17 +13,29 @@ import (
 	"github.com/jeroenrinzema/psql-wire/codes"
 	pgerror "github.com/jeroenrinzema/psql-wire/errors"
 
+	"github.com/akkio-inc/igloo/internal/config"
 	"github.com/akkio-inc/igloo/internal/distributed"
+	"github.com/akkio-inc/igloo/internal/memlimit"
+	"github.com/akkio-inc/igloo/internal/workload"
 )
 
-// A statement that runs out of memory runs again rather than fail, first
-// alone, then alone on fewer threads.
+// A statement that runs out of memory runs again rather than fail: on workers
+// where auto mode may run it there (see afterOutOfMemory), else here beside
+// the others once what it needs is free, then alone, then alone on fewer
+// threads.
 //
 // DuckDB has one memory pool per process and fails whichever statement asks
 // for memory the others hold, whatever each would need alone. So the statement
-// gives back its place and waits for the replica's whole memory (see
-// workload.Controller: a reservation of all of it starts once no other
-// reservation is held, and none starts after it meanwhile), then runs again.
+// gives back its place and waits for a reservation of what it held and the
+// block it failed to get, and runs again beside the others. If it runs out
+// again, it waits for the replica's whole memory and runs alone. It once went
+// straight to that, waiting in line for all of the memory and holding back
+// every statement behind it that reserved any: six that ran out of memory at
+// once beside a dashboard's load stopped the replica for 150 s. Now one
+// statement at a time waits to run alone, and holds nobody back as it waits
+// (see workload.Limits.Alone); another that comes to that step fails, saying
+// why, as does the one waiting if the replica has no moment free of others
+// for aloneWait.
 //
 // Some of DuckDB's operators hold memory for each thread, which they cannot
 // spill: an aggregate over grouping sets keeps a hash table for each set on
@@ -41,10 +54,12 @@ import (
 // runAlone is what a statement's run returns to runCancelable when it ran out
 // of memory and may run again (see mayRunAlone); cause is the error it ran out
 // with, and alone says no other statement ran when it did, so that running it
-// alone again on as many threads would only run out again.
+// again on as many threads would only run out again. log says what the steps
+// that run it again do.
 type runAlone struct {
 	cause error
 	alone bool
+	log   *slog.Logger
 }
 
 func (r *runAlone) Error() string { return r.cause.Error() }
@@ -84,12 +99,8 @@ func (sess *session) outOfMemoryHere(err error) bool {
 // again, returns to runCancelable.
 func (s *Server) againAlone(sess *session, err error) error {
 	others := s.othersRunning(sess)
-	how := "running it again once it can run alone"
-	if sess.alone || others == 0 {
-		how = "running it again on fewer threads"
-	}
-	s.log.Warn("a statement ran out of memory; "+how, "user", sess.currentUser().Name, "pid", sess.pid, "job", sess.job, "err", err)
-	return &runAlone{cause: err, alone: others == 0}
+	return &runAlone{cause: err, alone: others == 0,
+		log: s.log.With("user", sess.currentUser().Name, "pid", sess.pid, "job", sess.job, "others_running", others)}
 }
 
 // rerunsAlone has fn, run under runCancelable, run again alone, then on fewer
@@ -112,11 +123,16 @@ func (s *Server) rerunsAlone(sess *session, fn func(context.Context) error) func
 	}
 }
 
+// aloneWait is how long a statement waits for a moment free of others to run
+// alone (see above) before it fails, saying so.
+const aloneWait = 5 * time.Minute
+
 // runAgainAlone runs fn, the statement whose run under ctx returned alone,
-// again once it holds the replica's whole memory, and then on fewer threads
-// for as long as it runs out of memory (see above). outer is the context
-// runCancelable ran it under. It returns fn's error, or the one the statement
-// first ran out of memory with should it not start again before ctx ends.
+// again: beside the others once what it held and the block it failed to get
+// are free, then alone, then alone on fewer threads, for as long as it runs
+// out of memory (see above). outer is the context runCancelable ran it under.
+// It returns fn's error, why it cannot run alone, or the error it last ran
+// out of memory with should it not start again before ctx ends.
 func (sess *session) runAgainAlone(outer, ctx context.Context, alone *runAlone, fn func(context.Context) error) error {
 	again, cancel := sess.rearm(outer, ctx)
 	defer cancel()
@@ -124,15 +140,95 @@ func (sess *session) runAgainAlone(outer, ctx context.Context, alone *runAlone, 
 		// A cancel came as it ran out (see rearm).
 		return errCanceledBeforeRun
 	}
+	if need, ok := sess.againReservation(alone.cause); ok && !alone.alone {
+		alone.log.Warn("a statement ran out of memory; running it again beside others once what it held and the block it failed to get are free",
+			"reserve", memlimit.Format(need), "err", alone.cause)
+		err := sess.runReserved(again, need, alone, fn)
+		var more *runAlone
+		if !errors.As(err, &more) {
+			return err
+		}
+		alone = more
+	}
+	return sess.runAloneTurn(again, alone, fn)
+}
+
+// againReservation is what a statement that ran out of memory with cause
+// reserves to run again beside the others: what it held, as sampled or as it
+// reserved, and the block it failed to get. ok is false where that is three
+// quarters of the replica's memory or more, which only running alone gives,
+// or nothing is known of it.
+func (sess *session) againReservation(cause error) (need int64, ok bool) {
+	held := sess.wl.reserved
+	if sess.wl.sampled {
+		held = max(held, sess.wl.peak)
+	}
+	need = held + failedAllocation(cause)
+	budget := sess.wl.controller.Budget()
+	return need, need > 0 && (budget == 0 || float64(need) < 0.75*float64(budget))
+}
+
+// failedAllocation is the size of the block DuckDB's Out of Memory error err
+// says it failed to get, or 0.
+func failedAllocation(err error) int64 {
+	m := allocationSize.FindStringSubmatch(err.Error())
+	if m == nil {
+		return 0
+	}
+	n, perr := config.ParseSize(m[1])
+	if perr != nil {
+		return 0
+	}
+	return n
+}
+
+// allocationSize is the size in DuckDB's Out of Memory errors: "failed to
+// allocate data of size 8.0 KiB", "could not allocate block of size 2.3 GiB",
+// "failed to pin block of size 256.0 KiB".
+var allocationSize = regexp.MustCompile(`of size ([0-9.]+ ?[KMGT]?i?B)`)
+
+// runReserved runs fn under ctx once a reservation of need is free, beside
+// the others; alone is how its run before ran out.
+func (sess *session) runReserved(ctx context.Context, need int64, alone *runAlone, fn func(context.Context) error) error {
 	l := sess.wl.limits
-	l.Memory, l.Estimated, l.Unseen = math.MaxInt64, false, false
+	l.Memory, l.Estimated, l.Unseen = need, false, false
 	l.Counted, l.Apart = sess.wl.counted, sess.wl.apart
-	done, _, err := sess.wl.controller.Admit(again, l)
+	done, _, err := sess.wl.controller.Admit(ctx, l)
 	if err != nil {
 		if sess.wasCanceled() {
-			// As it waited.
 			return errCanceledBeforeRun
 		}
+		return alone.cause
+	}
+	// Its history keeps the larger of what its runs held.
+	defer func() { sess.wl.keepPeak(done()) }()
+	// What a park lets go of (see Server.parked).
+	sess.wl.admitted = func() { done() }
+	defer func() { sess.wl.admitted = nil }()
+	return fn(ctx)
+}
+
+// runAloneTurn runs fn under ctx alone, once the replica runs nothing else
+// (see workload.Limits.Alone), and then on fewer threads for as long as it
+// runs out of memory; alone is how its run before ran out.
+func (sess *session) runAloneTurn(ctx context.Context, alone *runAlone, fn func(context.Context) error) error {
+	l := sess.wl.limits
+	l.Memory, l.Estimated, l.Unseen, l.Alone = 0, false, false, true
+	l.Counted, l.Apart = sess.wl.counted, sess.wl.apart
+	wait, stop := context.WithTimeout(ctx, aloneWait)
+	done, _, err := sess.wl.controller.Admit(wait, l)
+	stop()
+	switch {
+	case errors.Is(err, workload.ErrAloneTaken):
+		alone.log.Warn("a statement ran out of memory, and another waits to run alone; it fails", "err", alone.cause)
+		return sess.outOfMemoryError(alone.cause, "beside other statements, and another was already waiting to run alone", true)
+	case err != nil && sess.wasCanceled():
+		return errCanceledBeforeRun
+	case err != nil && ctx.Err() == nil:
+		alone.log.Warn("a statement that ran out of memory found no moment to run alone; it fails", "waited", aloneWait, "err", alone.cause)
+		return sess.outOfMemoryError(alone.cause,
+			fmt.Sprintf("beside other statements, and the replica had no moment free of them in %s to run it alone", aloneWait), true)
+	case err != nil:
 		return alone.cause
 	}
 	// Its history keeps the larger of what its runs held.
@@ -147,7 +243,8 @@ func (sess *session) runAgainAlone(outer, ctx context.Context, alone *runAlone, 
 		// before it ran out.
 		err = alone
 	} else {
-		err = fn(again)
+		alone.log.Warn("a statement ran out of memory; running it again alone", "err", alone.cause)
+		err = fn(ctx)
 	}
 	threads := 0
 	for {
@@ -156,18 +253,19 @@ func (sess *session) runAgainAlone(outer, ctx context.Context, alone *runAlone, 
 			return err
 		}
 		if threads == 0 {
-			if threads = sess.threads(again); threads == 0 {
+			if threads = sess.threads(ctx); threads == 0 {
 				return more.cause
 			}
 		}
 		if threads /= 2; threads < 1 {
-			return sess.outOfMemoryAlone(more.cause)
+			return sess.outOfMemoryError(more.cause, "running alone, on one thread", false)
 		}
-		restore, ok := sess.setThreads(again, threads)
+		more.log.Warn("a statement ran out of memory alone; running it again on fewer threads", "threads", threads, "err", more.cause)
+		restore, ok := sess.setThreads(ctx, threads)
 		if !ok {
 			return more.cause
 		}
-		err = fn(again)
+		err = fn(ctx)
 		restore()
 	}
 }
@@ -214,10 +312,11 @@ func (sess *session) setThreads(ctx context.Context, n int) (restore func(), ok 
 	}, len(restores) > 0
 }
 
-// outOfMemoryAlone is the error of a statement that ran out of memory, cause,
-// running alone on one thread: it says so, and what would let it finish, which
-// are the operator's choices and the session's to make.
-func (sess *session) outOfMemoryAlone(cause error) error {
+// outOfMemoryError is the error of a statement that ran out of memory, cause,
+// where it gives up, which how says: running alone on one thread, or beside
+// others when it could not run alone (busy). It says so, and what would let
+// it finish, which are the operator's choices and the session's to make.
+func (sess *session) outOfMemoryError(cause error, how string, busy bool) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	limit, err := settingValue(ctx, sess.conn, "memory_limit")
@@ -225,9 +324,12 @@ func (sess *session) outOfMemoryAlone(cause error) error {
 		limit = "its"
 	}
 	finish := "a higher memory limit (IGLOO_MEMORY_LIMIT)"
+	if busy {
+		finish = "fewer statements beside it, or " + finish
+	}
 	if sess.mode() == distributed.ModeOff {
 		finish += ", or on workers with distributed_execution 'auto' or 'on' (it is 'off')"
 	}
-	return pgerror.WithCode(fmt.Errorf("this statement ran out of memory running alone, on one thread, under DuckDB's memory limit of %s; it would finish with %s: %w",
-		limit, finish, cause), codes.OutOfMemory)
+	return pgerror.WithCode(fmt.Errorf("this statement ran out of memory %s, under DuckDB's memory limit of %s; it would finish with %s: %w",
+		how, limit, finish, cause), codes.OutOfMemory)
 }

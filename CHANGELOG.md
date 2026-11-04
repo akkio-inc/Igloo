@@ -2522,13 +2522,21 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   the statement's next step too.
 
 - A statement that runs out of memory runs again rather than fail. DuckDB
-  fails whichever statement asks for memory the others hold, so the
-  statement waits for all of the replica's memory and runs again alone; if
-  it runs out alone, or was alone already, it runs again on half DuckDB's
+  fails whichever statement asks for memory the others hold. In auto mode
+  the statement runs again on workers, on those already running if auto
+  mode had not planned it for them. Otherwise it runs again here beside the
+  others, once a reservation of what it held and the block it failed to get
+  is free; if it runs out again, it runs alone, and then on half DuckDB's
   threads, and so on down to one, since some operators hold memory for each
   thread: TPC-DS q67's ROLLUP at scale 10 in 700 MB ran out alone on 16, 8
-  and 4 threads and finished on 2 in 8 s. A prepare that runs out of
-  memory is prepared again alone. On a replica of 1.8 GiB with two dozen
+  and 4 threads and finished on 2 in 8 s. One statement at a time waits to
+  run alone, and holds nobody back as it waits: statements that fit start
+  beside it. Another that comes to that step fails, saying so, as does the
+  one waiting when the replica has no moment free of others in 5 minutes.
+  Six statements that ran out of memory at once had each waited in line for
+  all of it, and nothing started on the replica for 150 s; in a test of
+  that, 1,660 statements of a dashboard's load started in 3 s, against 88
+  and then none. A prepare that runs out of memory is prepared again alone. On a replica of 1.8 GiB with two dozen
   sessions of joins, aggregates and commits, 404 statements failed so in
   three minutes, and 10 with this: 8 were one aggregate whose states need
   more memory than the replica has, on any number of threads, and 2 ran out

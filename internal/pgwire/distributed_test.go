@@ -585,6 +585,35 @@ func TestDistributedOutOfMemory(t *testing.T) {
 	}
 }
 
+// A statement auto mode does not plan for workers, on a small table, that runs
+// out of memory here runs on the workers already running, rather than wait to
+// run here again.
+func TestDistributedAfterOutOfMemoryUnplanned(t *testing.T) {
+	t.Parallel()
+	ds := startDistServer(t, 2)
+	conn := ds.testServer.admin(t, pgx.QueryExecModeSimpleProtocol)
+	mustExec(t, conn, "SET search_path = 'lake.public,memory.main'")
+	const query = "SELECT amount, count(*) AS n FROM orders GROUP BY amount ORDER BY amount"
+	want := texts(t, conn, query)
+	if q := lastRun(t, ds.history, query); q.Workers != 0 || q.PlanKey != "" {
+		t.Fatalf("auto mode planned it: %d workers, plan key %q", q.Workers, q.PlanKey)
+	}
+	var once atomic.Bool
+	ds.srv.failLocal = func(_ context.Context, st *statement) error {
+		if strings.Contains(st.query, "FROM orders GROUP BY amount") && once.CompareAndSwap(false, true) {
+			return &duckdb.Error{Type: duckdb.ErrorTypeOutOfMemory, Msg: "Out of Memory Error: failed to allocate data of size 8.0 KiB (42.8 GiB/42.2 GiB used)"}
+		}
+		return nil
+	}
+	defer func() { ds.srv.failLocal = nil }()
+	if got := texts(t, conn, query); !slices.Equal(got, want) {
+		t.Errorf("after running out of memory here: %q, want %q", got, want)
+	}
+	if q := lastRun(t, ds.history, query); q.Workers == 0 || q.Outcome != audit.OutcomeOK {
+		t.Errorf("history: %d workers, %s %s: %q", q.Workers, q.Outcome, q.SQLState, q.Placement)
+	}
+}
+
 // A statement that auto mode runs here, and that runs out of memory here
 // before it sends a row, runs again on workers, and the client gets its
 // rows as if nothing had happened; the next time, it runs on workers

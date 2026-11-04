@@ -650,28 +650,44 @@ func (sess *session) ranOutOfMemory(ctx context.Context, err error) bool {
 	return sess.shed
 }
 
+// mayMoveAfterOutOfMemory says a statement that ran out of memory here, of
+// parts, may run on workers instead (see afterOutOfMemory): auto mode chose
+// this replica for it (parts.key), or its session's mode is auto and there are
+// workers, though auto mode did not plan it for them. Statements auto mode
+// left unplanned, a dashboard's among them, ran out of memory beside a refresh
+// and waited to run here alone, and six such stopped the replica for 150 s.
+func (s *Server) mayMoveAfterOutOfMemory(sess *session, parts *distParts) bool {
+	return parts.key != "" || s.dist != nil && sess.mode() == distributed.ModeAuto
+}
+
 // afterOutOfMemory runs st on workers after it ran out of memory on this
-// replica, where auto mode had chosen to run it (parts.key), before it
-// sent the client a row: the client gets the rows as if it had run there,
-// and the history marks it so that it runs on workers next time. It
-// returns cause, the error here, if workers cannot run it. outer is the
-// context runCancelable ran st under, which a shed does not end; ctx the
-// one it gave st.
+// replica (see mayMoveAfterOutOfMemory), before it sent the client a row:
+// the client gets the rows as if it had run there, and the history marks
+// it so that it runs on workers next time. It returns cause, the error
+// here, if workers cannot run it. outer is the context runCancelable ran st
+// under, which a shed does not end; ctx the one it gave st.
 func (s *Server) afterOutOfMemory(outer, ctx context.Context, sess *session, st *statement, args []driver.NamedValue,
 	w *tagWriter, parts *distParts, cause error) error {
 	user := sess.currentUser()
-	s.dist.ObserveOutOfMemory(parts.key)
+	if parts.key != "" {
+		s.dist.ObserveOutOfMemory(parts.key)
+	}
 	retry, release := sess.rearm(outer, ctx)
 	defer release()
 	if retry.Err() != nil && sess.wasCanceled() {
 		// A cancel came as it ran out (see rearm).
 		return errCanceledBeforeRun
 	}
-	s.log.Warn("a statement ran out of memory on this replica; running it on workers", "user", user.Name, "key", parts.key, "err", cause)
+	s.log.Warn("a statement ran out of memory on this replica; trying it on workers", "user", user.Name, "key", parts.key, "err", cause)
 	since := time.Now()
 	// As an admin's forced statement runs: auto mode chose this replica
-	// for it, and nothing else would run it.
-	p, done, err := s.runDistributed(retry, sess, user, st, args, w, distributed.ModeOn)
+	// for it, and nothing else would run it. One auto mode did not plan, a
+	// small one, runs on workers already running, and starts none.
+	mode := distributed.ModeOn
+	if parts.key == "" {
+		mode = distributed.ModeOnRunning
+	}
+	p, done, err := s.runDistributed(retry, sess, user, st, args, w, mode)
 	if !done {
 		if p.release != nil {
 			p.release()

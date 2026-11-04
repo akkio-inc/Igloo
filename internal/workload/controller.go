@@ -2,6 +2,8 @@ package workload
 
 import (
 	"context"
+	"errors"
+	"math"
 	"slices"
 	"sort"
 	"sync"
@@ -72,6 +74,8 @@ type Controller struct {
 	// held is what DuckDB last held for running statements, as SampleMemory
 	// read it; zero before it has.
 	held int64
+	// alone says a statement waits or runs alone (see Limits.Alone).
+	alone bool
 
 	waiting prometheus.Gauge
 	waited  prometheus.Counter
@@ -89,8 +93,9 @@ type waiter struct {
 	// overdue says it is unseen and has waited for as long as it does (see
 	// unseenPatience), and late that it is the one of them that may start.
 	overdue, late bool
-	// apart says it runs in the second DuckDB (see Limits.Apart).
-	apart bool
+	// apart says it runs in the second DuckDB (see Limits.Apart), and yields
+	// that it holds nobody back as it waits (see Limits.Alone).
+	apart, yields bool
 	// due is its place in line: when it came, plus how long it takes alone.
 	due time.Time
 	// released says it has ended, and estimated that history set its memory, not
@@ -145,6 +150,49 @@ func (c *Controller) Metrics() []prometheus.Collector {
 	return []prometheus.Collector{c.waiting, c.waited}
 }
 
+// ErrAloneTaken is what Admit returns for a statement to run alone (see
+// Limits.Alone) while another waits or runs so.
+var ErrAloneTaken = errors.New("another statement is waiting to run alone, or running alone")
+
+// admitAlone is Admit of a statement to run alone (see Limits.Alone). Six
+// statements that ran out of memory beside a dashboard's load waited for all
+// of it in line, and as each held back every statement behind it that reserved
+// memory, nothing started for 150 s.
+func (c *Controller) admitAlone(ctx context.Context, l Limits) (release func() (int64, bool), waited time.Duration, err error) {
+	c.mu.Lock()
+	if c.alone {
+		c.mu.Unlock()
+		return nil, 0, ErrAloneTaken
+	}
+	c.alone = true
+	c.mu.Unlock()
+	free := func() {
+		c.mu.Lock()
+		c.alone = false
+		c.mu.Unlock()
+	}
+	l.Alone, l.Memory, l.Estimated, l.Unseen, l.yields = false, math.MaxInt64, false, false, true
+	done, waited, err := c.Admit(ctx, l)
+	if err != nil {
+		free()
+		return nil, waited, err
+	}
+	var once sync.Once
+	return func() (int64, bool) {
+		peak, sampled := done()
+		once.Do(free)
+		return peak, sampled
+	}, waited, nil
+}
+
+// Budget is the replica's query memory in bytes, zero if unknown.
+func (c *Controller) Budget() int64 {
+	if c == nil {
+		return 0
+	}
+	return c.budget
+}
+
 // Admit waits until a statement under l may start, or ctx ends, in which
 // case it returns ctx's error. The statement must call release when it
 // ends, which returns the most memory it was seen holding, peak, if a
@@ -152,10 +200,14 @@ func (c *Controller) Metrics() []prometheus.Collector {
 // long it was held back.
 func (c *Controller) Admit(ctx context.Context, l Limits) (release func() (peak int64, sampled bool), waited time.Duration, err error) {
 	unlimited := func() (int64, bool) { return 0, false }
+	if c != nil && l.Alone {
+		return c.admitAlone(ctx, l)
+	}
 	if c == nil || !l.Limited() && !(l.Counted && c.replicaMax > 0) && !l.Unseen && !l.Sample {
 		return unlimited, 0, nil
 	}
-	w := &waiter{slots: l.Slots, memory: c.reservation(l.Memory), estimated: l.Estimated, counted: l.Counted && c.replicaMax > 0, unseen: l.Unseen, apart: l.Apart, ready: make(chan struct{})}
+	w := &waiter{slots: l.Slots, memory: c.reservation(l.Memory), estimated: l.Estimated, counted: l.Counted && c.replicaMax > 0, unseen: l.Unseen, apart: l.Apart,
+		yields: l.yields, ready: make(chan struct{})}
 	if w.slots.Max == 0 && w.memory == 0 && !w.counted && !w.unseen && !l.Sample {
 		return unlimited, 0, nil
 	}
@@ -331,7 +383,12 @@ func (c *Controller) admit() {
 		// Later statements with the same slots wait behind this one
 		// whatever it waits for; others reserving memory only if it waits
 		// for memory, and other counted ones only if it waits for the
-		// replica's limit, not when it waits for its slots alone.
+		// replica's limit, not when it waits for its slots alone. None waits
+		// behind one that yields (see Limits.Alone).
+		if w.yields {
+			kept = append(kept, w)
+			continue
+		}
 		if w.slots.Max > 0 {
 			blocked[w.slots.Key] = true
 		}

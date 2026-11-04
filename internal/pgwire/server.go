@@ -15,7 +15,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"math"
 	"net"
 	"os"
 	"regexp"
@@ -1265,9 +1264,12 @@ func (s *Server) openSession(ctx context.Context) (context.Context, error) {
 	for _, stmt := range sessionCatalogSetup(sess.user.Name, sess.user.Role == auth.RoleAdmin, s.version, s.engine.BitmapsLoaded()) {
 		_, err := conn.ExecContext(ctx, stmt, nil)
 		if isOutOfMemory(err) {
-			// Other statements hold the memory: again once it holds all of it,
-			// as a statement does (see alone.go).
-			if done, _, aerr := s.workload.Admit(ctx, workload.Limits{Memory: math.MaxInt64}); aerr == nil {
+			// Other statements hold the memory: again alone, as a statement
+			// runs alone (see runAloneTurn).
+			wait, stop := context.WithTimeout(ctx, aloneWait)
+			done, _, aerr := s.workload.Admit(wait, workload.Limits{Alone: true})
+			stop()
+			if aerr == nil {
 				_, err = conn.ExecContext(ctx, stmt, nil)
 				done()
 			}
@@ -2399,7 +2401,7 @@ func (s *Server) preparedQuery(ctx context.Context, sess *session, user auth.Use
 					// below, rather than on workers with bitmaps.
 					return err
 				}
-				if err != nil && parts.key != "" && tw.Written() == 0 && outer.Err() == nil && sess.ranOutOfMemory(ctx, err) {
+				if err != nil && s.mayMoveAfterOutOfMemory(sess, &parts) && tw.Written() == 0 && outer.Err() == nil && sess.ranOutOfMemory(ctx, err) {
 					return s.afterOutOfMemory(outer, ctx, sess, st, args, tw, &parts, err)
 				}
 				return err
