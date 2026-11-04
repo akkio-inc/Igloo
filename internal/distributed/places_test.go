@@ -17,7 +17,8 @@ import (
 func TestPlaces(t *testing.T) {
 	ws := []*worker{{addr: "a"}, {addr: "b"}, {addr: "c"}}
 	for _, w := range ws {
-		w.status.Slots = 2
+		// One slot, and room for one task more, waiting there.
+		w.status.Slots = 1
 	}
 	p := newPlaces(ws, 1)
 	ctx := t.Context()

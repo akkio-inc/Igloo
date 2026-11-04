@@ -44,7 +44,12 @@ type placeWait struct {
 }
 
 // newPlaces gives each of ws room for as many tasks as its slots run at once,
-// of tasks that take slots of them each.
+// of tasks that take slots of them each, and one more, which waits there for
+// a slot: a worker gives the slot a task frees to the statement that has
+// started the fewest tasks there (see fairSlots), and with none of the
+// statement's waiting, its next task, sent once the coordinator heard the
+// last one end, found the slot taken by another statement's, and waited for
+// that to end too.
 func newPlaces(ws []*worker, slots int) *places {
 	p := &places{room: map[string]int{}, gone: map[string]bool{}}
 	for _, w := range ws {
@@ -52,7 +57,7 @@ func newPlaces(ws []*worker, slots int) *places {
 		if n <= 0 {
 			n = taskSlots(w.status.Cores, w.status.MemoryBytes)
 		}
-		p.room[w.addr] = max(n/max(slots, 1), 1)
+		p.room[w.addr] = max(n/max(slots, 1), 1) + 1
 	}
 	return p
 }
