@@ -432,6 +432,17 @@ func TestPeaks(t *testing.T) {
 	if _, ok := short(); ok {
 		t.Error("a statement no sample fell within has a peak")
 	}
+	// With nothing to hold them back, only those that ask to be are sampled.
+	free := NewController(22 * gb)
+	asked, _, _ := free.Admit(ctx, Limits{Counted: true, Sample: true})
+	unasked, _, _ := free.Admit(ctx, Limits{Counted: true})
+	free.sample(3 * gb)
+	if peak, ok := asked(); !ok || peak != 3*gb {
+		t.Errorf("a statement that asked to be sampled, with no limits: peak %d (%v), want 3 GB", peak, ok)
+	}
+	if _, ok := unasked(); ok {
+		t.Error("a statement that nothing holds back and that did not ask to be was sampled")
+	}
 
 	for _, f := range []struct {
 		allocated, peak int64

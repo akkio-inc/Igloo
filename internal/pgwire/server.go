@@ -2491,14 +2491,8 @@ func (s *Server) preparedQuery(ctx context.Context, sess *session, user auth.Use
 		case used != nil:
 			s.workload.ObserveEmpty(exact)
 		case err != nil && sampled:
-			// It ended before its end, holding at least that much, or, if it
-			// ran a while, all the memory: it may have held any of what the
-			// statements beside it were charged with.
-			if time.Since(start)-sess.wl.queued >= workload.LongUnfinished {
-				peak = max(peak, s.queryMemory)
-			}
-			s.workload.ObserveUnfinished(shape, peak)
-			s.workload.ObserveUnfinished(exact, peak)
+			// It ended before its end, holding at least that much.
+			s.observeUnfinished(shape, exact, peak, sampled, time.Since(start)-sess.wl.queued, 0, err)
 		}
 		if !sampled {
 			peak = 0

@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/duckdb/duckdb-go/v2"
 	"github.com/jackc/pgx/v5"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
@@ -469,6 +470,52 @@ func TestRefreshWaitsItsTurn(t *testing.T) {
 		}
 	}
 	t.Error("no refresh in the history")
+}
+
+// TestUnfinishedOutOfMemory checks what a run that DuckDB ran out of memory for
+// leaves its shape: at least what it allocated and the block it could not get,
+// sampled or not; what it was seen holding if more; all the memory if it was
+// seen running a while; and nothing for an unsampled run that failed otherwise.
+func TestUnfinishedOutOfMemory(t *testing.T) {
+	const gib = int64(1) << 30
+	oom := &duckdb.Error{Type: duckdb.ErrorTypeOutOfMemory,
+		Msg: "Out of Memory Error: could not allocate block of size 2.3 GiB (43.4 GiB/44.2 GiB used)"}
+	block, _ := config.ParseSize("2.3 GiB")
+	for _, c := range []struct {
+		name    string
+		peak    int64
+		sampled bool
+		ran     time.Duration
+		err     error
+		want    int64
+		ok      bool
+	}{
+		{"unsampled, out of memory", 0, false, 30 * time.Second, oom, gib/5 + block, true},
+		{"seen holding more", 4 * gib, true, time.Second, oom, 4 * gib, true},
+		{"seen holding less", gib, true, time.Second, oom, gib/5 + block, true},
+		{"seen running a while", gib, true, 30 * time.Second, oom, 40 * gib, true},
+		{"unsampled, canceled", 0, false, 30 * time.Second, context.Canceled, 0, false},
+		{"sampled, canceled", gib, true, time.Second, context.Canceled, gib, true},
+	} {
+		ctl := workload.NewController(44 * gib)
+		s := &Server{workload: ctl, queryMemory: 40 * gib}
+		s.observeUnfinished("shape", "exact", c.peak, c.sampled, c.ran, gib/5, c.err)
+		for _, key := range []string{"shape", "exact"} {
+			if got, ok := ctl.Footprint(key); ok != c.ok || got != c.want {
+				t.Errorf("%s: %s's footprint %d (%v), want %d (%v)", c.name, key, got, ok, c.want, c.ok)
+			}
+		}
+	}
+	for msg, want := range map[string]int64{
+		"Out of Memory Error: failed to allocate data of size 8.0 KiB (44.8 GiB/44.2 GiB used)":  8 << 10,
+		"Out of Memory Error: failed to pin block of size 36.0 KiB (41.1 GiB/44.2 GiB used)":     36 << 10,
+		"Out of Memory Error: could not allocate block of size 2.3 GiB (43.4 GiB/44.2 GiB used)": block,
+		"Out of Memory Error: something else":                                                    0,
+	} {
+		if got, ok := failedBlock(&duckdb.Error{Type: duckdb.ErrorTypeOutOfMemory, Msg: msg}); !ok || got != want {
+			t.Errorf("%q: block %d (%v), want %d", msg, got, ok, want)
+		}
+	}
 }
 
 func TestRefreshCost(t *testing.T) {

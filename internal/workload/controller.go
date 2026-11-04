@@ -152,11 +152,11 @@ func (c *Controller) Metrics() []prometheus.Collector {
 // long it was held back.
 func (c *Controller) Admit(ctx context.Context, l Limits) (release func() (peak int64, sampled bool), waited time.Duration, err error) {
 	unlimited := func() (int64, bool) { return 0, false }
-	if c == nil || !l.Limited() && !(l.Counted && c.replicaMax > 0) && !l.Unseen {
+	if c == nil || !l.Limited() && !(l.Counted && c.replicaMax > 0) && !l.Unseen && !l.Sample {
 		return unlimited, 0, nil
 	}
 	w := &waiter{slots: l.Slots, memory: c.reservation(l.Memory), estimated: l.Estimated, counted: l.Counted && c.replicaMax > 0, unseen: l.Unseen, apart: l.Apart, ready: make(chan struct{})}
-	if w.slots.Max == 0 && w.memory == 0 && !w.counted && !w.unseen {
+	if w.slots.Max == 0 && w.memory == 0 && !w.counted && !w.unseen && !l.Sample {
 		return unlimited, 0, nil
 	}
 	w.due = time.Now().Add(l.Expect)

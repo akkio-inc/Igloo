@@ -190,6 +190,11 @@ type Limits struct {
 	// Estimated says Memory is what statements like it held, not what its role or
 	// user set. It is the statement's, not the user's.
 	Estimated bool
+	// Sample says to sample what it holds as it runs (see SampleMemory), though
+	// nothing holds it back: a refresh of a materialized view, whose runs that
+	// ran out of memory must say what they held. It is the statement's, not the
+	// user's.
+	Sample bool
 	// Elsewhere, if set, receives once the statement is admitted what to call if
 	// it goes on to run on workers (see Controller.elsewhere). It is the
 	// statement's, not the user's.

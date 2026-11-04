@@ -1189,15 +1189,18 @@ func (s *Server) RunJob(ctx context.Context, j tasks.Job) (int64, error) {
 		// sampled as it runs, as a statement is: it is one, CREATE OR REPLACE
 		// TABLE ... AS of the view's query. A refresh of a view of a billion
 		// rows allocated 5.1 GiB every minute, which nothing reserved or
-		// sampled, and the dashboards beside it ran out of memory.
+		// sampled, and the dashboards beside it ran out of memory. It is
+		// sampled whatever it reserves, so that a run that fails says what it
+		// held: once one had failed, the next reserved too little to be
+		// admitted as more than a light statement, which nothing samples.
 		shape, exact := s.workloadShape(ctx, sess, text), s.workloadExact(sess, text)
-		sess.wl.counted, sess.wl.shape, sess.wl.exact = true, shape, exact
+		sess.wl.counted, sess.wl.sample, sess.wl.shape, sess.wl.exact = true, true, shape, exact
 		err := sess.runCancelable(ctx, text, s.rerunsAlone(sess, func(ctx context.Context) error {
 			var err error
 			res, err = s.refreshView(ctx, sess, owner, j)
 			return err
 		}))
-		sess.wl.counted, sess.wl.shape, sess.wl.exact = false, "", ""
+		sess.wl.counted, sess.wl.sample, sess.wl.shape, sess.wl.exact = false, false, "", ""
 		rows := res.rows
 		if err != nil {
 			rows = -1
@@ -1210,9 +1213,8 @@ func (s *Server) RunJob(ctx context.Context, j tasks.Job) (int64, error) {
 				s.workload.Observe(key, workload.FootprintOf(used.MemoryAllocated, peak, sampled))
 				s.workload.ObserveCost(key, used.CPUTime)
 			}
-		case err != nil && sampled:
-			s.workload.ObserveUnfinished(shape, peak)
-			s.workload.ObserveUnfinished(exact, peak)
+		case err != nil:
+			s.observeUnfinished(shape, exact, peak, sampled, time.Since(start)-sess.wl.queued, used.MemoryAllocated, err)
 		}
 		if !sampled {
 			peak = 0

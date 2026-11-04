@@ -20,6 +20,7 @@ import (
 
 	"github.com/akkio-inc/igloo/internal/audit"
 	"github.com/akkio-inc/igloo/internal/auth"
+	"github.com/akkio-inc/igloo/internal/config"
 	"github.com/akkio-inc/igloo/internal/distributed"
 	"github.com/akkio-inc/igloo/internal/engine"
 	"github.com/akkio-inc/igloo/internal/sqllex"
@@ -60,6 +61,9 @@ type workloadState struct {
 	// apart says it is known to be heavy and runs in the second DuckDB (see
 	// workload.Limits.Apart).
 	apart bool
+	// sample says to sample what it holds whatever it reserves (see
+	// workload.Limits.Sample).
+	sample bool
 	// shape is the statement's text with its literals masked, by which the
 	// controller estimates what it reserves (see statementShape); "" for
 	// none.
@@ -211,6 +215,7 @@ func (sess *session) admit(ctx context.Context) (release, leave func(), err erro
 	l := sess.wl.limits
 	l.Counted = sess.wl.counted
 	l.Apart = sess.wl.apart
+	l.Sample = sess.wl.sample
 	var elsewhere func()
 	l.Elsewhere = &elsewhere
 	if controller := sess.wl.controller; l.Counted {
@@ -267,6 +272,52 @@ func (sess *session) admit(ctx context.Context) (release, leave func(), err erro
 	}
 	return nil, nil, pgerror.WithCode(fmt.Errorf("canceling statement due to %s: it waited %s to start, behind %s",
 		why, waited.Round(time.Millisecond), strings.Join(behind, " and ")), codes.QueryCanceled)
+}
+
+// observeUnfinished records what a run of a statement of shape and exact that
+// ended before its end with err, after running for ran, held (see
+// workload.Controller.ObserveUnfinished): what it was seen holding, peak, if
+// sampled, or all the memory if it ran a while, as it may then have held any of
+// what the statements beside it were charged with; and, if DuckDB ran out of
+// memory for it, at least what it had allocated and the block it could not get.
+// Refreshes of a materialized view that asked for a block of 2.3 GiB with 43.4
+// of 44.2 GiB used recorded nothing, as nothing sampled them, and the refreshes
+// after them reserved nothing either.
+func (s *Server) observeUnfinished(shape, exact string, peak int64, sampled bool, ran time.Duration, allocated int64, err error) {
+	block, short := failedBlock(err)
+	if !sampled && !short {
+		return
+	}
+	held := int64(0)
+	if sampled {
+		held = peak
+		if ran >= workload.LongUnfinished {
+			held = max(held, s.queryMemory)
+		}
+	}
+	if short {
+		held = max(held, allocated+block)
+	}
+	s.workload.ObserveUnfinished(shape, held)
+	s.workload.ObserveUnfinished(exact, held)
+}
+
+// outOfMemoryBlock matches the size of what DuckDB could not allocate or pin
+// in its out-of-memory errors: "failed to allocate data of size 8.0 KiB",
+// "could not allocate block of size 2.3 GiB".
+var outOfMemoryBlock = regexp.MustCompile(`of size ([0-9.]+ ?[A-Za-z]*)`)
+
+// failedBlock returns the block DuckDB could not allocate when err says it ran
+// out of memory, and short true; a size it does not say is zero.
+func failedBlock(err error) (block int64, short bool) {
+	var de *duckdb.Error
+	if !errors.As(err, &de) || de.Type != duckdb.ErrorTypeOutOfMemory {
+		return 0, false
+	}
+	if m := outOfMemoryBlock.FindStringSubmatch(de.Msg); m != nil {
+		block, _ = config.ParseSize(m[1])
+	}
+	return block, true
 }
 
 // numberLiteral is a number in SQL code, not part of a name.
