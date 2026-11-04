@@ -997,8 +997,10 @@ more than 64 deep, or one that would compute a relation from itself, runs
 on one machine. In auto mode planning stops once it stalls: a statement
 runs on one machine once planning has planned no stage and described no
 new part for a tenth of the time the statement is expected to take there
-(what it took before, else the estimate), between half a second and a
-minute, or once planning has taken that time in all. Time the session
+(the longest of what it and statements of its shape took there lately,
+else the estimate), between half a second and a minute, or once planning
+has taken that time in all. A statement that ran on workers waits at least
+as long as it took there. Time the session
 spends waiting for the catalog lock, behind DDL or a refresh that holds it,
 counts for neither: the statement waits for the lock wherever it runs. A
 report expected to take minutes plans as long as it progresses; a cheap

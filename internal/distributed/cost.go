@@ -243,22 +243,23 @@ type Footprints interface {
 
 // LocalRuns is an Env whose session knows how long statements of the shape of
 // the one being planned took on this replica, in runs they completed:
-// LocalRun returns that, and ok is false when none has. Auto mode's history
+// LocalRun returns the median of them and the longest, and ok is false when
+// none has. Auto mode's history
 // keeps such times by plan key, which a statement has only if it was planned
 // for workers; with distributed_execution off, or where planning gave up, one
 // ran here and its time said nothing to the next. That key's own runs here
 // come first, as of tables of its sizes. A report that took 714 s here so went
 // on being estimated at 15 s, and was tried there again.
 type LocalRuns interface {
-	LocalRun() (took time.Duration, ok bool)
+	LocalRun() (took, longest time.Duration, ok bool)
 }
 
 // localRun is what env says of LocalRuns, if it says.
-func localRun(env Env) (time.Duration, bool) {
+func localRun(env Env) (took, longest time.Duration, ok bool) {
 	if lr, ok := env.(LocalRuns); ok {
 		return lr.LocalRun()
 	}
-	return 0, false
+	return 0, 0, false
 }
 
 // fleet is what the coordinator knows of its workers for an estimate.

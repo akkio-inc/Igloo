@@ -23,14 +23,24 @@ import (
 // report of many stages, whose parts each take a while to describe in the
 // session, took longer to plan than a cap of 10 s, which sent it to one
 // machine for many times as long as workers take. A cheap statement whose
-// planning stalls gives up within half a second. The
-// expected time is what the statement took here before, by the history of
-// the plan its shape got last, or else what one machine reads of its
-// tables cold, as auto mode's estimate of one machine reads them. Forced
-// runs on workers and EXPLAIN DISTRIBUTED plan for as long as planning
-// takes, within the statement's timeout; the planner's guards (a relation
-// is never its own input, and relations nest at most maxRelationDepth
-// deep) end plans that would recurse.
+// planning stalls gives up within half a second. The expected time is the
+// longest of what the statement took here before, by the history of the
+// plan its shape got last, and of the latest runs here of statements of its
+// shape, or else what one machine reads of its tables cold, as auto mode's
+// estimate of one machine reads them. The longest, as what giving up may
+// cost: a dashboard tile's shape ran here in a second or two for most of
+// its literals and 7 to 56 s for others, and with the median of its runs
+// for its expected time, 19 runs of it gave up planning on one lookup of
+// half a second, under load, and took 1,500 CPU-seconds of the replica.
+//
+// A statement that ran on workers waits for planning to get on at least as
+// long as it took there, within maxAutoStall: auto mode sent it there as
+// faster, and planning that long and running there again is about as quick
+// as one machine, without taking the replica's cores from the others.
+// Forced runs on workers and EXPLAIN DISTRIBUTED plan for as long as
+// planning takes, within the statement's timeout; the planner's guards (a
+// relation is never its own input, and relations nest at most
+// maxRelationDepth deep) end plans that would recurse.
 
 // autoStallShare is the share of a statement's expected time on one machine
 // auto mode waits for planning to progress; autoStallFloor and
@@ -50,14 +60,16 @@ type planLimits struct {
 }
 
 // autoLimits are auto mode's limits of planning a statement expected to
-// take seconds on one machine, if known (see the top of this file).
-func autoLimits(seconds float64, known bool) planLimits {
+// take seconds on one machine, if known, that took onWorkers seconds on
+// workers, zero if it has not run there (see the top of this file).
+func autoLimits(seconds, onWorkers float64, known bool) planLimits {
 	if !known {
 		return planLimits{stall: unknownStall}
 	}
 	expected := time.Duration(seconds * float64(time.Second))
-	stall := time.Duration(autoStallShare * float64(expected))
-	return planLimits{stall: min(max(stall, autoStallFloor), maxAutoStall), total: max(expected, autoStallFloor)}
+	stall := min(max(time.Duration(autoStallShare*float64(expected)), autoStallFloor), maxAutoStall)
+	stall = max(stall, min(time.Duration(onWorkers*float64(time.Second)), maxAutoStall))
+	return planLimits{stall: stall, total: max(expected, stall)}
 }
 
 // describeCache holds the session's descriptions of a statement's parts,
@@ -222,24 +234,30 @@ func (co *Coordinator) staysHere(shape string, env Env, workers int) *errUnsuppo
 }
 
 // expectedLocal is how many seconds the statement of shape is expected to
-// take on one machine: what it took here, by the history of the plan its
-// shape got last or by what ran it here (see LocalRuns), or what one machine
-// reads of its tables cold. ok is false when none is known.
-func (co *Coordinator) expectedLocal(pl *planner, stmt node, shape string) (float64, bool) {
-	if key, ok := co.shapes.key(shape); ok {
-		if r, ok := co.history.get(key); ok && r.local > 0 {
-			return r.local, true
+// take on one machine, for planning's limits (see the top of this file): the
+// longest of what it took here, by the history of the plan its shape got
+// last, and of what statements of its shape took here lately (see
+// LocalRuns), or what one machine reads of its tables cold; and how long it
+// took on workers or the large worker by that history, zero if it has not
+// run there. ok is false when the time on one machine is not known.
+func (co *Coordinator) expectedLocal(pl *planner, stmt node, shape string) (local, onWorkers float64, ok bool) {
+	if key, found := co.shapes.key(shape); found {
+		if r, found := co.history.get(key); found {
+			local, onWorkers = r.local, max(r.dist, r.large)
 		}
 	}
-	if took, ok := localRun(pl.env); ok {
-		return took.Seconds(), true
+	if _, longest, found := localRun(pl.env); found {
+		local = max(local, longest.Seconds())
 	}
-	bytes, ok := pl.statementReads(stmt)
-	if !ok {
-		return 0, false
+	if local > 0 {
+		return local, onWorkers, true
+	}
+	bytes, found := pl.statementReads(stmt)
+	if !found {
+		return 0, onWorkers, false
 	}
 	cores := float64(max(co.opts.Cores, 1))
-	return float64(bytes) / (cores * coldRateAt(float64(max(co.opts.Threads, co.opts.Cores))/cores)), true
+	return float64(bytes) / (cores * coldRateAt(float64(max(co.opts.Threads, co.opts.Cores))/cores)), onWorkers, true
 }
 
 // statementReads estimates what one machine reads of the catalog tables

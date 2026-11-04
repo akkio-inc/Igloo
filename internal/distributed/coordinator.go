@@ -691,7 +691,7 @@ func (co *Coordinator) planOn(ctx context.Context, query string, env Env, mode M
 	}
 	now := time.Now()
 	if r.local == 0 {
-		if took, ok := localRun(env); ok {
+		if took, _, ok := localRun(env); ok {
 			r.local, found = took.Seconds(), true
 		}
 	}

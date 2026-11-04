@@ -876,24 +876,24 @@ func TestLeavingEarly(t *testing.T) {
 }
 
 // TestTook checks how long a shape's statements take here, by its latest runs:
-// the median, the lower one of two, of its completed runs.
+// the median, the lower one of two, of its completed runs, and the longest.
 func TestTook(t *testing.T) {
 	c := NewController(1 << 30)
-	if _, ok := c.Took("a"); ok {
+	if _, _, ok := c.Took("a"); ok {
 		t.Error("a time for a shape not seen")
 	}
 	c.ObserveTook("a", 0)
 	c.ObserveTook("", time.Second)
-	if _, ok := c.Took("a"); ok {
+	if _, _, ok := c.Took("a"); ok {
 		t.Error("a time from a run that took none")
 	}
 	c.ObserveTook("a", 714*time.Second)
-	if got, ok := c.Took("a"); !ok || got != 714*time.Second {
-		t.Errorf("one run: %s, %v", got, ok)
+	if got, longest, ok := c.Took("a"); !ok || got != 714*time.Second || longest != got {
+		t.Errorf("one run: %s, longest %s, %v", got, longest, ok)
 	}
 	c.ObserveTook("a", 400*time.Second)
-	if got, _ := c.Took("a"); got != 400*time.Second {
-		t.Errorf("two runs: %s", got)
+	if got, longest, _ := c.Took("a"); got != 400*time.Second || longest != 714*time.Second {
+		t.Errorf("two runs: %s, longest %s", got, longest)
 	}
 	// What a shape took says nothing of what it held.
 	if _, ok := c.Footprint("a"); ok {
@@ -902,12 +902,12 @@ func TestTook(t *testing.T) {
 	for range footprintRuns {
 		c.ObserveTook("a", time.Second)
 	}
-	if got, _ := c.Took("a"); got != time.Second {
-		t.Errorf("after as many shorter runs as it keeps: %s", got)
+	if got, longest, _ := c.Took("a"); got != time.Second || longest != time.Second {
+		t.Errorf("after as many shorter runs as it keeps: %s, longest %s", got, longest)
 	}
 	var none *Controller
 	none.ObserveTook("a", time.Second)
-	if _, ok := none.Took("a"); ok {
+	if _, _, ok := none.Took("a"); ok {
 		t.Error("a time without a controller")
 	}
 }

@@ -93,7 +93,7 @@ func TestSeedHistory(t *testing.T) {
 	// i's, cancelled, nor c's, on another memory, or d's, which does not say.
 	wantTook := map[string]time.Duration{"a": time.Second, "e": time.Minute, "g": time.Minute, "f": time.Minute}
 	for _, shape := range []string{"a", "b", "c", "d", "e", "f", "g", "h", "i"} {
-		got, ok := footprints.Took(shape)
+		got, _, ok := footprints.Took(shape)
 		if w, learned := wantTook[shape]; ok != learned || got != w {
 			t.Errorf("seeded time of %s %s (%v), want %s", shape, got, ok, w)
 		}
@@ -105,7 +105,7 @@ func TestSeedHistory(t *testing.T) {
 		t.Fatal(err)
 	}
 	seedHistory(context.Background(), nil, queued, 22*gb, queuedStore, slog.New(slog.DiscardHandler))
-	if got, ok := queued.Took("j"); !ok || got != 700*time.Second {
+	if got, _, ok := queued.Took("j"); !ok || got != 700*time.Second {
 		t.Errorf("seeded time past its wait: %s (%v)", got, ok)
 	}
 	// What the guard learned of a run it moved, by the placement of that run on

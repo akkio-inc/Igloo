@@ -1226,8 +1226,9 @@ func (e *sessionEnv) Footprint() (allocated int64, ok bool) {
 }
 
 // LocalRun is how long statements of the shape of the one planned took on
-// this replica, in runs they completed (see distributed.LocalRuns).
-func (e *sessionEnv) LocalRun() (time.Duration, bool) {
+// this replica, in runs they completed, and the longest of them (see
+// distributed.LocalRuns).
+func (e *sessionEnv) LocalRun() (took, longest time.Duration, ok bool) {
 	return e.s.workload.Took(e.s.workloadShape(context.Background(), e.sess, e.st.prepared))
 }
 

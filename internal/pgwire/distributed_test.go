@@ -1106,7 +1106,7 @@ func TestLocalRunStands(t *testing.T) {
 	}
 	// So small a table reads nothing to speak of, which says nothing of its
 	// shape (see workload.ReadNothing): a run that did not, as a report's.
-	if _, ok := ds.srv.workload.Took(q.Shape); ok {
+	if _, _, ok := ds.srv.workload.Took(q.Shape); ok {
 		t.Error("a time from a run that read nothing")
 	}
 	busy := "SELECT sum(i * i % 7) FROM range(500000000) AS t(i)"
@@ -1116,7 +1116,7 @@ func TestLocalRunStands(t *testing.T) {
 	if b.Resources == nil || b.Resources.CPUTime < workload.LightCPU {
 		t.Fatalf("a busy statement took %+v", b.Resources)
 	}
-	if took, ok := ds.srv.workload.Took(b.Shape); !ok || took <= 0 || took > b.Duration {
+	if took, _, ok := ds.srv.workload.Took(b.Shape); !ok || took <= 0 || took > b.Duration {
 		t.Errorf("took %s here (%v), of a run of %s", took, ok, b.Duration)
 	}
 	ds.srv.workload.ObserveTook(q.Shape, 714*time.Second)

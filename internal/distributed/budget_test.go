@@ -13,22 +13,27 @@ import (
 // TestAutoLimits stops planning in auto mode once it made no progress for
 // a tenth of the time a statement is expected to take on one machine,
 // within autoStallFloor and maxAutoStall, or once planning took that time
-// in all; a statement whose time is not known waits unknownStall for
+// in all; one that ran on workers waits as long as it took there, within
+// maxAutoStall; a statement whose time is not known waits unknownStall for
 // progress, and is not limited in all.
 func TestAutoLimits(t *testing.T) {
 	for _, tc := range []struct {
-		seconds float64
-		known   bool
-		want    planLimits
+		seconds, onWorkers float64
+		known              bool
+		want               planLimits
 	}{
-		{0, true, planLimits{stall: autoStallFloor, total: autoStallFloor}},
-		{1, true, planLimits{stall: autoStallFloor, total: time.Second}},
-		{20, true, planLimits{stall: 2 * time.Second, total: 20 * time.Second}},
-		{3600, true, planLimits{stall: maxAutoStall, total: time.Hour}},
-		{0, false, planLimits{stall: unknownStall}},
+		{0, 0, true, planLimits{stall: autoStallFloor, total: autoStallFloor}},
+		{1, 0, true, planLimits{stall: autoStallFloor, total: time.Second}},
+		{20, 0, true, planLimits{stall: 2 * time.Second, total: 20 * time.Second}},
+		{3600, 0, true, planLimits{stall: maxAutoStall, total: time.Hour}},
+		{2, 12, true, planLimits{stall: 12 * time.Second, total: 12 * time.Second}},
+		{60, 3, true, planLimits{stall: 6 * time.Second, total: time.Minute}},
+		{1, 0.2, true, planLimits{stall: autoStallFloor, total: time.Second}},
+		{3600, 7200, true, planLimits{stall: maxAutoStall, total: time.Hour}},
+		{0, 0, false, planLimits{stall: unknownStall}},
 	} {
-		if got := autoLimits(tc.seconds, tc.known); got != tc.want {
-			t.Errorf("autoLimits(%v, %v) = %+v, want %+v", tc.seconds, tc.known, got, tc.want)
+		if got := autoLimits(tc.seconds, tc.onWorkers, tc.known); got != tc.want {
+			t.Errorf("autoLimits(%v, %v, %v) = %+v, want %+v", tc.seconds, tc.onWorkers, tc.known, got, tc.want)
 		}
 	}
 }
@@ -120,12 +125,16 @@ func TestPlanningWaitsForTheCatalog(t *testing.T) {
 }
 
 // slowEnv is a session whose describes each take delay, as one whose
-// catalog answers slowly, or one that hangs; it counts them.
+// catalog answers slowly, or one that hangs; it counts them. Statements of
+// the planned one's shape took ran here, if set (see LocalRuns).
 type slowEnv struct {
 	harnessEnv
 	delay     time.Duration
 	describes *int
+	ran       time.Duration
 }
+
+func (e slowEnv) LocalRun() (took, longest time.Duration, ok bool) { return e.ran, e.ran, e.ran > 0 }
 
 func (e slowEnv) Describe(ctx context.Context, query string) ([]Column, error) {
 	if e.describes != nil {
@@ -168,6 +177,42 @@ func TestCheapStatementGivesUpPlanning(t *testing.T) {
 	}
 	if took := time.Since(start); took <= 2*autoStallFloor {
 		t.Errorf("forced planning took %s: the test's describes are too quick to show it is not limited", took)
+	}
+}
+
+// TestHeavyStatementKeepsPlanning keeps planning in auto mode, past the half
+// second a cheap statement's planning may stall, a statement that ran on
+// workers in 20 s, and one of a shape that took 30 s here once: giving up
+// would cost it as much on this replica.
+func TestHeavyStatementKeepsPlanning(t *testing.T) {
+	ctx := context.Background()
+	for _, c := range []struct {
+		name          string
+		workers, here time.Duration
+	}{
+		{"ran on workers in 20 s", 20 * time.Second, 0},
+		{"its shape took 30 s here", 0, 30 * time.Second},
+	} {
+		h := householdHarness(t)
+		env := slowEnv{harnessEnv: harnessEnv{h}}
+		if c.workers > 0 {
+			// Its tables are small, for one machine's estimate to give it half
+			// a second: forced, it plans, and its shape gets the plan's key.
+			plan, _, err := h.co.plan(ctx, householdReport, env, ModeOn, false, nil)
+			if err != nil {
+				t.Fatalf("%s: %v", c.name, err)
+			}
+			stmt, err := h.co.parser.parse(householdReport)
+			if err != nil {
+				t.Fatal(err)
+			}
+			h.co.shapes.planned(planKey(stmt, nil, rewriteMark(env)), plan.Key)
+			h.co.Observe(plan.Key, 8, c.workers)
+		}
+		env.delay, env.ran = autoStallFloor+100*time.Millisecond, c.here
+		if _, err := h.co.Plan(ctx, householdReport, env, ModeAuto); err != nil && strings.Contains(err.Error(), "planning") {
+			t.Errorf("%s: %v", c.name, err)
+		}
 	}
 }
 
