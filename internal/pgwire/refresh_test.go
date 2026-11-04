@@ -15,6 +15,8 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 
 	"github.com/akkio-inc/igloo/internal/audit"
 	"github.com/akkio-inc/igloo/internal/catalog"
@@ -420,12 +422,28 @@ func TestRefreshWaitsItsTurn(t *testing.T) {
 		_, err := admin.Exec(context.Background(), "REFRESH MATERIALIZED VIEW spend_sums")
 		done <- err
 	}()
-	select {
-	case err := <-done:
-		release()
-		t.Fatalf("the refresh ran beside a statement the replica's limit holds it behind: %v", err)
-	case <-time.After(500 * time.Millisecond):
+	// Once the refresh waits in line, it is let go after held, so that it has
+	// queued at least that long however long it took to get in line.
+	var waiting prometheus.Gauge
+	for _, m := range ctl.Metrics() {
+		if g, ok := m.(prometheus.Gauge); ok {
+			waiting = g
+		}
 	}
+	const held = 150 * time.Millisecond
+	for deadline := time.Now().Add(30 * time.Second); testutil.ToFloat64(waiting) == 0; {
+		select {
+		case err := <-done:
+			release()
+			t.Fatalf("the refresh ran beside a statement the replica's limit holds it behind: %v", err)
+		case <-time.After(10 * time.Millisecond):
+		}
+		if time.Now().After(deadline) {
+			release()
+			t.Fatal("the refresh never waited behind the statement running")
+		}
+	}
+	time.Sleep(held)
 	release()
 	select {
 	case err := <-done:
@@ -444,7 +462,7 @@ func TestRefreshWaitsItsTurn(t *testing.T) {
 	}
 	for _, q := range qs {
 		if strings.HasPrefix(q.Text, `REFRESH MATERIALIZED VIEW "public"."spend_sums"`) {
-			if q.Shape == "" || q.Queued < 100*time.Millisecond {
+			if q.Shape == "" || q.Queued < held {
 				t.Errorf("the refresh's history: shape %q, queued %s", q.Shape, q.Queued)
 			}
 			return
