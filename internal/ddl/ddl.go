@@ -155,8 +155,15 @@ func (m *Manager) Close() error {
 }
 
 // Run polls the catalog's views (see PollViews) every syncInterval until
-// ctx is canceled.
+// ctx is canceled. It first starts the first read of the catalog's metadata
+// (see RefreshMetadata), which loads every table's, so that the first
+// statement that shows it need not wait for all of it.
 func (m *Manager) Run(ctx context.Context) {
+	go func() {
+		if err := m.RefreshMetadata(ctx); err != nil && ctx.Err() == nil {
+			m.log.Warn("could not read the catalog's metadata", "err", err)
+		}
+	}()
 	t := time.NewTicker(syncInterval)
 	defer t.Stop()
 	for {
