@@ -161,8 +161,8 @@ func (sess *session) runAgainAlone(outer, ctx context.Context, alone *runAlone, 
 // or nothing is known of it.
 func (sess *session) againReservation(cause error) (need int64, ok bool) {
 	held := sess.wl.reserved
-	if sess.wl.sampled {
-		held = max(held, sess.wl.peak)
+	if sess.wl.seen.Sampled {
+		held = max(held, sess.wl.seen.Peak)
 	}
 	need = held + failedAllocation(cause)
 	budget := sess.wl.controller.Budget()

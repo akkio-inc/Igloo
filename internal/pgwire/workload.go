@@ -81,11 +81,10 @@ type workloadState struct {
 	// admitted gives back what the running statement was admitted with, for
 	// a statement whose thread parked (see Server.statementThread); nil for none.
 	admitted func()
-	// peak is the most memory the latest statement was seen holding while
-	// it ran, in any of its runs (see keepPeak), and sampled says a sample
-	// fell within one (see workload.Controller.SampleMemory).
-	peak    int64
-	sampled bool
+	// seen is what the latest statement was seen holding while it ran, the
+	// most of any of its runs (see keepPeak and
+	// workload.Controller.SampleMemory).
+	seen workload.Seen
 	// reserved is the memory the latest statement reserved as it started,
 	// zero for none.
 	reserved int64
@@ -100,13 +99,13 @@ type workloadState struct {
 	controller *workload.Controller
 }
 
-// keepPeak keeps peak, a run's sampled peak if sampled, if it is the most a
-// run of the statement held: a statement that ran out of memory and ran
-// again alone (see runAgainAlone) reserves for the larger of its runs, so
-// that one that failed big and finished small reserves for the big one.
-func (w *workloadState) keepPeak(peak int64, sampled bool) {
-	if sampled && (!w.sampled || peak > w.peak) {
-		w.peak, w.sampled = peak, true
+// keepPeak keeps what a run was seen holding where it is the most a run of the
+// statement held: a statement that ran out of memory and ran again alone (see
+// runAgainAlone) reserves for the larger of its runs, so that one that failed
+// big and finished small reserves for the big one.
+func (w *workloadState) keepPeak(seen workload.Seen) {
+	if seen.Sampled {
+		w.seen = workload.Seen{Peak: max(w.seen.Peak, seen.Peak), Most: max(w.seen.Most, seen.Most), Sampled: true}
 	}
 }
 
@@ -243,7 +242,7 @@ func (sess *session) admit(ctx context.Context) (release, leave func(), err erro
 	}
 	done, waited, err := sess.wl.controller.Admit(ctx, l)
 	sess.wl.queued = waited
-	sess.wl.peak, sess.wl.sampled, sess.wl.reserved = 0, false, l.Memory
+	sess.wl.seen, sess.wl.reserved = workload.Seen{}, l.Memory
 	if err == nil {
 		sess.wl.elsewhere, sess.wl.admitted = elsewhere, func() { done() }
 		return func() {

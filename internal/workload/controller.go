@@ -105,10 +105,17 @@ type waiter struct {
 	// admitted is set, under the controller's lock, once the statement
 	// holds its slot and reservation.
 	admitted bool
-	// peak is the most memory it was seen holding while it ran, and
-	// sampled says a sample fell within its run (see SampleMemory).
-	peak    int64
-	sampled bool
+	// seen is what it was seen holding while it ran (see SampleMemory).
+	seen Seen
+}
+
+// Seen is what a statement was seen holding while it ran, as SampleMemory read
+// what DuckDB held for the statements running in it: Peak, the most of its
+// share of that; Most, the most of all of it, more than which it cannot have
+// held; and Sampled, whether a sample fell within its run.
+type Seen struct {
+	Peak, Most int64
+	Sampled    bool
 }
 
 // NewController enforces limits against budget bytes of query memory.
@@ -158,7 +165,7 @@ var ErrAloneTaken = errors.New("another statement is waiting to run alone, or ru
 // statements that ran out of memory beside a dashboard's load waited for all
 // of it in line, and as each held back every statement behind it that reserved
 // memory, nothing started for 150 s.
-func (c *Controller) admitAlone(ctx context.Context, l Limits) (release func() (int64, bool), waited time.Duration, err error) {
+func (c *Controller) admitAlone(ctx context.Context, l Limits) (release func() Seen, waited time.Duration, err error) {
 	c.mu.Lock()
 	if c.alone {
 		c.mu.Unlock()
@@ -178,10 +185,10 @@ func (c *Controller) admitAlone(ctx context.Context, l Limits) (release func() (
 		return nil, waited, err
 	}
 	var once sync.Once
-	return func() (int64, bool) {
-		peak, sampled := done()
+	return func() Seen {
+		seen := done()
 		once.Do(free)
-		return peak, sampled
+		return seen
 	}, waited, nil
 }
 
@@ -213,11 +220,10 @@ func (c *Controller) Memory() Memory {
 
 // Admit waits until a statement under l may start, or ctx ends, in which
 // case it returns ctx's error. The statement must call release when it
-// ends, which returns the most memory it was seen holding, peak, if a
-// sample fell within its run, sampled (see SampleMemory). waited is how
-// long it was held back.
-func (c *Controller) Admit(ctx context.Context, l Limits) (release func() (peak int64, sampled bool), waited time.Duration, err error) {
-	unlimited := func() (int64, bool) { return 0, false }
+// ends, which returns what it was seen holding (see SampleMemory). waited is
+// how long it was held back.
+func (c *Controller) Admit(ctx context.Context, l Limits) (release func() Seen, waited time.Duration, err error) {
+	unlimited := func() Seen { return Seen{} }
 	if c != nil && l.Alone {
 		return c.admitAlone(ctx, l)
 	}
@@ -261,9 +267,9 @@ func (c *Controller) Admit(ctx context.Context, l Limits) (release func() (peak 
 		*l.Elsewhere = func() { c.elsewhere(w) }
 	}
 	var once sync.Once
-	return func() (int64, bool) {
+	return func() Seen {
 		once.Do(func() { c.release(w) })
-		return w.peak, w.sampled
+		return w.seen
 	}, waited, nil
 }
 

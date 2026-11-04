@@ -372,7 +372,7 @@ func seedHistory(ctx context.Context, seed func([]distributed.Run), fp footprint
 				forms = append(forms, form{key: q.FlattenKey, lists: q.FlattenLists, ran: q.Duration - q.Queued, workers: q.Workers})
 			case q.Resources != nil && !empty:
 				forms = append(forms, form{q.FlattenKey, q.FlattenLists, q.Resources.CPUTime,
-					workload.FootprintOf(q.Resources.MemoryAllocated, q.Peak, q.Peak > 0), q.Duration - q.Queued, 0})
+					workload.FootprintOf(q.Resources.MemoryAllocated, workload.Seen{Peak: q.Peak, Sampled: q.Peak > 0}), q.Duration - q.Queued, 0})
 			}
 			switch {
 			case q.PlanKey == "":
@@ -402,7 +402,7 @@ func seedHistory(ctx context.Context, seed func([]distributed.Run), fp footprint
 			early := q.Outcome == audit.OutcomeCanceled || q.SQLState == "53200"
 			switch {
 			case q.Outcome == audit.OutcomeOK && q.Resources != nil:
-				fs = append(fs, footprint{q.Shape, workload.FootprintOf(q.Resources.MemoryAllocated, q.Peak, q.Peak > 0), false, q.Resources.CPUTime, empty,
+				fs = append(fs, footprint{q.Shape, workload.FootprintOf(q.Resources.MemoryAllocated, workload.Seen{Peak: q.Peak, Sampled: q.Peak > 0}), false, q.Resources.CPUTime, empty,
 					q.Duration - q.Queued, q.Exact, false})
 			case early && q.Peak > 0:
 				fs = append(fs, footprint{q.Shape, q.Peak, true, -1, false, 0, q.Exact, false})

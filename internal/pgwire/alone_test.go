@@ -345,11 +345,11 @@ func TestOutOfMemoryRefreshRunsAgainAlone(t *testing.T) {
 func TestKeepPeak(t *testing.T) {
 	t.Parallel()
 	var w workloadState
-	w.keepPeak(0, false)
-	w.keepPeak(5<<30, true)
-	w.keepPeak(1<<30, true)
-	w.keepPeak(9<<30, false)
-	if w.peak != 5<<30 || !w.sampled {
-		t.Errorf("peak %d, sampled %v; want the failed run's 5 GiB", w.peak, w.sampled)
+	w.keepPeak(workload.Seen{})
+	w.keepPeak(workload.Seen{Peak: 5 << 30, Most: 6 << 30, Sampled: true})
+	w.keepPeak(workload.Seen{Peak: 1 << 30, Most: 9 << 30, Sampled: true})
+	w.keepPeak(workload.Seen{Peak: 9 << 30})
+	if want := (workload.Seen{Peak: 5 << 30, Most: 9 << 30, Sampled: true}); w.seen != want {
+		t.Errorf("kept %+v, want %+v: the failed run's 5 GiB", w.seen, want)
 	}
 }

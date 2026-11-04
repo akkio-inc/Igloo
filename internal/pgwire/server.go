@@ -2483,10 +2483,10 @@ func (s *Server) preparedQuery(ctx context.Context, sess *session, user auth.Use
 		// A run planned to no rows says nothing of others of its shape (see
 		// workload.ReadNothing).
 		measured := used != nil && !workload.ReadNothing(used.BytesRead, used.CPUTime)
-		peak, sampled := sess.wl.peak, sess.wl.sampled
+		seen := sess.wl.seen
 		if measured && tr != nil && tr.flattenKey != "" {
 			s.workload.ObserveForm(tr.flattenKey, tr.flattenLists, used.CPUTime,
-				workload.FootprintOf(used.MemoryAllocated, peak, sampled), time.Since(start)-sess.wl.queued)
+				workload.FootprintOf(used.MemoryAllocated, seen), time.Since(start)-sess.wl.queued)
 		}
 		if used != nil && parts.workers == 0 && s.heavy != nil && (measured || !s.heavy.known(shape)) {
 			// Which of this replica's DuckDBs the next like it runs in.
@@ -2506,17 +2506,18 @@ func (s *Server) preparedQuery(ctx context.Context, sess *session, user auth.Use
 		case measured:
 			// What it held here, for the next statement like it, and the next the same.
 			for _, key := range []string{shape, exact} {
-				s.workload.Observe(key, workload.FootprintOf(used.MemoryAllocated, peak, sampled))
+				s.workload.Observe(key, workload.FootprintOf(used.MemoryAllocated, seen))
 				s.workload.ObserveCost(key, used.CPUTime)
 			}
 			s.workload.ObserveTook(shape, time.Since(start)-sess.wl.queued)
 		case used != nil:
 			s.workload.ObserveEmpty(exact)
-		case err != nil && sampled:
+		case err != nil && seen.Sampled:
 			// It ended before its end, holding at least that much.
-			s.observeUnfinished(shape, exact, peak, sampled, time.Since(start)-sess.wl.queued, 0, err)
+			s.observeUnfinished(shape, exact, seen.Peak, seen.Sampled, time.Since(start)-sess.wl.queued, 0, err)
 		}
-		if !sampled {
+		peak := seen.Peak
+		if !seen.Sampled {
 			peak = 0
 		}
 		queued := sess.wl.queued

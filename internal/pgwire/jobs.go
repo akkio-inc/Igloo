@@ -1213,9 +1213,10 @@ func (s *Server) RunJob(ctx context.Context, j tasks.Job) (int64, error) {
 			rows = -1
 		}
 		used := res.used
-		peak, sampled := sess.wl.peak, sess.wl.sampled
-		s.observeRefresh(shape, exact, res, peak, sampled, time.Since(start)-sess.wl.queued, err)
-		if !sampled {
+		seen := sess.wl.seen
+		s.observeRefresh(shape, exact, res, seen, time.Since(start)-sess.wl.queued, err)
+		peak := seen.Peak
+		if !seen.Sampled {
 			peak = 0
 		}
 		s.recordQuery(sess, queryRecord{text: text, used: &used, peak: peak, shape: shape, exact: exact, queued: sess.wl.queued,
@@ -1235,7 +1236,7 @@ func (s *Server) RunJob(ctx context.Context, j tasks.Job) (int64, error) {
 // workers; what it held here where it completed here, by what it allocated and
 // was seen holding; and, where it ended before its end, at least what it was
 // seen holding (see observeUnfinished).
-func (s *Server) observeRefresh(shape, exact string, res refreshResult, peak int64, sampled bool, ran time.Duration, err error) {
+func (s *Server) observeRefresh(shape, exact string, res refreshResult, seen workload.Seen, ran time.Duration, err error) {
 	used := res.used
 	switch {
 	case res.parts.workers > 0:
@@ -1245,11 +1246,11 @@ func (s *Server) observeRefresh(shape, exact string, res refreshResult, peak int
 		}
 	case err == nil && !workload.ReadNothing(used.BytesRead, used.CPUTime):
 		for _, key := range []string{shape, exact} {
-			s.workload.Observe(key, workload.FootprintOf(used.MemoryAllocated, peak, sampled))
+			s.workload.Observe(key, workload.FootprintOf(used.MemoryAllocated, seen))
 			s.workload.ObserveCost(key, used.CPUTime)
 		}
 	case err != nil:
-		s.observeUnfinished(shape, exact, peak, sampled, ran, used.MemoryAllocated, err)
+		s.observeUnfinished(shape, exact, seen.Peak, seen.Sampled, ran, used.MemoryAllocated, err)
 	}
 }
 

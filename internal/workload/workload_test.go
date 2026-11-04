@@ -264,7 +264,7 @@ func TestControllerAlone(t *testing.T) {
 	c := NewController(10)
 	ctx := context.Background()
 	held, _, _ := c.Admit(ctx, Limits{Memory: 6})
-	alone := make(chan func() (int64, bool), 1)
+	alone := make(chan func() Seen, 1)
 	go func() {
 		r, _, err := c.Admit(ctx, Limits{Alone: true})
 		if err != nil {
@@ -476,16 +476,16 @@ func TestPeaks(t *testing.T) {
 	c.sample(held)
 	smallest := 22 * gb / minReservationShare
 	want := int64(float64(held) * float64(smallest) / float64(16*gb+smallest))
-	if peak, ok := light(); !ok || peak != want {
-		t.Errorf("the light statement's peak %d (%v), want %d", peak, ok, want)
+	if seen := light(); !seen.Sampled || seen.Peak != want || seen.Most != held {
+		t.Errorf("the light statement saw %+v, want a peak of %d of %d", seen, want, held)
 	}
 	// Alone, a statement is charged with all of it.
 	c.sample(20 * gb)
-	if peak, ok := heavy(); !ok || peak != 20*gb {
-		t.Errorf("the heavy statement's peak %d (%v), want 20 GB", peak, ok)
+	if seen := heavy(); !seen.Sampled || seen.Peak != 20*gb || seen.Most != 20*gb {
+		t.Errorf("the heavy statement saw %+v, want 20 GB of 20", seen)
 	}
 	short, _, _ := c.Admit(ctx, Limits{Counted: true})
-	if _, ok := short(); ok {
+	if short().Sampled {
 		t.Error("a statement no sample fell within has a peak")
 	}
 	// With nothing to hold them back, only those that ask to be are sampled.
@@ -493,21 +493,25 @@ func TestPeaks(t *testing.T) {
 	asked, _, _ := free.Admit(ctx, Limits{Counted: true, Sample: true})
 	unasked, _, _ := free.Admit(ctx, Limits{Counted: true})
 	free.sample(3 * gb)
-	if peak, ok := asked(); !ok || peak != 3*gb {
-		t.Errorf("a statement that asked to be sampled, with no limits: peak %d (%v), want 3 GB", peak, ok)
+	if seen := asked(); !seen.Sampled || seen.Peak != 3*gb {
+		t.Errorf("a statement that asked to be sampled, with no limits: %+v, want 3 GB", seen)
 	}
-	if _, ok := unasked(); ok {
+	if unasked().Sampled {
 		t.Error("a statement that nothing holds back and that did not ask to be was sampled")
 	}
 
 	for _, f := range []struct {
-		allocated, peak int64
-		sampled         bool
-		want            int64
-	}{{84 * gb, 12 * gb, true, 56 * gb}, {3 * gb, 12 * gb, true, 3 * gb}, {3 * gb, 0, false, 2 * gb}, {3 * gb, -2 * gb, true, 2 * gb},
-		{12 * gb, 10 * gb, true, 10 * gb}} {
-		if got := FootprintOf(f.allocated, f.peak, f.sampled); got != f.want {
-			t.Errorf("FootprintOf(%d, %d, %v) = %d, want %d", f.allocated, f.peak, f.sampled, got, f.want)
+		allocated int64
+		seen      Seen
+		want      int64
+	}{{84 * gb, Seen{Peak: 12 * gb, Sampled: true}, 56 * gb}, {3 * gb, Seen{Peak: 12 * gb, Sampled: true}, 3 * gb}, {3 * gb, Seen{}, 2 * gb},
+		{3 * gb, Seen{Peak: -2 * gb, Sampled: true}, 2 * gb}, {12 * gb, Seen{Peak: 10 * gb, Sampled: true}, 10 * gb},
+		// Never more than DuckDB held in all while it ran: a FLATTEN statement
+		// that allocated 82 GB, beside others, of 35 GB held at most.
+		{82 * gb, Seen{Peak: 21 * gb, Most: 35 * gb, Sampled: true}, 35 * gb},
+		{12 * gb, Seen{Peak: 2 * gb, Most: 20 * gb, Sampled: true}, 8 * gb}} {
+		if got := FootprintOf(f.allocated, f.seen); got != f.want {
+			t.Errorf("FootprintOf(%d, %+v) = %d, want %d", f.allocated, f.seen, got, f.want)
 		}
 	}
 	c.Observe("s", 8*gb)
@@ -553,15 +557,15 @@ func TestPeaks(t *testing.T) {
 		c.mu.Lock()
 		sampled := false
 		for w := range c.active {
-			sampled = w.sampled
+			sampled = w.seen.Sampled
 		}
 		c.mu.Unlock()
 		if sampled {
 			break
 		}
 	}
-	if peak, ok := running(); !ok || peak != 3*gb {
-		t.Errorf("sampled peak %d (%v), want 3 GB", peak, ok)
+	if seen := running(); !seen.Sampled || seen.Peak != 3*gb {
+		t.Errorf("what it held: %+v, want 3 GB", seen)
 	}
 	stop()
 	<-done
@@ -888,7 +892,7 @@ func TestUnseenStopsWaiting(t *testing.T) {
 		t.Fatalf("an unseen statement with the memory full: waited %s: %v", waited, err)
 	}
 	// The next waits for that one to end, however long past its patience.
-	next := make(chan func() (int64, bool), 1)
+	next := make(chan func() Seen, 1)
 	go func() {
 		r, _, err := c.Admit(ctx, Limits{Counted: true, Unseen: true})
 		if err != nil {
@@ -952,8 +956,8 @@ func TestLeavingEarly(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("an unseen statement did not start once the other let go")
 	}
-	if peak, sampled := done(); peak != 7*gb || !sampled {
-		t.Errorf("what it held: %d, sampled %v", peak, sampled)
+	if seen := done(); seen.Peak != 7*gb || !seen.Sampled {
+		t.Errorf("what it held: %+v", seen)
 	}
 }
 
@@ -1065,7 +1069,7 @@ func TestReservationsWaitForWhatIsHeld(t *testing.T) {
 	}
 	// It holds more than it reserved.
 	c.sample(12 * gb)
-	second := make(chan func() (int64, bool), 1)
+	second := make(chan func() Seen, 1)
 	go func() {
 		r, _, err := c.Admit(ctx, Limits{Memory: 6 * gb})
 		if err != nil {
@@ -1086,7 +1090,7 @@ func TestReservationsWaitForWhatIsHeld(t *testing.T) {
 	small()
 	// The next sample that finds room lets it start.
 	c.sample(10 * gb)
-	var r func() (int64, bool)
+	var r func() Seen
 	select {
 	case r = <-second:
 	case <-time.After(5 * time.Second):
@@ -1101,7 +1105,7 @@ func TestReservationsWaitForWhatIsHeld(t *testing.T) {
 		t.Fatal(err)
 	}
 	c.sample(8 * gb)
-	all := make(chan func() (int64, bool), 1)
+	all := make(chan func() Seen, 1)
 	go func() {
 		r, _, err := c.Admit(ctx, Limits{Memory: 16 * gb})
 		if err != nil {
@@ -1186,7 +1190,7 @@ func TestUnseenStartOneAtATime(t *testing.T) {
 	if !c.Crowded() {
 		t.Error("not crowded beside one nothing is known of")
 	}
-	started := make(chan func() (int64, bool), 1)
+	started := make(chan func() Seen, 1)
 	go func() {
 		r, _, err := c.Admit(ctx, Limits{Counted: true, Unseen: true})
 		if err != nil {
@@ -1262,7 +1266,7 @@ func TestUnseenLineMoves(t *testing.T) {
 	}
 	// Four more wait, and each starts as the one before it ends, 100 ms apart:
 	// the last waits twice its patience.
-	next := make(chan func() (int64, bool), 4)
+	next := make(chan func() Seen, 4)
 	for range 4 {
 		go func() {
 			r, _, err := c.Admit(ctx, Limits{Counted: true, Unseen: true})
@@ -1294,7 +1298,7 @@ func TestUnseenLineMoves(t *testing.T) {
 	}
 	// One more, overdue too, goes as soon as that late one ends: the late one did not
 	// move the line.
-	after := make(chan func() (int64, bool), 1)
+	after := make(chan func() Seen, 1)
 	go func() {
 		r, _, err := c.Admit(ctx, Limits{Counted: true, Unseen: true})
 		if err != nil {
@@ -1362,7 +1366,7 @@ func TestElsewhere(t *testing.T) {
 	if err != nil || elsewhere == nil {
 		t.Fatalf("admitted: %v, %v", elsewhere != nil, err)
 	}
-	dashboard := make(chan func() (int64, bool), 1)
+	dashboard := make(chan func() Seen, 1)
 	go func() {
 		r, _, err := c.Admit(ctx, Limits{Counted: true, Memory: 2 * gb})
 		if err != nil {
@@ -1370,7 +1374,7 @@ func TestElsewhere(t *testing.T) {
 		}
 		dashboard <- r
 	}()
-	same := make(chan func() (int64, bool), 1)
+	same := make(chan func() Seen, 1)
 	go func() {
 		r, _, err := c.Admit(ctx, Limits{Slots: slots})
 		if err != nil {
@@ -1384,7 +1388,7 @@ func TestElsewhere(t *testing.T) {
 	case <-time.After(50 * time.Millisecond):
 	}
 	elsewhere()
-	var r func() (int64, bool)
+	var r func() Seen
 	select {
 	case r = <-dashboard:
 	case <-time.After(5 * time.Second):
