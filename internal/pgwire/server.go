@@ -15,6 +15,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"net"
 	"os"
 	"regexp"
@@ -970,6 +971,9 @@ type session struct {
 	// outer is the context runCancelable runs the statement's steps under,
 	// which a shed by the memory watch does not end, while it runs.
 	outer context.Context
+	// alone says the statement runs again alone, having run out of memory
+	// beside others (see alone.go).
+	alone bool
 	// held, while set, keeps queries recorded for the history (see
 	// holdRecords).
 	held *[]queryRecord
@@ -1248,7 +1252,16 @@ func (s *Server) openSession(ctx context.Context) (context.Context, error) {
 	sess.callGuard = func(call func()) { terminate.Statement(ended, call) }
 	conn.SetCallGuard(sess.callGuard)
 	for _, stmt := range sessionCatalogSetup(sess.user.Name, sess.user.Role == auth.RoleAdmin, s.version, s.engine.BitmapsLoaded()) {
-		if _, err := conn.ExecContext(ctx, stmt, nil); err != nil {
+		_, err := conn.ExecContext(ctx, stmt, nil)
+		if isOutOfMemory(err) {
+			// Other statements hold the memory: again once it holds all of it,
+			// as a statement does (see alone.go).
+			if done, _, aerr := s.workload.Admit(ctx, workload.Limits{Memory: math.MaxInt64}); aerr == nil {
+				_, err = conn.ExecContext(ctx, stmt, nil)
+				done()
+			}
+		}
+		if err != nil {
 			s.sessions.remove(sess)
 			s.releaseConn()
 			return ctx, errors.Join(fmt.Errorf("set up session catalog: %w", err), meter.Close())
@@ -1572,6 +1585,11 @@ func (sess *session) runCancelable(ctx context.Context, query string, fn func(co
 	stopWatch := sess.watchStuck(ctx)
 	err = fn(ctx)
 	stopWatch()
+	if alone := (*runAlone)(nil); errors.As(err, &alone) {
+		// It gives back its place, and waits for all of the memory.
+		release()
+		err = sess.runAgainAlone(sess.outer, ctx, alone, fn)
+	}
 	if err != nil && errors.Is(ctx.Err(), context.DeadlineExceeded) {
 		return errStatementTimeout
 	}
@@ -2297,7 +2315,16 @@ func (s *Server) preparedQuery(ctx context.Context, sess *session, user auth.Use
 					err = s.rerunWithoutIndexes(ctx, sess, st, err, runOnce)
 				}
 				if st.bitmaps && bitmapsDidNotFit(err) && tw.Written() == 0 && outer.Err() == nil {
-					return s.rerunWithoutBitmaps(ctx, sess, st, err, runOnce)
+					err = s.rerunWithoutBitmaps(ctx, sess, st, err, runOnce)
+				}
+				if outer.Err() == nil && sess.mayRunAlone(st, err, tw.Written() > 0) {
+					others := s.othersRunning(sess)
+					how := "running it again once it can run alone"
+					if sess.alone || others == 0 {
+						how = "running it again on fewer threads"
+					}
+					s.log.Warn("a statement ran out of memory; "+how, "user", sess.currentUser().Name, "pid", sess.pid, "err", err)
+					return &runAlone{cause: err, alone: others == 0}
 				}
 				return err
 			}

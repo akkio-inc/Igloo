@@ -2502,6 +2502,21 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
 
 ### Fixed
 
+- A statement that runs out of memory runs again rather than fail. DuckDB
+  fails whichever statement asks for memory the others hold, so the
+  statement waits for all of the replica's memory and runs again alone; if
+  it runs out alone, or was alone already, it runs again on half DuckDB's
+  threads, and so on down to one, since some operators hold memory for each
+  thread: TPC-DS q67's ROLLUP at scale 10 in 700 MB ran out alone on 16, 8
+  and 4 threads and finished on 2 in 8 s. A prepare that runs out of
+  memory is prepared again alone. On a replica of 1.8 GiB with two dozen
+  sessions of joins, aggregates and commits, 404 statements failed so in
+  three minutes, and 10 with this: 8 were one aggregate whose states need
+  more memory than the replica has, on any number of threads, and 2 ran out
+  as they were prepared, which now waits too. A statement runs again only
+  before it sent a row, outside a transaction block, and when it changes
+  nothing until it commits.
+
 - A replica no longer cancels its first statements for memory while it reads back,
   after a start, the parts of files DuckDB held. The read-back took a new buffer for
   each request, which Go's heap kept after it ended, until Go's next collection;
