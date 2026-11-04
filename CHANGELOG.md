@@ -2671,9 +2671,8 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   wherever auto mode would run that query there, and keeps no bitmaps; it goes
   on incrementally, from a bitmap of each group's values, only where workers
   would not run it. Beside a mixed load on 16 workers, full refreshes of the
-  reach of 1.5 billion impressions by advertiser and channel took 41 to 140 s,
-  with the dashboards at their best rate; incremental ones on the replica took
-  64 to 385 s and cost the dashboards 13 to 36% of theirs. Where it goes on
+  reach of 1.5 billion impressions by advertiser and channel take 41 to 140 s,
+  with the dashboards at their best rate. Where it goes on
   incrementally, its state is written in row groups of about 8 MB, not one row
   group of every group's bitmap, as DuckDB puts a vector of rows, up to 2,048,
   in each at least: 800 bitmaps, 2 GB, took more than 1 GB at once to read

@@ -407,14 +407,12 @@ is that aggregate.
   branches does, each change read through its branch alone.
 - **Distinct counts.** A view with `count(DISTINCT x)` refreshes in full,
   its query on workers, whenever auto mode would run that query there, and
-  keeps no state; `refresh_mode_reason` says so. Going on incrementally
-  means merging a bitmap of every changed group's values on the replica: for
-  the reach of 1.5 billion impressions by advertiser and channel, where each
-  batch changed all 800 groups, incremental refreshes on the replica took 64
-  to 385 s and slowed the dashboards beside them by 13 to 36%, and full ones
-  on 16 workers 41 to 140 s. It goes on incrementally where workers would not
-  run the query (none are configured, or auto mode keeps it on the replica),
-  and with `REFRESH_MODE = INCREMENTAL`.
+  keeps no state; `refresh_mode_reason` says so. The reach of 1.5 billion
+  impressions by advertiser and channel refreshes so on 16 workers in 41 to
+  140 s, beside dashboards. It goes on incrementally, from a bitmap of each
+  group's values, where workers would not run the query (none are
+  configured, or auto mode keeps it on the replica), and with
+  `REFRESH_MODE = INCREMENTAL`.
 - **Aggregates.** An aggregating view keeps each group's partial
   aggregates (counts, sums, minimums, maximums, and, where it goes on
   incrementally, `count(DISTINCT x)`'s values in a roaring bitmap, written in
