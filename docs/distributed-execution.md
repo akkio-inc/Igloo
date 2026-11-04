@@ -1062,8 +1062,8 @@ has started the fewest tasks there, so that a short statement gets past a
 long one's, and among those, to the first task to come.
 
 Statements in the background give way to the others on each worker: the
-refreshes of materialized views and dynamic tables, pipes' loads, and, with
-`IGLOO_HEAVY_IN_BACKGROUND` (on by default), statements whose shape held the
+refreshes of materialized views and dynamic tables, pipes' loads, and, when
+`IGLOO_HEAVY_IN_BACKGROUND` is set, statements whose shape held the
 workers 5 seconds or more and 8 times as long as the other statements there,
 in each of its latest runs (see [heavy statements beside short
 ones](workload-management.md#heavy-statements-beside-short-ones)). Their tasks
