@@ -203,12 +203,12 @@ func startWriteServerWith(t *testing.T, coordinate func(*distributed.Options), c
 }
 
 // writeWorkers says what workers a writeEnv has: of cores, taking their memory
-// for memory, and with a DuckDB of limit, if set; and what size every table
-// claims, if set.
+// for memory, with a DuckDB of limit, if set, loading the rb extension at rb,
+// if set; and what size every table claims, if set.
 type writeWorkers struct {
 	cores         int
 	memory, claim int64
-	limit         string
+	limit, rb     string
 }
 
 // startWriteServerOn is startWriteServerWith on such workers.
@@ -234,7 +234,7 @@ func startWriteServerOn(t *testing.T, workers writeWorkers, coordinate func(*dis
 	}
 	var addrs []string
 	for i := range 2 {
-		addr, _, _ := startTestWorkerLimited(t, dir, i, env.gate, "", workers.cores, workers.memory, workers.limit)
+		addr, _, _ := startTestWorkerLimited(t, dir, i, env.gate, workers.rb, workers.cores, workers.memory, workers.limit)
 		f := &writeFault{target: addr, client: &http.Transport{TLSClientConfig: clientTLS, ForceAttemptHTTP2: true}}
 		srv := httptest.NewUnstartedServer(f)
 		srv.TLS = serverTLS.Clone()
@@ -359,6 +359,43 @@ func (e *writeEnv) local(t *testing.T, query string) string {
 	mustExec(t, e.admin, "SET distributed_execution = off")
 	defer e.force(t)
 	return strings.Join(texts(t, e.admin, query), "\n")
+}
+
+// TestFullRefreshOnWorkers checks that a full refresh of a view that later
+// refreshes go on from, which keeps each group's distinct values in bitmaps,
+// runs its partial aggregates on workers under auto mode, as a read of them
+// would, and that the view has its query's rows; and that the next refresh,
+// after a write, goes on from them, which only the state the full refresh
+// keeps of them allows.
+func TestFullRefreshOnWorkers(t *testing.T) {
+	t.Parallel()
+	rb := os.Getenv("IGLOO_TEST_RB_EXTENSION")
+	if rb == "" {
+		if os.Getenv("CI") != "" {
+			t.Fatal("IGLOO_TEST_RB_EXTENSION is not set: CI builds the rb extension (extensions/rb/build.sh)")
+		}
+		t.Skip("IGLOO_TEST_RB_EXTENSION is not set; build the rb extension with extensions/rb/build.sh")
+	}
+	env := startWriteServerOn(t, writeWorkers{cores: 8, memory: 4 << 30, claim: 300 << 20, rb: rb}, nil)
+	admin := env.admin
+	mv := "SELECT g, count(DISTINCT id) AS d, count(*) AS n, sum(x) AS s FROM lake.public.src GROUP BY g"
+	mustExec(t, admin, "CREATE MATERIALIZED VIEW reach_mv AS "+mv)
+	mustExec(t, admin, "REFRESH MATERIALIZED VIEW reach_mv")
+	action, detail, _, reason := viewRefresh(t, admin, "public.reach_mv")
+	if action != actionFull || reason != "" || !strings.Contains(detail, "its query ran on") {
+		t.Errorf("the first refresh: %s: %s (%s)", action, detail, reason)
+	}
+	if got, want := env.local(t, "SELECT * FROM reach_mv ORDER BY ALL"), env.local(t, mv+" ORDER BY ALL"); got != want {
+		t.Errorf("after the full refresh:\n%s\nwant:\n%s", got, want)
+	}
+	mustExec(t, admin, "INSERT INTO src SELECT i, i % 7, i * 2, 'more', TIMESTAMP '2026-02-01' FROM range(40000, 40100) AS r(i)")
+	mustExec(t, admin, "REFRESH MATERIALIZED VIEW reach_mv")
+	if action, detail, _, _ := viewRefresh(t, admin, "public.reach_mv"); action != actionIncremental {
+		t.Errorf("the refresh after a write: %s: %s", action, detail)
+	}
+	if got, want := env.local(t, "SELECT * FROM reach_mv ORDER BY ALL"), env.local(t, mv+" ORDER BY ALL"); got != want {
+		t.Errorf("after the incremental refresh:\n%s\nwant:\n%s", got, want)
+	}
 }
 
 // TestWorkersWrite checks that the tasks of a fill write the table's files,

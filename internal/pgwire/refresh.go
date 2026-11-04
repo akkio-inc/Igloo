@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"slices"
 	"strconv"
 	"strings"
@@ -130,8 +131,10 @@ type refreshResult struct {
 	policies []string
 	action   string
 	detail   string
-	// used is what DuckDB measured of the statements it ran.
-	used audit.Resources
+	// used is what DuckDB measured of the statements it ran, and parts
+	// where its query ran when it ran on workers, for the history.
+	used  audit.Resources
+	parts distParts
 }
 
 // refreshView refreshes j, a materialized view or dynamic table, as user
@@ -160,7 +163,7 @@ func (s *Server) refreshView(ctx context.Context, sess *session, user auth.User,
 	r := &refresher{s: s, sess: sess, job: j, schema: schema, table: table, qualified: qualified, query: query, st: state,
 		digest: digest(query), access: checked, guard: g}
 	res, err := r.run(ctx)
-	res.used = r.used
+	res.used, res.parts = r.used, r.parts
 	if err != nil {
 		return res, err
 	}
@@ -189,31 +192,47 @@ type refresher struct {
 	// rewrote its query, for a run of its query on workers (see rebuild).
 	access *access
 	guard  *guard
-	// placement is where its query ran, when it ran on workers.
+	// placement is where its query ran, when it ran on workers, and parts
+	// what that took, for the history.
 	placement string
+	parts     distParts
 }
 
 // rebuild replaces the view's rows with its query's, the query on workers
 // where auto mode would run it there as a read by the view's owner (see
-// fillOn), the view written from their results.
+// fill), the view written from their results.
 func (r *refresher) rebuild(ctx context.Context) (int64, error) {
-	write := func(ctx context.Context, source string) (int64, error) {
+	return r.fill(ctx, "the query", r.query, r.rebuildWriter, func(ctx context.Context, source string) (int64, error) {
 		return r.replaceRows(ctx, "SELECT * FROM ("+source+") AS refresh")
-	}
+	})
+}
+
+// fill runs query, one of the refresh's that reads its tables in full, and
+// writes its rows with write, given query or the SQL that combines workers'
+// results of it: on workers where auto mode would run it there as a read by
+// the view's owner, as a client's CREATE TABLE ... AS runs (see fillOn), and
+// on workers too once it runs out of memory here. writer, if set, is how
+// workers would write the rows themselves. what names the query in the log,
+// which says where each ran.
+func (r *refresher) fill(ctx context.Context, what, query string, writer func(context.Context, *statement) *tableWrite,
+	write func(ctx context.Context, source string) (int64, error)) (int64, error) {
 	start := time.Now()
 	f := &stagedFill{s: r.s, sess: r.sess, ctx: ctx}
 	defer f.close()
-	src := r.s.fillSource(ctx, r.sess, &statement{access: r.access, guard: r.guard}, r.query)
-	if src != nil {
-		src.writer = r.rebuildWriter(ctx, src)
+	src := r.s.fillSource(ctx, r.sess, &statement{access: r.access, guard: r.guard}, query)
+	if src != nil && writer != nil {
+		src.writer = writer(ctx, src)
 	}
-	rows, parts, _, err := r.s.fillOn(f, src, func(ctx context.Context) (int64, error) { return write(ctx, r.query) }, write)
+	rows, parts, _, err := r.s.fillOn(f, src, func(ctx context.Context) (int64, error) { return write(ctx, query) }, write)
+	took := time.Since(cmp.Or(parts.since, start))
 	if err == nil && parts.key != "" {
-		r.s.dist.ObserveOn(parts.key, parts.workers, parts.large, time.Since(cmp.Or(parts.since, start)))
+		r.s.dist.ObserveOn(parts.key, parts.workers, parts.large, took)
 	}
 	if err == nil && parts.workers > 0 {
-		r.placement = parts.placement
+		r.placement, r.parts = parts.placement, parts
 	}
+	r.s.log.Info("a refresh ran "+what, "kind", r.job.Kind, "name", r.job.Name, "placement", cmp.Or(parts.placement, "this replica"),
+		"workers", parts.workers, "rows", rows, "seconds", math.Round(took.Seconds()*10)/10, "err", err)
 	return rows, err
 }
 
@@ -846,9 +865,20 @@ func (r *refresher) full(ctx context.Context, why string) (refreshResult, error)
 	if err != nil {
 		return refreshResult{}, err
 	}
-	if err := r.temp(ctx, "TABLE", "__igloo_full", p.Partials(input, false)); err != nil {
+	// The groups' partial aggregates over every row, the refresh's heaviest
+	// query, run where any read of them would: a count of distinct devices
+	// over a billion impressions ran on this replica for up to 257 s, beside
+	// the dashboards, that took 2 to 12 s on workers.
+	partials := p.Partials(input, false)
+	if err := r.makeTemp(ctx, "TABLE", "__igloo_full", partials); err != nil {
 		return refreshResult{}, err
 	}
+	if _, err := r.fill(ctx, "its partial aggregates", partials, nil, func(ctx context.Context, source string) (int64, error) {
+		return r.exec(ctx, "INSERT INTO temp.main.__igloo_full SELECT * FROM ("+source+") AS full_partials")
+	}); err != nil {
+		return refreshResult{}, err
+	}
+	detail += r.onWorkers()
 	if reason, err := r.keepState(ctx); err != nil {
 		return refreshResult{}, err
 	} else if reason != "" {
@@ -1038,23 +1068,25 @@ func (r *refresher) pinAt(ctx context.Context, table string, v int64) (increment
 // its own, outside the Iceberg catalog: making one holds the catalog lock only
 // while DuckDB binds its query, shared, as filling it does.
 func (r *refresher) temp(ctx context.Context, kind, name, query string) error {
+	if err := r.makeTemp(ctx, kind, name, query); err != nil || kind != "TABLE" {
+		return err
+	}
+	_, err := r.exec(ctx, "INSERT INTO temp.main."+quoteIdent(name)+"\n"+query)
+	return err
+}
+
+// makeTemp is temp, a table left empty.
+func (r *refresher) makeTemp(ctx context.Context, kind, name, query string) error {
 	create := "CREATE OR REPLACE TEMP " + kind + " " + quoteIdent(name) + " AS " + query
 	if kind == "TABLE" {
 		create += "\nWITH NO DATA"
 	}
-	run := func(q string) error {
-		_, err := r.exec(ctx, q)
-		return err
-	}
 	r.sess.temps = true
-	if err := run(create); err != nil {
+	if _, err := r.exec(ctx, create); err != nil {
 		return err
 	}
 	if !slices.Contains(r.temps, kind+" "+name) {
 		r.temps = append(r.temps, kind+" "+name)
-	}
-	if kind == "TABLE" {
-		return run("INSERT INTO temp.main." + quoteIdent(name) + "\n" + query)
 	}
 	return nil
 }

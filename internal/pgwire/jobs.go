@@ -1220,7 +1220,7 @@ func (s *Server) RunJob(ctx context.Context, j tasks.Job) (int64, error) {
 			peak = 0
 		}
 		s.recordQuery(sess, queryRecord{text: text, used: &used, peak: peak, shape: shape, exact: exact, queued: sess.wl.queued,
-			start: start, err: err, rows: rows, written: []auth.Object{{Schema: schema, Table: table}}, policies: res.policies,
+			start: start, err: err, rows: rows, written: []auth.Object{{Schema: schema, Table: table}}, policies: res.policies, parts: res.parts,
 			analyze:  s.rewrite(ctx, sess, owner, "CREATE OR REPLACE TABLE "+quoteName([]string{s.catalogName(), schema, table})+" AS "+j.Statement),
 			stmtType: duckdb.STATEMENT_TYPE_CREATE})
 		return rows, err
