@@ -2493,6 +2493,14 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
 
 ### Fixed
 
+- Reads of object storage reuse their connections. DuckDB opened one for
+  each file it read and closed it after, and each closed connection holds
+  a local port for a minute. A replica of 1.8 GiB whose two dozen sessions
+  read a table of 300 manifests beside commits to it held 28,403 such
+  ports, every one it had, and 260 to 550 of its statements in three
+  minutes failed with "Could not connect to server". With the
+  connections kept and reused, it held 29, and none failed so.
+
 - Igloo builds DuckDB's Iceberg extension itself (`extensions/iceberg`):
   DuckDB-Iceberg at the commit DuckDB 1.5.6 ships, with Igloo's patches,
   loaded as the rb extension is, checked against the SHA-256 the image

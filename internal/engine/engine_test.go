@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"os"
 	"runtime"
 	"strings"
 	"testing"
@@ -360,5 +361,31 @@ func TestCatalogShareContext(t *testing.T) {
 	}
 	if e.CatalogLockedFor() != 0 {
 		t.Error("a released catalog lock counts as held")
+	}
+}
+
+// TestObjectStorageConnectionsAreReused checks that httpfs keeps its
+// connections to object storage open between files and reuses them (see
+// extensionStatements).
+func TestObjectStorageConnectionsAreReused(t *testing.T) {
+	dir := os.Getenv("IGLOO_TEST_EXTENSION_DIR")
+	if dir == "" {
+		if os.Getenv("CI") != "" {
+			t.Fatal("IGLOO_TEST_EXTENSION_DIR is not set")
+		}
+		t.Skip("IGLOO_TEST_EXTENSION_DIR is not set")
+	}
+	e, err := Open(context.Background(), config.Config{DuckDB: config.DuckDB{ExtensionDir: dir}}, quietLog())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer e.Close() //nolint:errcheck
+	conn, err := e.Connect(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close() //nolint:errcheck
+	if got := queryOne(t, conn, "SELECT current_setting('httpfs_connection_caching')::VARCHAR"); got != "true" {
+		t.Fatalf("httpfs_connection_caching is %s", got)
 	}
 }

@@ -1119,8 +1119,16 @@ func azureChain() string {
 }
 
 // extensionStatements load the extensions every deployment uses.
+//
+// httpfs then keeps its connections to object storage open between files
+// and reuses them. By default it opens one for each file it reads and closes
+// it after, and every closed connection holds a local port for a minute: a
+// replica reading a table of 300 manifests in two dozen sessions at once
+// held 28,000, every port it has, and its statements failed with "Could not
+// connect to server".
 func extensionStatements() []string {
-	return append([]string{"LOAD httpfs", "LOAD iceberg", "LOAD avro", "LOAD tpch"}, mediaStatements()...)
+	return append([]string{"LOAD httpfs", "SET GLOBAL httpfs_connection_caching = true", "LOAD iceberg", "LOAD avro", "LOAD tpch"},
+		mediaStatements()...)
 }
 
 // secret registers Igloo's storage credentials, for the paths of scope.
