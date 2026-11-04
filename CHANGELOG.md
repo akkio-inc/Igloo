@@ -635,13 +635,6 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   audience, which FLATTENs people's objects and took 7 s alone, is estimated at
   3.7 s, where it was at 1.9.
 
-- Auto mode no longer takes a statement for short of memory on the replica by
-  what its stages exchange where DuckDB's plan says its working set fits. A
-  report whose stages read 30.7 GB of a lookup for exchanges, three times that
-  over the replica's 30.8 GB share, held 19 to 20 GB, as its plan said (15.3
-  GB), and ran in 23.5 s on the replica beside dashboards. Taken for short of
-  memory, it went to 4 workers and took 166.5 s.
-
 - Auto mode estimates a join to a lookup's latest version, `ver = (SELECT max(ver)
   FROM versions)`, by the rows of the row groups that hold that version: Iceberg's
   bounds name the few files that reach it, and their Parquet footers the row

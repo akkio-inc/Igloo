@@ -156,8 +156,7 @@ type estimate struct {
 	workers               int
 	large                 bool
 	// memory says the working set is over memoryShare of the coordinator's
-	// memory, by workingSetFactor and, where DuckDB's plan says what it
-	// holds, by that too; and spills that it is by heldFactor, as
+	// memory, by workingSetFactor, and spills that it is by heldFactor, as
 	// local says, whose oom says it should run out of memory there;
 	// farBeyond that the working set by DuckDB's plan, or else by the
 	// stages, is past farBeyondRatio times the room (see Plan.FitsHere).
@@ -814,15 +813,6 @@ func (x features) estimate(m machine, f fleet) estimate {
 		e.local.factor = max(e.local.factor, spillOn(set+held, m.memory).factor)
 	}
 	e.spills = e.local.factor > 1
-	if x.planned {
-		// Short of memory where DuckDB's plan says its working set is, not
-		// by what its stages exchange alone: a report whose stages read 30.7
-		// GB of a lookup for exchanges, three times that over a replica's
-		// 30.8 GB share, held 19 to 20 GB, as its plan said (15.3 GB), and
-		// ran in 23.5 s there beside dashboards. Taken for short of memory,
-		// it went to 4 workers and took 166.5 s.
-		e.memory = e.memory && (e.spills || e.local.oom)
-	}
 	e.oneMachine *= e.local.factor
 	// A fill's rows, written here wherever the query runs; a read's, sent
 	// to the client, from here or from the workers' merge alike.
