@@ -456,6 +456,7 @@ func (pl *planner) plan(stmt node) (*Plan, error) {
 	q := clone(stmt).(node)
 	pl.gov = pl.newGovernance(q)
 	pl.dropOrders(q)
+	pl.pruneBranches(q)
 	pl.markTopK(q)
 	out, err := pl.query(q, true, nil)
 	if err != nil {
