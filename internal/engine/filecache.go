@@ -24,8 +24,9 @@ package engine
 // back reads it as it would have, and the restore skips it. The restore
 // takes at most restoreShare of DuckDB's memory, as the ranges are buffers
 // DuckDB drops first when queries need the room, and stops early when DuckDB
-// has none to spare. Nothing is saved until it ends, so a stop in the middle
-// keeps the manifest it started from.
+// has none to spare, or the process none to be plentiful (see restoreRoom).
+// Nothing is saved until it ends, so a stop in the middle keeps the manifest
+// it started from.
 //
 // Emptying the cache (EmptyCache, as erasure requests do) stops a restore
 // under way and deletes the manifest, so no range DuckDB dropped comes back.
@@ -40,6 +41,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"slices"
 	"sort"
 	"strings"
@@ -50,6 +52,7 @@ import (
 	"github.com/duckdb/duckdb-go/v2"
 
 	"github.com/akkio-inc/igloo/internal/lockorder"
+	"github.com/akkio-inc/igloo/internal/memlimit"
 	"github.com/akkio-inc/igloo/internal/prefetch"
 )
 
@@ -400,6 +403,19 @@ func (f *fileCache) readManifest() (manifest, error) {
 	return m, nil
 }
 
+// restoreRoom says the process has memory to spare for more of a restore:
+// what it can still allocate is above twice memlimit.High, where
+// memlimit.Adapt takes memory for plentiful. Restores of 34 GB, three
+// quarters of DuckDB's memory on a machine of 60 GiB, went on as the first
+// statements after starts came in, and the memory watch canceled a report
+// 40 s into each: what is read back costs only a read, what was canceled
+// was a user's. A variable, for tests.
+var restoreRoom = func() bool {
+	total := processMemory()
+	left, ok := memlimit.Available()
+	return total <= 0 || !ok || left > 2*memlimit.High(total)
+}
+
 // restoreRead is one request of a restore: ranges of one file that lie
 // close together, read at once.
 type restoreRead struct {
@@ -482,8 +498,9 @@ func (e *Engine) restoreFileCache(ctx context.Context, log *slog.Logger) {
 	began := time.Now()
 	var restored, skipped, failed atomic.Int64
 	// full says DuckDB had no memory to spare for a range: the rest would
-	// only evict what queries use.
-	var full atomic.Bool
+	// only evict what queries use; short that the process had none to
+	// spare (see restoreRoom).
+	var full, short atomic.Bool
 	var opens sync.Map // path -> *restoreObject
 	work := make(chan restoreRead)
 	var wg sync.WaitGroup
@@ -499,8 +516,13 @@ func (e *Engine) restoreFileCache(ctx context.Context, log *slog.Logger) {
 			}
 			defer c.Close() //nolint:errcheck
 			conn := c.(*duckdb.Conn)
+			// One buffer, reused, as DuckDB copies what it is handed: with
+			// one a request, Go's heap held 6 GiB of them for 80 s past a
+			// restore of 19 GB, until its next collection, most of what
+			// DuckDB's limit leaves the process.
+			var buf []byte
 			for r := range work {
-				if ctx.Err() != nil || full.Load() {
+				if ctx.Err() != nil || full.Load() || short.Load() {
 					continue
 				}
 				obj, err := openOnce(ctx, &opens, r.file.Path, f.open).get()
@@ -508,7 +530,10 @@ func (e *Engine) restoreFileCache(ctx context.Context, log *slog.Logger) {
 					skipped.Add(int64(len(r.ranges)))
 					continue
 				}
-				buf := make([]byte, r.end-r.start)
+				if n := int(r.end - r.start); cap(buf) < n {
+					buf = make([]byte, n)
+				}
+				buf = buf[:r.end-r.start]
 				if _, err := obj.ReadAt(buf, r.start); err != nil && !(errors.Is(err, io.EOF) && r.end == r.file.Size) {
 					failed.Add(int64(len(r.ranges)))
 					continue
@@ -533,6 +558,10 @@ func (e *Engine) restoreFileCache(ctx context.Context, log *slog.Logger) {
 		if ctx.Err() != nil || full.Load() {
 			break
 		}
+		if !restoreRoom() {
+			short.Store(true)
+			break
+		}
 		select {
 		case work <- r:
 		case <-ctx.Done():
@@ -540,12 +569,15 @@ func (e *Engine) restoreFileCache(ctx context.Context, log *slog.Logger) {
 	}
 	close(work)
 	wg.Wait()
+	// The buffers go back to the system now, not at Go's next collection,
+	// which nothing may call for a while: the memory is DuckDB's to use.
+	debug.FreeOSMemory()
 	if ctx.Err() != nil {
 		return
 	}
 	log.Info("restored what DuckDB held in memory from object storage", "bytes", restored.Load(), "requests", len(reads),
 		"took", time.Since(began).Round(time.Millisecond), "ranges_skipped", skipped.Load(), "ranges_failed", failed.Load(),
-		"memory_full", full.Load())
+		"memory_full", full.Load(), "memory_short", short.Load())
 }
 
 // restoreObject opens a file once for every request of a restore.

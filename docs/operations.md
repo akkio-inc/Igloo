@@ -267,8 +267,10 @@ using all of its cores.
   second: what the container's memory limit leaves of its working set, and
   the machine's available memory. When that falls below an eighth of
   Igloo's memory (at least 512 MiB), Igloo first lowers DuckDB's memory
-  limit, down to half of `IGLOO_MEMORY_LIMIT` at most, so that DuckDB
-  writes buffers to its spill files and gives their memory back: under
+  limit, down to half of `IGLOO_MEMORY_LIMIT` at most, and below what
+  DuckDB holds where that is less than its limit, so that DuckDB drops
+  the parts of files it keeps in memory and writes buffers to its spill
+  files, and gives their memory back at once: under
   heavy work DuckDB keeps its tracked memory at its limit and uses more
   besides, 8 GiB more for one statement on a 61 GiB machine. It raises the
   limit back a step at a time once memory has stayed plentiful for 30
@@ -760,8 +762,10 @@ them back from there when it starts:
   24 GB back in 7 to 8 s, at its network's 3.6 GB/s, and the first run of
   the 22 queries took 22 s, against 58 s from the disk alone.
 - It takes at most three quarters of DuckDB's memory, and stops when
-  DuckDB has no memory to spare: the ranges are buffers DuckDB drops
-  first when queries need the room.
+  DuckDB has no memory to spare, the ranges being buffers DuckDB drops
+  first when queries need the room, or when what Igloo can still allocate
+  falls below a quarter of its memory, so that statements that start
+  meanwhile have it. Its buffers go back to the system when it ends.
 - It reads only files DuckDB had: Iceberg's data files, which never
   change, and other files only while their ETag is the one DuckDB had.
   Emptying the cache, as [erasure requests](#erasure-requests) do, deletes

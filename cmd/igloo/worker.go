@@ -105,7 +105,8 @@ func serveWorker() error {
 	// task on it; its statement fails as out of memory.
 	if plan.Total > 0 {
 		go memlimit.Watch(ctx, plan.Total, w.ShedMemory)
-		go memlimit.Adapt(ctx, plan.Total, plan.DuckDB, func(n int64) error { return eng.SetMemoryLimit(ctx, n) }, log)
+		go memlimit.Adapt(ctx, plan.Total, plan.DuckDB, func(n int64) error { return eng.SetMemoryLimit(ctx, n) },
+			func() (int64, bool) { return eng.HeldMemory(ctx) }, log)
 		log.Info("memory watch is on", "cancels_below", memlimit.Format(memlimit.Low(plan.Total)),
 			"spills_more_below", memlimit.Format(memlimit.High(plan.Total)))
 	}

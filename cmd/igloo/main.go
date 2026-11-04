@@ -579,7 +579,8 @@ func serve() error {
 	// uses besides (see memlimit.Adapt).
 	if memory.Total > 0 {
 		go memlimit.Watch(ctx, memory.Total, srv.ShedMemory)
-		go memlimit.Adapt(ctx, memory.Total, memory.DuckDB, func(n int64) error { return eng.SetMemoryLimit(ctx, n) }, log)
+		go memlimit.Adapt(ctx, memory.Total, memory.DuckDB, func(n int64) error { return eng.SetMemoryLimit(ctx, n) },
+			func() (int64, bool) { return eng.HeldMemory(ctx) }, log)
 		log.Info("memory watch is on", "cancels_below", memlimit.Format(memlimit.Low(memory.Total)),
 			"spills_more_below", memlimit.Format(memlimit.High(memory.Total)))
 	}

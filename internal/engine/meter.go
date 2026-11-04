@@ -217,6 +217,26 @@ func (e *Engine) SetMemoryLimit(ctx context.Context, n int64) error {
 	return e.setLimit(ctx, n)
 }
 
+// HeldMemory is what DuckDB holds, caches included, with the second DuckDB's
+// beside it if that is open: what memlimit.Adapt lowers their limit from.
+func (e *Engine) HeldMemory(ctx context.Context) (int64, bool) {
+	n, err := e.held(ctx, queryAllMemory)
+	if err != nil {
+		return 0, false
+	}
+	e.bgMu.Lock()
+	bg := e.bg
+	e.bgMu.Unlock()
+	if bg != nil {
+		m, err := bg.held(ctx, queryAllMemory)
+		if err != nil {
+			return 0, false
+		}
+		n += m
+	}
+	return n, true
+}
+
 // setLimit sets DuckDB's memory limit, to n bytes.
 func (e *Engine) setLimit(ctx context.Context, n int64) error {
 	c, err := e.connector.Connect(ctx)
