@@ -605,6 +605,11 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
 
 ### Distributed execution
 
+- A commit no longer makes the next statements over its table wait to plan. The
+  table's metadata loads again in the background as it changes, where the next
+  lookup of it waited 0.3 to 1.2 s for that load, and dashboards' cheap statements
+  gave up planning for workers and ran on the replica: 17 of 19 such give-ups in a
+  mixed window came within 4.4 s of a commit of the ELT.
 - A slow worker no longer holds up every stage. The coordinator sends a stage's
   tasks to workers as they have room, rather than all at once, so a slow or busy
   worker runs fewer of them. A report on 16 workers took 573.9 s at the median

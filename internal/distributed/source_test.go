@@ -186,8 +186,9 @@ func TestDistinctCountsLoaded(t *testing.T) {
 // TestTableLoadsShared checks that lookups of a table not loaded share one load
 // of it, that a lookup of one whose decision lapsed decides by it at once while
 // it loads again, that one past tableStale waits for that load, until its
-// context ends, and that one at a newer version of the table waits for a load
-// at that version.
+// context ends, that one at a newer version of the table waits for a load at
+// that version, and that, watched for changes, a table loads again at its new
+// version before a lookup asks for it.
 func TestTableLoadsShared(t *testing.T) {
 	src := NewIceberg(restTable(t, "2", iceberg.NestedField{ID: 1, Name: "id", Type: iceberg.PrimitiveTypes.Int64}))
 	var loads atomic.Int32
@@ -279,6 +280,42 @@ func TestTableLoadsShared(t *testing.T) {
 	}
 	if n := loads.Load(); n != 3 {
 		t.Errorf("%d loads in all, want 3", n)
+	}
+
+	// Watched, a change loads the table again before any lookup, and the next
+	// lookup decides by that load without waiting.
+	var changed atomic.Uint64
+	watch, stop := context.WithCancel(t.Context())
+	defer stop()
+	go src.WatchChanges(watch, changed.Load)
+	version.Store(2)
+	// Changed again until the watch, which starts from what it first sees,
+	// has seen a change.
+	for start := time.Now(); loads.Load() < 4; time.Sleep(5 * time.Millisecond) {
+		changed.Add(1)
+		if time.Since(start) > 10*time.Second {
+			t.Fatalf("%d loads, want 4", loads.Load())
+		}
+	}
+	gate <- struct{}{}
+	for start := time.Now(); ; time.Sleep(time.Millisecond) {
+		src.mu.Lock()
+		at := src.tables["s\x00t"].version
+		src.mu.Unlock()
+		if at == 2 {
+			break
+		}
+		if time.Since(start) > 10*time.Second {
+			t.Fatal("the change's load did not end")
+		}
+	}
+	ctx, cancel = context.WithTimeout(t.Context(), 50*time.Millisecond)
+	defer cancel()
+	if err := lookup(ctx); err != nil {
+		t.Fatalf("a lookup after the change was loaded: %v", err)
+	}
+	if n := loads.Load(); n != 4 {
+		t.Errorf("%d loads in all, want 4", n)
 	}
 }
 

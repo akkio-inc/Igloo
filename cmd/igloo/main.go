@@ -366,6 +366,9 @@ func serve() error {
 	if cat != nil {
 		tables = distributed.NewIceberg(cat)
 		tables.SetVersions(eng.TableVersion)
+		// A table written here or elsewhere loads again as it changes, not
+		// as the next statement looks it up.
+		go tables.WatchChanges(ctx, eng.DataVersion)
 	}
 
 	// Reading ahead for statements lists their scans as distributed
