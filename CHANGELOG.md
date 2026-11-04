@@ -591,11 +591,13 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
 
 ### Distributed execution
 
-- TPC-DS q09, q10, q35 and q69 run on workers, where they stayed on one machine. A scalar subquery in
+- TPC-DS q09, q10, q16, q35, q69 and q94 run on workers, where they stayed on one machine. A scalar subquery in
   the columns of a statement that does not group, one aggregate of all the rows of a
   large table, is a relation of one row that the workers compute. An `OR` of `EXISTS`
   subqueries correlated by the same columns is one semi join to the union of their keys.
-  `NOT EXISTS` is an anti join also beside other joins of the statement's tables.
+  `NOT EXISTS` is an anti join also beside other joins of the statement's tables. An
+  `EXISTS` or `NOT EXISTS` may also compare its columns to the statement's otherwise
+  (`ws1.ws_warehouse_sk <> ws2.ws_warehouse_sk`), which the join checks beside its keys.
 - Auto mode estimates a statement's time on one machine by what each of its
   operators takes, not by its hash tables' rows alone: scans by their rows and
   width, joins by the rows probed, built on and made, aggregates by their rows,

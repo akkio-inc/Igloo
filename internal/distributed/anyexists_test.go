@@ -64,3 +64,34 @@ func TestNotExistsOverJoins(t *testing.T) {
 		t.Errorf("%s\n%s", msg, plan.describe())
 	}
 }
+
+// TestResidualCorrelations runs TPC-DS q94 and q16, which keep orders shipped
+// from more than one warehouse and never returned, on workers, with the sales
+// and returns too large for every worker to read: their EXISTS of the same
+// order from another warehouse is a semi join by the order's key that checks
+// the warehouses beside it (see correlation.residual), and the rows are one
+// machine's.
+func TestResidualCorrelations(t *testing.T) {
+	h := newTPCDSHarness(t, 0.01, 4, 3)
+	for _, name := range []string{"web_sales", "catalog_sales", "web_returns", "catalog_returns"} {
+		h.tables[name].Bytes = 1 << 36
+	}
+	for _, nr := range []string{"94", "16"} {
+		rows, _, err := h.query(context.Background(), "SELECT query FROM tpcds_queries() WHERE query_nr = "+nr)
+		if err != nil || len(rows) != 1 {
+			t.Fatalf("q%s: %v", nr, err)
+		}
+		q := rows[0][0].(string)
+		want, _, err := h.query(t.Context(), q)
+		if err != nil {
+			t.Fatalf("q%s on one machine: %v", nr, err)
+		}
+		got, _, plan, _, err := h.run(t.Context(), q, ModeOn)
+		if err != nil {
+			t.Fatalf("q%s: %v", nr, err)
+		}
+		if msg := compareRows(want, got, hasOrderBy(q)); msg != "" {
+			t.Errorf("q%s: %s\n%s", nr, msg, plan.describe())
+		}
+	}
+}

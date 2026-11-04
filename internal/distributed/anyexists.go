@@ -31,7 +31,7 @@ func (pl *planner) anyExists(cond node, ctes cteScope) node {
 			return nil
 		}
 		c := pl.correlationOf(q, ctes)
-		if c == nil {
+		if c == nil || len(c.residual) > 0 {
 			return nil
 		}
 		if outer == nil {

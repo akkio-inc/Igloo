@@ -33,8 +33,14 @@ type correlation struct {
 	// outer and inner are the columns its WHERE makes equal, the statement's
 	// and its own, in pairs.
 	outer, inner []node
-	// where are the conditions of its WHERE on its own columns alone.
-	where []node
+	// where are the conditions of its WHERE on its own columns alone, and
+	// residual those of its WHERE on its columns and the statement's that do
+	// not make one equal to the other, such as TPC-DS q94's
+	// ws1.ws_warehouse_sk <> ws2.ws_warehouse_sk, which an EXISTS's join checks
+	// beside its keys, and a join of an aggregate cannot; reads are the
+	// subquery's own columns they read, and outerReads the statement's.
+	where, residual   []node
+	reads, outerReads []node
 }
 
 // correlationOf returns q's correlation, or nil if it has not that shape. ctes
@@ -99,13 +105,37 @@ func (pl *planner) correlationOf(q node, ctes cteScope) *correlation {
 			continue
 		}
 		l, r := child(cond, "left"), child(cond, "right")
-		if str(cond["class"]) != "COMPARISON" || str(cond["type"]) != "COMPARE_EQUAL" || str(l["class"]) != "COLUMN_REF" || str(r["class"]) != "COLUMN_REF" {
-			return nil
-		}
 		li, lok := inner(l)
 		ri, rok := inner(r)
+		if str(cond["class"]) != "COMPARISON" || str(cond["type"]) != "COMPARE_EQUAL" || str(l["class"]) != "COLUMN_REF" ||
+			str(r["class"]) != "COLUMN_REF" || lok && rok && li == ri {
+			if hasClass(cond, "AGGREGATE") || hasClass(cond, "WINDOW") || hasVolatile(cond) {
+				return nil
+			}
+			known := true
+			walk(cond, func(n node) bool {
+				if str(n["class"]) != "COLUMN_REF" {
+					return true
+				}
+				is, ok := inner(n)
+				known = known && ok
+				reads := &c.outerReads
+				if is {
+					reads = &c.reads
+				}
+				if !slices.ContainsFunc(*reads, func(o node) bool { return sameRef(o, n) }) {
+					*reads = append(*reads, n)
+				}
+				return known
+			})
+			if !known {
+				return nil
+			}
+			c.residual = append(c.residual, cond)
+			continue
+		}
 		switch {
-		case !lok || !rok || li == ri:
+		case !lok || !rok:
 			return nil
 		case li:
 			c.inner, c.outer = append(c.inner, l), append(c.outer, r)
@@ -150,13 +180,18 @@ func (pl *planner) readsOuter(sel node, c *correlation, ctes cteScope) bool {
 		return false
 	}
 	q["from_table"] = clone(sel["from_table"])
-	items := make([]any, len(c.outer))
-	for i, e := range c.outer {
-		items[i] = clone(e)
+	items := make([]any, 0, len(c.outer)+len(c.outerReads))
+	for _, e := range slices.Concat(c.outer, c.outerReads) {
+		items = append(items, clone(e))
 	}
 	q["select_list"] = items
 	_, err = pl.describe(q, ctes)
 	return err == nil
+}
+
+// sameRef reports whether column references a and b name the same column.
+func sameRef(a, b node) bool {
+	return slices.EqualFunc(columnNames(a), columnNames(b), strings.EqualFold)
 }
 
 // setWhere makes q's WHERE the conjunction of conds.
@@ -210,6 +245,15 @@ func (pl *planner) joinOn(sel node, kind, alias string, sub node, names []any, c
 		cond["left"] = clone(e)
 		child(cond, "right")["column_names"] = []any{alias, names[i]}
 		conds[i] = cond
+	}
+	for _, r := range c.residual {
+		conds = append(conds, rewrite(clone(r), func(n node) (node, bool) {
+			i := slices.IndexFunc(c.reads, func(o node) bool { return str(n["class"]) == "COLUMN_REF" && sameRef(o, n) })
+			if i < 0 {
+				return nil, false
+			}
+			return node{"class": "COLUMN_REF", "type": "COLUMN_REF", "alias": "", "column_names": []any{alias, names[len(c.outer)+i]}}, true
+		}).(node))
 	}
 	on, err := pl.andOf(conds)
 	if err != nil {
@@ -307,9 +351,9 @@ func (pl *planner) existsJoin(sel, cond node, ctes cteScope) (bool, error) {
 		return false, nil
 	}
 	sub := clone(q).(node)
-	items := make([]any, len(c.inner))
-	for i, e := range c.inner {
-		items[i] = clone(e)
+	items := make([]any, 0, len(c.inner)+len(c.reads))
+	for _, e := range slices.Concat(c.inner, c.reads) {
+		items = append(items, clone(e))
 	}
 	sub["select_list"] = items
 	if err := pl.setWhere(sub, c.where); err != nil {
@@ -324,7 +368,11 @@ func (pl *planner) existsJoin(sel, cond node, ctes cteScope) (bool, error) {
 	}
 	alias := "__igloo_in" + strconv.Itoa(pl.ins)
 	pl.ins++
-	right, err := pl.joinOn(sel, kind, alias, sub, keyColumns(len(c.inner)), c)
+	names := keyColumns(len(c.inner))
+	for i := range c.reads {
+		names = append(names, "__igloo_r"+strconv.Itoa(i))
+	}
+	right, err := pl.joinOn(sel, kind, alias, sub, names, c)
 	if err != nil {
 		return false, err
 	}
@@ -402,7 +450,7 @@ func (pl *planner) scalarJoins(sel node, ctes cteScope) error {
 			return same, true
 		}
 		c := pl.correlationOf(q, ctes)
-		if c == nil || !pl.readsOuter(sel, c, ctes) {
+		if c == nil || len(c.residual) > 0 || !pl.readsOuter(sel, c, ctes) {
 			return same, true
 		}
 		sub := clone(q).(node)

@@ -212,12 +212,14 @@ In detail, a part runs distributed when:
   partitioned by `y`, and a subquery of one row
   (`ver = (SELECT max(ver) FROM t WHERE ...)`) one that every task reads.
   A correlated subquery over a large table is the join it means, where its
-  `WHERE` only makes its columns equal to the statement's and otherwise
+  `WHERE` makes its columns equal to the statement's and otherwise
   filters its own rows: `EXISTS` a semi join, an `OR` of `EXISTS` by the same
   columns one semi join to the union of their keys, `NOT EXISTS` an anti join, and a
   scalar subquery of `min`, `max`, `sum`, `avg` (or arithmetic on them) or a
   count a `LEFT JOIN` to its groups, in `WHERE` or in a select list that does
-  not group.
+  not group. An `EXISTS` or `NOT EXISTS` may also compare its columns to the
+  statement's otherwise (TPC-DS q94's `ws1.ws_warehouse_sk <> ws2.ws_warehouse_sk`),
+  which its join checks beside the equal ones.
   A scalar subquery in the select list of a statement that does not group,
   one aggregate of all of its rows, that reads more than the coordinator
   would read itself (see [when](#when)) is a relation of one row that workers
@@ -323,7 +325,8 @@ aggregates over `DISTINCT` values of unrelated
 expressions in one `SELECT` (`count(DISTINCT a), count(DISTINCT b)`),
 window functions over rows but those of the next section, a large table read again in a correlated
 subquery expression of another shape (`NOT IN`, whose rows depend on whether
-any of its subquery's is `NULL`; a correlation by anything but equal columns;
+any of its subquery's is `NULL`; a correlation with no equal columns, or by
+anything but equal columns in a scalar subquery or an `OR` of `EXISTS`;
 a scalar subquery of another aggregate, or that gives a value over no rows),
 subqueries in `GROUP BY`, samples of a number of rows,
 large tables joined on different keys in one `SELECT`, statements that call user-defined macros
