@@ -213,7 +213,8 @@ In detail, a part runs distributed when:
   (`ver = (SELECT max(ver) FROM t WHERE ...)`) one that every task reads.
   A correlated subquery over a large table is the join it means, where its
   `WHERE` only makes its columns equal to the statement's and otherwise
-  filters its own rows: `EXISTS` a semi join, `NOT EXISTS` an anti join, and a
+  filters its own rows: `EXISTS` a semi join, an `OR` of `EXISTS` by the same
+  columns one semi join to the union of their keys, `NOT EXISTS` an anti join, and a
   scalar subquery of `min`, `max`, `sum`, `avg` (or arithmetic on them) or a
   count a `LEFT JOIN` to its groups, in `WHERE` or in a select list that does
   not group.

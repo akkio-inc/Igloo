@@ -122,7 +122,7 @@ func (g *gen) pred(t string) string {
 
 // subqueryPred is a condition that reads a subquery, of f's columns as t names them.
 func (g *gen) subqueryPred(t string) string {
-	switch g.n(0, 8) {
+	switch g.n(0, 9) {
 	case 0:
 		return fmt.Sprintf("%s.v > (SELECT avg(v) FROM f2 WHERE h = %d)", t, g.n(0, 6))
 	case 1:
@@ -140,6 +140,11 @@ func (g *gen) subqueryPred(t string) string {
 		return fmt.Sprintf("%s.v %s (SELECT v FROM f2 WHERE h = %d AND id < %d)", t, g.pick("> ALL", ">= ANY", "= ANY"), g.n(0, 6), g.n(20, 400))
 	case 7:
 		return fmt.Sprintf("%s.h = (SELECT max(w) FROM dim WHERE dim.k = %s.k)", t, t)
+	case 8:
+		// Rows of either of two tables of the same key, as TPC-DS q10 asks of web
+		// and catalog sales; one EXISTS of their union (see anyExists).
+		return fmt.Sprintf("(EXISTS (SELECT 1 FROM dim WHERE dim.k = %[1]s.k AND dim.w > %[2]d) OR EXISTS (SELECT 1 FROM f2 WHERE f2.k = %[1]s.k AND f2.h = %[3]d))",
+			t, g.n(0, 25), g.n(0, 6))
 	default:
 		return fmt.Sprintf("%s.g > (SELECT min(g) FROM f2 WHERE f2.k = %s.k)", t, t)
 	}
