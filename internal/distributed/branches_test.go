@@ -64,3 +64,26 @@ func TestPrunedBranches(t *testing.T) {
 		}
 	}
 }
+
+// TestBranchesStayUnderDistinctOn checks that a filter on a union's constant
+// column leaves its branches be under a DISTINCT ON of other columns, which picks
+// a row of each group that the filter may then reject: one machine returns none
+// of the groups, as their first rows are the left-out section's.
+func TestBranchesStayUnderDistinctOn(t *testing.T) {
+	h := newHarness(t, 0.01, 2, 1)
+	h.tables["lineitem"].Bytes = 1 << 34
+	h.tables["orders"].Bytes = 1 << 32
+	q := `SELECT * FROM (SELECT DISTINCT ON (k) sec, k FROM (SELECT 'a' AS sec, l_partkey % 7 AS k FROM lineitem
+		UNION ALL SELECT 'b', o_orderkey % 7 FROM orders) AS u ORDER BY k, sec) AS t WHERE t.sec = 'b'`
+	want, _, err := h.query(t.Context(), q)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, _, plan, _, err := h.run(t.Context(), q, ModeOn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if msg := compareRows(want, got, false); msg != "" || plan.pruned != 0 {
+		t.Errorf("%s; left out %d\n%s", msg, plan.pruned, plan.describe())
+	}
+}

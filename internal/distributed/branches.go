@@ -179,8 +179,9 @@ func (b *brancher) restrict(q node, at int, pred node, scope cteScope) bool {
 
 // passes reports whether a filter on column ref of sel's FROM clause, named as
 // it is by sel, may go below sel: sel limits no rows, groups by ref in its one
-// grouping set if it groups or aggregates at all, and every window function
-// it computes partitions by ref.
+// grouping set if it groups or aggregates at all, picks rows of DISTINCT ON
+// groups of ref if it picks any, and every window function it computes
+// partitions by ref.
 func (b *brancher) passes(sel node, ref node) bool {
 	if hasModifier(sel, "LIMIT_MODIFIER") || hasModifier(sel, "LIMIT_PERCENT_MODIFIER") {
 		return false
@@ -188,6 +189,13 @@ func (b *brancher) passes(sel node, ref node) bool {
 	same := func(e any) bool {
 		n, ok := e.(node)
 		return ok && str(n["class"]) == "COLUMN_REF" && slices.EqualFunc(columnNames(n), columnNames(ref), strings.EqualFold)
+	}
+	for _, m := range list(sel, "modifiers") {
+		// DISTINCT ON picks a row of each of its groups: of those the filter
+		// keeps only if they are groups of ref.
+		if on := list(m.(node), "distinct_on_targets"); len(on) > 0 && !slices.ContainsFunc(on, same) {
+			return false
+		}
 	}
 	groups := list(sel, "group_expressions")
 	if len(groups) > 0 || hasClass(sel["select_list"], "AGGREGATE") || hasClass(sel["having"], "AGGREGATE") {
