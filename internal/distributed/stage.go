@@ -281,6 +281,9 @@ type execution struct {
 	// it has (see retryShape); 0 means 1.
 	smaller int
 	slots   int
+	// places are its places on its workers, which its stages' tasks take
+	// (see places); nil sends each task at once.
+	places *places
 	// roots are the statement's directories in object storage for
 	// exchanges (see spreadRoots).
 	roots     []string
@@ -783,7 +786,7 @@ func (e *execution) stage(ctx context.Context, s *Stage) error {
 	run = func(p piece, first, round int) ([]ranPiece, error) {
 		task, bytes := request(p, round)
 		task.splittable = !p.split() && units(p.i) > 1
-		w, head, err := e.co.dispatch(tctx, task, e.targets(), first, outOf(p), sp)
+		w, head, err := e.dispatchPlaced(tctx, task, first, outOf(p), sp)
 		// A worker lost with files the task reads: once what they held is
 		// written again, the task runs on what is there now (see repair).
 		rounds := round
@@ -791,7 +794,7 @@ func (e *execution) stage(ctx context.Context, s *Stage) error {
 			rounds++
 			task, bytes = request(p, rounds)
 			task.splittable = !p.split() && units(p.i) > 1
-			w, head, err = e.co.dispatch(tctx, task, e.targets(), first, outOf(p), sp)
+			w, head, err = e.dispatchPlaced(tctx, task, first, outOf(p), sp)
 		}
 		var lost *taskLostError
 		if errors.As(err, &lost) && tctx.Err() == nil {
@@ -799,7 +802,7 @@ func (e *execution) stage(ctx context.Context, s *Stage) error {
 			if k < 2 {
 				// Not worth dividing after all: as one task, on the others.
 				task.splittable = false
-				w, head, err = e.co.dispatch(tctx, task, e.targets(), first+1, outOf(p), sp)
+				w, head, err = e.dispatchPlaced(tctx, task, first+1, outOf(p), sp)
 			} else {
 				e.co.log.Warn("a worker was lost while it ran a task; running the task as smaller ones on the others", "query", e.qid,
 					"stage", s.ID, "task", p.i, "worker", lost.worker, "tasks", k)
@@ -904,6 +907,21 @@ func (e *execution) stage(ctx context.Context, s *Stage) error {
 		e.mu.Unlock()
 	}
 	return nil
+}
+
+// dispatchPlaced runs task as dispatch does, on the statement's workers, once
+// one has a place for it, worker first first (see places).
+func (e *execution) dispatchPlaced(ctx context.Context, task *taskRequest, first int, path string, sp *spool) (*worker, *taskResult, error) {
+	ws := e.targets()
+	if e.places == nil || len(ws) == 0 {
+		return e.co.dispatch(ctx, task, ws, first, path, sp)
+	}
+	at, release, err := e.places.take(ctx, ws, first%len(ws))
+	if err != nil {
+		return nil, nil, err
+	}
+	defer release()
+	return e.co.dispatch(ctx, task, ws, at, path, sp)
 }
 
 // describe says what each exchange held: rows and files by partition.
