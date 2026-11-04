@@ -1085,10 +1085,10 @@ refreshes of materialized views and dynamic tables, pipes' loads, and, when
 workers 5 seconds or more and 8 times as long as the other statements there,
 in each of its latest runs (see [heavy statements beside short
 ones](workload-management.md#heavy-statements-beside-short-ones)). Their tasks
-get a quarter of a worker's slots before other tasks, rounded down, and one
-before them whenever none of theirs has started there for 10 seconds, so that
-dashboards that keep the workers busy slow them and never stop them; more only
-once no other statement's task has run or waited there for 2 seconds. Beside a full
+start on a worker only once no other statement's task has run or waited there
+for 2 seconds, and one goes before the others' whenever none of theirs has
+started there for 10 seconds, so that dashboards that keep the workers busy
+slow them and never stop them. Beside a full
 refresh on 16 workers that took them for 40 to 140 s at a time, dashboards'
 statements on workers took 9.7 s at the median and 42 s at the 95th percentile,
 against 6.6 and 23 s while none ran. On two workers beside back-to-back full

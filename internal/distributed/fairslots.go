@@ -28,20 +28,19 @@ import (
 // and 23 s with none. The fewest-started rule already let their tasks past the
 // refresh's waiting ones, but in every lull the refresh's took all the slots,
 // and the tiles' next tasks waited for those to end, or ran beside them, each
-// task on all of the worker's threads. So background statements' tasks take
-// more slots than a floor, a quarter of them, only once no other statement's
-// task has run or waited here for backgroundQuiet. Up to the floor they go
-// before other tasks, and past it one of them goes before them once none has
+// task on all of the worker's threads. So background statements' tasks start
+// only once no other statement's task has run or waited here for
+// backgroundQuiet, and one of them goes before the others' once none has
 // started here for backgroundAge: so dashboards that keep the workers busy slow
-// them, and never stop them, on a worker of one slot as of many.
+// them, and never stop them. With a floor of a quarter of the slots besides,
+// which they got before other tasks, mixed windows ran 100 to 112 dashboards a
+// minute against 190.7 before, those on workers taking 87 to 165 s at the 95th
+// percentile beside a full refresh, against 38 to 46 s.
 type fairSlots struct {
 	mu   sync.Mutex
 	free int64
-	// floor is how many slots background statements' tasks get before any
-	// other's, and background how many they hold; started is when one of them
-	// last started here.
-	floor, background int64
-	started           time.Time
+	// started is when a background statement's task last started here.
+	started time.Time
 	// others is how many tasks of statements not in the background run or
 	// wait here, and quiet when the last of them ended.
 	others int
@@ -96,19 +95,17 @@ func InBackground(ctx context.Context) bool {
 	return b
 }
 
-// backgroundShare is what part of a worker's slots background statements' tasks
-// get before any other's, a quarter; backgroundQuiet how long no other
-// statement's task has run or waited on a worker before they take more; and
-// backgroundAge how long after one of them last started there one goes before
-// the others' anyway (see fairSlots).
+// backgroundQuiet is how long no other statement's task has run or waited on a
+// worker before background statements' tasks start there, and backgroundAge how
+// long after one of them last started there one goes before the others' anyway
+// (see fairSlots).
 const (
-	backgroundShare = 4
 	backgroundQuiet = 2 * time.Second
 	backgroundAge   = 10 * time.Second
 )
 
 func newFairSlots(n int64) *fairSlots {
-	return &fairSlots{free: n, floor: n / backgroundShare, quietFor: backgroundQuiet, ageFor: backgroundAge,
+	return &fairSlots{free: n, quietFor: backgroundQuiet, ageFor: backgroundAge,
 		queries: map[string]*slotQuery{}, now: time.Now}
 }
 
@@ -140,7 +137,7 @@ func (f *fairSlots) acquire(ctx context.Context, query string, n int64, first, b
 	select {
 	case <-w.ready:
 		// It had just got them.
-		f.give(q, n)
+		f.free += n
 	default:
 		for i, other := range f.waiting {
 			if other == w {
@@ -158,18 +155,9 @@ func (f *fairSlots) acquire(ctx context.Context, query string, n int64, first, b
 func (f *fairSlots) release(query string, n int64) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	q := f.queries[query]
-	f.give(q, n)
-	f.leave(query, q)
-	f.next()
-}
-
-// give takes back the n slots a task of q held. f.mu is held.
-func (f *fairSlots) give(q *slotQuery, n int64) {
 	f.free += n
-	if q != nil && q.background {
-		f.background -= n
-	}
+	f.leave(query, f.queries[query])
+	f.next()
 }
 
 // leave has q, query's, a task fewer, and forgets it with none left.
@@ -190,10 +178,10 @@ func (f *fairSlots) leave(query string, q *slotQuery) {
 // next starts the tasks that may start. f.mu is held.
 func (f *fairSlots) next() {
 	// rank orders the waiting tasks: those that run again what a lost worker
-	// held; background statements' under the floor, or once none of theirs has
-	// started for ageFor, however many other tasks wait; other statements'; and
-	// then background statements', once the others have been quiet for quietFor,
-	// or -1 for none yet.
+	// held; a background statement's once none of theirs has started for
+	// ageFor, however many other tasks wait; other statements'; and then
+	// background statements', once the others have been quiet for quietFor, or
+	// -1 for none yet.
 	now := f.now()
 	aged, quiet := f.started.Add(f.ageFor), f.quiet.Add(f.quietFor)
 	rank := func(w *slotWaiter) int {
@@ -202,7 +190,7 @@ func (f *fairSlots) next() {
 			return 0
 		case !w.query.background:
 			return 2
-		case f.background < f.floor || !now.Before(aged):
+		case !now.Before(aged):
 			return 1
 		case f.others == 0 && !now.Before(quiet):
 			return 3
@@ -240,7 +228,6 @@ func (f *fairSlots) next() {
 		f.free -= w.n
 		w.query.started += w.n
 		if w.query.background {
-			f.background += w.n
 			f.started, aged = now, now.Add(f.ageFor)
 		}
 		f.waiting = append(f.waiting[:pick], f.waiting[pick+1:]...)

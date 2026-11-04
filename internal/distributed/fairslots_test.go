@@ -176,10 +176,9 @@ func waitingCount(f *fairSlots) int {
 }
 
 // TestBackgroundSlots checks that a background statement's tasks take a worker's
-// slots after other statements' beyond their floor, which they get before them
-// however many wait, and more only once no other statement's task has run or
-// waited there for a while; and that on a worker of one slot, with no floor, one
-// of them goes first once none has started for a while.
+// slots after other statements', only once no other statement's task has run or
+// waited there for a while; and that one of them goes first once none has
+// started for a while.
 func TestBackgroundSlots(t *testing.T) {
 	ctx := context.Background()
 	f := newFairSlots(4)
@@ -192,35 +191,35 @@ func TestBackgroundSlots(t *testing.T) {
 	}
 	queue, next, none := slotTurns(t, f)
 	queue("refresh", "refresh 5", true)
-	queue("refresh", "refresh 6", true)
 	queue("tile 1", "tile 1", false)
 	queue("tile 2", "tile 2", false)
 	queue("tile 3", "tile 3", false)
-	// As the refresh's tasks end, the tiles' go first, until the refresh holds
-	// less than its floor of one slot.
-	for _, want := range []string{"tile 1", "tile 2", "tile 3", "refresh 5"} {
+	// As the refresh's tasks end, the tiles' go first, and the refresh's wait
+	// for them, and for a while after them, though a slot is free.
+	for _, want := range []string{"tile 1", "tile 2", "tile 3"} {
 		f.release("refresh", 1)
 		next(want)
 	}
-	// At its floor, it waits for the tiles, and for a while after them.
-	queue("tile 4", "tile 4", false)
+	f.release("refresh", 1)
+	none("while the tiles ran")
+	if err := f.acquire(ctx, "tile 4", 1, false, false); err != nil {
+		t.Fatal(err)
+	}
 	f.release("tile 1", 1)
-	next("tile 4")
 	f.release("tile 2", 1)
 	f.release("tile 3", 1)
 	none("while a tile ran")
 	start := time.Now()
 	f.release("tile 4", 1)
-	next("refresh 6")
+	next("refresh 5")
 	if waited := time.Since(start); waited < 40*time.Millisecond {
-		t.Errorf("the refresh took more than its floor %s after the last tile ended", waited)
+		t.Errorf("the refresh started %s after the last tile ended", waited)
 	}
-	f.release("refresh", 1)
 	f.release("refresh", 1)
 	settled(t, f, 4)
 
-	// One slot: no floor, and one of the refresh's tasks goes before the tiles'
-	// once none of its own has started for ageFor.
+	// One slot: one of the refresh's tasks goes before the tiles' once none of
+	// its own has started for ageFor.
 	f = newFairSlots(1)
 	f.quietFor, f.ageFor = time.Hour, 50*time.Millisecond
 	if err := f.acquire(ctx, "tile a", 1, false, false); err != nil {
@@ -295,9 +294,8 @@ func settled(t *testing.T, f *fairSlots, n int64) {
 	t.Helper()
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if len(f.queries) != 0 || f.free != n || f.background != 0 || f.others != 0 || len(f.waiting) != 0 {
-		t.Errorf("after all: %d statements, %d free, %d background, %d others, %d waiting",
-			len(f.queries), f.free, f.background, f.others, len(f.waiting))
+	if len(f.queries) != 0 || f.free != n || f.others != 0 || len(f.waiting) != 0 {
+		t.Errorf("after all: %d statements, %d free, %d others, %d waiting", len(f.queries), f.free, f.others, len(f.waiting))
 	}
 }
 

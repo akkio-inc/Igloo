@@ -618,10 +618,10 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
 - Refreshes, pipes' loads and heavy statements give way to dashboards on workers.
   Beside a full refresh on all 16 workers, 40 to 140 s at a time, dashboards'
   statements on workers took 9.7 s at the median and 42 s at the 95th percentile,
-  against 6.6 and 23 s while none ran. A statement in the background now gets a
-  quarter of a worker's slots before other tasks, and one whenever none of its tasks
-  has started there for 10 seconds, so that it always finishes, and more only once
-  no other statement's task has run or waited there for 2 seconds.
+  against 6.6 and 23 s while none ran. A statement in the background now starts its tasks
+  on a worker only once no other statement's task has run or waited there for 2
+  seconds, and one before them whenever none of its tasks has started there for 10
+  seconds, so that it always finishes.
   Materialized views' and dynamic tables' refreshes and pipes run so, and
   statements whose shape held the workers 8 times as long as the others there. Their `placement` ends with `in the background`.
 - TPC-DS q09, q10, q16, q32, q35, q69, q92 and q94 run on workers, where they stayed on
