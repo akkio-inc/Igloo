@@ -213,8 +213,9 @@ type Options struct {
 	// plans aggregates in passes against (see aggpasses.go); 0 runs none
 	// in passes.
 	QueryMemory int64
-	// HeavyInBackground runs heavy reads in a second DuckDB of this process
-	// whose threads give way to the first's (see background.go).
+	// HeavyInBackground runs clients' heavy statements, not only jobs', in a
+	// second DuckDB of this process whose threads give way to the first's (see
+	// background.go).
 	HeavyInBackground bool
 	// ResultCacheSize is IGLOO_RESULT_CACHE_SIZE: the memory the results
 	// the server keeps of queries may take (see resultcache.go); 0 keeps
@@ -556,13 +557,13 @@ type Server struct {
 	// run (for tests).
 	beforeRun func(sess *session, query string)
 	// heavy says which statements run in the second DuckDB (see
-	// background.go), and lane is that DuckDB; heavy is nil to run all in
-	// the first.
-	heavy *heavyHistory
-	lane  backgroundLane
+	// background.go), and lane is that DuckDB; heavyClients says clients'
+	// heavy statements run there too, not only jobs'.
+	heavy        *heavyHistory
+	lane         backgroundLane
+	heavyClients bool
 	// heavyOnWorkers says which statements run on workers in the background,
-	// by the seconds statements of their shapes took there (see background.go);
-	// nil to run none so.
+	// by the seconds statements of their shapes took there (see background.go).
 	heavyOnWorkers *heavyHistory
 	// beforeFill, if set, runs as a staged CREATE TABLE ... AS starts to
 	// fill its table, with the context that ends the fill (for tests).
@@ -812,12 +813,10 @@ func New(engine Engine, opts Options, log *slog.Logger) (*Server, error) {
 	}
 	s.deleteTargets = deletefiles.NewTargets()
 	s.queryMemory = opts.QueryMemory
-	if opts.HeavyInBackground {
-		s.heavy = newHeavyHistory()
-		s.heavyOnWorkers = newHeavyHistoryOf(heavySeconds * time.Second)
-		if e, ok := s.engine.(interface{ WatchForeground(func() bool) }); ok {
-			e.WatchForeground(s.workload.HeldBehindSecond)
-		}
+	s.heavy, s.heavyClients = newHeavyHistory(), opts.HeavyInBackground
+	s.heavyOnWorkers = newHeavyHistoryOf(heavySeconds * time.Second)
+	if e, ok := s.engine.(interface{ WatchForeground(func() bool) }); ok {
+		e.WatchForeground(s.workload.HeldBehindSecond)
 	}
 	s.scanner, s.prefetcher = opts.Scanner, opts.Prefetcher
 	s.bitmaps, s.bitmapMinRows, s.bitmapIndexesOn = opts.Bitmaps, opts.BitmapMinRows, opts.BitmapIndexes

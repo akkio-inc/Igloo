@@ -27,6 +27,13 @@ import (
 // in a second DuckDB of this process whose threads give way to the first's.
 // Alone, they run as fast as they would have in the first.
 //
+// Whose heavy statements run there (see backgroundFor): a job's, as a task's,
+// always, and a client's only with IGLOO_HEAVY_IN_BACKGROUND. A dashboard's own
+// heavy statement is part of what its user waits for: at ten times its data on 16
+// cores, the dashboard's heavy FLATTEN statement ran 22 s alone in the first
+// DuckDB and 57 to 78 s in the second, beside its tiles, and the burst waited
+// for it.
+//
 // A statement is heavy if statements of its shape, its text with the
 // literals masked, lately took heavySeconds of all the machine's cores and
 // heavyFactor times what the replica's others of some size do (see
@@ -478,10 +485,17 @@ func (s *Server) mayRunInBackground(sess *session, st *statement, tw *tagWriter,
 	return s.readInBackground(sess, st) && parts.local == 0 && tw.Written() == 0
 }
 
+// backgroundFor says whether sess's heavy statements may run in the second
+// DuckDB: a job's, and with IGLOO_HEAVY_IN_BACKGROUND a client's too (see the
+// top of this file).
+func (s *Server) backgroundFor(sess *session) bool {
+	return s.heavy != nil && (sess.job != "" || s.heavyClients)
+}
+
 // readInBackground says whether st is a read that could run in the second
 // DuckDB, whatever comes of its turn.
 func (s *Server) readInBackground(sess *session, st *statement) bool {
-	return s.heavy != nil && sess.wl.shape != "" && st.stmtType == duckdb.STATEMENT_TYPE_SELECT && st.kind == returnsRows &&
+	return s.backgroundFor(sess) && sess.wl.shape != "" && st.stmtType == duckdb.STATEMENT_TYPE_SELECT && st.kind == returnsRows &&
 		!sess.inTx && len(st.loads) > 0 && !st.ai && len(st.indexPins) == 0 && st.idCounts == nil && policyReason(st) == ""
 }
 
@@ -579,7 +593,7 @@ func (s *Server) foregroundRead(st *statement) {
 // the second DuckDB: if statements of its shape are known to be heavy, and it
 // would write and read the same there.
 func (s *Server) writesInBackground(ctx context.Context, sess *session, st *statement) bool {
-	return s.heavy != nil && sess.wl.shape != "" && s.heavy.heavy(sess.wl.shape) && !sess.inTx && st.ids == nil && !st.ai &&
+	return s.backgroundFor(sess) && sess.wl.shape != "" && s.heavy.heavy(sess.wl.shape) && !sess.inTx && st.ids == nil && !st.ai &&
 		policyReason(st) == "" && s.sameInBackground(ctx, sess, st)
 }
 
