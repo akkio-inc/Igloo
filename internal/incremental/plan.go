@@ -928,18 +928,6 @@ func (p *Plan) Invertible() bool {
 	return true
 }
 
-// Bitmaps reports whether the plan's state keeps values in bitmaps, for a
-// count(DISTINCT x): a state that grows with the values counted, and is
-// merged whole for each group that changes.
-func (p *Plan) Bitmaps() bool {
-	for _, a := range p.aggs {
-		if a.kind == "count_distinct" {
-			return true
-		}
-	}
-	return false
-}
-
 // aggregatesQuery is a query that returns the plan's aggregates, as the
 // query computes them, for their types.
 func (p *Plan) aggregatesQuery(ctx context.Context) (string, error) {

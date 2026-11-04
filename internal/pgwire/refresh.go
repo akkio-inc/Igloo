@@ -196,9 +196,6 @@ type refresher struct {
 	// what that took, for the history.
 	placement string
 	parts     distParts
-	// stateless says it refreshes in full and keeps no state, though it could
-	// (see bitmapsOnWorkers).
-	stateless bool
 }
 
 // rebuild replaces the view's rows with its query's, the query on workers
@@ -316,10 +313,6 @@ func (r *refresher) run(ctx context.Context) (refreshResult, error) {
 	if r.st.Mode == refreshFull {
 		why = "its REFRESH_MODE is FULL"
 	}
-	if why == "" && r.st.Mode != refreshIncremental && r.bitmapsOnWorkers(ctx) {
-		why, r.stateless = bitmapsOnWorkers, true
-		r.st.Incremental, r.st.Reason = false, why
-	}
 	if why == "" {
 		why = r.baseline(ctx)
 	}
@@ -333,29 +326,54 @@ func (r *refresher) run(ctx context.Context) (refreshResult, error) {
 	return r.full(ctx, why)
 }
 
-// bitmapsOnWorkers is why a view counting distinct values is refreshed in
-// full, its query on workers (see refresher.bitmapsOnWorkers).
-const bitmapsOnWorkers = "it counts distinct values, and workers run its query whole faster than this replica merges its bitmaps"
+// stateRowGroupBytes is about how many bytes of a state's bitmaps each of its
+// files' row groups holds (see slices).
+const stateRowGroupBytes = 8 << 20
 
-// bitmapsOnWorkers says the view counts distinct values, which an incremental
-// refresh keeps in bitmaps and merges on this replica, and auto mode would run
-// its query on workers. Going on from 800 groups' bitmaps of distinct devices,
-// a billion impressions' reach took 180 to 283 s here, 13 to 55 CPU-minutes,
-// beside dashboards whose tiles count the same distinct devices on workers in
-// 2 to 12 s; refreshed in full, its query runs on workers and keeps no state.
-func (r *refresher) bitmapsOnWorkers(ctx context.Context) bool {
-	if r.plan == nil || !r.plan.Grouped || !r.plan.Bitmaps() || r.s.dist == nil {
-		return false
+// slices returns the ranges of rowid of rel, a temporary table of state rows
+// about to be written, to write them in: about stateRowGroupBytes of their
+// bitmaps each, or one range of them all (lo -1) for a state of no bitmaps.
+//
+// DuckDB writes at least a vector of rows, up to 2,048, in each row group of
+// a Parquet file, whatever its row group size in rows or bytes: the 800 bitmaps
+// of a billion impressions' distinct devices by advertiser and channel, 2 GB,
+// were one row group, and reading them back took more than 1 GB at once, which
+// a replica busy with dashboards could not give. The refresh failed and ran
+// again, for minutes. Written a slice a statement, each is a row group of its
+// own; slices of 8 MB took 1.4 s for the 2 GB, and read back in 1 GB.
+func (r *refresher) slices(ctx context.Context, rel string) ([][2]int64, error) {
+	var blobs []string
+	for _, c := range r.plan.StateColumns() {
+		if c.Type == "BLOB" {
+			blobs = append(blobs, "coalesce(octet_length("+quoteIdent(c.Name)+"), 0)")
+		}
 	}
-	src := r.s.fillSource(ctx, r.sess, &statement{access: r.access, guard: r.guard}, r.query)
-	if src == nil {
-		return false
+	if len(blobs) == 0 {
+		return [][2]int64{{-1, -1}}, nil
 	}
-	defer src.close() //nolint:errcheck
-	user := r.sess.currentUser()
-	env := &sessionEnv{s: r.s, sess: r.sess, user: user, st: src}
-	_, err := r.s.dist.Plan(ctx, src.query, env, sessionMode(r.sess, user))
-	return err == nil
+	n, err := r.count(ctx, "SELECT count(*) FROM "+rel)
+	if err != nil {
+		return nil, err
+	}
+	width, err := r.count(ctx, "SELECT CAST(coalesce(avg("+strings.Join(blobs, " + ")+"), 0) AS BIGINT) FROM "+rel)
+	if err != nil {
+		return nil, err
+	}
+	per := max(r.s.stateRowGroupBytes/max(width, 1), 1)
+	var out [][2]int64
+	for lo := int64(0); lo < n; lo += per {
+		out = append(out, [2]int64{lo, lo + per})
+	}
+	return out, nil
+}
+
+// inSlice is the condition that a row of alias, of a temporary table, is in
+// slice (see slices), with the AND before it, or nothing for all rows.
+func inSlice(alias string, slice [2]int64) string {
+	if slice[0] < 0 {
+		return ""
+	}
+	return fmt.Sprintf(" AND %s.rowid >= %d AND %s.rowid < %d", alias, slice[0], alias, slice[1])
 }
 
 // planQuery plans the query, and loads its tables' current snapshots. It
@@ -842,7 +860,13 @@ func (r *refresher) mergeGroups(ctx context.Context, input, detail string) (refr
 	} else {
 		stateStmts = append(stateStmts, "DELETE FROM "+state+" AS s WHERE EXISTS (SELECT 1 FROM __igloo_delta AS d WHERE "+p.Match("s", "d")+")")
 	}
-	stateStmts = append(stateStmts, "INSERT INTO "+state+" "+alive)
+	slices, err := r.slices(ctx, "__igloo_merged")
+	if err != nil {
+		return refreshResult{}, "", err
+	}
+	for _, slice := range slices {
+		stateStmts = append(stateStmts, "INSERT INTO "+state+" "+alive+inSlice("m", slice))
+	}
 	var rows int64
 	if whole != "" {
 		rows, err = r.replaceRows(ctx, whole, stateStmts...)
@@ -864,7 +888,7 @@ func (r *refresher) full(ctx context.Context, why string) (refreshResult, error)
 		detail = fmt.Sprintf("ran the query over every row (%d rows, %d bytes of files): %s", rows, bytes, why)
 	}
 	p := r.plan
-	if p == nil || p.Reason != "" || r.snaps == nil || r.st.Mode == refreshFull || r.stateless {
+	if p == nil || p.Reason != "" || r.snaps == nil || r.st.Mode == refreshFull {
 		// Nothing to go on from: the query as it is, and no state.
 		rows, err := r.rebuild(ctx)
 		if err != nil {
@@ -935,7 +959,16 @@ func (r *refresher) full(ctx context.Context, why string) (refreshResult, error)
 	if err != nil {
 		return refreshResult{}, err
 	}
-	n, err := r.replaceRows(ctx, final, "INSERT INTO "+state+" "+rows)
+	slices, err := r.slices(ctx, "__igloo_full")
+	if err != nil {
+		return refreshResult{}, err
+	}
+	var stateStmts []string
+	for _, slice := range slices {
+		stateStmts = append(stateStmts, "INSERT INTO "+state+" SELECT "+r.stateColumns()+" FROM ("+
+			p.StateRows("__igloo_full AS full_state WHERE true"+inSlice("full_state", slice))+") AS f")
+	}
+	n, err := r.replaceRows(ctx, final, stateStmts...)
 	if err != nil {
 		return refreshResult{}, err
 	}
@@ -1193,7 +1226,7 @@ func (r *refresher) write(ctx context.Context, stmts ...string) (int64, error) {
 func (r *refresher) done(ctx context.Context, res refreshResult) (refreshResult, string, error) {
 	st := &r.st
 	st.Action, st.Detail, st.DataTimestamp = res.action, res.detail, time.Now().UTC()
-	if r.snaps != nil && r.plan != nil && r.plan.Reason == "" && st.Unkeepable != r.digest && st.Mode != refreshFull && !r.stateless {
+	if r.snaps != nil && r.plan != nil && r.plan.Reason == "" && st.Unkeepable != r.digest && st.Mode != refreshFull {
 		st.Query, st.Sources = r.digest, r.snaps
 		if snap, err := r.snapshot(ctx, r.schema, r.table); err == nil {
 			st.Table = snap

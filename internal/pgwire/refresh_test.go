@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"math/rand/v2"
 	"os"
+	"path/filepath"
 	"regexp"
 	"slices"
 	"strconv"
@@ -538,6 +539,61 @@ func TestObserveRefresh(t *testing.T) {
 	s.observeRefresh("shape", "exact", there, 0, false, 10*time.Second, nil)
 	if !ctl.RunsOnWorkers("exact", "shape") {
 		t.Error("a refresh whose query ran on workers does not count as one that ran there")
+	}
+}
+
+// TestStateRowGroupsByBytes checks that the files of a refresh's state that
+// keeps bitmaps hold about as many bytes of them as the server sets in each row
+// group, in a full refresh and in an incremental one, rather than 122,880 rows:
+// here a few kilobytes, so one bitmap a row group. The view keeps its query's
+// rows.
+func TestStateRowGroupsByBytes(t *testing.T) {
+	t.Parallel()
+	if os.Getenv("IGLOO_TEST_RB_EXTENSION") == "" {
+		t.Skip("IGLOO_TEST_RB_EXTENSION not set")
+	}
+	env := startRefreshServer(t, func(o *Options) { o.stateRowGroupBytes = 4 << 10 })
+	admin := env.admin
+	mustExec(t, admin, "CREATE TABLE visits AS SELECT i % 5 AS g, i AS person FROM range(200000) AS r(i)")
+	const query = "SELECT g, count(DISTINCT person) AS people, count(*) AS n FROM visits GROUP BY g"
+	mustExec(t, admin, "CREATE MATERIALIZED VIEW reach AS "+query)
+	// rowGroups returns the row groups the state's files written since since
+	// hold, and the most rows one of them holds.
+	rowGroups := func(since time.Time) (groups, most int) {
+		t.Helper()
+		files, err := filepath.Glob(filepath.Join(env.dir, "*", "data", "*.parquet"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, f := range files {
+			info, err := os.Stat(f)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if info.ModTime().Before(since) {
+				continue
+			}
+			got := texts(t, admin, "SELECT count(*) || '|' || coalesce(max(row_group_num_rows), 0) FROM parquet_metadata('"+f+"') WHERE path_in_schema = '__c1'")
+			n, rows, _ := strings.Cut(got[0], "|")
+			k, _ := strconv.Atoi(n)
+			m, _ := strconv.Atoi(rows)
+			groups, most = groups+k, max(most, m)
+		}
+		return groups, most
+	}
+	for _, step := range []struct{ what, action string }{{"full", actionFull}, {"incremental", actionIncremental}} {
+		since := time.Now()
+		mustExec(t, admin, "REFRESH MATERIALIZED VIEW reach")
+		if action, detail, _, reason := viewRefresh(t, admin, "public.reach"); action != step.action {
+			t.Fatalf("the %s refresh: %s: %s (%s)", step.what, action, detail, reason)
+		}
+		if groups, most := rowGroups(since); groups != 5 || most != 1 {
+			t.Errorf("the %s refresh wrote the state in %d row groups of up to %d rows, want one a bitmap", step.what, groups, most)
+		}
+		if got, want := texts(t, admin, "SELECT * FROM reach ORDER BY ALL"), texts(t, admin, query+" ORDER BY ALL"); !slices.Equal(got, want) {
+			t.Errorf("after the %s refresh: %q, want %q", step.what, got, want)
+		}
+		mustExec(t, admin, "INSERT INTO visits SELECT i % 5, i FROM range(200000, 210000) AS r(i)")
 	}
 }
 

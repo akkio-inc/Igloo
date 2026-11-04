@@ -254,6 +254,8 @@ type Options struct {
 	shedStuckAfter time.Duration
 	exit           func(code int)
 	stuckGrace     time.Duration
+	// stateRowGroupBytes, when set, replaces stateRowGroupBytes (for tests).
+	stateRowGroupBytes int64
 	// ReportRewrite has the statement layer recognize the counting CTEs
 	// of audience reports and answer them through the report API
 	// (IGLOO_REPORT_REWRITE; see reportrecognize.go).
@@ -487,6 +489,9 @@ type Server struct {
 	shedStuckAfter time.Duration
 	exitProcess    func(code int)
 	freeMemory     func(context.Context)
+	// stateRowGroupBytes is about how many bytes of a refresh state's rows a
+	// row group of its files holds (see refresher.sizeRowGroups).
+	stateRowGroupBytes int64
 	// stuck lets the client of a statement that does not stop once
 	// canceled go (see watchStuck).
 	stuck *stuckWatch
@@ -815,6 +820,7 @@ func New(engine Engine, opts Options, log *slog.Logger) (*Server, error) {
 		s.memoryCritical = memlimit.Critical(opts.MemoryTotal)
 	}
 	s.shedStuckAfter = cmp.Or(opts.shedStuckAfter, shedStuckAfter)
+	s.stateRowGroupBytes = cmp.Or(opts.stateRowGroupBytes, stateRowGroupBytes)
 	s.stuck = &stuckWatch{grace: cmp.Or(opts.stuckGrace, stuckGrace), log: s.log}
 	s.exitProcess = opts.exit
 	s.freeMemory = opts.FreeMemory

@@ -2606,16 +2606,21 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   peaks for the next like it, so one that failed big and finished small
   reserves for the big one. Tasks and alerts had this already.
 
-- Refreshes run their queries on workers where auto mode would run reads of
-  them there. A full refresh of a view that later refreshes go on from
-  computed its groups' partial aggregates on the replica. A view counting
-  distinct values went on from bitmaps of them, merged on the replica: the
-  reach of a billion impressions by advertiser and channel took 180 to 283 s
-  there, 13 to 55 CPU-minutes, each refresh, beside dashboards whose tiles
-  count the same on workers in 2 to 12 s. Such a view is now refreshed in
-  full, its query on workers, and keeps no bitmaps, as long as auto mode
-  would run that query there. The log says where each of a refresh's
-  queries ran, and the history where its query did.
+- A full refresh of a view that later refreshes go on from runs its query on
+  workers where auto mode would run a read of it there; it computed its
+  groups' partial aggregates on the replica. The log says where each of a
+  refresh's queries ran, and the history where its query did.
+
+- A view counting distinct values refreshes incrementally in seconds. Its
+  state, a bitmap of each group's values, was written as one row group of
+  every group's bitmap, as DuckDB puts a vector of rows, up to 2,048, in each
+  at least: for the
+  reach of a billion impressions by advertiser and channel, 800 bitmaps and
+  2 GB, which took more than 1 GB at once to read back. Beside dashboards that
+  memory was not there, and refreshes failed and ran again for 180 to 283 s.
+  The state is now written in row groups of about 8 MB. Alone, a refresh after
+  8 million new impressions takes 8 to 9 s, and writes 267 row groups of up
+  to 9 MB.
 
 - A replica no longer cancels its first statements for memory while it reads back,
   after a start, the parts of files DuckDB held. The read-back took a new buffer for
