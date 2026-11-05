@@ -22,7 +22,9 @@ import (
 // that failed among them; once for runs out of memory close together.
 func TestOutOfMemoryCapture(t *testing.T) {
 	t.Parallel()
-	eng, err := engine.Open(context.Background(), config.Config{}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	// Four threads leave the net room to run it again on two, then one,
+	// whatever the machine's cores.
+	eng, err := engine.Open(context.Background(), config.Config{DuckDB: config.DuckDB{Threads: 4}}, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
 		t.Fatal(err)
 	}

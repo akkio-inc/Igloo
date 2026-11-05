@@ -151,7 +151,9 @@ jobs:
         if: matrix.part == 'packages'
         run: |
           mapfile -t packages < <(go list -tags duckdb_arrow ./... | grep -v '/internal/pgwire$')
-          go test -tags duckdb_arrow "${packages[@]}"
+          # internal/distributed alone takes over 10 minutes on these runners,
+          # go test's default limit for a package.
+          go test -tags duckdb_arrow -timeout 25m "${packages[@]}"
 
       - name: Test internal/pgwire
         if: matrix.part != 'packages'
@@ -171,7 +173,7 @@ jobs:
           else
             select=(-skip "^($(awk -v n="$n" 'NR % n != 0' <<<"$tests" | paste -sd '|' -))\$")
           fi
-          go test -tags duckdb_arrow -parallel 4 "${select[@]}" ./internal/pgwire/
+          go test -tags duckdb_arrow -timeout 25m -parallel 4 "${select[@]}" ./internal/pgwire/
 
   migrate:
     name: Migration report
