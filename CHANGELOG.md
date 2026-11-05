@@ -2758,7 +2758,8 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   written into them, and longer text assigned in one call a chunk. On 4
   million synthetic rows from 32 files, merged rows read through DuckDB
   take about as long as DuckDB's sort of the same rows, three times faster
-  than before.
+  than before. A coordinator of fewer than 4 cores, or DuckDB threads, has
+  DuckDB sort the rows instead, which is faster there.
 - A worker told to stop, by a Spot Instance's interruption notice or by
   SIGTERM, keeps serving the exchange files on its disk until the
   statements that read them end, or its deadline passes (ten seconds
