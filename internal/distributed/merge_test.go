@@ -16,6 +16,8 @@ import (
 // keep the order rows are read in, it sorts as before.
 func TestMergeOrdered(t *testing.T) {
 	h := behaviorsHarness(t)
+	// Cores enough to merge on (see mergesKeepUp); the last case has fewer.
+	h.co.opts.Cores = mergeCores
 	for _, tc := range []struct {
 		query string
 		// settings are SET before it runs; merged says the coordinator
@@ -73,6 +75,34 @@ func TestMergeOrdered(t *testing.T) {
 			}
 		})
 	}
+	// On fewer cores than a merge keeps up on, the coordinator sorts.
+	t.Run("few cores", func(t *testing.T) {
+		h.t = t
+		h.co.opts.Cores = mergeCores - 2
+		defer func() { h.co.opts.Cores = mergeCores }()
+		q := `SELECT bvalue, count(*) AS n FROM behaviors4 GROUP BY 1 ORDER BY n DESC, bvalue`
+		ctx := context.Background()
+		want, _, err := h.query(ctx, q)
+		if err != nil {
+			t.Fatal(err)
+		}
+		plan, err := h.co.Plan(ctx, q, harnessEnv{h}, ModeOn)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ex, err := h.co.Execute(ctx, plan, h.settings(ctx))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer ex.Close()
+		got, _, err := h.query(ctx, ex.SQL)
+		if err != nil {
+			t.Fatalf("%v\n%s", err, ex.SQL)
+		}
+		if msg := compareRows(want, got, true); msg != "" || !strings.Contains(ex.SQL, "ORDER BY") {
+			t.Errorf("on %d cores: %s, the statement %s", h.co.opts.Cores, msg, ex.SQL)
+		}
+	})
 }
 
 // TestResolveMerge checks the order keys take from the session's

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 
@@ -194,7 +195,9 @@ func BenchmarkMergedRows(b *testing.B) {
 // quarter longer, for a runner busy with other work: the coordinator merging
 // workers' sorted rows here took three times as long, and longer than one
 // machine at scale. Each is timed at its best of three, the two
-// interleaved.
+// interleaved. It times the way the coordinator reads them on this machine's
+// cores (see mergesKeepUp): merged where the merge keeps up, and otherwise
+// sorted by DuckDB, which on 2 cores took two thirds of the merge's time.
 func TestMergedRowsKeepUp(t *testing.T) {
 	if testing.Short() {
 		t.Skip("reads four million rows six times")
@@ -202,9 +205,18 @@ func TestMergedRowsKeepUp(t *testing.T) {
 	const files, perFile = 32, 125_000
 	paths, conn := mergeBench(t, files, perFile)
 	runs := mergeRuns(t, paths, conn)
+	var threads int
+	if err := conn.QueryRowContext(context.Background(), "SELECT current_setting('threads')").Scan(&threads); err != nil {
+		t.Fatal(err)
+	}
+	way := "sorted"
+	if mergesKeepUp(0, threads) {
+		way = "merged"
+	}
+	runs["read"] = runs[way]
 	best := map[string]time.Duration{}
 	for range 3 {
-		for _, name := range []string{"merged", "sorted"} {
+		for _, name := range []string{"read", "sorted"} {
 			start := time.Now()
 			n, err := runs[name](context.Background())
 			took := time.Since(start)
@@ -216,8 +228,23 @@ func TestMergedRowsKeepUp(t *testing.T) {
 			}
 		}
 	}
-	t.Logf("%d rows: merged %s, sorted by DuckDB %s", files*perFile, best["merged"], best["sorted"])
-	if best["merged"] > best["sorted"]*5/4 {
-		t.Errorf("merged rows took %s, over a quarter longer than DuckDB's sort of them, %s", best["merged"], best["sorted"])
+	t.Logf("%d rows on %d cores and %d threads: %s %s, sorted by DuckDB %s", files*perFile, runtime.GOMAXPROCS(0), threads, way, best["read"], best["sorted"])
+	if best["read"] > best["sorted"]*5/4 {
+		t.Errorf("rows read %s took %s, over a quarter longer than DuckDB's sort of them, %s", way, best["read"], best["sorted"])
+	}
+}
+
+// TestMergesKeepUp checks the cores and DuckDB threads the coordinator merges
+// sorted rows on: both mergeCores or more.
+func TestMergesKeepUp(t *testing.T) {
+	for _, c := range []struct {
+		cores, threads int
+		want           bool
+	}{
+		{1, 0, false}, {2, 0, false}, {2, 4, false}, {4, 0, true}, {4, 2, false}, {16, 32, true}, {16, 4, true},
+	} {
+		if got := mergesKeepUp(c.cores, c.threads); got != c.want {
+			t.Errorf("%d cores, %d threads: %v", c.cores, c.threads, got)
+		}
 	}
 }
