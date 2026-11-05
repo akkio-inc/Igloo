@@ -546,6 +546,8 @@ set_exchanges object
 echo "workers write tables"
 # files_of TABLE: the table's data files.
 files_of() { psql_admin -c "SELECT file_path FROM iceberg_metadata('lake.public.$1') WHERE status <> 'DELETED'"; }
+# only_sealed TABLE: every file TABLE holds is in a statement's directory.
+only_sealed() { local f; f="$(files_of "$1")"; ! grep -qv -e '/igloo-sealed-' -e '^$' <<<"$f"; }
 # wrote_by_workers NAME TABLE QUERY: TABLE holds what QUERY returns on one
 # machine, in files of statements' directories.
 wrote_by_workers() {
@@ -553,7 +555,7 @@ wrote_by_workers() {
   got="$(psql_admin -c "SET distributed_execution = 'off'" -c "SELECT count(*), count(DISTINCT l_orderkey), sum(l_extendedprice) FROM $2" | grep -v '^SET$')"
   want="$(psql_admin -c "SET distributed_execution = 'off'" -c "SELECT count(*), count(DISTINCT l_orderkey), sum(l_extendedprice) FROM ($3)" | grep -v '^SET$')"
   if [ -n "$want" ] && [ "$got" = "$want" ]; then pass "$1: the same rows"; else fail "$1: [$got], want [$want]"; fi
-  if [ -n "$(files_of "$2")" ] && [ -z "$(files_of "$2" | grep -v '/igloo-sealed-')" ]; then
+  if [ -n "$(files_of "$2")" ] && only_sealed "$2"; then
     pass "$1: its files are of a statement's directory"
   else
     fail "$1: its files: $(files_of "$2" | head -3)"
@@ -601,7 +603,7 @@ wide_rows() {
 }
 psql_admin -c "SET distributed_execution = 'on'" -c "CREATE TABLE written_wide AS $slow_copy" >/dev/null 2>&1 || true
 wide_rows "wide rows, forced onto workers of 1 GB" written_wide
-if [ -n "$(files_of written_wide)" ] && [ -z "$(files_of written_wide | grep -v '/igloo-sealed-')" ]; then
+if [ -n "$(files_of written_wide)" ] && only_sealed written_wide; then
   pass "and workers wrote them"
 else
   fail "wide rows: its files: $(files_of written_wide | head -3)"
@@ -635,7 +637,7 @@ if [ "$ran_out" = 0 ]; then
 else
   fail "wide rows in partitions: tasks ran out of memory $ran_out times"
 fi
-if [ -z "$(files_of written_wide_parts | grep -v '/igloo-sealed-')" ]; then
+if only_sealed written_wide_parts; then
   pass "and workers wrote them"
 else
   fail "wide rows in partitions: its files: $(files_of written_wide_parts | head -3)"

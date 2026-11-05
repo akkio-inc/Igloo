@@ -1989,7 +1989,7 @@ expect "and holds what PostgreSQL's does" "1|ann|10.50|2026-01-01 10:00:00|true|
 3|o'brien|0.00|2026-06-30 21:59:59.5|-|-||\\." igloo "$admin_password" \
   "SELECT id, coalesce(who, '-'), amount, coalesce(CAST(paid_at AT TIME ZONE 'UTC' AS VARCHAR), '-'), coalesce(ok::VARCHAR, '-'),
      coalesce(array_to_string(tags, ';'), '-'), coalesce(hex(data), '-'), replace(note, chr(10), '\\n') FROM pgload.ledger ORDER BY id"
-got="$(psql_admin -c "DROP SCHEMA pgload")" && fail "DROP SCHEMA of a schema with tables went through" || pass "a schema with tables is kept without CASCADE"
+if got="$(psql_admin -c "DROP SCHEMA pgload")"; then fail "DROP SCHEMA of a schema with tables went through"; else pass "a schema with tables is kept without CASCADE"; fi
 expect "DROP SCHEMA ... CASCADE drops it with its tables" "DROP SCHEMA" igloo "$admin_password" "DROP SCHEMA pgload CASCADE"
 expect "and they are gone" "0" igloo "$admin_password" \
   "SELECT count(*) FROM information_schema.tables WHERE table_catalog = 'lake' AND table_schema = 'pgload'"
