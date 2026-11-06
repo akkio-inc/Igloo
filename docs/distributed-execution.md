@@ -159,7 +159,9 @@ all, holding a batch of rows a worker in memory whatever the result, and
 sends the client each batch as it merges it, rather than once it has merged
 them all. The merge runs on several cores: each worker's file is decoded
 apart, groups of up to eight files are merged at once, and the groups'
-rows merged in turn, ahead of DuckDB reading them. It merges by
+rows merged in turn, ahead of DuckDB reading them. It merges on a
+coordinator of 4 cores and DuckDB threads or more; on fewer, DuckDB sorts
+the gathered rows, which is faster there. It merges by
 columns of numbers, text and `BLOB`s (by their bytes), dates, times,
 timestamps, decimals and booleans, the result's columns or the groups and
 aggregates they show, in the session's default order and `NULLS` order.
