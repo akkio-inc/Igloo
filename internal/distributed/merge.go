@@ -10,6 +10,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -32,9 +33,10 @@ import (
 // sorting: memory for a batch of rows a task, whatever the result. It does
 // so where it can compare the values as DuckDB orders them: integers,
 // floating-point numbers (NaN last), text and BLOBs by their bytes, without
-// a collation, dates, times, timestamps, decimals and booleans; and where
-// the session keeps the order rows are read in (preserve_insertion_order).
-// Otherwise the coordinator sorts, as before.
+// a collation, dates, times, timestamps, decimals and booleans; where the
+// session keeps the order rows are read in (preserve_insertion_order); and on
+// a coordinator of mergeCores cores and DuckDB threads or more. Otherwise the
+// coordinator sorts, as before.
 //
 // A plan whose session reads the merge as it is made (Plan.StreamMerged)
 // gets it as a stream of batches, which the statement reads through a
@@ -71,6 +73,11 @@ func (co *Coordinator) mergeOrdered(ctx context.Context, final node, stages []*S
 	}
 	keys, ok := resolveMerge(s.merge, res.columns, settings)
 	if !ok {
+		return
+	}
+	if !mergesKeepUp(co.opts.Cores, co.opts.Threads) {
+		co.log.Debug("sorting a stage's sorted rows again, as a merge would not keep up on this coordinator's cores", "query", qid,
+			"stage", s.String(), "cores", co.opts.Cores, "threads", co.opts.Threads)
 		return
 	}
 	if stream {
@@ -147,6 +154,28 @@ func mergeType(t string) bool {
 type resolvedKey struct {
 	col              int
 	desc, nullsFirst bool
+}
+
+// mergeCores is the fewest cores, and DuckDB threads, on which the
+// coordinator merges a stage's sorted rows; on fewer, DuckDB sorts them, as
+// one machine does. The merge decodes each file and merges groups of them on
+// goroutines of their own, and DuckDB copies the merged rows in: 4 million
+// rows from 32 sorted files, read through DuckDB as a statement reads them,
+// took 1.03 times DuckDB's own sort of them on 4 cores and 0.98 on 16, but 1.5
+// on 2 and 1.8 on 1.
+const mergeCores = 4
+
+// mergesKeepUp says a merge of sorted rows keeps up with DuckDB's sort of
+// them on cores cores (0 for those Go may use) and threads DuckDB threads (0
+// for one a core).
+func mergesKeepUp(cores, threads int) bool {
+	if cores <= 0 {
+		cores = runtime.GOMAXPROCS(0)
+	}
+	if threads <= 0 {
+		threads = cores
+	}
+	return min(cores, threads) >= mergeCores
 }
 
 // resolveMerge works out how keys order a stage's rows, of columns cols,

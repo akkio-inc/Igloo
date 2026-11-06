@@ -606,7 +606,9 @@ func TestSortedRowsFromWorkers(t *testing.T) {
 // then runs again read whole. After rows went out, the internal error.
 func TestStreamFailsReadingMerge(t *testing.T) {
 	t.Parallel()
-	ds := startDistServer(t, 2)
+	// Cores enough to merge on (see distributed's mergesKeepUp), whatever the
+	// machine's.
+	ds := startDistServerWith(t, t.TempDir(), 2, func(o *distributed.Options) { o.Cores, o.Threads = 4, 4 })
 	mustExec(t, ds.catalogServer.admin, "INSERT INTO lake.public.orders SELECT i, i % 97 FROM range(2000, 60000) t(i)")
 	conn := ds.testServer.admin(t, pgx.QueryExecModeSimpleProtocol)
 	ctx := context.Background()
