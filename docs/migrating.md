@@ -396,23 +396,3 @@ reads the history. Connection settings come from the environment:
 Databricks SDK's (`DATABRICKS_HOST` with `DATABRICKS_TOKEN`, or a profile
 named by `DATABRICKS_CONFIG_PROFILE`) with `DATABRICKS_WAREHOUSE_ID` or
 `DATABRICKS_HTTP_PATH`.
-
-## Limits
-
-- **Results compare only on the same data.** The tool cannot tell a copy
-  that differs from the source from a wrong answer, beyond row counts and
-  snapshot times. Text generated independently (two runs of a data
-  generator, a re-keyed copy) makes values differ that Igloo did not.
-- **Names in text.** Table names are rewritten in the statement's text, so
-  that the statement is otherwise as written. A column or alias spelled
-  like a table that has to be renamed, unqualified, is renamed with it.
-  Snowflake's quoted names are case-sensitive; the tool matches names
-  without regard to case.
-- **One run each.** Timings are one run on Igloo, cold or warm as it
-  happens; the source's are medians over the period.
-- **Statements that are not queries or writes** (stored procedures,
-  `COPY`, `PUT`, streams and tasks, session settings) are counted, not
-  replayed. Neither are multi-statement scripts.
-- **Databricks' history** does not record each statement's session catalog
-  and schema; set `--default-namespace` to where most of the workload runs.
-```
