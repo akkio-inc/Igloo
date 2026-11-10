@@ -14,7 +14,7 @@ import Pillars from '../components/landing/Pillars.astro';
 import QuickStart from '../components/landing/QuickStart.astro';
 import Migrate from '../components/landing/Migrate.astro';
 import Screens from '../components/landing/Screens.astro';
-import { SHARE, SITE_PUBLIC, siteUrl } from '../site-config.mjs';
+import { ANALYTICS, SHARE, SITE_PUBLIC, siteUrl } from '../site-config.mjs';
 
 const { title, description, imageAlt } = SHARE;
 const image = siteUrl(SHARE.image);
@@ -44,6 +44,7 @@ const jsonLd = {
 		<title>{title}</title>
 		<meta name="description" content={description} />
 		{!SITE_PUBLIC && <meta name="robots" content="noindex, nofollow" />}
+		{ANALYTICS && <script is:inline type="module" src={ANALYTICS.src} data-cf-beacon={ANALYTICS.beacon} />}
 		{canonical && <link rel="canonical" href={canonical} />}
 		<link rel="icon" href="/favicon.svg" type="image/svg+xml" />
 		<link rel="apple-touch-icon" href="/apple-touch-icon.png" />
