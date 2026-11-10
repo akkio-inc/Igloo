@@ -16,17 +16,6 @@ export const SITE_URL = process.env.SITE_URL || undefined;
 export const NOINDEX_META = { tag: 'meta', attrs: { name: 'robots', content: 'noindex, nofollow' } };
 
 /**
- * Page views and clicks on links that leave the site are counted by Plausible,
- * which sets no cookie, under the site's own domain. Only a build for that
- * domain carries the script: a preview on another origin counts nothing.
- */
-const ANALYTICS_DOMAIN = 'igloodb.com';
-export const ANALYTICS =
-	SITE_URL && new URL(SITE_URL).hostname === ANALYTICS_DOMAIN
-		? { domain: ANALYTICS_DOMAIN, src: 'https://plausible.io/js/script.tagged-events.outbound-links.js' }
-		: null;
-
-/**
  * A path on the site as the absolute URL that link previews (Open Graph,
  * Twitter cards) need. Without SITE_URL it stays a path, which some previews
  * cannot follow: set SITE_URL when building a site that will be shared.
@@ -60,8 +49,3 @@ export const SHARE_HEAD = [
 	{ tag: 'link', attrs: { rel: 'apple-touch-icon', href: '/apple-touch-icon.png' } },
 	{ tag: 'link', attrs: { rel: 'manifest', href: '/site.webmanifest' } },
 ];
-
-/** The analytics script for the docs pages; the landing page sets the same tag itself. */
-export const ANALYTICS_HEAD = ANALYTICS
-	? [{ tag: 'script', attrs: { defer: true, 'data-domain': ANALYTICS.domain, src: ANALYTICS.src } }]
-	: [];
