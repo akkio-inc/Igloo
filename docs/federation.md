@@ -810,20 +810,3 @@ same cloud region as the Snowflake account, or expect a copy to go at the
 speed of the network between them. To copy part of a table, filter it
 (`WHERE updated_at >= ...`), which Snowflake applies before sending
 anything.
-
-### Limits
-
-- Canceling a statement in Igloo, or its `statement_timeout`, does not
-  cancel a Snowflake query that is still running: DuckDB's `postgres`
-  extension waits for its first rows and cannot be interrupted before
-  then. The query stops at `query_timeout`, which bounds what it can cost;
-  set it to what the longest query should take.
-- A scan of a Snowflake table runs on one of DuckDB's threads (the
-  downloads run in parallel); scans of PostgreSQL tables can be split by
-  page range, but Snowflake's results cannot be split that way yet.
-- Encrypted private keys, OAuth and single sign-on are not supported;
-  sign in with an unencrypted key or a password.
-- `TIMESTAMP_TZ`'s offsets, and fractions of a second finer than a
-  microsecond, are not kept (see [names and types](#names-and-types)).
-- Tables created in Snowflake since the replica started appear after
-  `ALTER CONNECTION ... REFRESH` on that replica, or its restart.
