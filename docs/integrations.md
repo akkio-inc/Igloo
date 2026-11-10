@@ -200,19 +200,3 @@ its own values of them. For the largest extracts into pandas or polars,
 DuckDB's Arrow batches as they are. To export tens of millions of rows,
 `COPY (query) TO 's3://bucket/export.parquet'` writes Parquet from Igloo
 directly (see [loading and exporting](sql.md#loading-and-exporting-data)).
-
-## Known limitations
-
-- `ROLLBACK TO SAVEPOINT` works only when nothing changed since the
-  savepoint (enough for psycopg's and SQLAlchemy's nested blocks that just
-  read); otherwise roll back the whole transaction.
-- Catalog metadata (`information_schema.columns`, `pg_attribute`, and so
-  JDBC's `getColumns` and SQLAlchemy's `get_columns`) shows every column of
-  an Iceberg table as nullable, although writes enforce `NOT NULL`.
-- Primary and foreign keys are not reported: Iceberg does not keep them, so
-  BI tools' automatic joins and Power BI's relationship detection have
-  nothing to go on. Define relationships in the tool.
-- `TO_CHAR` formats dates and timestamps (`YYYY`, `MM`, `DD`, `HH24`, `MI`,
-  `SS`, `Month`, `Mon`, `Day`, `Dy` and the like), not numbers.
-- The SQL is DuckDB's: PostgreSQL-only functions a tool's custom SQL uses
-  may need rewriting (see [the dialect](sql.md#dialect)).

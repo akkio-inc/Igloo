@@ -645,19 +645,3 @@ statement that names a dataset, for the checks every protected table takes.
   asks: thresholds and budgets cost nothing to correct results, while noise
   changes every number and is a party's decision for its own data. Sums
   across parties need it, since without it a sum can answer for one person.
-
-## Limitations
-
-- Templates are one `SELECT` of joins and aggregates: no subqueries, CTEs or
-  window functions, so attribution models beyond a window after exposure
-  (first touch, last touch, multi-touch) need data shaped for them, such as
-  one exposure row per person and campaign.
-- Datasets are tables and external tables, not views or connections'
-  tables. Copies a party made of a table before it joined a room, by `CREATE
-  TABLE AS` or a clone, are the party's, outside the room.
-- Partners' results are served through the API; a share of results is not
-  made for them automatically.
-- Partners cannot add templates over the API; a local collaborator or an
-  admin adds them, and the partner approves them.
-- The schema `clean_rooms` holds result tables, which Igloo replaces; do not
-  keep other tables there under their names.
