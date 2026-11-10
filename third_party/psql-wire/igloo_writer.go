@@ -2,6 +2,7 @@ package wire
 
 import (
 	"errors"
+	"fmt"
 
 	"github.com/jeroenrinzema/psql-wire/pkg/types"
 )
@@ -77,6 +78,73 @@ func (writer *dataWriter) CopyDone() error {
 
 func (writer *dataWriter) CopyAbort() error {
 	return writer.client.EndBatch()
+}
+
+// CopyFramer is a CopyOuter that also takes CopyData messages whole.
+type CopyFramer interface {
+	// CopyFrames sends data, whole CopyData messages, each with its type
+	// byte and length, as they are: the rows of a copy its statement
+	// encoded itself, many to a write. They follow what CopyData was given.
+	CopyFrames(data []byte) error
+}
+
+func (writer *dataWriter) CopyFrames(data []byte) error {
+	if err := writer.client.FlushBatch(); err != nil {
+		return err
+	}
+	_, err := writer.client.Write(data)
+	return err
+}
+
+// EncodedRowWriter is a DataWriter that takes rows a statement encoded
+// itself. Row and Rows take each value as a Go value and find, for each, how
+// its type is encoded: most of the time a large result takes. A statement
+// that reads its rows where its engine holds them writes each value's bytes
+// once, a column at a time.
+type EncodedRowWriter interface {
+	// RowFormats returns the formats the client asked for the columns'
+	// values in: none for text, one for every column, or one a column.
+	RowFormats() []FormatCode
+	// RowLimit returns how many rows the client takes before it reads on,
+	// the rest of a portal's row limit, or 0 for no limit. EncodedRows
+	// takes no more than that at a time.
+	RowLimit() int
+	// EncodedRows sends data, n whole DataRow messages, each with its type
+	// byte and length, in the columns' formats.
+	EncodedRows(n int, data []byte) error
+}
+
+func (writer *dataWriter) RowFormats() []FormatCode {
+	return writer.formats
+}
+
+func (writer *dataWriter) RowLimit() int {
+	if writer.batchable || writer.remaining == nil {
+		return 0
+	}
+	return int(*writer.remaining)
+}
+
+func (writer *dataWriter) EncodedRows(n int, data []byte) error {
+	if writer.closed {
+		return ErrClosedWriter
+	}
+	if limit := writer.RowLimit(); limit > 0 && n > limit {
+		return fmt.Errorf("%d encoded rows for a client that takes %d", n, limit)
+	}
+	if err := writer.ctx.Err(); err != nil {
+		return err
+	}
+	if _, err := writer.client.Write(data); err != nil {
+		return err
+	}
+	writer.written += uint32(n)
+	// As after a row, or a batch of them: the client's Execute may have its
+	// rows now, or its portal may be closed.
+	if !writer.yield(n) {
+		return ErrSuspendedHandlerClosed
+	}
+	return nil
 }
 
 // Drainer is a DataWriter that says whether the statement runs to its end

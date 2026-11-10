@@ -442,6 +442,19 @@ func (st *statement) readRows(ctx context.Context, query func(context.Context, [
 	}
 
 	b := newRowBatcher(w, st.columns)
+	// A client gets its rows a chunk at a time, each value written from
+	// where DuckDB holds it (see rowchunks.go).
+	if chunks, ok := rows.(duckdb.ChunkRows); ok {
+		if sender := st.chunkSender(ctx, w); sender != nil {
+			if _, _, err := st.sendChunks(chunks, sender, b, -1); err != nil {
+				return err
+			}
+			if err := b.flush(); err != nil {
+				return err
+			}
+			return w.Complete(commandTag(st.stmtType, st.query, int64(w.Written())))
+		}
+	}
 	dest := make([]driver.Value, len(st.columns))
 	for {
 		err := rows.Next(dest)
@@ -488,10 +501,11 @@ func drainerOf(w wire.DataWriter) wire.Drainer {
 	}
 }
 
-// rowBatch is how many rows go to the client at a time. psql-wire sends a
-// batch in a few large writes rather than a network write per row, which
-// was the bottleneck for large results; within a portal that a client reads
-// a few rows at a time, it still sends them row by row.
+// rowBatch is how many rows that go a row at a time (those the result cache
+// keeps, those of results Igloo makes itself; see rowchunks.go for the
+// others) go to the client at a time. psql-wire sends a batch in a few large
+// writes rather than a network write per row; within a portal that a client
+// reads a few rows at a time, it still sends them row by row.
 const rowBatch = 256
 
 // rowBatcher collects encoded rows for the client.
