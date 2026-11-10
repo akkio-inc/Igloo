@@ -16,21 +16,6 @@ export const SITE_URL = process.env.SITE_URL || undefined;
 export const NOINDEX_META = { tag: 'meta', attrs: { name: 'robots', content: 'noindex, nofollow' } };
 
 /**
- * Cloudflare Web Analytics counts the site's page views and visits, with no
- * cookie, through its beacon. The token names the site in Cloudflare and is
- * public, as every page carries it. Only a build for the site's own domain
- * loads the beacon: a preview on another origin counts nothing.
- */
-const ANALYTICS_DOMAIN = 'igloodb.com';
-export const ANALYTICS =
-	SITE_URL && new URL(SITE_URL).hostname === ANALYTICS_DOMAIN
-		? {
-				src: 'https://static.cloudflareinsights.com/beacon.min.js',
-				beacon: JSON.stringify({ token: '1992238721004f78882e081186230413' }),
-			}
-		: null;
-
-/**
  * A path on the site as the absolute URL that link previews (Open Graph,
  * Twitter cards) need. Without SITE_URL it stays a path, which some previews
  * cannot follow: set SITE_URL when building a site that will be shared.
@@ -64,8 +49,3 @@ export const SHARE_HEAD = [
 	{ tag: 'link', attrs: { rel: 'apple-touch-icon', href: '/apple-touch-icon.png' } },
 	{ tag: 'link', attrs: { rel: 'manifest', href: '/site.webmanifest' } },
 ];
-
-/** The analytics beacon for the docs pages; the landing page sets the same tag itself. */
-export const ANALYTICS_HEAD = ANALYTICS
-	? [{ tag: 'script', attrs: { type: 'module', src: ANALYTICS.src, 'data-cf-beacon': ANALYTICS.beacon } }]
-	: [];
