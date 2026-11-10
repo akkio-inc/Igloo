@@ -90,8 +90,11 @@ type Portal struct {
 	formats    []FormatCode
 
 	// The iterator state (created by iter.Pull)
-	next func() (struct{}, bool)
+	next func() (int, bool)
 	stop func()
+	// remaining is how many rows the Execute being carried out still
+	// takes, NoLimit for all of them. (Igloo patch; see EncodedRowWriter.)
+	remaining Limit
 	// Filled in by dataWriter.Complete when the handler finishes. Used to
 	// return the tag when re-executing a completed portal.
 	tag string
@@ -152,7 +155,9 @@ func (p *Portal) execute(ctx context.Context, limit Limit, reader *buffer.Reader
 		session, _ := GetSession(ctx)
 		// Create a simple push-style iterator (iter.Seq) around the
 		// statement.fn.
-		seq := func(yield func(struct{}) bool) {
+		// Igloo patch: yield carries how many rows the handler sent, one
+		// for Row and as many as EncodedRows was given.
+		seq := func(yield func(int) bool) {
 			dw := &dataWriter{
 				ctx:     ctx,
 				session: session,
@@ -162,6 +167,8 @@ func (p *Portal) execute(ctx context.Context, limit Limit, reader *buffer.Reader
 				client:  writer,
 				yield:   yield,
 				tag:     &p.tag,
+				// Igloo patch; see EncodedRowWriter.
+				remaining: &p.remaining,
 				// A first unlimited Execute drains the handler in this call;
 				// no later Execute can impose a limit on remaining rows.
 				batchable: limit == NoLimit,
@@ -189,7 +196,11 @@ func (p *Portal) execute(ctx context.Context, limit Limit, reader *buffer.Reader
 		// Run the handler until it has produced the next row or finishes. The
 		// dataWriter inside the handler will call yield to "teleport" back
 		// here.
-		_, ok := p.next()
+		p.remaining = NoLimit
+		if limit != NoLimit {
+			p.remaining = limit - count
+		}
+		n, ok := p.next()
 		if !ok {
 			// The handler has finished. CommandComplete was already written
 			// by dataWriter.Complete.
@@ -198,7 +209,7 @@ func (p *Portal) execute(ctx context.Context, limit Limit, reader *buffer.Reader
 			return p.err
 		}
 
-		count++
+		count += Limit(n)
 	}
 }
 

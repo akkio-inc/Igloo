@@ -151,6 +151,12 @@ func (writer *Writer) EndBatch() error {
 	return writer.flushBatch()
 }
 
+// FlushBatch writes the complete frames a batch holds and keeps batching.
+// (Igloo patch: for a caller that then writes frames of its own.)
+func (writer *Writer) FlushBatch() error {
+	return writer.flushBatch()
+}
+
 func (writer *Writer) flushBatch() error {
 	if writer.batch.Len() == 0 {
 		return nil

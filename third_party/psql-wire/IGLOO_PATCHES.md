@@ -56,6 +56,18 @@ otherwise unchanged except for these patches:
 - `igloo_writer.go`: `CopyInColumns`, which starts `COPY ... FROM STDIN` with
   a CopyInResponse for as many columns as the table it fills, as a
   statement that returns no rows describes none.
+- `igloo_writer.go`: `EncodedRowWriter`, a `DataWriter` that takes rows
+  already encoded as DataRow messages (`RowFormats`, `EncodedRows`), and
+  `CopyFramer`, a `CopyOuter` that takes CopyData messages whole
+  (`CopyFrames`), with `FlushBatch` in `pkg/buffer/writer.go` to send what
+  a batch holds first. `Row` and `Rows` take each value as a Go value and
+  look up how its type is encoded, which was most of the time a large
+  result took; Igloo writes a result's rows from where DuckDB holds them
+  and sends each chunk's messages in one write. For a portal with a row
+  limit, `Portal.execute` (`cache.go`) counts the rows a handler says it
+  sent, one for `Row` and as many as `EncodedRows` was given (the
+  iterator's value, which was empty), and `RowLimit` is how many the
+  client's Execute still takes.
 
 Drop this copy and the `replace` directive once a psql-wire release includes
 equivalent fixes.

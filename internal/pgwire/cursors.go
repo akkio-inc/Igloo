@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/duckdb/duckdb-go/v2"
 	wire "github.com/jeroenrinzema/psql-wire"
 	"github.com/jeroenrinzema/psql-wire/codes"
 	pgerror "github.com/jeroenrinzema/psql-wire/errors"
@@ -77,7 +78,7 @@ func (s *Server) cursorCommand(ctx context.Context, sess *session, user auth.Use
 			limit = 1
 		}
 		return wire.Prepared(wire.NewStatement(s.audited(sess, q.Query, func(ctx context.Context, w wire.DataWriter, _ []wire.Parameter) error {
-			n, err := c.fetch(w, limit)
+			n, err := c.fetch(ctx, w, limit)
 			if err != nil {
 				return pgError(err)
 			}
@@ -164,11 +165,21 @@ func (s *Server) declareCursor(ctx context.Context, sess *session, user auth.Use
 }
 
 // fetch writes up to limit rows (all if limit < 0) and returns how many.
-func (c *cursor) fetch(w wire.DataWriter, limit int) (int, error) {
+func (c *cursor) fetch(ctx context.Context, w wire.DataWriter, limit int) (int, error) {
 	if c.done {
 		return 0, nil
 	}
 	b := newRowBatcher(w, c.st.columns)
+	// A chunk at a time, as a statement's own rows (see rowchunks.go).
+	if chunks, ok := c.rows.(duckdb.ChunkRows); ok {
+		if sender := c.st.chunkSender(ctx, w); sender != nil {
+			n, ended, err := c.st.sendChunks(chunks, sender, b, limit)
+			if c.done = ended; err != nil {
+				return n, err
+			}
+			return n, b.flush()
+		}
+	}
 	dest := make([]driver.Value, len(c.st.columns))
 	n := 0
 	for limit < 0 || n < limit {

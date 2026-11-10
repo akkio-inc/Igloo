@@ -85,7 +85,7 @@ type dataWriter struct {
 	formats []FormatCode
 	client  *buffer.Writer
 	reader  *buffer.Reader
-	yield   func(struct{}) bool
+	yield   func(int) bool
 	tag     *string
 	closed  bool
 	written uint32
@@ -93,6 +93,9 @@ type dataWriter struct {
 	// must continue yielding per row, including after subsequent Executes.
 	batchable     bool
 	encodeScratch []byte
+	// remaining points at how many rows the client's Execute still takes,
+	// NoLimit for all of them. (Igloo patch; see EncodedRowWriter.)
+	remaining *Limit
 }
 
 func (writer *dataWriter) Columns() Columns {
@@ -113,7 +116,7 @@ func (writer *dataWriter) Row(values []any) error {
 	// The yield call "teleports" us back the next call of the pull consumer in
 	// Portal.execute. The yield function returns true when the pull consumer
 	// calls next again, and returns false when stop is called.
-	if !writer.yield(struct{}{}) {
+	if !writer.yield(1) {
 		return ErrSuspendedHandlerClosed
 	}
 	return nil
@@ -141,7 +144,7 @@ func (writer *dataWriter) Rows(rows [][]any) (err error) {
 		if err == nil {
 			err = flushErr
 		}
-		if pending && flushErr == nil && !writer.yield(struct{}{}) && err == nil {
+		if pending && flushErr == nil && !writer.yield(0) && err == nil {
 			err = ErrSuspendedHandlerClosed
 		}
 	}()
@@ -152,7 +155,7 @@ func (writer *dataWriter) Rows(rows [][]any) (err error) {
 			return err
 		}
 		writer.written++
-		if writer.client.Buffered() == 0 && !writer.yield(struct{}{}) {
+		if writer.client.Buffered() == 0 && !writer.yield(0) {
 			return ErrSuspendedHandlerClosed
 		}
 	}
