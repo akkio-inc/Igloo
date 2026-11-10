@@ -1746,7 +1746,7 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   each file is written again with its own partition spec, or another
   whose columns that schema has. Admins and roles granted
   `ERASE ON ACCOUNT` make them. `docs/privacy.md` says what a completed
-  request guarantees, what it trusts, and its known limitations. `iceberg-go`'s copy gains
+  request guarantees and what it trusts. `iceberg-go`'s copy gains
   `Transaction.ForgetFiles`, which rewrites the manifests that list removed
   files, and `WithMaxRefAge`, so expiring snapshots keeps branches and
   tags, and writes the manifests of a spec whose column was dropped since

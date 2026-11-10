@@ -1453,7 +1453,7 @@ Workers keep what they read in their read caches, and more, past a
 statement. Table files workers wrote are a table's files like any others, and
 what a stopped write left under a table's location is among its orphan files,
 which a request deletes, or waits for and verifies are gone
-([what a request does](privacy.md#what-a-request-does)). [Erasure requests](privacy.md#workers) have every worker purge
+([what a request does](privacy.md#what-a-request-does)). [Erasure requests](privacy.md) have every worker purge
 what they deleted: coordinators push the purge within 15 seconds, every
 task carries the last deletion its coordinator knew of, and a worker that
 was stopped meanwhile purges before it serves again. A worker that hears
@@ -1697,7 +1697,7 @@ On a worker (`igloo worker`): `IGLOO_WORKER_SECRET`,
 [Spot workers](#spot-workers)), `IGLOO_WORKER_ISOLATED_PURGE_AFTER` (`1m`,
 at least `10s`: how long it goes without hearing from any coordinator
 before it empties its caches by itself, for [erasure
-requests](privacy.md#workers)), the server's storage settings, and
+requests](#erasure-requests)), the server's storage settings, and
 `IGLOO_DUCKDB_*`, `IGLOO_CACHE_*`, `IGLOO_HTTP_ADDR` and `IGLOO_LOG_*` as on
 the server; with local exchanges, `IGLOO_EXCHANGE_MAX_SIZE` caps what they
 may take on its disk (empty: a quarter of its free space at a time).
