@@ -237,7 +237,7 @@ disk, so that queries after a restart read them from there; see
 | `IGLOO_CACHE_SIZE` | automatic | Largest size of the cache, e.g. `50GB` or `40GiB`, in place of the automatic 100 GiB; unless `IGLOO_CACHE_DEDICATED`, the cache never takes more than half of the disk space other files leave free, whatever it says. `0` turns the cache off. |
 | `IGLOO_CACHE_DEDICATED` | `false` | The cache has its volume to itself, as the Helm chart's ephemeral volume or claim: it fills to `IGLOO_CACHE_SIZE` (or 100 GiB), keeping 5% of the volume free, rather than half of the free space. |
 | `IGLOO_CACHE_DIR` | `/var/lib/igloo/cache` in the image | Where the cache lives. Mount a volume here to keep it across restarts. |
-| `IGLOO_CACHE_EPHEMERAL` | `false` | The cache's volume goes with the pod or machine, as a Kubernetes `emptyDir` or ephemeral volume does (the Helm chart sets it): [erasure requests](privacy.md#known-limitations) then count a replica that is gone as holding nothing, rather than its cache as pending. |
+| `IGLOO_CACHE_EPHEMERAL` | `false` | The cache's volume goes with the pod or machine, as a Kubernetes `emptyDir` or ephemeral volume does (the Helm chart sets it): [erasure requests](privacy.md) then count a replica that is gone as holding nothing, rather than its cache as pending. |
 | `IGLOO_CACHE_READ_THREADS` | `0`, `8` on workers | Threads a read of the read cache may start for its blocks, up to 1024; `0` starts none, and reads them as DuckDB's tasks. See [read cache](operations.md#read-cache). |
 | `IGLOO_PREFETCH` | `true`, `false` on workers | Read ahead, into the read cache, the blocks scans are about to read, with requests of its own; see [prefetch](operations.md#prefetch). |
 | `IGLOO_PREFETCH_CONCURRENCY` | `256` | Requests the prefetcher keeps in flight, for all statements together. |
@@ -301,7 +301,7 @@ A worker (`igloo worker`) reads `IGLOO_WORKER_SECRET`,
 EC2, take no more tasks and finish those running once AWS says it is taking a
 Spot Instance back; `off`), `IGLOO_WORKER_ISOLATED_PURGE_AFTER` (`1m`, at
 least `10s`: how long it goes without hearing from any coordinator before it
-empties its caches by itself, for [erasure requests](privacy.md#workers)),
+empties its caches by itself, for [erasure requests](distributed-execution.md#erasure-requests)),
 and the server's settings for storage
 (`IGLOO_WAREHOUSE_LOCATION`, `IGLOO_ALLOWED_LOCATIONS`, `IGLOO_S3_*`,
 `IGLOO_GCS_*`, `IGLOO_AZURE_*`), DuckDB (`IGLOO_DUCKDB_*`), the read cache
