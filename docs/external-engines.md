@@ -432,18 +432,3 @@ Igloo's history: more moving parts for operators to run and watch
 read what. Lakekeeper's remote request signing, which needs no cloud role,
 was not used either: Trino, Snowflake and Databricks do not support it, and
 without an authorizer Lakekeeper signs writes for readers too.
-
-## Limitations
-
-- Storage credentials on Amazon S3 and S3-compatible stores only (see above).
-- Writing from an engine needs `INSERT`, `UPDATE` and `DELETE` on the table;
-  narrower grants apply through Igloo's SQL only.
-- A snapshot committed to a table in the warehouse must have its manifest
-  list in the warehouse, written before the commit, as engines write it
-  under the table's location: one that is not there, or is outside the
-  warehouse, is refused with 400, since no engine, and no [erasure
-  request](privacy.md), could read the snapshot.
-- Credentials outlive a revoked grant by up to an hour.
-- Views, table registration and multi-table transactions are not served.
-- Trino and other shared engines sign in as one Igloo user each; Igloo cannot
-  tell their own users apart.

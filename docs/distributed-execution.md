@@ -1877,35 +1877,3 @@ draining the node. On Kubernetes, where a Spot node is drained first, a stopping
 worker so drains for up to 110 seconds, within the pod's grace period
 (`workers.terminationGracePeriodSeconds`, 125 by default). Ask for
 several instance types and zones, so that capacity one lacks another has.
-
-## Limitations
-
-- The large inputs of one `SELECT` are partitioned by one key. Large tables
-  joined on different keys need a step each: a common table expression or
-  subquery per key. A large table read again in a correlated subquery
-  expression that is not one of the joins it can mean (`NOT IN`, a
-  correlation with no equal columns) runs on one machine; written as a join
-  to a common table expression, it runs distributed. Give the machines that run
-  such statements a lot of memory and fast spill disk.
-- `ROLLUP`, `CUBE` and `GROUPING SETS` run on workers up to the finest groups
-  of their sets, and the coordinator, or in a subquery or common table
-  expression one task, computes the sets from those groups: its memory grows
-  with them, as a plain `GROUP BY`'s does not.
-- Where workers have no room on their disks, or with `IGLOO_EXCHANGES=object`,
-  partitioned joins, aggregations and every step of a multi-stage plan
-  write what they exchange to object storage and read it back: that costs
-  request charges and adds a few seconds per step, and
-  leftovers of a coordinator that crashed mid-statement stay under
-  `_igloo_shuffle/` for six hours or more, until a replica's sweep removes
-  them.
-- The coordinator receives an aggregation's result, one row a group, and
-  keeps it on its disk until the statement has run: a `GROUP BY` whose
-  result is billions of groups sends it all of them. Groups taken to be few
-  (see [what runs distributed](#what-runs-distributed)) it receives from
-  every worker, as partial results.
-- Tables with data files without field IDs, views that group, sort or
-  limit, and time travel to any snapshot but a table's latest run on one
-  machine.
-- Workers read each table's files directly and do not use Iceberg partition
-  statistics to skip files; DuckDB skips row groups by their Parquet
-  statistics instead.

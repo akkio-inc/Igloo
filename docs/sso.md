@@ -431,20 +431,3 @@ through hold none for long.
 | Your account matches an Igloo user that belongs to someone else | The name and the name with domain are taken by other users or roles. Create the user with another name and the account's email. |
 | `password authentication failed` with a token | The token is wrong, expired, revoked, or another user's; check `SHOW TOKENS` and the login history's `reason`. |
 | `too many failed logins` | See [failed logins](#failed-logins); wait 15 minutes. |
-
-## Limitations
-
-- **Without SCIM**, Igloo learns about people and their groups only when
-  they sign in, so deactivation at the provider does not stop access tokens
-  already made. Use SCIM, or disable people in Igloo when they leave.
-- **SCIM** supports what Okta and Entra ID use: users and groups, filters
-  of the form `attribute eq "value"`, and PATCH; not bulk requests, sorting
-  or ETags. Changes to a user's `userName` do not rename the Igloo user.
-- **One identity provider** per deployment.
-- **Signing out of the console** does not sign out of the provider, so the
-  next *Sign in with SSO* may not ask for a password.
-- **Tokens carry all of their user's privileges**; there are no read-only
-  or per-schema tokens. Use service accounts with narrow grants.
-- **Entra ID group overage**: users in more than 200 groups get none in the
-  token; assign the relevant groups to the application.
-- Failed-login limits are kept per replica.
