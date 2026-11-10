@@ -1,8 +1,5 @@
 <p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/banner-dark.png">
-    <img alt="An igloo with a lit doorway in the snow." src="docs/assets/banner-light.png" width="100%">
-  </picture>
+  <img alt="An igloo with a lit doorway beside a frozen river, under the northern lights." src="docs/assets/banner.jpg" width="100%">
 </p>
 
 # Igloo
@@ -378,6 +375,9 @@ Connector/C, the MySQL client library, in the `mysql` extension.
   one machine, run in parts on workers
 - [SQL and clients](docs/sql.md): the SQL dialect, Iceberg features, type
   mapping, tested drivers and tools
+- [Snowflake SQL](docs/snowflake-sql.md): Snowflake's dialect for a session,
+  so queries, dashboards and dbt models written for Snowflake run without
+  being rewritten
 - [Loading and scheduling](docs/loading.md): `COPY INTO`, pipes, tasks and
   materialized views
 - [Alerts and notifications](docs/alerts.md): alerts, notification
@@ -481,8 +481,29 @@ internal/schedule/  cron and interval schedules
 internal/sharing/   Delta Sharing: the provider endpoint and external tables
 internal/tasks/     tasks, pipes, materialized views, alerts, load history, scheduler
 internal/workload/  query tags, role limits and their enforcement
+internal/snowflake/ Snowflake's SQL dialect, translated into DuckDB's
+internal/ddl/       views and comments in the Iceberg catalog
+internal/catalogproxy/ what DuckDB asks of the Iceberg catalog, each change made once
+internal/maintenance/ compaction, snapshot expiry and file cleanup, on a schedule
+internal/filerewrite/, deletefiles/ rewriting data files within a memory budget
+internal/incremental/ materialized views refreshed from what changed
+internal/iddomain/  ID domains: dense ids for identifier columns, for exact distinct counts
+internal/ai/        AI functions in SQL, through the model provider you choose
+internal/ml/, models/ models trained and scored in SQL
+internal/tsfm/, tsforecast/, modelpack/ forecasts on open-weight foundation models
+internal/gateway/, activity/ the scale-to-zero gateway, and the work it must not stop
+internal/prefetch/  reading ahead into the read cache
+internal/memlimit/  memory divided between DuckDB and Go
+internal/spot/, prices/ Spot interruption notices and machine prices, for workers
+internal/awscreds/, azurecreds/ cloud credentials, refreshed for the whole process
+internal/uploads/   unfinished uploads to object stores, found and ended
+internal/logwriter/, lockorder/, sqllex/ logging that never blocks, lock order, SQL lexing
+internal/icebergtest/, testdb/ an Iceberg catalog and PostgreSQL databases for tests
+extensions/         Igloo's DuckDB extensions: roaring bitmaps (rb), patches to iceberg
+third_party/        patched copies of duckdb-go, psql-wire and iceberg-go, and CRoaring
 deploy/             Docker Compose, Helm chart, AWS/GCP/Azure modules
 docs/               documentation
+site/               the website and its docs pages, built from the repository's markdown
 scripts/            test and end-to-end scripts
 bench/              price-performance benchmark against Snowflake and Databricks
 migrate/            migration report: a Snowflake or Databricks workload replayed on Igloo
