@@ -22,8 +22,7 @@
 //
 // It also prepares the landing page's inputs in src/generated/: the
 // screenshots, and the README's quick start and "How it works" sections. The
-// hero's art is the banners' illustration without their lettering, in
-// src/assets/.
+// hero's art is in src/assets/.
 //
 // Output goes to src/content/docs/, public/files/ and src/generated/, all
 // ignored by git. Files are rewritten only when their content changes, and
@@ -65,7 +64,7 @@ const posix = path.posix;
 /** The repository files the site is built from, as absolute paths. */
 export function sourceFiles() {
 	const files = pages.map((page) => page.source);
-	files.push(...['light', 'dark'].map((theme) => `docs/assets/banner-${theme}.png`));
+	files.push('docs/assets/banner.jpg');
 	files.push(...LANDING_SCREENSHOTS.map((name) => `docs/assets/screenshots/${name}.png`));
 	return [...new Set(files)].map((file) => path.join(repoDir, file));
 }

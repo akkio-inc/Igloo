@@ -191,10 +191,7 @@ cd site && npx wrangler@4.147.0 deploy
   caches, sharing), keeps [what erasure
   guarantees](docs/privacy.md#what-erasure-guarantees): one that can let a
   request report itself completed while the person's data is still readable
-  or recoverable within that guarantee does not merge. Anything else such a
-  change leaves, or that can keep a request from completing, is documented
-  under [Known limitations](docs/privacy.md#known-limitations), with what an
-  admin can do about it.
+  or recoverable within that guarantee does not merge.
 
 ## Releasing
 

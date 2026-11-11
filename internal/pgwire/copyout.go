@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/duckdb/duckdb-go/v2"
 	"github.com/jackc/pgx/v5/pgtype"
 	wire "github.com/jeroenrinzema/psql-wire"
 	"github.com/jeroenrinzema/psql-wire/codes"
@@ -32,6 +33,9 @@ type copyTo struct {
 	header    bool
 	delimiter string
 	null      string
+	// special, set as the copy runs, marks the bytes that make a value need
+	// quotes or an escape (see specials).
+	special *[256]bool
 }
 
 // parseCopyTo recognizes COPY (query) TO STDOUT and COPY table [(columns)]
@@ -270,6 +274,7 @@ func (c copyTo) copyRows(ctx context.Context, st *statement, rows driver.Rows, o
 	if types == nil {
 		types = newTypeMap()
 	}
+	c.special = c.specials()
 	// As from PostgreSQL, each row is a CopyData message, and a binary
 	// copy's header comes with the first row (or the trailer): psycopg and
 	// ADBC read it so.
@@ -290,6 +295,14 @@ func (c copyTo) copyRows(ctx context.Context, st *statement, rows driver.Rows, o
 			return 0, err
 		}
 		buf = buf[:0]
+	}
+
+	// A chunk at a time, each value written from where DuckDB holds it (see
+	// rowchunks.go): the same messages, many to a write.
+	if chunks, ok := rows.(duckdb.ChunkRows); ok && rowChunks.Load() == 0 {
+		if framer, ok := out.(wire.CopyFramer); ok {
+			return c.copyChunks(ctx, st, chunks, out, framer, types, buf)
+		}
 	}
 
 	dest := make([]driver.Value, len(st.columns))
@@ -351,12 +364,71 @@ func (c copyTo) copyRows(ctx context.Context, st *statement, rows driver.Rows, o
 	return n, nil
 }
 
+// copyChunks is copyRows a chunk at a time. head is what goes before the
+// first row, in its message: a binary copy's header.
+func (c copyTo) copyChunks(ctx context.Context, st *statement, rows duckdb.ChunkRows, out wire.CopyOuter, framer wire.CopyFramer,
+	types *pgtype.Map, head []byte) (int64, error) {
+	enc := chunkEncoder{st: st, types: types, copy: &c, head: head, cols: make([]chunkColumn, len(st.columns))}
+	for i := range enc.cols {
+		enc.cols[i].binary = c.format == "binary"
+	}
+	var n int64
+	for {
+		chunk, from, err := rows.NextChunk()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			return n, err
+		}
+		if err := ctx.Err(); err != nil {
+			return n, err
+		}
+		to := chunk.GetSize()
+		if err := enc.encode(chunk, from, to, func(rows int, data []byte) error {
+			n += int64(rows)
+			return framer.CopyFrames(data)
+		}); err != nil {
+			return n, err
+		}
+		chunksSent.Add(1)
+		rows.Skip(to - from)
+	}
+	if c.format == "binary" {
+		return n, out.CopyData(append(enc.head, 0xff, 0xff))
+	}
+	return n, nil
+}
+
+// specials marks the bytes that make a value need quotes in CSV, or an
+// escape in text.
+func (c copyTo) specials() *[256]bool {
+	var special [256]bool
+	chars := c.delimiter + "\\\n\r\t"
+	if c.format == "csv" {
+		chars = c.delimiter + "\"\r\n"
+	}
+	for _, b := range []byte(chars) {
+		special[b] = true
+	}
+	return &special
+}
+
 // appendText appends a value in text or CSV COPY format.
 func (c copyTo) appendText(buf, value []byte) []byte {
+	special := c.special
+	if special == nil {
+		special = c.specials()
+	}
+	plain := true
+	for _, b := range value {
+		if special[b] {
+			plain = false
+			break
+		}
+	}
 	if c.format == "csv" {
-		quote := len(value) == 0 && c.null == "" || string(value) == c.null ||
-			strings.ContainsAny(string(value), c.delimiter+"\"\r\n")
-		if !quote {
+		if plain && string(value) != c.null && (len(value) > 0 || c.null != "") {
 			return append(buf, value...)
 		}
 		buf = append(buf, '"')
@@ -367,6 +439,9 @@ func (c copyTo) appendText(buf, value []byte) []byte {
 			buf = append(buf, b)
 		}
 		return append(buf, '"')
+	}
+	if plain {
+		return append(buf, value...)
 	}
 	for _, b := range value {
 		switch b {

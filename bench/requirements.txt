@@ -1,6 +1,6 @@
 psycopg[binary]==3.3.6
 sqlglot==26.29.0
 # Only for the platform you run against:
-snowflake-connector-python==3.18.1
+snowflake-connector-python==4.7.3
 databricks-sql-connector==4.5.0
 databricks-sdk==0.58.0

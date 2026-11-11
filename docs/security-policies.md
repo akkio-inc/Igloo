@@ -285,32 +285,3 @@ policy's own condition can still be pushed into the table scan; the
 statement's other conditions on the table's columns cannot, since they must
 not see hidden rows, and neither can conditions on masked columns. Statements
 of users a policy exempts run as written, after the same checks.
-
-## Limitations
-
-- **Admins are not a boundary.** They manage policies, can read the
-  warehouse's files and attach other databases, and statements only admins
-  may run (such as `PRAGMA tpch`) do not go through policies. Policies keep
-  them from seeing raw data by accident; the query history records what
-  they do.
-- **External engines.** Spark, Trino and others read table files
-  directly, so they cannot apply policies. Igloo's two ways of serving
-  tables to them both refuse tables with policies to everyone but admins:
-  the [Iceberg REST catalog](external-engines.md#tables-with-data-policies)
-  will not load, hand out credentials for or commit to such a table, and
-  [Delta Sharing](sharing.md#tables-with-masking-or-row-access-policies)
-  will not add one to a share or serve a shared table that gains one.
-  Storage credentials an engine got before a policy was attached work for
-  up to an hour. Engines given the catalog database or object storage
-  directly see raw data; do not give them access to tables with policies.
-- **External tables** (Delta Sharing) take no policies or tags; copy what
-  users may read into a table to protect it.
-- **Existence of hidden rows.** A condition that fails on `NULL` can show,
-  by failing, that a table has rows the user cannot see, though nothing
-  about them.
-- **Deterministic masks** keep what they do not hide: a hash keeps joins
-  and distinct counts working, and so shows which rows share a value. Use a
-  constant where that matters.
-- `EXPLAIN` shows the rewritten statement, policy expressions included.
-- Policies attach to tables, not views, and take one column per masking
-  policy (no `USING` clause). There are no column privileges.

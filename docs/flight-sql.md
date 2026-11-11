@@ -225,23 +225,21 @@ forwards it with `IGLOO_GATEWAY_FLIGHT_BACKEND`.
 
 `bench/extract.py` pulls TPC-H lineitem rows into Python both ways, in turn,
 and keeps each way's best of three rounds. For 3,000,000 rows of all 16
-columns (TPC-H scale factor 1), with the single-machine stack and the client
-on one Apple-silicon Mac (18 cores, 16 GB for Docker) that other work was
-also using:
+columns (TPC-H scale factor 1) held in memory, with Igloo and the client on
+one Apple-silicon Mac (18 cores) that other work was also using:
 
 | Client | Seconds | Rows per second | Speedup |
 |---|---:|---:|---:|
-| psycopg 3.3, Python rows | 56.2 | 53,000 | |
-| psycopg 3.3, pandas DataFrame | 65.2 | 46,000 | |
-| ADBC 1.12, Arrow table | 1.9 | 1,557,000 | 29x psycopg's rows |
-| ADBC 1.12, pandas DataFrame | 4.5 | 663,000 | 14x psycopg's DataFrame |
-| ADBC 1.12, polars DataFrame | 1.4 | 2,138,000 | 46x psycopg's DataFrame |
+| psycopg 3.3, Python rows | 2.8 | 1,087,000 | |
+| psycopg 3.3, pandas DataFrame | 4.5 | 664,000 | |
+| ADBC 1.13, Arrow table | 0.31 | 9,724,000 | 8.9x psycopg's rows |
+| ADBC 1.13, pandas DataFrame | 1.5 | 2,043,000 | 3.1x psycopg's DataFrame |
+| ADBC 1.13, polars DataFrame | 0.39 | 7,710,000 | 11.6x psycopg's DataFrame |
 
-Over the PostgreSQL protocol, Igloo renders every value as text and the
-client parses it back, row by row. Over Flight SQL, DuckDB's columnar result
+Over the PostgreSQL protocol, each value crosses as text and psycopg makes a
+Python object of it, row by row. Over Flight SQL, DuckDB's columnar result
 goes out as Arrow buffers that pyarrow uses as they arrive; polars takes the
-same Arrow data without copying, and its lead over the Arrow table here is
-within the run-to-run noise of a shared machine (rounds varied up to 2x).
+same Arrow data without copying, and pandas converts it a column at a time.
 Measure on your own hardware with:
 
 ```sh

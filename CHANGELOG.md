@@ -9,7 +9,10 @@ The release workflow publishes the section whose heading matches the tag
 
 ## [Unreleased]
 
-First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
+## [1.0.0-rc.2] - 2026-11-11
+
+Igloo's first published release: an open-source SQL data warehouse that runs
+in your own cloud account or on your own hardware.
 
 ### SQL and tables
 
@@ -1746,7 +1749,7 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   each file is written again with its own partition spec, or another
   whose columns that schema has. Admins and roles granted
   `ERASE ON ACCOUNT` make them. `docs/privacy.md` says what a completed
-  request guarantees, what it trusts, and its known limitations. `iceberg-go`'s copy gains
+  request guarantees and what it trusts. `iceberg-go`'s copy gains
   `Transaction.ForgetFiles`, which rewrites the manifests that list removed
   files, and `WithMaxRefAge`, so expiring snapshots keeps branches and
   tags, and writes the manifests of a spec whose column was dropped since
@@ -1993,6 +1996,24 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   gateway forwards it (`IGLOO_GATEWAY_ICEBERG_BACKEND`).
 
 ### Performance and cost
+
+- Large results reach clients four to eleven times faster. A result's rows went
+  out a row at a time: DuckDB's driver made each value a Go value (an allocation
+  for most, a call into DuckDB for each date, a big integer for each decimal),
+  which was then encoded through a lookup of its type and copied twice on its way
+  to the client. Igloo now reads each chunk of a result where DuckDB holds it and
+  writes its rows once, in the client's text or binary format: a statement's rows,
+  those `FETCH` reads from a cursor, those of a portal read with a row limit
+  (JDBC's fetch size) and those of `COPY ... TO STDOUT` in each of its formats.
+  The bytes are those a row at a time sent; tests compare the two for every type,
+  at the edges of each. To a client that only reads them, 200,000 rows of sixteen
+  columns shaped like TPC-H's `lineitem` take 41 ms in text where they took 282,
+  34 ms in binary (341), 37 ms as a binary copy (316) and 68 ms as CSV (361).
+  Python clients are now the slower side: of 2 million rows of five columns,
+  psycopg's `fetchall` reads 3.5 million a second where it read 1.3 million, a
+  server-side cursor 3.6 million (1.4), polars through connectorx 2.9 million
+  (2.0) and pandas' `read_sql` 1.4 million (0.9) (see
+  [notebooks and Python](docs/integrations.md#notebooks-and-python)).
 
 - A dashboard's own heavy statements stay in the first DuckDB. With nothing set,
   only tasks' heavy statements run in the second DuckDB, whose threads give way
@@ -3409,4 +3430,5 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   Igloo process uses the directory, which it tells by a lock that each
   process holds there (docs/operations.md#spill-directory).
 
-[Unreleased]: https://github.com/akkio-inc/Igloo/commits/main
+[Unreleased]: https://github.com/akkio-inc/Igloo/compare/v1.0.0-rc.2...HEAD
+[1.0.0-rc.2]: https://github.com/akkio-inc/Igloo/releases/tag/v1.0.0-rc.2

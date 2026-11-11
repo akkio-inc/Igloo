@@ -177,41 +177,26 @@ SQLAlchemy's inspector (`get_schema_names`, `get_table_names`,
 connectorx and ADBC (polars' `read_database_uri`, `pandas.read_sql` with
 an ADBC connection) fetch with `COPY (query) TO STDOUT` in PostgreSQL's
 binary format and build Arrow columns, without a Python object per value,
-which keeps a notebook's memory down. On one machine, pulling 2 million rows
-of five columns (integers, a date, a decimal and a string) into a client in
-a container next to Igloo took:
+which keeps a notebook's memory down. On one machine of 18 cores, pulling
+2 million rows of five columns (integers, a date, a decimal and a string)
+into a client beside Igloo took:
 
 | Path | Rows per second |
 |---|---|
-| psycopg 3, `fetchall` (text) | about 440,000 |
-| psycopg 3, a server-side cursor | about 420,000 |
-| polars `read_database_uri` (connectorx) | about 290,000 |
-| polars `read_database_uri` (ADBC) | about 250,000 |
-| polars `read_database` through SQLAlchemy | about 215,000 |
-| pandas `read_sql` through SQLAlchemy | about 150,000 |
+| psycopg 3, a server-side cursor | about 3.6 million |
+| psycopg 3, `fetchall` (text) | about 3.5 million |
+| polars `read_database_uri` (connectorx) | about 2.9 million |
+| polars `read_database_uri` (ADBC) | about 2.5 million |
+| pandas `read_sql` through SQLAlchemy | about 1.4 million |
+| polars `read_database` through SQLAlchemy | about 1.2 million |
 
 `scripts/e2e.sh` prints these rates for TPC-H `lineitem` on every run.
-Every path is bound by the PostgreSQL protocol, which encodes each value
-on its own: Igloo sends a few hundred thousand rows a second per session,
-far less than the query itself produces. For large extracts into pandas or
-polars, use [Arrow Flight SQL](flight-sql.md) through ADBC's Flight SQL
-driver instead, which sends DuckDB's Arrow batches as they are. To export
-tens of millions of rows, `COPY (query) TO 's3://bucket/export.parquet'`
-writes Parquet from Igloo directly, much faster (see
-[loading and exporting](sql.md#loading-and-exporting-data)).
-
-## Known limitations
-
-- `ROLLBACK TO SAVEPOINT` works only when nothing changed since the
-  savepoint (enough for psycopg's and SQLAlchemy's nested blocks that just
-  read); otherwise roll back the whole transaction.
-- Catalog metadata (`information_schema.columns`, `pg_attribute`, and so
-  JDBC's `getColumns` and SQLAlchemy's `get_columns`) shows every column of
-  an Iceberg table as nullable, although writes enforce `NOT NULL`.
-- Primary and foreign keys are not reported: Iceberg does not keep them, so
-  BI tools' automatic joins and Power BI's relationship detection have
-  nothing to go on. Define relationships in the tool.
-- `TO_CHAR` formats dates and timestamps (`YYYY`, `MM`, `DD`, `HH24`, `MI`,
-  `SS`, `Month`, `Mon`, `Day`, `Dy` and the like), not numbers.
-- The SQL is DuckDB's: PostgreSQL-only functions a tool's custom SQL uses
-  may need rewriting (see [the dialect](sql.md#dialect)).
+Igloo writes a result's rows from where DuckDB holds them, a chunk at a
+time, in the client's text or binary format: a client that only reads them
+takes 200,000 rows of five columns in about 12 ms and of sixteen in about
+41 ms, 16 and 5 million rows a second. The rates above are what each client takes to make
+its own values of them. For the largest extracts into pandas or polars,
+[Arrow Flight SQL](flight-sql.md) through ADBC's Flight SQL driver sends
+DuckDB's Arrow batches as they are. To export tens of millions of rows,
+`COPY (query) TO 's3://bucket/export.parquet'` writes Parquet from Igloo
+directly (see [loading and exporting](sql.md#loading-and-exporting-data)).

@@ -136,7 +136,9 @@ all, holding a batch of rows a worker in memory whatever the result, and
 sends the client each batch as it merges it, rather than once it has merged
 them all. The merge runs on several cores: each worker's file is decoded
 apart, groups of up to eight files are merged at once, and the groups'
-rows merged in turn, ahead of DuckDB reading them. It merges by
+rows merged in turn, ahead of DuckDB reading them. It merges on a
+coordinator of 4 cores and DuckDB threads or more; on fewer, DuckDB sorts
+the gathered rows, which is faster there. It merges by
 columns of numbers, text and `BLOB`s (by their bytes), dates, times,
 timestamps, decimals and booleans, the result's columns or the groups and
 aggregates they show, in the session's default order and `NULLS` order.
@@ -1451,7 +1453,7 @@ Workers keep what they read in their read caches, and more, past a
 statement. Table files workers wrote are a table's files like any others, and
 what a stopped write left under a table's location is among its orphan files,
 which a request deletes, or waits for and verifies are gone
-([what a request does](privacy.md#what-a-request-does)). [Erasure requests](privacy.md#workers) have every worker purge
+([what a request does](privacy.md#what-a-request-does)). [Erasure requests](privacy.md) have every worker purge
 what they deleted: coordinators push the purge within 15 seconds, every
 task carries the last deletion its coordinator knew of, and a worker that
 was stopped meanwhile purges before it serves again. A worker that hears
@@ -1695,7 +1697,7 @@ On a worker (`igloo worker`): `IGLOO_WORKER_SECRET`,
 [Spot workers](#spot-workers)), `IGLOO_WORKER_ISOLATED_PURGE_AFTER` (`1m`,
 at least `10s`: how long it goes without hearing from any coordinator
 before it empties its caches by itself, for [erasure
-requests](privacy.md#workers)), the server's storage settings, and
+requests](#erasure-requests)), the server's storage settings, and
 `IGLOO_DUCKDB_*`, `IGLOO_CACHE_*`, `IGLOO_HTTP_ADDR` and `IGLOO_LOG_*` as on
 the server; with local exchanges, `IGLOO_EXCHANGE_MAX_SIZE` caps what they
 may take on its disk (empty: a quarter of its free space at a time).
@@ -1852,35 +1854,3 @@ draining the node. On Kubernetes, where a Spot node is drained first, a stopping
 worker so drains for up to 110 seconds, within the pod's grace period
 (`workers.terminationGracePeriodSeconds`, 125 by default). Ask for
 several instance types and zones, so that capacity one lacks another has.
-
-## Limitations
-
-- The large inputs of one `SELECT` are partitioned by one key. Large tables
-  joined on different keys need a step each: a common table expression or
-  subquery per key. A large table read again in a correlated subquery
-  expression that is not one of the joins it can mean (`NOT IN`, a
-  correlation with no equal columns) runs on one machine; written as a join
-  to a common table expression, it runs distributed. Give the machines that run
-  such statements a lot of memory and fast spill disk.
-- `ROLLUP`, `CUBE` and `GROUPING SETS` run on workers up to the finest groups
-  of their sets, and the coordinator, or in a subquery or common table
-  expression one task, computes the sets from those groups: its memory grows
-  with them, as a plain `GROUP BY`'s does not.
-- Where workers have no room on their disks, or with `IGLOO_EXCHANGES=object`,
-  partitioned joins, aggregations and every step of a multi-stage plan
-  write what they exchange to object storage and read it back: that costs
-  request charges and adds a few seconds per step, and
-  leftovers of a coordinator that crashed mid-statement stay under
-  `_igloo_shuffle/` for six hours or more, until a replica's sweep removes
-  them.
-- The coordinator receives an aggregation's result, one row a group, and
-  keeps it on its disk until the statement has run: a `GROUP BY` whose
-  result is billions of groups sends it all of them. Groups taken to be few
-  (see [what runs distributed](#what-runs-distributed)) it receives from
-  every worker, as partial results.
-- Tables with data files without field IDs, views that group, sort or
-  limit, and time travel to any snapshot but a table's latest run on one
-  machine.
-- Workers read each table's files directly and do not use Iceberg partition
-  statistics to skip files; DuckDB skips row groups by their Parquet
-  statistics instead.

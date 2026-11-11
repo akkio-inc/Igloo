@@ -1,8 +1,5 @@
 <p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/banner-dark.png">
-    <img alt="An igloo with a lit doorway in the snow." src="docs/assets/banner-light.png" width="100%">
-  </picture>
+  <img alt="An igloo with a lit doorway beside a frozen river, under the northern lights." src="docs/assets/banner.jpg" width="100%">
 </p>
 
 # Igloo
@@ -379,6 +376,9 @@ Connector/C, the MySQL client library, in the `mysql` extension.
   one machine, run in parts on workers
 - [SQL and clients](docs/sql.md): the SQL dialect, Iceberg features, type
   mapping, tested drivers and tools
+- [Snowflake SQL](docs/snowflake-sql.md): Snowflake's dialect for a session,
+  so queries, dashboards and dbt models written for Snowflake run without
+  being rewritten
 - [Loading and scheduling](docs/loading.md): `COPY INTO`, pipes, tasks and
   materialized views
 - [Alerts and notifications](docs/alerts.md): alerts, notification
@@ -418,45 +418,6 @@ Connector/C, the MySQL client library, in the `mysql` extension.
   vulnerability
 - [Contributing](CONTRIBUTING.md)
 
-## Limitations in 1.0
-
-- **Distribution covers the common big shapes.** A query over a very large
-  table runs in parts on [workers](docs/distributed-execution.md) when it
-  scans, filters, aggregates and joins it to smaller tables, to another large
-  table or to itself on equal columns, and when it reads it again in a
-  correlated `EXISTS`, `NOT EXISTS` or aggregate subquery by equal columns,
-  which run as the joins they mean: TPC-DS q09, q10, q16, q32, q35, q69, q92
-  and q94 among them. Three large tables joined on different keys, aggregates
-  that do not combine (`median`, `string_agg`) and window functions over rows
-  still run on one replica; give it a large memory-optimized machine and fast
-  spill disk for those.
-- **Grants stop at tables.** Views run with the querying user's privileges,
-  and there are no column privileges: use masking policies instead. Table
-  and column names are visible to every user through the system catalogs
-  (descriptions, owners, usage and lineage only to those who may see the
-  table). Policies do not bind admins, who manage them, nor engines that
-  read the Iceberg tables directly.
-- **Lineage is table-level.** It comes from the statements Igloo runs; there
-  is no column-level lineage, and what other engines do to the tables
-  directly is not seen ([details](docs/catalog.md#lineage)).
-- **Scale to zero saves node costs on one machine, not yet in the cloud
-  modules.** The AWS, Google Cloud and Azure modules run Igloo on their
-  general node pool, so scaling its pods to zero does not release nodes
-  ([details](docs/scale-to-zero.md#on-kubernetes)).
-- **Branches are read-only.** Writes go to a table's `main` branch. Other
-  engines can write to branches, which Igloo reads and fast-forwards `main`
-  to; for changes made in Igloo, clone the table.
-- **Keys are not enforced.** `PRIMARY KEY` and `UNIQUE` on Iceberg tables are
-  accepted but not checked, so duplicates are possible. `NOT NULL` is
-  enforced.
-- **Other engines get storage credentials on S3 only.** On Google Cloud
-  Storage and Azure, engines using the Iceberg REST catalog need their own
-  access to the files ([details](docs/external-engines.md#storage-credentials)).
-- **Connections attach at startup.** A new connection to another database
-  is attached when each replica next restarts; changes to its credentials
-  and host apply at once. Connections are read-only, and BigQuery is not
-  supported yet ([details](docs/federation.md)).
-
 ## Repository layout
 
 ```
@@ -484,8 +445,29 @@ internal/schedule/  cron and interval schedules
 internal/sharing/   Delta Sharing: the provider endpoint and external tables
 internal/tasks/     tasks, pipes, materialized views, alerts, load history, scheduler
 internal/workload/  query tags, role limits and their enforcement
+internal/snowflake/ Snowflake's SQL dialect, translated into DuckDB's
+internal/ddl/       views and comments in the Iceberg catalog
+internal/catalogproxy/ what DuckDB asks of the Iceberg catalog, each change made once
+internal/maintenance/ compaction, snapshot expiry and file cleanup, on a schedule
+internal/filerewrite/, deletefiles/ rewriting data files within a memory budget
+internal/incremental/ materialized views refreshed from what changed
+internal/iddomain/  ID domains: dense ids for identifier columns, for exact distinct counts
+internal/ai/        AI functions in SQL, through the model provider you choose
+internal/ml/, models/ models trained and scored in SQL
+internal/tsfm/, tsforecast/, modelpack/ forecasts on open-weight foundation models
+internal/gateway/, activity/ the scale-to-zero gateway, and the work it must not stop
+internal/prefetch/  reading ahead into the read cache
+internal/memlimit/  memory divided between DuckDB and Go
+internal/spot/, prices/ Spot interruption notices and machine prices, for workers
+internal/awscreds/, azurecreds/ cloud credentials, refreshed for the whole process
+internal/uploads/   unfinished uploads to object stores, found and ended
+internal/logwriter/, lockorder/, sqllex/ logging that never blocks, lock order, SQL lexing
+internal/icebergtest/, testdb/ an Iceberg catalog and PostgreSQL databases for tests
+extensions/         Igloo's DuckDB extensions: roaring bitmaps (rb), patches to iceberg
+third_party/        patched copies of duckdb-go, psql-wire and iceberg-go, and CRoaring
 deploy/             Docker Compose, Helm chart, AWS/GCP/Azure modules
 docs/               documentation
+site/               the website and its docs pages, built from the repository's markdown
 scripts/            test and end-to-end scripts
 bench/              price-performance benchmark against Snowflake and Databricks
 migrate/            migration report: a Snowflake or Databricks workload replayed on Igloo

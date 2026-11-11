@@ -83,6 +83,18 @@ were removed; the code is otherwise unchanged except for these patches:
   vector as an opaque pointer. `SetChunkValue` checks the column and
   converts each value; Igloo's table function of a merge of sorted rows
   spent most of its time there.
+- `igloo_rowchunk.go` (new), with `rows.Next`'s loop that fetches chunks
+  moved into `rows.advance` (`rows.go`): `ChunkRows`, which the rows of
+  `Stmt.QueryContext` and `Stmt.QueryStreamContext` implement, reads a
+  result a chunk at a time (`NextChunk`, `Skip`), and `ChunkColumn`
+  reads a column of it where DuckDB holds it: its type (`Type`, `IsJSON`,
+  `Decimal`), the memory of values of a fixed size (`Fixed`), the validity
+  mask (`Validity`) and strings without a copy (`Borrowed`);
+  `DataChunk.RowValue` is one value as `Next` gives it. `Next` makes every
+  value a Go value, an allocation for most, a call into DuckDB for each
+  date and a `big.Int` for each decimal, and Igloo, which sends a result on
+  to a client in the client's encoding, spent most of a large result's time
+  on them (see `internal/pgwire/rowchunks.go`).
 
 Drop this copy and the `replace` directive once a duckdb-go release can
 describe and run a prepared statement as Arrow and DuckDB-Iceberg's set of

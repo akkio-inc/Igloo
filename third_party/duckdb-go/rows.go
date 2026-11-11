@@ -56,7 +56,10 @@ func (r *rows) Columns() []string {
 	return r.chunk.columnNames
 }
 
-func (r *rows) Next(dst []driver.Value) error {
+// advance fetches chunks until the current one has a row left to read, or
+// returns io.EOF. (Igloo patch: Next's loop, which NextChunk runs too; see
+// igloo_rowchunk.go.)
+func (r *rows) advance() error {
 	for r.rowCount == r.chunk.size {
 		if r.closeChunk {
 			r.chunk.close()
@@ -72,6 +75,13 @@ func (r *rows) Next(dst []driver.Value) error {
 			return getError(err, nil)
 		}
 		r.rowCount = 0
+	}
+	return nil
+}
+
+func (r *rows) Next(dst []driver.Value) error {
+	if err := r.advance(); err != nil {
+		return err
 	}
 
 	// Call getFn directly, bypassing GetValue/verifyAndRewriteColIdx — indices are
