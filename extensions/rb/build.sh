@@ -1,16 +1,18 @@
 #!/usr/bin/env bash
-# Builds the rb extension, rb.duckdb_extension, for this Linux machine's
-# architecture, and its SHA-256 beside it:
+# Builds the rb extension, rb.duckdb_extension, for this machine's system
+# (Linux or macOS) and architecture, and its SHA-256 beside it:
 #
 #   extensions/rb/build.sh OUT_DIR
 #
 # It compiles against DuckDB's headers at the version duckdb-go's bindings
 # were built from, and links no DuckDB of its own: duckdb-go links the
-# bindings' static libraries with -rdynamic, so the igloo binary (and every Go
-# test binary) exports DuckDB's symbols, and the extension's calls resolve to
-# the very DuckDB that loads it. It is half a megabyte rather than 34 MB, and
-# cannot run a different DuckDB than igloo's; it loads only into such a
-# binary. Needs go, gcc, g++, git and sha256sum, as golang:bookworm has.
+# bindings' static libraries with -rdynamic (a macOS binary exports its
+# symbols anyway), so the igloo binary (and every Go test binary) exports
+# DuckDB's symbols, and the extension's calls resolve to the very DuckDB that
+# loads it. It is half a megabyte rather than 34 MB, and cannot run a
+# different DuckDB than igloo's; it loads only into such a binary. Needs go,
+# gcc, g++, git and sha256sum, as golang:bookworm has; on macOS, the Xcode
+# command line tools.
 # DuckDB's headers are fetched once, checked against the pinned commit, into
 # $RB_CACHE (default ~/.cache/igloo); DUCKDB_HEADERS points at a src/include
 # directory to use instead.
@@ -34,9 +36,18 @@ amd64 | arm64) ;;
 	exit 1
 	;;
 esac
-platform="linux_$arch"
+# DuckDB names macOS osx, the bindings darwin.
+case "$(uname -s)" in
+Linux) os=linux bindings_os=linux ;;
+Darwin) os=osx bindings_os=darwin ;;
+*)
+	echo "rb: unsupported system $(uname -s)" >&2
+	exit 1
+	;;
+esac
+platform="${os}_$arch"
 
-lib_module="github.com/duckdb/duckdb-go-bindings/lib/linux-$arch"
+lib_module="github.com/duckdb/duckdb-go-bindings/lib/$bindings_os-$arch"
 have=$(go -C "$root" list -m -f '{{.Version}}' "$lib_module")
 if [ "$have" != "$bindings_version" ]; then
 	echo "rb: go.mod has $lib_module $have; this script pins DuckDB $duckdb_tag for $bindings_version." >&2
@@ -81,7 +92,12 @@ printf '%s\n' "${units[@]}" | xargs -P "$jobs" -I{} \
 	-c "$src/{}.cpp" -o "$obj/{}.o"
 
 objs=("${units[@]/#/$obj/}")
-g++ -shared -Wl,-s -o "$obj/rb.so" "$obj/roaring.o" "${objs[@]/%/.o}" -lstdc++ -lm
+if [ "$os" = osx ]; then
+	# DuckDB's symbols are left for the binary that loads it to provide.
+	g++ -shared -undefined dynamic_lookup -Wl,-x -o "$obj/rb.so" "$obj/roaring.o" "${objs[@]/%/.o}"
+else
+	g++ -shared -Wl,-s -o "$obj/rb.so" "$obj/roaring.o" "${objs[@]/%/.o}" -lstdc++ -lm
+fi
 
 # DuckDB's extension footer, unsigned: 22 bytes of WebAssembly custom-section
 # header, eight 32-byte fields in reverse order (magic "4", platform, DuckDB
@@ -94,5 +110,6 @@ field() { printf '%s' "$1"; head -c $((32 - ${#1})) /dev/zero; }
 } >>"$obj/rb.so"
 
 mv "$obj/rb.so" "$out/rb.duckdb_extension"
-sha256sum "$out/rb.duckdb_extension" | cut -d' ' -f1 >"$out/rb.duckdb_extension.sha256"
+if command -v sha256sum >/dev/null; then sha256=(sha256sum); else sha256=(shasum -a 256); fi
+"${sha256[@]}" "$out/rb.duckdb_extension" | cut -d' ' -f1 >"$out/rb.duckdb_extension.sha256"
 echo "built $out/rb.duckdb_extension ($platform, DuckDB $duckdb_tag): $(cat "$out/rb.duckdb_extension.sha256")"
