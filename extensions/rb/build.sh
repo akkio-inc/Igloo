@@ -70,19 +70,25 @@ mkdir -p "$obj"
 src="$here/src"
 croaring="$root/third_party/croaring"
 gcc -std=c11 -O3 -fPIC -fvisibility=hidden -I"$croaring" -c "$croaring/roaring.c" -o "$obj/roaring.o"
-pids=()
-for f in rb_extension rb_aggregate rb_scalar rb_memory rb_rewrite rb_stats rb_fold rb_strings rb_divide rb_flatten rb_filecache; do
-	g++ -std=c++17 -O2 -fPIC -DNDEBUG -DDUCKDB_BUILD_LOADABLE_EXTENSION -I"$headers" -I"$croaring" -I"$src" \
-		-c "$src/$f.cpp" -o "$obj/$f.o" &
-	pids+=($!)
-done
-for pid in "${pids[@]}"; do
-	wait "$pid"
-done
+units=(rb_extension rb_aggregate rb_scalar rb_memory rb_rewrite rb_stats rb_fold rb_strings rb_divide rb_flatten rb_filecache)
 
-g++ -shared -Wl,-s -o "$obj/rb.so" "$obj/roaring.o" "$obj/rb_extension.o" "$obj/rb_aggregate.o" "$obj/rb_scalar.o" \
-	"$obj/rb_memory.o" "$obj/rb_rewrite.o" "$obj/rb_stats.o" "$obj/rb_fold.o" "$obj/rb_strings.o" "$obj/rb_divide.o" "$obj/rb_flatten.o" "$obj/rb_filecache.o" \
-	-lstdc++ -lm
+# Each unit's compile peaks at 0.8 GB, so compile as many at once as there is
+# memory for at 1 GiB each, and no more than there are cores: all of them at
+# once don't fit in a VM of 6 GB.
+free=$(($(awk '/^MemAvailable:/ { print $2 }' /proc/meminfo) * 1024))
+if [ -r /sys/fs/cgroup/memory.max ] && [ "$(cat /sys/fs/cgroup/memory.max)" != max ]; then
+	room=$(($(cat /sys/fs/cgroup/memory.max) - $(cat /sys/fs/cgroup/memory.current)))
+	if [ "$room" -lt "$free" ]; then free=$room; fi
+fi
+jobs=$((free >> 30))
+if [ "$jobs" -gt "$(nproc)" ]; then jobs=$(nproc); fi
+if [ "$jobs" -lt 1 ]; then jobs=1; fi
+printf '%s\n' "${units[@]}" | xargs -P "$jobs" -I{} \
+	g++ -std=c++17 -O2 -fPIC -DNDEBUG -DDUCKDB_BUILD_LOADABLE_EXTENSION -I"$headers" -I"$croaring" -I"$src" \
+	-c "$src/{}.cpp" -o "$obj/{}.o"
+
+objs=("${units[@]/#/$obj/}")
+g++ -shared -Wl,-s -o "$obj/rb.so" "$obj/roaring.o" "${objs[@]/%/.o}" -lstdc++ -lm
 
 # DuckDB's extension footer, unsigned: 22 bytes of WebAssembly custom-section
 # header, eight 32-byte fields in reverse order (magic "4", platform, DuckDB
