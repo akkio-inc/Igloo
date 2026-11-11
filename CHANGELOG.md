@@ -9,7 +9,10 @@ The release workflow publishes the section whose heading matches the tag
 
 ## [Unreleased]
 
-First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
+## [1.0.0-rc.2] - 2026-11-11
+
+Igloo's first published release: an open-source SQL data warehouse that runs
+in your own cloud account or on your own hardware.
 
 ### SQL and tables
 
@@ -3427,4 +3430,5 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   Igloo process uses the directory, which it tells by a lock that each
   process holds there (docs/operations.md#spill-directory).
 
-[Unreleased]: https://github.com/akkio-inc/Igloo/commits/main
+[Unreleased]: https://github.com/akkio-inc/Igloo/compare/v1.0.0-rc.2...HEAD
+[1.0.0-rc.2]: https://github.com/akkio-inc/Igloo/releases/tag/v1.0.0-rc.2
