@@ -76,7 +76,9 @@ jobs:
 
   image:
     name: Image (${{ matrix.arch }})
-    needs: [prepare, ci]
+    # Built alongside CI, and pushed by digest only: nothing gets a tag, or
+    # is signed, until CI has passed (see publish).
+    needs: [prepare]
     runs-on: ${{ matrix.runner }}
     # Without a cache, the iceberg extension alone takes up to an hour.
     timeout-minutes: 120
@@ -141,7 +143,7 @@ jobs:
 
   publish:
     name: Publish image
-    needs: [prepare, image]
+    needs: [prepare, ci, image]
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
