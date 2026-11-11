@@ -17,7 +17,7 @@ import (
 func TestMergeOrdered(t *testing.T) {
 	h := behaviorsHarness(t)
 	// Cores enough to merge on (see mergesKeepUp); the last case has fewer.
-	h.co.opts.Cores = mergeCores
+	h.co.opts.Cores = MergeCores
 	for _, tc := range []struct {
 		query string
 		// settings are SET before it runs; merged says the coordinator
@@ -78,8 +78,8 @@ func TestMergeOrdered(t *testing.T) {
 	// On fewer cores than a merge keeps up on, the coordinator sorts.
 	t.Run("few cores", func(t *testing.T) {
 		h.t = t
-		h.co.opts.Cores = mergeCores - 2
-		defer func() { h.co.opts.Cores = mergeCores }()
+		h.co.opts.Cores = MergeCores - 2
+		defer func() { h.co.opts.Cores = MergeCores }()
 		q := `SELECT bvalue, count(*) AS n FROM behaviors4 GROUP BY 1 ORDER BY n DESC, bvalue`
 		ctx := context.Background()
 		want, _, err := h.query(ctx, q)

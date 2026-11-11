@@ -608,7 +608,9 @@ func TestStreamFailsReadingMerge(t *testing.T) {
 	t.Parallel()
 	// Cores enough to merge on (see distributed's mergesKeepUp), whatever the
 	// machine's.
-	ds := startDistServerWith(t, t.TempDir(), 2, func(o *distributed.Options) { o.Cores, o.Threads = 4, 4 })
+	ds := startDistServerWith(t, t.TempDir(), 2, func(o *distributed.Options) {
+		o.Cores, o.Threads = distributed.MergeCores, distributed.MergeCores
+	})
 	mustExec(t, ds.catalogServer.admin, "INSERT INTO lake.public.orders SELECT i, i % 97 FROM range(2000, 60000) t(i)")
 	conn := ds.testServer.admin(t, pgx.QueryExecModeSimpleProtocol)
 	ctx := context.Background()
