@@ -51,6 +51,27 @@ gofmt -l cmd internal    # must print nothing
 
 The first build links DuckDB and is slow; later builds are cached.
 
+Tests that load Igloo's own DuckDB extensions, rb and iceberg, or the
+extensions Igloo installs from DuckDB, skip without them, and CI runs them
+all. Both extensions build on Linux and macOS. Build them and install
+DuckDB's extensions once, then point the tests at them. Set `TZ=UTC`, as CI's
+runners have it: a few tests expect it.
+
+```sh
+dir=~/.cache/igloo/test
+extensions/rb/build.sh $dir/rb             # seconds
+extensions/iceberg/build.sh $dir/iceberg   # 6 to 30 minutes the first time, by cores
+go run -tags duckdb_arrow ./cmd/igloo install-extensions $dir/duckdb-extensions
+export IGLOO_TEST_RB_EXTENSION=$dir/rb/rb.duckdb_extension
+export IGLOO_TEST_ICEBERG_EXTENSION=$dir/iceberg/iceberg.duckdb_extension
+export IGLOO_TEST_EXTENSION_DIR=$dir/duckdb-extensions
+TZ=UTC go test -tags duckdb_arrow ./internal/pgwire/
+```
+
+The iceberg build also needs CMake, Ninja and pkg-config (on macOS,
+`brew install cmake ninja pkg-config`), and keeps its sources, libraries and
+compiler cache, about 5 GB, in `~/.cache/igloo/iceberg`.
+
 ### What CI checks
 
 [`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs on every pull
