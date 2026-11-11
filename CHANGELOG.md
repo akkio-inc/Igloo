@@ -9,16 +9,6 @@ The release workflow publishes the section whose heading matches the tag
 
 ## [Unreleased]
 
-### Fixed
-
-- A refresh of a view counting distinct values decides once where its query
-  runs. It planned the query to decide whether to keep a state, and planned it
-  again to run it; in between, a short earlier run on workers or another
-  statement starting on the replica could change auto mode's choice, and a view
-  it had decided to keep on this replica ran its partial aggregates on workers.
-  The refresh now runs the plan it decided with, and where that plan keeps the
-  query on this replica, its partial aggregates run there too.
-
 ## [1.0.0-rc.2] - 2026-11-11
 
 Igloo's first published release: an open-source SQL data warehouse that runs
@@ -2632,6 +2622,14 @@ in your own cloud account or on your own hardware.
   message and the stack it was thrown from.
 
 ### Fixed
+
+- A refresh of a view counting distinct values decides once where its query
+  runs. It planned the query to decide whether to keep a state, and planned it
+  again to run it; in between, a short earlier run on workers or another
+  statement starting on the replica could change auto mode's choice, and a view
+  it had decided to keep on this replica ran its partial aggregates on workers.
+  The refresh now runs the plan it decided with, and where that plan keeps the
+  query on this replica, its partial aggregates run there too.
 
 - A cancel always stops the statement. A statement is prepared, readied
   and run in steps, and a cancel request, the console's cancel, the client
