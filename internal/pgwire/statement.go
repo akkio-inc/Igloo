@@ -129,6 +129,10 @@ type statement struct {
 	// here, as for a read of it (see fillOn): for the query history, and
 	// for auto mode's history of the query.
 	filled *distParts
+	// decided is where the statement runs, decided before it runs, which
+	// startDistributed takes once rather than plan it again (see
+	// refresher.bitmapsOnWorkers).
+	decided *placement
 	// behindOnce says it was planned again after a worker refused it for an erasure
 	// request's deletion its coordinator had not heard of (see distributed.Behind).
 	behindOnce bool

@@ -253,11 +253,10 @@ type distRun struct {
 	end   func()
 }
 
-// startDistributed runs st's parts on workers if it qualifies in mode, and
-// returns their results to combine (see runDistributed). Without them,
-// done false says st runs on this replica, and parts why, for the guard;
-// done true that it must not, and err why.
-func (s *Server) startDistributed(ctx context.Context, sess *session, user auth.User, st *statement, mode distributed.Mode) (run *distRun, parts distParts, done bool, err error) {
+// planDistributed plans st for workers if it qualifies in mode. Without a
+// plan, done false says st runs on this replica, and parts why, for the
+// guard; done true that it must not, and err why.
+func (s *Server) planDistributed(ctx context.Context, sess *session, user auth.User, st *statement, mode distributed.Mode) (plan *distributed.Plan, parts distParts, done bool, err error) {
 	if s.dist == nil || st.stmtType != duckdb.STATEMENT_TYPE_SELECT || st.kind != returnsRows || sess.inTx || mode == distributed.ModeOff {
 		return nil, parts, false, nil
 	}
@@ -266,29 +265,59 @@ func (s *Server) startDistributed(ctx context.Context, sess *session, user auth.
 		return nil, parts, false, nil
 	}
 	env := &sessionEnv{s: s, sess: sess, user: user, st: st}
-	plan, err := s.dist.Plan(ctx, st.query, env, mode)
-	if err != nil {
-		if ctx.Err() != nil {
-			return nil, parts, true, ctx.Err()
-		}
-		parts.key = distributed.PlanKey(err)
-		if parts.key != "" {
-			// Auto mode chose this replica.
-			parts.placement = "this replica: " + strings.TrimPrefix(err.Error(), "cannot distribute: ")
-		}
-		if est, ok := distributed.LocalEstimate(err); ok {
+	plan, err = s.dist.Plan(ctx, st.query, env, mode)
+	if err == nil {
+		return plan, parts, false, nil
+	}
+	if ctx.Err() != nil {
+		return nil, parts, true, ctx.Err()
+	}
+	parts.key = distributed.PlanKey(err)
+	if parts.key != "" {
+		// Auto mode chose this replica.
+		parts.placement = "this replica: " + strings.TrimPrefix(err.Error(), "cannot distribute: ")
+	}
+	if est, ok := distributed.LocalEstimate(err); ok {
+		parts.local = est
+		parts.alt, _ = distributed.WorkersEstimate(err)
+		parts.budget, _ = distributed.LocalBudget(err)
+	}
+	if !distributed.IsUnsupported(err) {
+		s.log.Warn("could not plan a distributed statement; running it here", "user", user.Name, "err", err)
+	} else {
+		s.logHere(mode, "statement runs on this replica", "user", user.Name, "reason", err)
+	}
+	return nil, parts, false, nil
+}
+
+// placement is where a statement runs, decided before it runs: the plan
+// that runs it on workers, or, without one, why it runs on this replica.
+type placement struct {
+	plan *distributed.Plan
+	here distParts
+}
+
+// startDistributed runs st's parts on workers if it qualifies in mode, and
+// returns their results to combine (see runDistributed), where st.decided
+// does not say already where it runs. Without them, done false says st runs
+// on this replica, and parts why, for the guard; done true that it must
+// not, and err why.
+func (s *Server) startDistributed(ctx context.Context, sess *session, user auth.User, st *statement, mode distributed.Mode) (run *distRun, parts distParts, done bool, err error) {
+	var plan *distributed.Plan
+	if d := st.decided; d != nil {
+		// Where its caller decided it runs, planned once (see placement).
+		st.decided = nil
+		plan, parts = d.plan, d.here
+	} else {
+		plan, parts, done, err = s.planDistributed(ctx, sess, user, st, mode)
+	}
+	if plan == nil {
+		if !done && parts.local > 0 {
 			// Workers stay up while it runs here, as an idle replica would
 			// stop them, so that the guard can run it on them.
-			parts.local, parts.release = est, s.dist.Keep()
-			parts.alt, _ = distributed.WorkersEstimate(err)
-			parts.budget, _ = distributed.LocalBudget(err)
+			parts.release = s.dist.Keep()
 		}
-		if !distributed.IsUnsupported(err) {
-			s.log.Warn("could not plan a distributed statement; running it here", "user", user.Name, "err", err)
-		} else {
-			s.logHere(mode, "statement runs on this replica", "user", user.Name, "reason", err)
-		}
-		return nil, parts, false, nil
+		return nil, parts, done, err
 	}
 	settings, err := s.distributedSettings(ctx, sess)
 	if err != nil {

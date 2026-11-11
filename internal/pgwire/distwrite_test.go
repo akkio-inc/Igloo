@@ -376,9 +376,15 @@ func TestFullRefreshOnWorkers(t *testing.T) {
 		}
 		t.Skip("IGLOO_TEST_RB_EXTENSION is not set; build the rb extension with extensions/rb/build.sh")
 	}
-	env := startWriteServerOn(t, writeWorkers{cores: 8, memory: 4 << 30, claim: 300 << 20, rb: rb}, nil)
+	// Its table claims 300 MB, and auto mode estimates its queries at tens of
+	// seconds, but they take tenths of one: under a threshold of a second, a
+	// run on workers of less than a sixth of it is too short for them (see
+	// distributed.choose), and whether the reach's second refresh ran on
+	// workers depended on how fast this machine had run its first.
+	env := startWriteServerOn(t, writeWorkers{cores: 8, memory: 4 << 30, claim: 300 << 20, rb: rb},
+		func(o *distributed.Options) { o.Threshold = time.Millisecond })
 	admin := env.admin
-	sums := "SELECT g, count(*) AS n, sum(x) AS s FROM lake.public.src GROUP BY g"
+	sums :="SELECT g, count(*) AS n, sum(x) AS s FROM lake.public.src GROUP BY g"
 	reach := "SELECT g, count(DISTINCT id) AS d, count(*) AS n, sum(x) AS s FROM lake.public.src GROUP BY g"
 	mustExec(t, admin, "CREATE MATERIALIZED VIEW sums_mv AS "+sums)
 	mustExec(t, admin, "CREATE MATERIALIZED VIEW reach_mv AS "+reach)
