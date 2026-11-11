@@ -384,7 +384,7 @@ func TestFullRefreshOnWorkers(t *testing.T) {
 	env := startWriteServerOn(t, writeWorkers{cores: 8, memory: 4 << 30, claim: 300 << 20, rb: rb},
 		func(o *distributed.Options) { o.Threshold = time.Millisecond })
 	admin := env.admin
-	sums :="SELECT g, count(*) AS n, sum(x) AS s FROM lake.public.src GROUP BY g"
+	sums := "SELECT g, count(*) AS n, sum(x) AS s FROM lake.public.src GROUP BY g"
 	reach := "SELECT g, count(DISTINCT id) AS d, count(*) AS n, sum(x) AS s FROM lake.public.src GROUP BY g"
 	mustExec(t, admin, "CREATE MATERIALIZED VIEW sums_mv AS "+sums)
 	mustExec(t, admin, "CREATE MATERIALIZED VIEW reach_mv AS "+reach)
