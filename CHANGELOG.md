@@ -9,6 +9,14 @@ The release workflow publishes the section whose heading matches the tag
 
 ## [Unreleased]
 
+### Fixed
+
+- The image builds on a machine of 6 GB. Its two C++ extensions ran a
+  compile a core, or, for rb, all eleven at once, and the compiler was killed
+  for memory. Each build now runs as many compiles at once as memory holds:
+  1 GiB each for rb, and 2 GiB each for DuckDB and the iceberg extension. In
+  6 GB on 4 cores the iceberg build took 26 minutes and peaked at 2.9 GB.
+
 ## [1.0.0-rc.2] - 2026-11-11
 
 Igloo's first published release: an open-source SQL data warehouse that runs

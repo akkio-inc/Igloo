@@ -9,6 +9,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       build-essential cmake ninja-build pkg-config autoconf automake autoconf-archive libtool \
       curl zip unzip tar git rsync python3 perl ca-certificates linux-libc-dev ccache && \
     rm -rf /var/lib/apt/lists/*
+COPY extensions/jobs.sh /src/extensions/
 COPY extensions/iceberg/build.sh /src/extensions/iceberg/
 COPY extensions/iceberg/patches /src/extensions/iceberg/patches
 RUN --mount=type=cache,target=/root/.cache/igloo \

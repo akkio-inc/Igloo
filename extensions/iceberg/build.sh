@@ -95,6 +95,12 @@ export VCPKG_TOOLCHAIN_PATH="$vcpkg/scripts/buildsystems/vcpkg.cmake"
 export VCPKG_DEFAULT_BINARY_CACHE="$cache/vcpkg-binary"
 export CCACHE_DIR="$cache/ccache"
 export GEN=ninja
+# DuckDB's and the dependencies' compiles, at 2 GiB each.
+# shellcheck source=extensions/jobs.sh
+. "$here/../jobs.sh"
+jobs=$(build_jobs $((2 << 30)))
+export CMAKE_BUILD_PARALLEL_LEVEL=$jobs VCPKG_MAX_CONCURRENCY=$jobs
+echo "iceberg: $jobs compiles at once"
 mkdir -p "$VCPKG_DEFAULT_BINARY_CACHE"
 # DuckDB's CMake caches C++11 before the extension asks for the C++14 it is
 # written in. No shell or test runner: only the extension is wanted.
