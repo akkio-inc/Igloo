@@ -78,7 +78,8 @@ jobs:
     name: Image (${{ matrix.arch }})
     needs: [prepare, ci]
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 60
+    # Without a cache, the iceberg extension alone takes up to an hour.
+    timeout-minutes: 120
     permissions:
       contents: read
       packages: write
@@ -293,6 +294,15 @@ jobs:
             /^\[[^]]+\]: / { if (found) exit }
             found { print }
           ' CHANGELOG.md | sed -e '/./,$!d' >"$notes"
+
+          # A release's notes hold at most 125,000 characters. A longer section
+          # gives its opening paragraphs and a link to the rest.
+          if [ "$(wc -c <"$notes")" -gt 120000 ]; then
+            awk '/^### /{exit} {print}' "$notes" >"$notes.lead"
+            printf 'Every change is listed in [CHANGELOG.md](%s/%s/blob/%s/CHANGELOG.md).\n' \
+              "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$TAG" >>"$notes.lead"
+            mv "$notes.lead" "$notes"
+          fi
 
           if grep -q '[^[:space:]]' "$notes"; then
             echo "generate=false" >>"$GITHUB_OUTPUT"
