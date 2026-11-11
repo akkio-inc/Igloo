@@ -197,7 +197,8 @@ func BenchmarkMergedRows(b *testing.B) {
 // machine at scale. Each is timed at its best of three, the two
 // interleaved. It times the way the coordinator reads them on this machine's
 // cores (see mergesKeepUp): merged where the merge keeps up, and otherwise
-// sorted by DuckDB, which on 2 cores took two thirds of the merge's time.
+// sorted by DuckDB, which on CI's 4 vCPUs took four fifths of the merge's
+// time, and on 2 cores two thirds.
 func TestMergedRowsKeepUp(t *testing.T) {
 	if testing.Short() {
 		t.Skip("reads four million rows six times")
@@ -235,13 +236,13 @@ func TestMergedRowsKeepUp(t *testing.T) {
 }
 
 // TestMergesKeepUp checks the cores and DuckDB threads the coordinator merges
-// sorted rows on: both mergeCores or more.
+// sorted rows on: both MergeCores or more.
 func TestMergesKeepUp(t *testing.T) {
 	for _, c := range []struct {
 		cores, threads int
 		want           bool
 	}{
-		{1, 0, false}, {2, 0, false}, {2, 4, false}, {4, 0, true}, {4, 2, false}, {16, 32, true}, {16, 4, true},
+		{1, 0, false}, {2, 0, false}, {4, 0, false}, {4, 8, false}, {8, 0, true}, {8, 4, false}, {16, 32, true}, {16, 8, true},
 	} {
 		if got := mergesKeepUp(c.cores, c.threads); got != c.want {
 			t.Errorf("%d cores, %d threads: %v", c.cores, c.threads, got)
