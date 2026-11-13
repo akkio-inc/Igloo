@@ -17,6 +17,12 @@ The release workflow publishes the section whose heading matches the tag
   loaded it, so a client that reflected after its DDL, as SQLAlchemy and
   Alembic do, saw the old columns until a later statement loaded the table,
   and ten `ADD COLUMN`s in a row listed the first nine.
+- With credentials from the AWS chain (IAM roles for service accounts),
+  statements and commits no longer fail with `Catalog write-write conflict on
+  alter with "igloo_storage"` when the credentials expire. DuckDB replaced
+  them inside the transaction of whichever statement found them expired, and
+  two sessions doing so at once conflicted. Igloo now replaces them every 10
+  minutes, outside every transaction.
 - The image builds on a machine of 6 GB. Its two C++ extensions ran a
   compile a core, or, for rb, all eleven at once, and the compiler was killed
   for memory. Each build now runs as many compiles at once as memory holds:

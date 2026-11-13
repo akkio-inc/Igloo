@@ -36,6 +36,7 @@ func OpenWorker(ctx context.Context, cfg config.Config, log *slog.Logger) (*Engi
 		release()
 		return nil, err
 	}
+	e.refreshStorageCredentials(cfg.Storage)
 	if e.cache != nil {
 		e.startCache(log)
 	}

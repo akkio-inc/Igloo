@@ -139,6 +139,8 @@ type Engine struct {
 	// bgOver is what the process holds past what the two DuckDBs hold (see
 	// balance).
 	bgOver atomic.Int64
+	// stopCredentials stops refreshStorageCredentials, if it runs.
+	stopCredentials func()
 }
 
 // OpenPartitionFiles is how many files of a partitioned write DuckDB keeps
@@ -180,6 +182,9 @@ func Open(ctx context.Context, cfg config.Config, log *slog.Logger, opts ...Opti
 		}
 		release()
 		return nil, err
+	}
+	if cfg.Catalog.URI != "" {
+		e.refreshStorageCredentials(cfg.Storage)
 	}
 	if e.cache != nil && !e.isBackground {
 		// The first DuckDB keeps the cache they share to its size.
@@ -684,6 +689,9 @@ func (e *Engine) HoldCommit(schema, name, dir string) *catalogproxy.CommitHold {
 // closes, deleting its spill files, as the last connection to it closes.
 func (e *Engine) Close() error {
 	var err error
+	if e.stopCredentials != nil {
+		e.stopCredentials()
+	}
 	e.bgMu.Lock()
 	if e.bg != nil {
 		close(e.bgStop)
@@ -1087,28 +1095,90 @@ func storageStatements(s config.Storage) []string {
 		}
 
 	default:
-		opts := []string{
-			"TYPE s3",
-			"REGION " + literal(s.S3.Region),
-			"URL_STYLE " + literal(s.S3.URLStyle),
-			fmt.Sprintf("USE_SSL %t", s.S3.UseSSL),
-		}
-		if s.S3.Endpoint != "" {
-			opts = append(opts, "ENDPOINT "+literal(s.S3.Endpoint))
-		}
-		if s.S3.AccessKeyID != "" {
-			opts = append(opts, "KEY_ID "+literal(s.S3.AccessKeyID), "SECRET "+literal(s.S3.SecretAccessKey))
-		} else {
-			// IAM roles for service accounts, instance profiles, env vars.
-			// Those credentials expire (after an hour for IRSA), so DuckDB
-			// must fetch new ones as they do.
+		if s.S3.AccessKeyID == "" {
 			stmts = append(stmts, "LOAD aws")
-			opts = append(opts, "PROVIDER credential_chain", "REFRESH auto")
 		}
-		stmts = append(stmts, secret(scope, opts...))
+		stmts = append(stmts, s3Secret(s))
 	}
 
 	return stmts
+}
+
+// s3Secret registers the credentials of S3 storage: its keys, or else those
+// the AWS default chain (IAM roles for service accounts, instance profiles,
+// the environment) gives as it runs. The chain's credentials expire, an hour
+// after they are issued for IRSA, so Igloo runs it again well before that,
+// outside every transaction (see refreshStorageCredentials).
+//
+// The secret has no REFRESH auto. With it, DuckDB made the secret again
+// itself when object storage refused a request, inside the transaction of
+// the statement that sent it, and a secret is a catalog entry: of two
+// sessions whose transactions met the expired credentials, the second
+// failed with "Catalog write-write conflict on alter with "igloo_storage"",
+// in a statement or in its COMMIT ("Failed to commit Iceberg transaction").
+// And the refresh was undone with every transaction that rolled back, every
+// Iceberg commit's own among them.
+func s3Secret(s config.Storage) string {
+	opts := []string{
+		"TYPE s3",
+		"REGION " + literal(s.S3.Region),
+		"URL_STYLE " + literal(s.S3.URLStyle),
+		fmt.Sprintf("USE_SSL %t", s.S3.UseSSL),
+	}
+	if s.S3.Endpoint != "" {
+		opts = append(opts, "ENDPOINT "+literal(s.S3.Endpoint))
+	}
+	if s.S3.AccessKeyID != "" {
+		opts = append(opts, "KEY_ID "+literal(s.S3.AccessKeyID), "SECRET "+literal(s.S3.SecretAccessKey))
+	} else {
+		opts = append(opts, "PROVIDER credential_chain")
+	}
+	return secret(storageScope(s), opts...)
+}
+
+// storageCredentialsEvery is how often Igloo makes the storage secret again
+// when its credentials come from the AWS default chain. A transaction sees
+// the secret as it was when the transaction began, so one that began just
+// before a refresh holds credentials that are at most this old: with IRSA's
+// hour, it may run for 50 minutes before they expire. A variable, for tests.
+var storageCredentialsEvery = 10 * time.Minute
+
+// refreshStorageCredentials makes the storage secret again, from the AWS
+// default chain, every storageCredentialsEvery until Close, on a connection
+// of its own in a transaction of its own, so that DuckDB never needs to,
+// inside a user's (see s3Secret). It is the secret's one writer, so its
+// replacements never conflict. A failed one keeps the secret held, whose
+// credentials outlast several more tries.
+func (e *Engine) refreshStorageCredentials(s config.Storage) {
+	if s.Type == config.StorageGCS || s.Type == config.StorageAzure || s.S3.AccessKeyID != "" {
+		return
+	}
+	stmt := s3Secret(s)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	e.stopCredentials = func() {
+		cancel()
+		<-done
+	}
+	go func() {
+		defer close(done)
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(storageCredentialsEvery):
+			}
+			c, err := e.connector.Connect(ctx)
+			if err == nil {
+				_, err = c.(*duckdb.Conn).ExecContext(ctx, stmt, nil)
+				err = errors.Join(err, c.Close())
+			}
+			if err != nil && ctx.Err() == nil {
+				// Never echo the statement: secrets' statements can hold keys.
+				e.log.Warn("could not refresh the object storage credentials; keeping those held", "err", err)
+			}
+		}
+	}()
 }
 
 // useAzureIdentity has DuckDB ask this process for an Azure identity's tokens, where it
