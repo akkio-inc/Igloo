@@ -159,6 +159,15 @@ func (p *Provider) fetch(ctx context.Context) (aws.Credentials, error) {
 		p.inner = inner
 		p.mu.Unlock()
 	}
+	// The default chain's provider is the SDK's cache of it, which hands
+	// out what it holds until that has expired. Asked ahead of the expiry,
+	// as refresh asks, it gave the same credentials back, and for their
+	// last validMargin, which Retrieve does not hand out, every caller
+	// failed ("the credentials fetched have expired"): a minute an hour
+	// with IRSA. This fetch is for new credentials, so the cache gets them.
+	if c, ok := inner.(interface{ Invalidate() }); ok {
+		c.Invalidate()
+	}
 	return inner.Retrieve(ctx)
 }
 

@@ -23,6 +23,11 @@ The release workflow publishes the section whose heading matches the tag
   them inside the transaction of whichever statement found them expired, and
   two sessions doing so at once conflicted. Igloo now replaces them every 10
   minutes, outside every transaction.
+- Igloo's own reads of table files with credentials from the AWS chain, such
+  as planning statements for workers and maintenance, no longer go without
+  credentials for the last minute of each set's life. Its refresh ahead of
+  their expiry asked the AWS SDK's cache, which gave the same credentials back
+  until they had expired.
 - The image builds on a machine of 6 GB. Its two C++ extensions ran a
   compile a core, or, for rb, all eleven at once, and the compiler was killed
   for memory. Each build now runs as many compiles at once as memory holds:
