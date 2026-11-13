@@ -224,6 +224,13 @@ func catalogStress(t *testing.T, ext string, run time.Duration) {
 			}
 			return err
 		}},
+		// Column changes, to the tables of schema s2, which no rename moves:
+		// each commit replaces its table's entry in the set with one not yet
+		// loaded (see patches/0005), while binds load the table and listings
+		// list it.
+		{"alter", 2, func(conn *sql.Conn, r *rand.Rand, w int) error {
+			return do(conn, fmt.Sprintf("ALTER TABLE lake.s2.u%d ADD COLUMN c%d_%d INTEGER", r.IntN(4), w, r.Uint32()))
+		}},
 		// Creates and drops of tables of their own.
 		{"create+drop", 2, func(conn *sql.Conn, r *rand.Rand, w int) error {
 			name := fmt.Sprintf("lake.s.scratch%d_%d", w, r.IntN(1000))

@@ -11,6 +11,12 @@ The release workflow publishes the section whose heading matches the tag
 
 ### Fixed
 
+- The catalog views (`information_schema.columns`, `pg_attribute`,
+  `duckdb_columns()`) list the columns an `ALTER TABLE` changed as soon as it
+  commits, in every session. They listed a table as a statement had last
+  loaded it, so a client that reflected after its DDL, as SQLAlchemy and
+  Alembic do, saw the old columns until a later statement loaded the table,
+  and ten `ADD COLUMN`s in a row listed the first nine.
 - The image builds on a machine of 6 GB. Its two C++ extensions ran a
   compile a core, or, for rb, all eleven at once, and the compiler was killed
   for memory. Each build now runs as many compiles at once as memory holds:

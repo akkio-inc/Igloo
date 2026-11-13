@@ -521,7 +521,15 @@ func (e *Engine) ForgetTable(schema, name, as string) (stop func()) {
 // an Iceberg table's schema the first time the table is used and until then
 // lists a placeholder column named "__"; tools that browse schemas would
 // see only that. Loaded schemas are shared by all sessions, so this costs
-// one catalog request per table not yet used.
+// one catalog request per table not yet used. A commit that changes a
+// table's columns or comment turns it back into a placeholder (see
+// extensions/iceberg's patch 0005), so the next listing loads it again.
+//
+// conn is the session's, and lists the placeholders its statement would
+// see; the tables load on connections of their own. In a transaction that
+// has already bound a table, a bind answers from what the transaction
+// loaded and replaces nothing that listings show, so loading on conn left a
+// table another session had changed listed as its placeholder.
 func (e *Engine) LoadSchemas(ctx context.Context, conn *duckdb.Conn) error {
 	if e.catalog == "" {
 		return nil
@@ -530,7 +538,7 @@ func (e *Engine) LoadSchemas(ctx context.Context, conn *duckdb.Conn) error {
 	if err != nil {
 		return err
 	}
-	return e.loadSchemas(ctx, conn, tables, nil)
+	return e.loadSchemas(ctx, tables, nil)
 }
 
 // WarmSchemas loads, in the background of a replica that has just started,
@@ -555,7 +563,7 @@ func (e *Engine) WarmSchemas(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	return e.loadSchemas(ctx, conn, tables, e.CatalogShare)
+	return e.loadSchemas(ctx, tables, e.CatalogShare)
 }
 
 // placeholders lists the Iceberg tables whose schemas DuckDB has not loaded
@@ -581,18 +589,18 @@ func (e *Engine) placeholders(ctx context.Context, conn *duckdb.Conn) ([][2]stri
 	}
 }
 
-// loadSchemas loads tables' schemas. hold, if set, is taken around each
-// load (see WarmSchemas); otherwise the caller keeps the rest of Igloo off
-// the catalog meanwhile (see CatalogLock).
-func (e *Engine) loadSchemas(ctx context.Context, conn *duckdb.Conn, tables [][2]string, hold func() func()) error {
+// loadSchemas loads tables' schemas, on connections of its own, outside
+// any transaction. hold, if set, is taken around each load (see
+// WarmSchemas); otherwise the caller keeps the rest of Igloo off the
+// catalog meanwhile (see CatalogLock).
+func (e *Engine) loadSchemas(ctx context.Context, tables [][2]string, hold func() func()) error {
 	if len(tables) == 0 {
 		return nil
 	}
 	// Each load waits on the catalog and on object storage, so they run
-	// side by side, on conn and connections of their own: a catalog of
-	// hundreds of tables took seconds one at a time. Loading binds the
-	// table, which DuckDB-Iceberg's own lock keeps safe alongside other
-	// binds.
+	// side by side: a catalog of hundreds of tables took seconds one at a
+	// time. Loading binds the table, which DuckDB-Iceberg's own lock keeps
+	// safe alongside other binds.
 	jobs := make(chan [2]string)
 	var (
 		mu   lockorder.Mutex
@@ -618,10 +626,12 @@ func (e *Engine) loadSchemas(ctx context.Context, conn *duckdb.Conn, tables [][2
 			}
 		}
 	}
-	wg.Go(func() { load(conn) })
-	for range min(len(tables), schemaLoaders) - 1 {
+	for i := range min(len(tables), schemaLoaders) {
 		c, err := e.connector.Connect(ctx)
 		if err != nil {
+			if i == 0 {
+				return fmt.Errorf("load schemas: %w", err)
+			}
 			break
 		}
 		wg.Go(func() {
