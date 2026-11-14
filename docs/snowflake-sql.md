@@ -493,7 +493,8 @@ What Igloo cannot reproduce exactly, and what it does instead.
   standard deviation), exact up to about 300 values. Their results
   differ from Snowflake's within that error. In a select with `GROUP BY`
   and as window functions they count exactly, as `COUNT(DISTINCT)`.
-  DuckDB's own `approx_count_distinct` has 64 registers and errs by about
+  `approx_count_distinct` in DuckDB's dialect counts the same way (see
+  [SQL](sql.md#dialect)); DuckDB's own has 64 registers and errs by about
   13%.
   `APPROX_PERCENTILE` is DuckDB's `approx_quantile`, approximate within its
   own error. `APPROX_TOP_K` counts exactly.
@@ -506,9 +507,9 @@ What Igloo cannot reproduce exactly, and what it does instead.
 - `APPROX_COUNT_DISTINCT` and `HLL` count exactly when grouped, since a
   sketch per group is slower than `COUNT(DISTINCT x)` with many groups (13
   s rather than 0.5 s for 7.9 million groups of 37 million rows). Ungrouped,
-  as when profiling columns, the sketch is as fast as DuckDB's
+  as when profiling columns, the sketch is as fast as DuckDB's own
   `approx_count_distinct`. Grouped by a few thousand groups or fewer,
-  counting exactly takes up to three times as long as DuckDB's
+  counting exactly takes up to three times as long as DuckDB's own
   approximation (0.8 s rather than 0.24 s for 270 groups of 37 million
   rows).
 - Statements whose translations call the `sf_` macros (`FLATTEN`,

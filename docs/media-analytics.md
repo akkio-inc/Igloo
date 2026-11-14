@@ -150,14 +150,13 @@ FROM (SELECT user_id, count(*) AS frequency
 ```
 
 For an exact distinct count of one ad hoc set, use `count(DISTINCT
-user_id)`; it needs no sketch. DuckDB's own `approx_count_distinct(user_id)`
-is fast but rough: its HyperLogLog has 64 registers and errs by about 13%
-(one standard deviation, measured from 1,000 to 10 million values), by
-over 50% in the worst of 200 draws. For an approximate count within about
-1.6%, use `datasketch_hll_estimate(datasketch_hll(12, user_id))`, which
-Snowflake SQL's `APPROX_COUNT_DISTINCT` becomes when ungrouped; it is as
-fast ungrouped and much slower with many groups, where Snowflake SQL's
-`APPROX_COUNT_DISTINCT` counts exactly instead.
+user_id)`; it needs no sketch. `approx_count_distinct(user_id)` counts within
+about 1.6%, in either dialect (see [SQL](sql.md#dialect)): Igloo counts it
+with `datasketch_hll_estimate(datasketch_hll(12, ...))` of the values' hash,
+as fast as DuckDB's own, whose HyperLogLog has 64 registers and errs by about
+13% (one standard deviation, measured from 1,000 to 10 million values), by
+over 50% in the worst of 200 draws. A sketch per group is much slower with
+many groups, so with `GROUP BY` it counts exactly instead.
 
 ## Geospatial
 
@@ -263,7 +262,7 @@ These are DuckDB's own and need no extension. Every user can call them.
 
 | Need | Functions |
 |---|---|
-| Distinct counts | `count(DISTINCT x)`, `approx_count_distinct(x)` (about 13% error; see [above](#reach-and-frequency-with-sketches) for 1.6%) |
+| Distinct counts | `count(DISTINCT x)`, `approx_count_distinct(x)` (about 1.6% error; see [above](#reach-and-frequency-with-sketches)) |
 | Quantiles and medians | `quantile_cont(x, 0.5)`, `median(x)`, `approx_quantile(x, [0.5, 0.9, 0.99])` (t-digest), `reservoir_quantile(x, 0.9)` |
 | Top values and distributions | `approx_top_k(x, 10)`, `mode(x)`, `histogram(x)` |
 | Samples | `FROM t USING SAMPLE 10 PERCENT (bernoulli)`, `USING SAMPLE reservoir(10000 ROWS) REPEATABLE (42)`, `TABLESAMPLE 1%` |

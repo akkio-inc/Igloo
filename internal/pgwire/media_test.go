@@ -3,9 +3,11 @@ package pgwire
 import (
 	"context"
 	"encoding/binary"
+	"fmt"
 	"math"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -216,6 +218,114 @@ func TestSnowflakeApproxCountDistinct(t *testing.T) {
 	conn := ts.admin(t, pgx.QueryExecModeSimpleProtocol)
 	mustExec(t, conn, "SET sql_dialect = 'snowflake'")
 	if err := conn.QueryRow(ctx, "SELECT APPROX_COUNT_DISTINCT(x) FROM (VALUES (1), (2), (2)) t(x)").Scan(&n); err != nil || n != 2 {
+		t.Errorf("without the extension: %d %v", n, err)
+	}
+}
+
+// TestDuckDBApproxCountDistinct checks that approx_count_distinct in
+// DuckDB's dialect counts as APPROX_COUNT_DISTINCT does in Snowflake's (see
+// approxcount.go). DuckDB's own, of 64 registers, counted a column profile's
+// 6 distinct values as 5, 1,000 as 1,249 and 100,000 as 96,408. The sketch
+// of 4,096 registers has a standard error of about 1.6%, so one set of
+// 100,000 values can be off by more than 2% (0 to 99,999 are, by 4.5%):
+// each of 40 sets counts within 5%, three standard errors, and the sets
+// within 2% on average (root mean square). DuckDB's own was off by 15% on
+// average and by up to 40%, and 29 of the 40 by more than 5%. In a select
+// with GROUP BY and as a window function it counts exactly; without the
+// datasketches extension it is DuckDB's own.
+func TestDuckDBApproxCountDistinct(t *testing.T) {
+	t.Parallel()
+	cs, _ := mediaServer(t)
+	ctx := context.Background()
+	const sets = 40
+	cols := []string{"'category_' || (i % 6) AS c0", "i % 1000 AS c1"}
+	names := []string{"c0", "c1"}
+	for k := range sets {
+		cols = append(cols, fmt.Sprintf("i %% 100000 + %d AS s%d", k*1000003, k))
+		names = append(names, fmt.Sprintf("s%d", k))
+	}
+	mustExec(t, cs.admin, "CREATE TABLE profile AS SELECT "+strings.Join(cols, ", ")+", i % 2 AS g FROM range(300000) t(i)")
+	profile := func(fn string) string {
+		items := make([]string, len(names))
+		for i, c := range names {
+			items[i] = fmt.Sprintf(`%s("%s") AS %s_D`, fn, c, strings.ToUpper(c))
+		}
+		return "SELECT " + strings.Join(items, ", ") + " FROM profile"
+	}
+	counts := func(q string) []int64 {
+		t.Helper()
+		got := make([]int64, len(names))
+		ptrs := make([]any, len(got))
+		for i := range got {
+			ptrs[i] = &got[i]
+		}
+		if err := cs.admin.QueryRow(ctx, q).Scan(ptrs...); err != nil {
+			t.Fatalf("%s: %v", q, err)
+		}
+		return got
+	}
+
+	// A column profile as data tools send it.
+	got := counts(profile("APPROX_COUNT_DISTINCT"))
+	t.Logf("6, 1,000 and 0 to 99,999: %v", got[:3])
+	if got[0] != 6 {
+		t.Errorf("6 distinct values: %d", got[0])
+	}
+	if d := got[1] - 1000; d < -20 || d > 20 {
+		t.Errorf("1,000 distinct values: %d", got[1])
+	}
+	var squares float64
+	for i, n := range got[2:] {
+		e := float64(n)/100000 - 1
+		squares += e * e
+		if math.Abs(e) > 0.05 {
+			t.Errorf("%s, 100,000 distinct values: %d (%.1f%% off)", names[i+2], n, 100*e)
+		}
+	}
+	rms := math.Sqrt(squares / sets)
+	t.Logf("sets of 100,000 values: %.2f%% off on average", 100*rms)
+	if rms > 0.02 {
+		t.Error("sets of 100,000 values: more than 2% off on average")
+	}
+	// Snowflake's dialect counts alike; so does the name in lower case.
+	mustExec(t, cs.admin, "SET sql_dialect = 'snowflake'")
+	snow := counts(profile("APPROX_COUNT_DISTINCT"))
+	mustExec(t, cs.admin, "SET sql_dialect = 'duckdb'")
+	if lower := counts(profile("approx_count_distinct")); !slices.Equal(lower, got) || !slices.Equal(snow, got) {
+		t.Errorf("DuckDB's dialect counts %v, in lower case %v, Snowflake's %v", got, lower, snow)
+	}
+
+	// A call without an alias keeps the name DuckDB gives its column.
+	rows, err := cs.admin.Query(ctx, `SELECT approx_count_distinct(c1), approx_count_distinct("c0") FROM profile`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var unnamed []string
+	for _, f := range rows.FieldDescriptions() {
+		unnamed = append(unnamed, f.Name)
+	}
+	var c1, c0 int64
+	for rows.Next() {
+		if err := rows.Scan(&c1, &c0); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if rows.Close(); rows.Err() != nil || c1 != got[1] || c0 != 6 ||
+		!slices.Equal(unnamed, []string{"approx_count_distinct(c1)", "approx_count_distinct(c0)"}) {
+		t.Errorf("without aliases: columns %q, counts %d and %d, %v", unnamed, c1, c0, rows.Err())
+	}
+
+	// Grouped and as a window function, exactly; nothing to count is 0, and
+	// NULLs do not count.
+	expectRows(t, cs.admin, "SELECT g, approx_count_distinct(c1) FROM profile GROUP BY g ORDER BY g", "0|500", "1|500")
+	expectRows(t, cs.admin, "SELECT DISTINCT g, approx_count_distinct(c1) OVER (PARTITION BY g) AS n FROM profile ORDER BY g", "0|500", "1|500")
+	expectRows(t, cs.admin, "SELECT approx_count_distinct(c1) FROM profile WHERE false", "0")
+	expectRows(t, cs.admin, "SELECT approx_count_distinct(x) FROM (VALUES (1), (NULL), (1), (2)) v(x)", "2")
+
+	ts := startServer(t)
+	conn := ts.admin(t, pgx.QueryExecModeSimpleProtocol)
+	var n int64
+	if err := conn.QueryRow(ctx, "SELECT approx_count_distinct(x) FROM (VALUES (1), (2), (2)) t(x)").Scan(&n); err != nil || n != 2 {
 		t.Errorf("without the extension: %d %v", n, err)
 	}
 }

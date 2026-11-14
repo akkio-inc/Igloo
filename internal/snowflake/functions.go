@@ -2119,7 +2119,8 @@ func countFn(c *call) (*node, error) {
 // has 64 registers, and errs by about 13%. In a select with GROUP BY (see
 // collectGrouped) and as window functions they count exactly: a sketch per
 // group or partition is slower than COUNT(DISTINCT), by 25 times with
-// millions of groups, and up to twice as fast with a few hundred.
+// millions of groups, and up to twice as fast with a few hundred. Igloo
+// counts DuckDB's own approx_count_distinct the same way (see SketchCount).
 func approxCountDistinct(c *call) (*node, error) {
 	if err := c.argc(1, -1); err != nil {
 		return nil, err
@@ -2129,15 +2130,11 @@ func approxCountDistinct(c *call) (*node, error) {
 	case c.t.grouped[c.span[0]] || len(c.over) > 0:
 		fn = "count(DISTINCT "
 	case c.t.opts.Sketches:
-		parts := []any{"CAST(coalesce(round(datasketch_hll_estimate(datasketch_hll(12, CASE WHEN "}
+		ops := make([]any, len(c.args))
 		for k := range c.args {
-			if k > 0 {
-				parts = append(parts, " AND ")
-			}
-			parts = append(parts, c.op(k), " IS NOT NULL")
+			ops[k] = c.op(k)
 		}
-		parts = append(parts, " THEN hash(", c.list(0), ") END))), 0) AS BIGINT)")
-		return c.out(parts...), nil
+		return c.out(sketchCount(nil, ops, c.list(0))...), nil
 	}
 	if len(c.args) == 1 {
 		return c.out(fn, c.arg(0), ")", c.over), nil
@@ -2151,6 +2148,48 @@ func approxCountDistinct(c *call) (*node, error) {
 	}
 	parts = append(parts, " THEN (", c.list(0), ") END)", c.over)
 	return c.out(parts...), nil
+}
+
+// sketchCount returns the parts of the DuckDB text that counts distinct
+// values with the datasketches extension, as APPROX_COUNT_DISTINCT does:
+// ops are the values, each ready to sit next to an operator, and list is
+// all of them separated by commas. A row counts where no value is NULL and
+// the condition where, if it is not nil, holds; the count of no rows is 0,
+// a BIGINT.
+func sketchCount(where any, ops []any, list any) []any {
+	parts := []any{"CAST(coalesce(round(datasketch_hll_estimate(datasketch_hll(12, CASE WHEN "}
+	if where != nil {
+		parts = append(parts, where, " AND ")
+	}
+	for k, op := range ops {
+		if k > 0 {
+			parts = append(parts, " AND ")
+		}
+		parts = append(parts, op, " IS NOT NULL")
+	}
+	return append(parts, " THEN hash(", list, ") END))), 0) AS BIGINT)")
+}
+
+// SketchCount is APPROX_COUNT_DISTINCT's translation with the datasketches
+// extension (see approxCountDistinct) of values written in DuckDB's
+// dialect, each ready to sit next to an operator, counting only the rows
+// where the condition where, if it is not empty, holds. Igloo counts
+// DuckDB's own approx_count_distinct with it too, so that both dialects
+// count alike.
+func SketchCount(where string, values ...string) string {
+	var cond any
+	if where != "" {
+		cond = where
+	}
+	ops := make([]any, len(values))
+	for k, v := range values {
+		ops[k] = v
+	}
+	var b strings.Builder
+	for _, p := range sketchCount(cond, ops, strings.Join(values, ", ")) {
+		b.WriteString(p.(string))
+	}
+	return b.String()
 }
 
 // timeFromParts translates TIME_FROM_PARTS(h, m, s [, ns]); the parts may

@@ -263,10 +263,11 @@ In detail, a part runs distributed when:
   HyperLogLog sketches combine too: `datasketch_hll(k, x)` and
   `datasketch_hll_union(k, sketch)` of a constant `k`, which is what
   Snowflake's `HLL_ACCUMULATE` and `HLL_COMBINE` become, and
-  `APPROX_COUNT_DISTINCT` and `HLL` without `GROUP BY` (with it, they count
-  `DISTINCT` values exactly, as above). Each worker sketches its share's values and the
-  final stage merges the sketches, so the estimate is one machine's, within
-  the sketch's error, and no values cross.
+  `APPROX_COUNT_DISTINCT` (in either dialect) and `HLL` without `GROUP BY`
+  (with it, they count `DISTINCT` values exactly, as above). Each worker
+  sketches its share's values and the final stage merges the sketches, so
+  the estimate is one machine's, within the sketch's error, and no values
+  cross.
   `GROUP BY` may use positions, aliases, `ALL`, `ROLLUP`, `CUBE` and
   `GROUPING SETS`. A scalar subquery that stands on its own, in the select
   list, `HAVING` or `ORDER BY` of an aggregation (`count(*) / (SELECT
@@ -324,9 +325,9 @@ In detail, a part runs distributed when:
   its source to, every task lists itself beside its share of the source.
 
 Everything else runs on one machine: median and other aggregates that do
-not combine (`median`, `quantile`, `approx_count_distinct`, `string_agg`,
-`list(x ORDER BY y)`), except over a relation workers compute, which is then
-partitioned by the groups so that each worker computes whole groups;
+not combine (`median`, `quantile`, `string_agg`, `list(x ORDER BY y)`),
+except over a relation workers compute, which is then partitioned by the
+groups so that each worker computes whole groups;
 aggregates over `DISTINCT` values of unrelated
 expressions in one `SELECT` (`count(DISTINCT a), count(DISTINCT b)`),
 window functions over rows but those of the next section, a large table read again in a correlated

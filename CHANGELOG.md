@@ -20,6 +20,18 @@ The release workflow publishes the section whose heading matches the tag
   `'random'`, and `early_stop` and `min_rel_progress` no longer change
   training. `TRAINING_INFO` has a row for each epoch.
 
+### Fixed
+
+- In DuckDB's dialect, `approx_count_distinct` counts as `APPROX_COUNT_DISTINCT`
+  does in Snowflake's, so both dialects give the same counts. It was DuckDB's
+  own HyperLogLog of 64 registers, which errs by about 13%: a column profile
+  counted 6 categories as 5 and 1,000 values as 1,249, and was off by 15% on
+  average over 40 columns of 100,000 values, by up to 40%. It now counts with
+  DataSketches' HyperLogLog of 4,096 registers, as Snowflake's dialect does:
+  6, 1,020, and 1.8% on average. In a select with `GROUP BY` and as a window
+  function it counts exactly, as `count(DISTINCT x)`. A select item without
+  an alias that is the call of a column keeps the column name DuckDB gave it.
+
 ## [1.0.0-rc.6] - 2026-11-14
 
 ### Fixed
