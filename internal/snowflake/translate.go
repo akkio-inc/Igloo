@@ -373,10 +373,54 @@ func (t *translator) statement(nodes []*node) ([]*node, string, error) {
 			"read files with read_parquet or read_csv, or load them with COPY INTO from a location in IGLOO_ALLOWED_LOCATIONS")
 	case "GRANT", "REVOKE":
 		return t.grantStatement(nodes, idx)
+	case "UPDATE", "MERGE":
+		return t.expressions(unqualifyAssignments(nodes))
 	case "UNDROP":
 		return nil, "", unsupported("UNDROP", "query an earlier snapshot of a table with AT (TIMESTAMP => ...) instead")
 	}
 	return t.expressions(nodes)
+}
+
+// unqualifyAssignments drops the table from each column a SET assigns, in
+// UPDATE t SET t.a = 1 and in MERGE ... THEN UPDATE SET m.ver = m.ver + 1:
+// Snowflake accepts the qualifier and DuckDB refuses it ("Qualified column
+// names in UPDATE .. SET not supported"). The assigned column is always the
+// target table's, so the bare name means the same; the value keeps its
+// qualifiers.
+func unqualifyAssignments(nodes []*node) []*node {
+	out := append([]*node(nil), nodes...)
+	for i := 0; i < len(out); i++ {
+		if !out[i].isOp("=") || !assignment(out, i) {
+			continue
+		}
+		col := prevSig(out, i)
+		if col < 0 {
+			continue
+		}
+		if _, _, ok := out[col].name(); !ok {
+			continue
+		}
+		start := col
+		for {
+			dot := prevSig(out, start)
+			if dot < 0 || !out[dot].isOp(".") {
+				break
+			}
+			q := prevSig(out, dot)
+			if q < 0 {
+				break
+			}
+			if _, _, ok := out[q].name(); !ok {
+				break
+			}
+			start = q
+		}
+		if start < col {
+			out = append(out[:start], out[col:]...)
+			i -= col - start
+		}
+	}
+	return out
 }
 
 // expressions translates the expressions and clauses of a statement.

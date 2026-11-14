@@ -9,6 +9,13 @@ The release workflow publishes the section whose heading matches the tag
 
 ## [Unreleased]
 
+### Fixed
+
+- In the Snowflake dialect, `UPDATE` and `MERGE` accept the target's name or
+  alias on the columns `SET` assigns, as Snowflake does: `UPDATE t SET t.a = 1`
+  and `MERGE ... WHEN MATCHED THEN UPDATE SET m.ver = m.ver + 1` failed with
+  `Qualified column names in UPDATE .. SET not supported`.
+
 ## [1.0.0-rc.4] - 2026-11-13
 
 ### Fixed

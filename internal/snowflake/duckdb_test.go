@@ -406,3 +406,43 @@ func TestLikeAnyContains(t *testing.T) {
 		}
 	}
 }
+
+// TestAssignedColumnsLoseTheirTable checks that UPDATE and MERGE, written as
+// Snowflake takes them with the target's alias on the columns SET assigns, run
+// on DuckDB, and that only the assigned column loses its table.
+func TestAssignedColumnsLoseTheirTable(t *testing.T) {
+	conn := session(t)
+	ctx := context.Background()
+	for _, s := range []string{
+		"CREATE TABLE meta (audience_id VARCHAR, ver BIGINT, size BIGINT)",
+		"INSERT INTO meta VALUES ('a', 1, 3)",
+	} {
+		if _, err := conn.ExecContext(ctx, s); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, in := range []string{
+		"MERGE INTO meta AS m USING (SELECT 'a' AS audience_id) AS s ON m.audience_id = s.audience_id " +
+			"WHEN MATCHED THEN UPDATE SET m.ver = m.ver + 1, size = 5 " +
+			"WHEN NOT MATCHED THEN INSERT (audience_id, ver, size) VALUES ('a', 0, 5)",
+		"UPDATE meta AS m SET m.ver = m.ver * 10, \"M\".size = m.size + 1 WHERE m.audience_id = 'a'",
+	} {
+		res, err := Translate(in, Options{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(res.SQL, "m.ver") {
+			t.Errorf("the value lost its qualifier: %s", res.SQL)
+		}
+		if _, err := conn.ExecContext(ctx, res.SQL); err != nil {
+			t.Fatalf("%v\n%s", err, res.SQL)
+		}
+	}
+	var ver, size int
+	if err := conn.QueryRowContext(ctx, "SELECT ver, size FROM meta").Scan(&ver, &size); err != nil {
+		t.Fatal(err)
+	}
+	if ver != 20 || size != 6 {
+		t.Errorf("got ver %d size %d, want 20 and 6", ver, size)
+	}
+}
