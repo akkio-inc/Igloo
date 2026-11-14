@@ -1,7 +1,6 @@
 package ml
 
 import (
-	"errors"
 	"math"
 	"math/rand/v2"
 )
@@ -13,18 +12,6 @@ type KMeans struct {
 	Centroids []float64
 }
 
-// KMeansParams configure TrainKMeans.
-type KMeansParams struct {
-	// Iterations bounds Lloyd's iterations (default 20); training stops
-	// sooner once the mean squared distance improves by less than
-	// MinRelProgress of itself (default 0.01).
-	Iterations     int
-	MinRelProgress float64
-	Seed           uint64
-	Threads        int
-	Interrupt      func() error
-}
-
 // KMeansInfo is what training learned besides the centroids.
 type KMeansInfo struct {
 	// Loss is the mean squared distance of rows to their centroids after
@@ -34,39 +21,6 @@ type KMeansInfo struct {
 
 // initSample bounds the rows k-means++ seeds the centroids from.
 const initSample = 100_000
-
-// TrainKMeans clusters n vectors of d values (row-major) into k clusters:
-// centroids seeded by k-means++, then Lloyd's iterations.
-func TrainKMeans(x []float64, n, d, k int, p KMeansParams) (*KMeans, KMeansInfo, error) {
-	var info KMeansInfo
-	if k < 1 || k > n {
-		return nil, info, errors.New("k-means needs at least as many distinct rows as clusters")
-	}
-	if p.Iterations <= 0 {
-		p.Iterations = 20
-	}
-	if p.MinRelProgress <= 0 {
-		p.MinRelProgress = 0.01
-	}
-	km := &KMeans{K: k, D: d, Centroids: seedCentroids(x, n, d, k, p.Seed)}
-	assign := make([]int32, n)
-	prev := math.Inf(1)
-	for range p.Iterations {
-		if p.Interrupt != nil {
-			if err := p.Interrupt(); err != nil {
-				return nil, info, err
-			}
-		}
-		loss := km.assign(x, n, assign, p.Threads)
-		info.Loss = append(info.Loss, loss)
-		km.update(x, n, assign, p.Threads)
-		if prev-loss < p.MinRelProgress*loss {
-			break
-		}
-		prev = loss
-	}
-	return km, info, nil
-}
 
 // seedCentroids picks k rows by k-means++: the first at random, each next
 // with a chance proportional to its squared distance from the nearest
@@ -160,57 +114,6 @@ func (km *KMeans) assign(x []float64, n int, assign []int32, threads int) float6
 		total += v
 	}
 	return total / float64(max(n, 1))
-}
-
-// update moves each centroid to the mean of its rows; a centroid left
-// with none moves to the row farthest from its own.
-func (km *KMeans) update(x []float64, n int, assign []int32, threads int) {
-	K, D := km.K, km.D
-	type part struct {
-		sum   []float64
-		count []int
-	}
-	parts := make([]part, numChunks(n))
-	parallelFor(len(parts), threads, func(ch int) {
-		lo, hi := chunkRange(ch, n)
-		p := part{sum: make([]float64, K*D), count: make([]int, K)}
-		for i := lo; i < hi; i++ {
-			c := int(assign[i])
-			p.count[c]++
-			row := x[i*D : (i+1)*D]
-			s := p.sum[c*D : (c+1)*D]
-			for j, v := range row {
-				s[j] += v
-			}
-		}
-		parts[ch] = p
-	})
-	sum, count := make([]float64, K*D), make([]int, K)
-	for _, p := range parts {
-		for i, v := range p.sum {
-			sum[i] += v
-		}
-		for c, v := range p.count {
-			count[c] += v
-		}
-	}
-	for c := range K {
-		if count[c] == 0 {
-			far, fd := 0, -1.0
-			for i := range n {
-				own := int(assign[i])
-				if dd := sqDist(x[i*D:(i+1)*D], km.Centroids[own*D:(own+1)*D]); dd > fd {
-					far, fd = i, dd
-				}
-			}
-			copy(km.Centroids[c*D:(c+1)*D], x[far*D:(far+1)*D])
-			assign[far] = int32(c)
-			continue
-		}
-		for j := range D {
-			km.Centroids[c*D+j] = sum[c*D+j] / float64(count[c])
-		}
-	}
 }
 
 // KMeansStats are a clustering's quality on rows.

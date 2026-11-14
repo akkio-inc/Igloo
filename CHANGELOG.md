@@ -9,6 +9,17 @@ The release workflow publishes the section whose heading matches the tag
 
 ## [Unreleased]
 
+### Changed
+
+- `IGLOO.ML.KMEANS` trains by e-means (arXiv 2611.09501), mini-batch k-means
+  with exponentially decayed centroids, from k-means++ centroids, for
+  `max_iterations` epochs (now default 5). On held-out rows it matched or
+  beat Lloyd's iterations at every cluster count from 3 to 100 (0.9% lower
+  loss at 16 clusters, 2.4% at 32), in about the same time from 16 clusters
+  up and at most twice the time below. `kmeans_init_method` also takes
+  `'random'`, and `early_stop` and `min_rel_progress` no longer change
+  training. `TRAINING_INFO` has a row for each epoch.
+
 ## [1.0.0-rc.6] - 2026-11-14
 
 ### Fixed

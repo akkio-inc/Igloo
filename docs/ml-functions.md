@@ -590,14 +590,18 @@ WHERE is_anomaly;
 ```
 
 k-means clustering of every column, numbers standardized
-(`'standardize_features'`, default `TRUE`) and categories one hot, seeded
-by k-means++ and refined by Lloyd's iterations (`max_iterations`, default
-20, until the mean squared distance improves by less than
-`min_rel_progress`, 0.01, unless `'early_stop': FALSE`). Without
-`num_clusters` (2 to 100), Igloo clusters up to 20,000 of the rows into 2
-to 10 clusters and keeps the number whose Davies-Bouldin index is lowest;
-the model's `hyperparameters` record each. `kmeans_init_method` is
-`'kmeans++'` and `distance_type` `'euclidean'`; others are refused.
+(`'standardize_features'`, default `TRUE`) and categories one hot,
+trained by [e-means](https://arxiv.org/abs/2611.09501): mini-batch
+k-means whose centroids are exponentially decayed means of the rows
+assigned to them, for `max_iterations` epochs (default 5). It starts from
+k-means++ centroids, or with `'kmeans_init_method': 'random'` from rows
+drawn at random, as the paper does; with few clusters a random start can
+put two centroids in one group. `early_stop` and `min_rel_progress` are
+accepted and change nothing: e-means runs every epoch on its schedule.
+Without `num_clusters` (2 to 100), Igloo clusters up to 20,000 of the rows
+into 2 to 10 clusters and keeps the number whose Davies-Bouldin index is
+lowest; the model's `hyperparameters` record each. `distance_type` is
+`'euclidean'`; others are refused.
 
 | Method | Returns |
 |---|---|
@@ -605,7 +609,7 @@ the model's `hyperparameters` record each. `kmeans_init_method` is
 | `DETECT_ANOMALIES` | `is_anomaly`, `normalized_distance` (the distance to the nearest centroid divided by the mean distance of its training rows) and `centroid_id`; `CONFIG_OBJECT => {'contamination': x}` (more than 0, at most 0.5) is the share of training rows that would be anomalies, which sets the threshold |
 | `EVALUATE` | `davies_bouldin_index` and `mean_squared_distance` (in standardized units), on the training rows or on `INPUT_DATA` |
 | `CENTROIDS` | `centroid_id`, `feature`, `numerical_value` (in the feature's own units), and for categories `category` and `categorical_value`, the share of the cluster's rows in it |
-| `TRAINING_INFO` | each iteration's mean squared distance, as `loss` |
+| `TRAINING_INFO` | each epoch's mean squared distance, as `loss`, then the final centroids' |
 
 ### PCA
 

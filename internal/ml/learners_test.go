@@ -158,7 +158,7 @@ func TestKMeans(t *testing.T) {
 		c := centers[i%3]
 		x[i*d], x[i*d+1] = c[0]+0.5*r.NormFloat64(), c[1]+0.5*r.NormFloat64()
 	}
-	km, _, err := TrainKMeans(x, n, d, 3, KMeansParams{Seed: 4})
+	km, _, err := TrainEMeans(x, n, d, 3, EMeansParams{Seed: 4})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -172,12 +172,12 @@ func TestKMeans(t *testing.T) {
 	if st.DaviesBouldin > 0.3 || slices.Min(st.Counts) != 300 {
 		t.Errorf("stats %+v", st)
 	}
-	km2, _, _ := TrainKMeans(x, n, d, 3, KMeansParams{Seed: 4, Threads: 1})
+	km2, _, _ := TrainEMeans(x, n, d, 3, EMeansParams{Seed: 4, Threads: 1})
 	if !slices.Equal(km.Centroids, km2.Centroids) {
 		t.Error("k-means depends on the threads")
 	}
 	// Two clusters fit these rows worse.
-	km2, _, _ = TrainKMeans(x, n, d, 2, KMeansParams{Seed: 4})
+	km2, _, _ = TrainEMeans(x, n, d, 2, EMeansParams{Seed: 4})
 	if st2 := km2.Stats(x, n, 0); st2.DaviesBouldin <= st.DaviesBouldin {
 		t.Errorf("Davies-Bouldin of 2 clusters %v, of 3 %v", st2.DaviesBouldin, st.DaviesBouldin)
 	}
