@@ -7,7 +7,7 @@ All notable changes to Igloo are recorded here. The format follows
 The release workflow publishes the section whose heading matches the tag
 (`## [1.2.3] - YYYY-MM-DD` for `v1.2.3`) as that GitHub Release's notes.
 
-## [Unreleased]
+## [1.0.0-rc.7] - 2026-11-14
 
 ### Changed
 
