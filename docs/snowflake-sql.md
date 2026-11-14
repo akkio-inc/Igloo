@@ -136,7 +136,11 @@ JSON and JSON text alike.
   `ARRAY_FLATTEN`, `ARRAY_GENERATE_RANGE`, `SPLIT`, `STRTOK_TO_ARRAY`.
 - `[LATERAL] FLATTEN(input => ..., path => ..., outer => ..., recursive =>
   ..., mode => ...)` and `TABLE(FLATTEN(...))`, with the columns `SEQ`,
-  `KEY`, `PATH`, `INDEX`, `VALUE` and `THIS`. `FLATTEN` of an `ARRAY` or
+  `KEY`, `PATH`, `INDEX`, `VALUE` and `THIS`. It joins after a comma or
+  with `JOIN`, `INNER JOIN` or `LEFT [OUTER] JOIN`, without `ON` as
+  Snowflake writes it, and `SPLIT_TO_TABLE` and `GENERATOR` join so too; a
+  `LEFT JOIN` keeps a row for which `FLATTEN` gives no rows, with `NULL`s,
+  as `OUTER => TRUE` does. `FLATTEN` of an `ARRAY` or
   `OBJECT` column unnests its list or map directly, and `FLATTEN` of an
   array constant (`[OBJECT_CONSTRUCT(...), ...]`, `ARRAY_CONSTRUCT(...)`)
   unnests its elements without building the array: over 15 million
@@ -236,6 +240,22 @@ known to be one: `ARRAY_AGG`, `ARRAY_CONSTRUCT`, `[...]`, `SPLIT`,
 query's `SELECT` (not of a `UNION`'s). Any other semi-structured value,
 `PARSE_JSON(...)` among them, makes a `VARIANT` column, the JSON text of its
 values; cast it to `ARRAY` or `OBJECT` for a list or a map.
+
+A statement in Snowflake's dialect sends each `ARRAY` and `OBJECT` value to
+the client as one value of PostgreSQL's `json` type, the JSON text of the
+whole array or object, whether it computes the value or selects a column
+that holds it; a `VARIANT` value it computes (`PARSE_JSON(s)`, `v:a`) is
+`json` too, and a `VARIANT` column of an Iceberg table, which holds its
+values' JSON text, is sent as that text (`text`). An `ARRAY` or `OBJECT`
+column goes out as `TO_JSON` reads it, its elements' objects and arrays as
+objects and arrays: after `CREATE TABLE t AS SELECT
+ARRAY_AGG(OBJECT_CONSTRUCT('zip_code', z)) AS zips ...`, `SELECT zips FROM
+t` sends `[{"zip_code":"55603"}]`, as the `ARRAY_AGG` itself does. In
+DuckDB's dialect the same column arrives as JSON of its strings,
+`["{\"zip_code\":\"55603\"}"]`. Structured `ARRAY(type)`, `OBJECT(...)` and
+`MAP(...)` columns are `json` too, their values as typed, except that
+`ARRAY(VARCHAR)` and `MAP(VARCHAR, VARCHAR)`, the same DuckDB types as
+`ARRAY` and `OBJECT` columns, go out as those do.
 
 ### Functions
 
@@ -449,12 +469,11 @@ What Igloo cannot reproduce exactly, and what it does instead.
 - Objects list their keys in alphabetical order, as Snowflake shows them;
   `OBJECT_CONSTRUCT_KEEP_NULL` and `OBJECT_INSERT` keep `null` values.
 - An `ARRAY` or `OBJECT` column holds numbers and booleans as their text
-  (`["1","true"]`): `TYPEOF(a[0])` is `VARCHAR` and `TO_JSON(a)` shows
-  them quoted, where Snowflake shows `INTEGER` and `[1,true]`. Comparing,
-  casting and summing them gives the number. Selecting such a column
-  shows objects and arrays inside it as their JSON text in quotes;
-  `TO_JSON(a)` and `a::VARIANT` show them as objects and arrays. Store a
-  value whose types matter in a `VARIANT` column.
+  (`["1","true"]`): `TYPEOF(a[0])` is `VARCHAR`, and `TO_JSON(a)` and
+  selecting the column show them quoted, where Snowflake shows `INTEGER`
+  and `[1,true]`. Comparing, casting and summing them gives the number.
+  Objects and arrays inside it read and show as objects and arrays. Store
+  a value whose types matter in a `VARIANT` column.
 - A masking policy on an `ARRAY` or `OBJECT` column returns its type, as
   the column holds it: Igloo casts what its expression returns, so
   `OBJECT_CONSTRUCT(...)` works.

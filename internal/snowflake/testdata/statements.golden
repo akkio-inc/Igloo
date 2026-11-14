@@ -67,6 +67,18 @@ SELECT json_extract_string(f.value, '$.name') AS "F.VALUE:NAME::STRING", f.index
 -- SELECT s.value FROM TABLE(SPLIT_TO_TABLE('a,b', ',')) s
 SELECT s.value FROM LATERAL (SELECT CAST(NULL AS BIGINT) AS "SEQ", _sf_i AS "INDEX", _sf_split._sf_parts[_sf_i] AS "VALUE" FROM (SELECT string_split('a,b', ',') AS _sf_parts) AS _sf_split, range(1, len(_sf_split._sf_parts) + 1) AS _sf_range(_sf_i) ORDER BY _sf_i) AS "s"
 
+-- SELECT f.key, SUM(f.value:count::integer) AS events FROM t LEFT JOIN LATERAL FLATTEN(input => t.info, outer => true) f WHERE t.d BETWEEN '2000-01-01' AND '2050-01-01' GROUP BY f.key
+SELECT f.key, SUM(CAST(json_extract_string(f.value, '$.count') AS BIGINT)) AS "EVENTS" FROM t LEFT JOIN LATERAL (SELECT CAST(NULL AS BIGINT) AS "SEQ", CASE WHEN json_type(_sf_flatten_input._sf_this) = 'OBJECT' THEN _sf_flatten.key END AS "KEY", coalesce(regexp_replace(substring(_sf_flatten.fullkey, 2), '^\.', ''), '') AS "PATH", CASE WHEN json_type(_sf_flatten_input._sf_this) = 'ARRAY' THEN CAST(_sf_flatten.key AS BIGINT) END AS "INDEX", _sf_flatten.value AS "VALUE", _sf_flatten_input._sf_this AS "THIS" FROM (SELECT sf_json(t.info) AS _sf_this) AS _sf_flatten_input LEFT JOIN LATERAL (SELECT * FROM json_each(_sf_flatten_input._sf_this) AS _sf_flatten WHERE json_type(_sf_flatten_input._sf_this) IN ('ARRAY', 'OBJECT')) AS _sf_flatten ON true ORDER BY _sf_flatten.id) AS "f" ON true WHERE t.d BETWEEN '2000-01-01' AND '2050-01-01' GROUP BY f.key
+
+-- SELECT f.value FROM t JOIN LATERAL FLATTEN(input => t.items) f
+SELECT f.value FROM t JOIN LATERAL (SELECT CAST(NULL AS BIGINT) AS "SEQ", _sf_flatten._sf_key AS "KEY", coalesce(CASE WHEN _sf_flatten._sf_key IS NULL THEN '[' || _sf_flatten._sf_index || ']' ELSE _sf_flatten._sf_key END, '') AS "PATH", _sf_flatten._sf_index AS "INDEX", _sf_flatten._sf_value AS "VALUE", CAST(NULL AS JSON) AS "THIS" FROM (SELECT unnest(sf_flatten_values(t.items, 'BOTH')) AS _sf_value, CAST(NULL AS VARCHAR) AS _sf_key, CAST(NULL AS BIGINT) AS _sf_index) AS _sf_flatten) AS "f" ON true
+
+-- SELECT f.value FROM t INNER JOIN LATERAL FLATTEN(input => t.items) f WHERE t.id > 1
+SELECT f.value FROM t INNER JOIN LATERAL (SELECT CAST(NULL AS BIGINT) AS "SEQ", _sf_flatten._sf_key AS "KEY", coalesce(CASE WHEN _sf_flatten._sf_key IS NULL THEN '[' || _sf_flatten._sf_index || ']' ELSE _sf_flatten._sf_key END, '') AS "PATH", _sf_flatten._sf_index AS "INDEX", _sf_flatten._sf_value AS "VALUE", CAST(NULL AS JSON) AS "THIS" FROM (SELECT unnest(sf_flatten_values(t.items, 'BOTH')) AS _sf_value, CAST(NULL AS VARCHAR) AS _sf_key, CAST(NULL AS BIGINT) AS _sf_index) AS _sf_flatten) AS "f" ON (t.id > 1)
+
+-- SELECT s.value FROM t LEFT OUTER JOIN TABLE(SPLIT_TO_TABLE(t.s, ',')) s
+SELECT s.value FROM t LEFT OUTER JOIN LATERAL (SELECT CAST(NULL AS BIGINT) AS "SEQ", _sf_i AS "INDEX", _sf_split._sf_parts[_sf_i] AS "VALUE" FROM (SELECT string_split(t.s, ',') AS _sf_parts) AS _sf_split, range(1, len(_sf_split._sf_parts) + 1) AS _sf_range(_sf_i) ORDER BY _sf_i) AS "s" ON true
+
 -- SELECT SPLIT(s, ','), SPLIT_PART(s, ',', 0), STRTOK(s, ' ', 2) FROM t
 SELECT to_json(string_split(s, ',')) AS "SPLIT(S, ',')", split_part(s, ',', 1) AS "SPLIT_PART(S, ',', 0)", sf_tokens(s, ' ')[CAST(2 AS BIGINT)] AS "STRTOK(S, ' ', 2)" FROM t
 

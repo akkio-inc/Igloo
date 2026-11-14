@@ -2,6 +2,7 @@ package pgwire
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"log/slog"
 	"slices"
@@ -11,6 +12,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/akkio-inc/igloo/internal/audit"
 	"github.com/akkio-inc/igloo/internal/auth"
@@ -661,3 +663,156 @@ type discard struct{}
 func (discard) Columns([]Column) error { return nil }
 func (discard) Row([]any) error        { return nil }
 func (discard) Complete(string) error  { return nil }
+
+// wireRows runs sql and returns its result's column types as the client was
+// told them, and its rows, values separated by "|": a json value as the text
+// the server sent, NULL as NULL, anything else as pgx decodes it.
+func wireRows(t *testing.T, conn *pgx.Conn, sql string) ([]uint32, []string) {
+	t.Helper()
+	rows, err := conn.Query(context.Background(), sql)
+	if err != nil {
+		t.Fatalf("%s: %v", sql, err)
+	}
+	defer rows.Close()
+	var oids []uint32
+	for _, f := range rows.FieldDescriptions() {
+		oids = append(oids, f.DataTypeOID)
+	}
+	var out []string
+	for rows.Next() {
+		vals, err := rows.Values()
+		if err != nil {
+			t.Fatal(err)
+		}
+		parts := make([]string, len(vals))
+		for i, v := range vals {
+			raw := rows.RawValues()[i]
+			switch {
+			case raw == nil:
+				parts[i] = "NULL"
+			case oids[i] == pgtype.JSONOID:
+				parts[i] = string(raw)
+			case oids[i] == pgtype.NumericOID:
+				n := v.(pgtype.Numeric)
+				f, _ := n.Float64Value()
+				parts[i] = fmt.Sprint(f.Float64)
+			default:
+				parts[i] = fmt.Sprint(v)
+			}
+		}
+		out = append(out, strings.Join(parts, "|"))
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("%s: %v", sql, err)
+	}
+	return oids, out
+}
+
+// A lateral FLATTEN joined with LEFT JOIN and no ON, as an audience report
+// runs it in Snowflake, runs through a session, in each protocol, with the
+// rows and column types Snowflake's would have.
+func TestSnowflakeFlattenLeftJoin(t *testing.T) {
+	t.Parallel()
+	ts := startServer(t)
+	setup := ts.admin(t, pgx.QueryExecModeSimpleProtocol)
+	mustExec(t, setup, "SET sql_dialect = 'snowflake'")
+	for _, s := range []string{
+		`CREATE TABLE content (id STRING, partition_date DATE, daily_category_info VARIANT)`,
+		`INSERT INTO content SELECT 'a', '2024-01-01', PARSE_JSON('{"news":{"count":3,"domains":["x.com","y.com"]},"sport":{"count":1,"domains":["z.com"]}}')`,
+		`INSERT INTO content SELECT 'b', '2024-01-02', PARSE_JSON('{}')`,
+		`INSERT INTO content SELECT 'c', '2024-01-03', NULL`,
+		`INSERT INTO content SELECT 'd', '2051-01-01', PARSE_JSON('{"news":{"count":5,"domains":["x.com"]}}')`,
+		`INSERT INTO content SELECT 'e', '2024-01-05', PARSE_JSON('{"tech":{"count":9,"domains":[]}}')`,
+		`CREATE TABLE audience AS SELECT column1 AS id FROM VALUES ('a'), ('b'), ('c'), ('d')`,
+	} {
+		mustExec(t, setup, s)
+	}
+	const report = `SELECT f.key AS category, COUNT(DISTINCT t.ID) AS ids, SUM(ARRAY_SIZE(f.value:domains)) AS domains, SUM(f.value:count::integer) AS events
+FROM content t
+INNER JOIN audience a ON a.ID = t.ID
+LEFT JOIN LATERAL FLATTEN(input => t.DAILY_CATEGORY_INFO, outer => true) f
+WHERE t.PARTITION_DATE BETWEEN '2000-01-01' AND '2050-01-01'
+GROUP BY f.key ORDER BY events DESC LIMIT 2400`
+	for name, mode := range modes {
+		t.Run(name, func(t *testing.T) {
+			conn := ts.admin(t, mode)
+			mustExec(t, conn, "SET sql_dialect = 'snowflake'")
+			oids, rows := wireRows(t, conn, report)
+			if want := []uint32{pgtype.TextOID, pgtype.Int8OID, pgtype.NumericOID, pgtype.NumericOID}; !slices.Equal(oids, want) {
+				t.Errorf("column types %v, want %v", oids, want)
+			}
+			if want := []string{"NULL|2|NULL|NULL", "news|1|2|3", "sport|1|1|1"}; !slices.Equal(rows, want) {
+				t.Errorf("rows %q, want %q", rows, want)
+			}
+			// Without OUTER the LEFT JOIN keeps the rows FLATTEN gives none
+			// for; JOIN does not.
+			_, rows = wireRows(t, conn, `SELECT t.id, f.key, f.value FROM content t LEFT JOIN LATERAL FLATTEN(input => t.daily_category_info) f ORDER BY 1, 2`)
+			if want := []string{`a|news|{"count":3,"domains":["x.com","y.com"]}`, `a|sport|{"count":1,"domains":["z.com"]}`, "b|NULL|NULL", "c|NULL|NULL",
+				`d|news|{"count":5,"domains":["x.com"]}`, `e|tech|{"count":9,"domains":[]}`}; !slices.Equal(rows, want) {
+				t.Errorf("LEFT JOIN: %q, want %q", rows, want)
+			}
+			_, rows = wireRows(t, conn, `SELECT t.id, f.key FROM content t JOIN LATERAL FLATTEN(input => t.daily_category_info) f ORDER BY 1, 2`)
+			if want := []string{"a|news", "a|sport", "d|news", "e|tech"}; !slices.Equal(rows, want) {
+				t.Errorf("JOIN: %q, want %q", rows, want)
+			}
+		})
+	}
+}
+
+// A statement in Snowflake's dialect sends an ARRAY or an OBJECT as one
+// json value, its objects and arrays as objects and arrays, however it
+// computes it: an aggregate, a table's ARRAY or OBJECT column that holds
+// one, and structured columns. DuckDB's dialect sends the same columns as
+// before, as JSON of their strings.
+func TestSnowflakeSemiStructuredResults(t *testing.T) {
+	t.Parallel()
+	ts := startServer(t)
+	setup := ts.admin(t, pgx.QueryExecModeSimpleProtocol)
+	mustExec(t, setup, "SET sql_dialect = 'snowflake'")
+	for _, s := range []string{
+		`CREATE TABLE z (zip STRING, g INT)`,
+		`INSERT INTO z SELECT column1, column2 FROM VALUES ('55603', 1), ('55604', 1), ('10001', 2)`,
+		`CREATE TABLE agg AS SELECT g, ARRAY_AGG(OBJECT_CONSTRUCT('zip_code', zip)) WITHIN GROUP (ORDER BY zip) AS zips,
+			OBJECT_AGG(zip, OBJECT_CONSTRUCT('n', g)) AS by_zip FROM z GROUP BY g`,
+		`CREATE TABLE held (id INT, a ARRAY, o OBJECT, n ARRAY(NUMBER), s OBJECT(city VARCHAR, zip NUMBER))`,
+		`INSERT INTO held SELECT 1, ARRAY_CONSTRUCT('x', 1, OBJECT_CONSTRUCT('k', 'v'), ARRAY_CONSTRUCT('y')),
+			OBJECT_CONSTRUCT('s', 'text', 'o', OBJECT_CONSTRUCT('k', 'v')), ARRAY_CONSTRUCT(1, 2), OBJECT_CONSTRUCT('city', 'Paris', 'zip', 75001)`,
+		`INSERT INTO held SELECT 2, ARRAY_CONSTRUCT(), OBJECT_CONSTRUCT(), NULL, NULL`,
+		`INSERT INTO held SELECT 3, NULL, NULL, NULL, NULL`,
+	} {
+		mustExec(t, setup, s)
+	}
+	zips := []string{`1|[{"zip_code":"55603"},{"zip_code":"55604"}]`, `2|[{"zip_code":"10001"}]`}
+	for _, c := range []struct {
+		dialect, q string
+		oids       []uint32
+		want       []string
+	}{
+		{"snowflake", `SELECT g, ARRAY_AGG(OBJECT_CONSTRUCT('zip_code', zip)) WITHIN GROUP (ORDER BY zip) AS zips FROM z GROUP BY g ORDER BY g`,
+			[]uint32{pgtype.Int8OID, pgtype.JSONOID}, zips},
+		{"snowflake", `SELECT g, COALESCE(ARRAY_AGG(OBJECT_CONSTRUCT('zip_code', zip)) WITHIN GROUP (ORDER BY zip), ARRAY_CONSTRUCT()) AS zips FROM z GROUP BY g ORDER BY g`,
+			[]uint32{pgtype.Int8OID, pgtype.JSONOID}, zips},
+		// The same ARRAY, and an OBJECT of objects, kept in a table.
+		{"snowflake", `SELECT g, zips FROM agg ORDER BY g`, []uint32{pgtype.Int8OID, pgtype.JSONOID}, zips},
+		{"snowflake", `SELECT by_zip FROM agg ORDER BY g`, []uint32{pgtype.JSONOID},
+			[]string{`{"55603":{"n":1},"55604":{"n":1}}`, `{"10001":{"n":2}}`}},
+		// Numbers in ARRAY and OBJECT columns are their text (see
+		// TestNativeColumnsHoldText); structured columns hold their types.
+		{"snowflake", `SELECT id, a, o, n, s FROM held ORDER BY id`,
+			[]uint32{pgtype.Int8OID, pgtype.JSONOID, pgtype.JSONOID, pgtype.JSONOID, pgtype.JSONOID},
+			[]string{`1|["x","1",{"k":"v"},["y"]]|{"o":{"k":"v"},"s":"text"}|[1,2]|{"city":"Paris","zip":75001}`, `2|[]|{}|NULL|NULL`, `3|NULL|NULL|NULL|NULL`}},
+		{"snowflake", `SELECT TO_JSON(a) AS j, a::VARIANT AS v FROM held WHERE id = 1`, []uint32{pgtype.TextOID, pgtype.JSONOID},
+			[]string{`["x","1",{"k":"v"},["y"]]|["x","1",{"k":"v"},["y"]]`}},
+		{"duckdb", `SELECT zips, by_zip FROM agg ORDER BY g`, []uint32{pgtype.JSONOID, pgtype.JSONOID},
+			[]string{`["{\"zip_code\":\"55603\"}","{\"zip_code\":\"55604\"}"]|{"55603":"{\"n\":1}","55604":"{\"n\":1}"}`, `["{\"zip_code\":\"10001\"}"]|{"10001":"{\"n\":2}"}`}},
+	} {
+		for name, mode := range modes {
+			conn := ts.admin(t, mode)
+			mustExec(t, conn, "SET sql_dialect = '"+c.dialect+"'")
+			oids, rows := wireRows(t, conn, c.q)
+			if !slices.Equal(oids, c.oids) || !slices.Equal(rows, c.want) {
+				t.Errorf("%s, %s: %s\n got %v %q\nwant %v %q", c.dialect, name, c.q, oids, rows, c.oids, c.want)
+			}
+		}
+	}
+}

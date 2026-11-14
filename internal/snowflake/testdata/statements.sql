@@ -21,6 +21,10 @@ SELECT v:a.b[0]::string, v:c, v['d'] FROM t WHERE v:type = 'click' AND v:n > 5
 SELECT GET(v, 'a'), GET_PATH(v, 'a.b[0]'), ARRAY_SIZE(v:items), ARRAY_CONTAINS(1::variant, arr) FROM t
 SELECT f.value:name::string, f.index FROM t, LATERAL FLATTEN(input => t.items) f
 SELECT s.value FROM TABLE(SPLIT_TO_TABLE('a,b', ',')) s
+SELECT f.key, SUM(f.value:count::integer) AS events FROM t LEFT JOIN LATERAL FLATTEN(input => t.info, outer => true) f WHERE t.d BETWEEN '2000-01-01' AND '2050-01-01' GROUP BY f.key
+SELECT f.value FROM t JOIN LATERAL FLATTEN(input => t.items) f
+SELECT f.value FROM t INNER JOIN LATERAL FLATTEN(input => t.items) f WHERE t.id > 1
+SELECT s.value FROM t LEFT OUTER JOIN TABLE(SPLIT_TO_TABLE(t.s, ',')) s
 SELECT SPLIT(s, ','), SPLIT_PART(s, ',', 0), STRTOK(s, ' ', 2) FROM t
 SELECT REGEXP_SUBSTR(s, '[0-9]+', 1, 2), REGEXP_LIKE(s, 'a.*'), s RLIKE 'b+', REGEXP_REPLACE(s, 'a', 'b') FROM t
 SELECT CHARINDEX('b', s), POSITION('b', s), LEN(s), LEFT(s, 2), SQUARE(n) FROM t

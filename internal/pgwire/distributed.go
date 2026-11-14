@@ -813,6 +813,7 @@ func (st *statement) runFinal(ctx context.Context, conn *duckdb.Conn, query stri
 		return errors.New("the combined result does not match the statement's columns")
 	}
 	fin.stmtType, fin.query, fin.names, fin.readsOnce, fin.streams = st.stmtType, st.query, st.names, len(merged) > 0, st.streams
+	fin.presentAs(st)
 	return fin.run(ctx, args, w)
 }
 

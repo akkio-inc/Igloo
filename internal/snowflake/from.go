@@ -271,6 +271,9 @@ func (t *translator) tableFunctions(nodes []*node) ([]*node, error) {
 		if alias != "" && aliasEnd > end {
 			end = aliasEnd
 		}
+		if !removed[out] {
+			t.tableOuts[out] = true
+		}
 		out.pos, out.end = nodes[start].pos, nodes[end-1].end
 		nodes = replace(nodes, start, end, out)
 		i = start
@@ -360,6 +363,41 @@ func whereOn(nodes []*node, flats []flattened, moved func(flatten, open, close *
 		moved(nodes[last], open, close)
 	}
 	return append(out, nodes[end:]...)
+}
+
+// lateralOn gives each table function that tableFunctions translated,
+// joined with JOIN, INNER JOIN or LEFT [OUTER] JOIN without a condition,
+// the ON true that DuckDB needs. Snowflake joins a table function so, its
+// rows those it gives for each row before it, as after a comma, and
+// refuses a condition there ("lateral table function called with OUTER
+// JOIN syntax or a join predicate"); DuckDB refuses a join without ON or
+// USING other than a CROSS, NATURAL or POSITIONAL one ("syntax error at or
+// near WHERE"). A LEFT JOIN keeps a row before it for which the function
+// gives no rows, with NULLs, as FLATTEN's OUTER => TRUE does. It runs
+// after whereOn and structWhere, which may make a WHERE the join's ON.
+func (t *translator) lateralOn(nodes []*node) ([]*node, error) {
+	for k := 0; k < len(nodes); k++ {
+		if !t.tableOuts[nodes[k]] {
+			continue
+		}
+		j := prevSig(nodes, k)
+		if j < 0 || nodes[j].word() != "JOIN" {
+			continue
+		}
+		p := prevSig(nodes, j)
+		if p >= 0 && nodes[p].word() == "OUTER" {
+			p = prevSig(nodes, p)
+		}
+		if p >= 0 && nodes[p].word() != "LEFT" && nodes[p].word() != "INNER" && joinEndWords[nodes[p].word()] {
+			continue // CROSS, NATURAL, RIGHT, FULL, ASOF
+		}
+		if q := nextSig(nodes, k); q >= 0 && (nodes[q].word() == "ON" || nodes[q].word() == "USING" ||
+			nodes[q].kind == kRaw && strings.HasPrefix(strings.TrimSpace(nodes[q].text), "ON ")) {
+			continue // as written, or a WHERE made its ON
+		}
+		nodes = replace(nodes, k+1, k+1, raw(" ON true"))
+	}
+	return nodes, nil
 }
 
 // whereClause finds, at one level of a statement, a select's SELECT, FROM

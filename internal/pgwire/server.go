@@ -2568,6 +2568,7 @@ func (s *Server) preparedQuery(ctx context.Context, sess *session, user auth.Use
 		for i, c := range tr.columns(st.columns) {
 			st.names[i] = c.Name
 		}
+		st.presentAsSnowflake()
 	}
 
 	sess.open[ps] = st

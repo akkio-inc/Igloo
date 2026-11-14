@@ -137,6 +137,9 @@ type translator struct {
 	// would make so.
 	listCols     map[*node]*hoist
 	flattenLists int
+	// tableOuts holds what each table function in FROM became, which
+	// lateralOn gives the ON its join may lack.
+	tableOuts map[*node]bool
 	// grouped holds the APPROX_COUNT_DISTINCT and HLL calls, by their
 	// names' nodes, of selects with GROUP BY (see collectGrouped).
 	grouped map[*node]bool
@@ -179,7 +182,7 @@ func Translate(sql string, opts Options) (Result, error) {
 		structReads: map[*node]*structFlatten{}, onlyValues: map[*node]bool{}, hoists: map[*node]*hoist{}, elemReads: map[*node]string{},
 		elemTexts: map[*node]bool{}, guarded: map[*node]bool{}, flattenOuts: map[*node]string{}, structOuts: map[*node]*structOut{},
 		folds: map[*node]*structFold{}, textValues: map[*node]bool{}, valueFolds: map[*node]*structFold{}, valueOns: map[*node][2]*node{},
-		listCols: map[*node]*hoist{}}
+		listCols: map[*node]*hoist{}, tableOuts: map[*node]bool{}}
 	for _, tok := range toks {
 		if tok.kind == kQuoted {
 			t.quoted[tok.val] = true

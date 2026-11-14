@@ -843,6 +843,78 @@ func TestFlattenWhere(t *testing.T) {
 	}
 }
 
+// TestFlattenJoins runs FLATTEN, SPLIT_TO_TABLE and GENERATOR joined each
+// way Snowflake joins a table function, without ON: after a comma, with
+// JOIN, INNER JOIN and LEFT [OUTER] JOIN, LATERAL and TABLE(...), with
+// OUTER => TRUE and without, of JSON objects, of OBJECT and ARRAY columns
+// and of objects the translation keeps as structs; and with an ON, which
+// Snowflake refuses and Igloo takes. The first is an audience report's
+// query as Snowflake ran it.
+func TestFlattenJoins(t *testing.T) {
+	conn := session(t)
+	ctx := context.Background()
+	for _, s := range []string{
+		`CREATE TABLE content (ID VARCHAR, PARTITION_DATE DATE, DAILY_CATEGORY_INFO JSON, CATS MAP(VARCHAR, VARCHAR), TAGS VARCHAR[])`,
+		`INSERT INTO content VALUES
+			('a', '2024-01-01', '{"news":{"count":3,"domains":["x.com","y.com"]},"sport":{"count":1,"domains":["z.com"]}}',
+				MAP {'news': '{"count":3}', 'sport': '{"count":1}'}, ['x', 'y']),
+			('b', '2024-01-02', '{}', MAP {}, []),
+			('c', '2024-01-03', NULL, NULL, NULL),
+			('d', '2051-01-01', '{"news":{"count":5,"domains":["x.com"]}}', MAP {'news': '{"count":5}'}, ['z']),
+			('e', '2024-01-05', '{"tech":{"count":9,"domains":[]}}', MAP {'tech': '{"count":9}'}, ['w'])`,
+		`CREATE TABLE audience AS SELECT * FROM (VALUES ('a'), ('b'), ('c'), ('d')) v(ID)`,
+	} {
+		if _, err := conn.ExecContext(ctx, s); err != nil {
+			t.Fatalf("%s: %v", s, err)
+		}
+	}
+	for _, c := range []struct{ q, want string }{
+		{`SELECT f.key AS category, COUNT(DISTINCT t.ID) AS ids, SUM(ARRAY_SIZE(f.value:domains)) AS domains, SUM(f.value:count::integer) AS events
+			FROM content t
+			INNER JOIN audience a ON a.ID = t.ID
+			LEFT JOIN LATERAL FLATTEN(input => t.DAILY_CATEGORY_INFO, outer => true) f
+			WHERE t.PARTITION_DATE BETWEEN '2000-01-01' AND '2050-01-01'
+			GROUP BY f.key ORDER BY events DESC LIMIT 2400`,
+			"NULL|2|NULL|NULL\nnews|1|2|3\nsport|1|1|1"},
+		// A LEFT JOIN keeps the rows FLATTEN gives none for, as OUTER does.
+		{`select t.id, f.key, f.value:count::int from content t left join lateral flatten(input => t.daily_category_info) f order by 1, 2`,
+			"a|news|3\na|sport|1\nb|NULL|NULL\nc|NULL|NULL\nd|news|5\ne|tech|9"},
+		{`select t.id, f.key, f.index, f.value from content t left outer join lateral flatten(input => t.daily_category_info, outer => true) f where t.id > 'a' and t.id < 'e' order by 1, 2`,
+			"b|NULL|NULL|NULL\nc|NULL|NULL|NULL\nd|news|NULL|{\"count\":5,\"domains\":[\"x.com\"]}"},
+		{`select t.id, f.key, f.value:count::int from content t join lateral flatten(input => t.daily_category_info) f order by 1, 2`,
+			"a|news|3\na|sport|1\nd|news|5\ne|tech|9"},
+		{`select t.id, f.key from content t inner join lateral flatten(input => t.daily_category_info) f where t.id <> 'a' order by 1, 2`,
+			"d|news\ne|tech"},
+		{`select t.id, f.key, f.value:count::int from content t join table(flatten(input => t.daily_category_info)) f join audience a on a.id = t.id order by 1, 2`,
+			"a|news|3\na|sport|1\nd|news|5"},
+		// An OBJECT column's members, and an ARRAY column's elements.
+		{`select t.id, f.key, f.value:count::int from content t left join table(flatten(input => t.cats)) f order by 1, 2`,
+			"a|news|3\na|sport|1\nb|NULL|NULL\nc|NULL|NULL\nd|news|5\ne|tech|9"},
+		{`select t.id, f.index, f.value::string from content t left join lateral flatten(input => t.tags, outer => true) f order by 1, 2`,
+			"a|0|x\na|1|y\nb|NULL|NULL\nc|NULL|NULL\nd|0|z\ne|0|w"},
+		{`select t.id, f.value::string from content t, lateral flatten(input => t.tags, outer => true) f order by 1, 2`,
+			"a|x\na|y\nb|NULL\nc|NULL\nd|z\ne|w"},
+		{`select t.id, f.value::string from content t cross join lateral flatten(input => t.tags) f order by 1, 2`,
+			"a|x\na|y\nd|z\ne|w"},
+		{`select t.id, f.value::string from content t join lateral flatten(input => t.tags) f on f.value::string <> 'y' order by 1, 2`,
+			"a|x\nd|z\ne|w"},
+		{`select t.id, f.value::string from content t left join lateral flatten(input => t.tags) f on f.value::string = 'x' order by 1, 2`,
+			"a|x\nb|NULL\nc|NULL\nd|NULL\ne|NULL"},
+		// Objects kept as structs: hoisted into the table's select list, and not.
+		{`select t.id, g.value:k::string from content t join lateral flatten(input => [object_construct('k', t.id), object_construct('k', 'z')]) g where t.id < 'c' order by 1, 2`,
+			"a|a\na|z\nb|b\nb|z"},
+		{`select t.id, g.value:k::string from content t left join lateral flatten(input => [object_construct('k', t.id)]) g where t.id < 'c' order by 1, 2`,
+			"a|a\nb|b"},
+		{`select a.id, s.value from audience a left join table(split_to_table(a.id || ',' || upper(a.id), ',')) s where a.id < 'c' order by 1, 2`,
+			"a|A\na|a\nb|B\nb|b"},
+		{`select count(*) from audience a join table(generator(rowcount => 3)) g`, "12"},
+	} {
+		if got := nativeRows(t, conn, c.q); got != c.want {
+			t.Errorf("%s\n got %q\nwant %q", c.q, got, c.want)
+		}
+	}
+}
+
 // TestFlattenListsHoisted checks FLATTENs of lists computed from a FROM
 // item's columns, which the item's select list unnests (see listHoistOf):
 // their rows against the same FLATTENs as lateral subqueries, where OUTER =>

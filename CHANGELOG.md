@@ -7,6 +7,26 @@ All notable changes to Igloo are recorded here. The format follows
 The release workflow publishes the section whose heading matches the tag
 (`## [1.2.3] - YYYY-MM-DD` for `v1.2.3`) as that GitHub Release's notes.
 
+## [Unreleased]
+
+### Fixed
+
+- In the Snowflake dialect, `FLATTEN` joined with `JOIN`, `INNER JOIN` or
+  `LEFT [OUTER] JOIN` and no `ON`, as Snowflake writes it, runs: `LEFT JOIN
+  LATERAL FLATTEN(input => t.info, outer => true) f WHERE ...` failed with
+  `syntax error at or near "WHERE"`, or near whatever else followed the
+  join. `SPLIT_TO_TABLE` and `GENERATOR` joined so run too. A `LEFT JOIN`
+  keeps a row for which `FLATTEN` gives no rows, with `NULL`s, as `OUTER =>
+  TRUE` does.
+- In the Snowflake dialect, selecting an `ARRAY` or `OBJECT` column sends the
+  array or object it holds, as every other `ARRAY` and `OBJECT` goes out:
+  one `json` value whose objects and arrays are objects and arrays. Their
+  elements went out as strings of their JSON text, so after `CREATE TABLE t
+  AS SELECT ARRAY_AGG(OBJECT_CONSTRUCT('zip_code', z)) AS zips ...`,
+  `SELECT zips FROM t` sent `["{\"zip_code\":\"55603\"}"]`, which a client
+  reads as a list of strings, where the `ARRAY_AGG` itself sent
+  `[{"zip_code":"55603"}]`. DuckDB's dialect sends them as before.
+
 ## [1.0.0-rc.7] - 2026-11-14
 
 ### Changed

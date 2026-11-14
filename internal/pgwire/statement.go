@@ -105,6 +105,12 @@ type statement struct {
 	// names, when set, are the names clients see for the result's columns,
 	// as the Snowflake dialect names them; columns keeps DuckDB's.
 	names []string
+	// types are the DuckDB types of the result's columns, nil where DuckDB
+	// could not tell, and snowflake says the statement was translated from
+	// Snowflake's dialect, whose values it sends as Snowflake does (see
+	// presentAsSnowflake).
+	types     []duckdb.TypeInfo
+	snowflake bool
 	// ran says the statement has run, for freshForRun.
 	ran bool
 	// ids is set for an INSERT into a table with columns in ID domains,
@@ -193,7 +199,7 @@ func (st *statement) describeWithNulls(ctx context.Context, conn *duckdb.Conn) e
 	if probe.unknown || probe.kind != returnsRows {
 		return errors.New("the result's columns are still unknown")
 	}
-	st.columns, st.encoders, st.unknown = probe.columns, probe.encoders, false
+	st.columns, st.encoders, st.types, st.unknown = probe.columns, probe.encoders, probe.types, false
 	return nil
 }
 
@@ -223,9 +229,30 @@ func (st *statement) reprepare(ctx context.Context, conn *duckdb.Conn) error {
 		return pgerror.WithCode(errors.New("the statement's result changed since it was prepared; prepare it again"),
 			codes.FeatureNotSupported)
 	}
+	fresh.presentAs(st)
 	old := st.stmt
-	st.stmt, st.encoders = fresh.stmt, fresh.encoders
+	st.stmt, st.encoders, st.types = fresh.stmt, fresh.encoders, fresh.types
 	return old.Close()
+}
+
+// presentAs has st, which runs in orig's place or replaces it, send its
+// values as orig does.
+func (st *statement) presentAs(orig *statement) {
+	if orig.snowflake {
+		st.presentAsSnowflake()
+	}
+}
+
+// presentAsSnowflake has st send its values as Snowflake sends a
+// statement's: Igloo's ARRAY and OBJECT columns as Snowflake's (see
+// snowflakeEncoder).
+func (st *statement) presentAsSnowflake() {
+	st.snowflake = true
+	for i, t := range st.types {
+		if enc := snowflakeEncoder(t); enc != nil {
+			st.encoders[i] = enc
+		}
+	}
 }
 
 // freshForRun prepares st again, on conn, if it is a CREATE statement that
@@ -282,6 +309,7 @@ func (st *statement) describe(clientOIDs []uint32) error {
 				// PostgreSQL does an untyped parameter, send it as text.
 				st.columns = append(st.columns, wire.Column{Name: name, Oid: pgtype.TextOID, Width: -1})
 				st.encoders = append(st.encoders, toText)
+				st.types = append(st.types, nil)
 				st.unknown = true
 				continue
 			}
@@ -297,6 +325,7 @@ func (st *statement) describe(clientOIDs []uint32) error {
 			}
 			st.columns = append(st.columns, col)
 			st.encoders = append(st.encoders, enc)
+			st.types = append(st.types, info)
 		}
 	}
 

@@ -608,6 +608,7 @@ func (s *Server) runWriteInBackground(ctx context.Context, sess *session, st *st
 		return false, nil
 	}
 	fin.stmtType, fin.query = st.stmtType, st.query
+	fin.presentAs(st)
 	if err := fin.run(ctx, args, w); err != nil {
 		return true, err
 	}
@@ -683,6 +684,7 @@ func (s *Server) runInBackground(ctx context.Context, sess *session, st *stateme
 		return false, nil
 	}
 	fin.stmtType, fin.query = st.stmtType, st.query
+	fin.presentAs(st)
 	sess.setInBackground(true)
 	defer sess.setInBackground(false)
 	// On this thread, which works on the statement's tasks too, at the
