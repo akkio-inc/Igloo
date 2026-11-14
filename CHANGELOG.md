@@ -9,7 +9,7 @@ The release workflow publishes the section whose heading matches the tag
 
 ## [Unreleased]
 
-## [1.0.0-rc.5] - 2026-11-14
+## [1.0.0-rc.6] - 2026-11-14
 
 ### Fixed
 
