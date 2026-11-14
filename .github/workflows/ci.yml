@@ -205,7 +205,10 @@ jobs:
     # Each architecture builds on its own native runner: cross-compiling cgo
     # and DuckDB under QEMU is slow and fragile.
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 45
+    # amd64 took 44.9 minutes in 1.0.0-rc.6's release and passed 45 in
+    # rc.7's, which was cancelled: with the Actions cache near its limit the
+    # build can miss its cache and compile DuckDB again.
+    timeout-minutes: 75
     strategy:
       fail-fast: false
       matrix:
