@@ -9,6 +9,8 @@ The release workflow publishes the section whose heading matches the tag
 
 ## [Unreleased]
 
+## [1.0.0-rc.10] - 2026-11-15
+
 ### Added
 
 - `IGLOO.ML.XGBOOST`, a model class that XGBoost's own library trains. The
