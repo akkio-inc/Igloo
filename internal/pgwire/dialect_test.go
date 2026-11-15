@@ -763,7 +763,9 @@ GROUP BY f.key ORDER BY events DESC LIMIT 2400`
 // json value, its objects and arrays as objects and arrays, however it
 // computes it: an aggregate, a table's ARRAY or OBJECT column that holds
 // one, and structured columns. DuckDB's dialect sends the same columns as
-// before, as JSON of their strings.
+// before, as JSON of their strings. An aggregate or constructor of a
+// VARCHAR column that holds objects' JSON text, as a VARIANT column copied
+// from Snowflake does, sends the objects.
 func TestSnowflakeSemiStructuredResults(t *testing.T) {
 	t.Parallel()
 	ts := startServer(t)
@@ -779,10 +781,15 @@ func TestSnowflakeSemiStructuredResults(t *testing.T) {
 			OBJECT_CONSTRUCT('s', 'text', 'o', OBJECT_CONSTRUCT('k', 'v')), ARRAY_CONSTRUCT(1, 2), OBJECT_CONSTRUCT('city', 'Paris', 'zip', 75001)`,
 		`INSERT INTO held SELECT 2, ARRAY_CONSTRUCT(), OBJECT_CONSTRUCT(), NULL, NULL`,
 		`INSERT INTO held SELECT 3, NULL, NULL, NULL, NULL`,
+		// A VARIANT column copied from Snowflake is the JSON text of its
+		// values, a VARCHAR, as a table made in DuckDB's dialect holds it.
+		`SET sql_dialect = 'duckdb'`,
+		`CREATE TABLE located AS SELECT '{"zip_code":"1","latitude":4.5}' AS LOCATION UNION ALL SELECT '{"zip_code":"2","latitude":3.5}'`,
 	} {
 		mustExec(t, setup, s)
 	}
 	zips := []string{`1|[{"zip_code":"55603"},{"zip_code":"55604"}]`, `2|[{"zip_code":"10001"}]`}
+	l1, l2 := `{"latitude":4.5,"zip_code":"1"}`, `{"latitude":3.5,"zip_code":"2"}`
 	for _, c := range []struct {
 		dialect, q string
 		oids       []uint32
@@ -805,6 +812,16 @@ func TestSnowflakeSemiStructuredResults(t *testing.T) {
 			[]string{`["x","1",{"k":"v"},["y"]]|["x","1",{"k":"v"},["y"]]`}},
 		{"duckdb", `SELECT zips, by_zip FROM agg ORDER BY g`, []uint32{pgtype.JSONOID, pgtype.JSONOID},
 			[]string{`["{\"zip_code\":\"55603\"}","{\"zip_code\":\"55604\"}"]|{"55603":"{\"n\":1}","55604":"{\"n\":1}"}`, `["{\"zip_code\":\"10001\"}"]|{"10001":"{\"n\":2}"}`}},
+		// The functions that build an ARRAY or OBJECT take such a column's
+		// objects as objects, as TYPEOF and paths read them.
+		{"snowflake", `SELECT ARRAY_AGG(LOCATION) WITHIN GROUP (ORDER BY LOCATION:zip_code) AS L, TYPEOF(ANY_VALUE(LOCATION)) AS T FROM located`,
+			[]uint32{pgtype.JSONOID, pgtype.TextOID}, []string{"[" + l1 + "," + l2 + "]|OBJECT"}},
+		{"snowflake", `SELECT ARRAY_AGG(LOCATION) AS L FROM located WHERE LOCATION:zip_code = '2'`, []uint32{pgtype.JSONOID}, []string{"[" + l2 + "]"}},
+		{"snowflake", `SELECT ARRAY_CONSTRUCT(LOCATION) AS A, OBJECT_CONSTRUCT('l', LOCATION) AS O, [LOCATION] AS C FROM located ORDER BY LOCATION:zip_code`,
+			[]uint32{pgtype.JSONOID, pgtype.JSONOID, pgtype.JSONOID},
+			[]string{"[" + l1 + `]|{"l":` + l1 + "}|[" + l1 + "]", "[" + l2 + `]|{"l":` + l2 + "}|[" + l2 + "]"}},
+		{"snowflake", `SELECT OBJECT_AGG(LOCATION:zip_code::string, LOCATION) AS O FROM located`, []uint32{pgtype.JSONOID},
+			[]string{`{"1":` + l1 + `,"2":` + l2 + "}"}},
 	} {
 		for name, mode := range modes {
 			conn := ts.admin(t, mode)
@@ -813,6 +830,17 @@ func TestSnowflakeSemiStructuredResults(t *testing.T) {
 			if !slices.Equal(oids, c.oids) || !slices.Equal(rows, c.want) {
 				t.Errorf("%s, %s: %s\n got %v %q\nwant %v %q", c.dialect, name, c.q, oids, rows, c.oids, c.want)
 			}
+		}
+	}
+	// The report's own aggregate, ordered by a hash of each object, sends
+	// what it does of the objects PARSE_JSON reads.
+	for name, mode := range modes {
+		conn := ts.admin(t, mode)
+		mustExec(t, conn, "SET sql_dialect = 'snowflake'")
+		_, got := wireRows(t, conn, `SELECT ARRAY_AGG(LOCATION) WITHIN GROUP (ORDER BY HASH(TO_JSON(LOCATION))) AS L FROM located`)
+		_, want := wireRows(t, conn, `SELECT ARRAY_AGG(PARSE_JSON(LOCATION)) WITHIN GROUP (ORDER BY HASH(TO_JSON(PARSE_JSON(LOCATION)))) AS L FROM located`)
+		if !slices.Equal(got, want) {
+			t.Errorf("%s: ARRAY_AGG(LOCATION) sends %q, ARRAY_AGG(PARSE_JSON(LOCATION)) %q", name, got, want)
 		}
 	}
 }

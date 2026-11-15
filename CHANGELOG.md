@@ -9,6 +9,21 @@ The release workflow publishes the section whose heading matches the tag
 
 ## [Unreleased]
 
+### Fixed
+
+- In the Snowflake dialect, the functions that build an `ARRAY` or an
+  `OBJECT` take a `VARCHAR` column, as Igloo holds a `VARIANT` column copied
+  from Snowflake, as `TYPEOF` and paths read it: the JSON text of an object
+  or an array as that object or array, any other text as a string.
+  `ARRAY_AGG(LOCATION) WITHIN GROUP (ORDER BY ...)` of such a column sent
+  `["{\"zip_code\":\"55603\"}", ...]`, a list of strings, where Snowflake
+  and `ARRAY_AGG(PARSE_JSON(LOCATION))` send `[{"zip_code":"55603"}, ...]`.
+  The same holds for every function that takes such a column into a value
+  it builds: `ARRAY_UNIQUE_AGG`, `OBJECT_AGG`, `ARRAY_CONSTRUCT`, `[...]`,
+  `OBJECT_CONSTRUCT`, `OBJECT_INSERT`, `ARRAY_APPEND`, `ARRAY_CONTAINS`,
+  `TO_JSON`, `TO_VARIANT`, `::VARIANT` and the like. An expression's text,
+  such as `x::STRING`, stays a string.
+
 ## [1.0.0-rc.8] - 2026-11-14
 
 ### Changed

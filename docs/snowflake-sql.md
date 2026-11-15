@@ -231,7 +231,14 @@ array reads as that object or array, so paths into an `ARRAY` of objects
 (`f.value:name`) work; one that is a number or a boolean reads as a string,
 which compares, casts and sums as the number (see [known
 differences](#known-differences)). A `VARIANT` column, or JSON text in any
-`VARCHAR` column, reads as the JSON it holds.
+`VARCHAR` column, reads as the JSON it holds. A function that builds a
+value of such a column (`ARRAY_AGG`, `OBJECT_AGG`, `ARRAY_CONSTRUCT`,
+`OBJECT_CONSTRUCT`, `TO_JSON`, `::VARIANT` and the others) takes its text
+as an element of an `ARRAY` column reads: the JSON text of an object or an
+array as that object or array, any other text as a string. So
+`ARRAY_AGG(location)` of a `VARIANT` column copied from Snowflake gives its
+objects, `[{"zip_code":"55603"}, ...]`, as in Snowflake. Text an expression
+computes, such as `x::STRING`, stays a string.
 
 `CREATE TABLE ... AS SELECT` makes `ARRAY` and `OBJECT` columns of what is
 known to be one: `ARRAY_AGG`, `ARRAY_CONSTRUCT`, `[...]`, `SPLIT`,
@@ -474,6 +481,12 @@ What Igloo cannot reproduce exactly, and what it does instead.
   and `[1,true]`. Comparing, casting and summing them gives the number.
   Objects and arrays inside it read and show as objects and arrays. Store
   a value whose types matter in a `VARIANT` column.
+- A `VARIANT` column and a `VARCHAR` column are both text in Iceberg, so
+  Igloo reads a `VARCHAR` column that holds the JSON text of an object or an
+  array as that object or array, also where it builds a value of it:
+  `ARRAY_AGG(s)` of a `VARCHAR` column `s` that holds `{"k":1}` gives
+  `[{"k":1}]`, where Snowflake gives `["{\"k\":1}"]`. Cast the column
+  (`s::STRING`) to build of it as a string.
 - A masking policy on an `ARRAY` or `OBJECT` column returns its type, as
   the column holds it: Igloo casts what its expression returns, so
   `OBJECT_CONSTRUCT(...)` works.

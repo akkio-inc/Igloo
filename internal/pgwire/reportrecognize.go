@@ -2955,14 +2955,17 @@ func (c *countingSelect) metricColumn(n jnode) (string, error) {
 	return "", notReport("a metric that is not a column")
 }
 
-// sfColumn reads sf_fields_string(sf_list_part(c), sf_string_part(c),
-// sf_other_part(c)): the Snowflake translation's text of a column.
+// sfColumn reads sf_fields_string(sf_list_part(c), sf_column_string_part(c),
+// sf_other_part(c)): the Snowflake translation's text of a column. Of a
+// VARCHAR column that is its text, except that the translation writes text
+// that holds an object or an array as DuckDB writes the JSON (see
+// sf_to_json), which differs only in spacing.
 func sfColumn(n jnode) jnode {
 	if !isFunc(n, "sf_fields_string") {
 		return nil
 	}
 	ch := childrenOf(n)
-	if len(ch) != 3 || !isFunc(ch[0], "sf_list_part") || !isFunc(ch[1], "sf_string_part") || !isFunc(ch[2], "sf_other_part") {
+	if len(ch) != 3 || !isFunc(ch[0], "sf_list_part") || !isFunc(ch[1], "sf_column_string_part") || !isFunc(ch[2], "sf_other_part") {
 		return nil
 	}
 	var x jnode
