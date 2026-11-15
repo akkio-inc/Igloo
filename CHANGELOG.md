@@ -23,11 +23,12 @@ The release workflow publishes the section whose heading matches the tag
   transaction to check its grants, so on a pilot deployment one
   transaction block (`BEGIN`, a `MERGE`, an `INSERT`) took every session
   down because another session had created and read a table since the
-  block began. The statement now fails its transaction, with a message
-  that names the table and the transaction's start (printed before as a
-  date in 1970) and asks for a restart, and the retried transaction
-  succeeds; from DuckDB's own statements the client gets SQLSTATE 40001
-  (`extensions/iceberg/patches/0006`).
+  block began. A listing now shows such a table at its current schema, so
+  that block commits. A statement that reads or writes the table itself
+  fails its transaction with SQLSTATE 40001 and a message that names the
+  table and the transaction's start (printed before as a date in 1970) and
+  asks for a restart, and the retried transaction succeeds
+  (`extensions/iceberg/patches/0006` and `0007`).
 
 ## [1.0.0-rc.10] - 2026-11-15
 

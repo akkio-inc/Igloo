@@ -20,16 +20,17 @@ import (
 // the listing reached a table created since the block began, the iceberg
 // extension threw an InternalException as the listing ran, and DuckDB
 // invalidated its database: every session, new ones included, failed until
-// the process restarted. Now the INSERT fails the block alone, the server
-// serves on, and the client's retry of the block succeeds.
+// the process restarted. The listing now shows that table at its current
+// schema, and the block commits; a block that writes the new table fails
+// alone, with SQLSTATE 40001, the server serves on, and the client's retry
+// of the block succeeds.
 func TestTableNewerThanTransaction(t *testing.T) {
 	cases := []struct {
 		name string
 		// insert is the block's insert, into lake.p.new, the table the other
 		// session created, or lake.p.meta, which is older than the block.
 		insert string
-		// code is the SQLSTATE the insert fails with, if Igloo gives one:
-		// the error of a listing for the grant checks gets none.
+		// code is the SQLSTATE the insert fails with, "" if it succeeds.
 		code string
 	}{
 		{"insert into an older table", "INSERT INTO lake.p.meta VALUES (3)", ""},
@@ -75,19 +76,19 @@ func TestTableNewerThanTransaction(t *testing.T) {
 				mustExec(t, other, "SELECT count(*) FROM lake.p.new")
 
 				_, err = walt.Exec(ctx, c.insert)
-				if err == nil {
-					t.Fatalf("%s succeeded in a block older than p.new", c.insert)
+				if got := pgCode(err); got != c.code {
+					t.Fatalf("%s: SQLSTATE %q, want %q: %v", c.insert, got, c.code, err)
 				}
-				if msg := err.Error(); !strings.Contains(msg, "Table p.new ") || !strings.Contains(msg, "restart your transaction") {
-					t.Errorf("the error does not name p.new or ask for a restart: %v", err)
+				if err != nil {
+					if msg := err.Error(); !strings.Contains(msg, "Table p.new ") || !strings.Contains(msg, "restart your transaction") {
+						t.Errorf("the error does not name p.new or ask for a restart: %v", err)
+					}
+					mustExec(t, walt, "ROLLBACK")
+					for _, q := range append(block, c.insert) {
+						mustExec(t, walt, q)
+					}
 				}
-				if got := pgCode(err); c.code != "" && got != c.code {
-					t.Errorf("%s: SQLSTATE %q, want %q: %v", c.insert, got, c.code, err)
-				}
-				mustExec(t, walt, "ROLLBACK")
-				for _, q := range append(block, c.insert, "COMMIT") {
-					mustExec(t, walt, q)
-				}
+				mustExec(t, walt, "COMMIT")
 
 				// The server serves on: the other session and a new one
 				// (count fails the test on an error).

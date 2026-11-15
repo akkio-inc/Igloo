@@ -34,7 +34,8 @@ import (
 // TestTableNewerThanTransaction takes each way to that throw, against the
 // extension alone in a DuckDB of its own, and checks that the statement
 // fails with an error that ends only its transaction (patches/0006), which
-// names the table and the time the transaction started; that the DuckDB
+// names the table and the time the transaction started, or, for a listing,
+// shows the table at its current schema (patches/0007); that the DuckDB
 // goes on serving the other connection and a new one; and that the same
 // statement succeeds once the transaction starts again.
 // internal/pgwire's test of the same name takes the way a pilot deployment
@@ -80,12 +81,13 @@ func TestTableNewerThanTransaction(t *testing.T) {
 		// t: a table made and written in between is newer than it.
 		{"read outside a transaction", nil, createAndInsert, "SELECT count(*) FROM lake.s.t", nil, 1},
 		// The throws above come as DuckDB prepares the statement; this one
-		// comes as it runs, and invalidated the database. A listing shows
-		// each table's entry in the set every connection shares, as of the
+		// came as it ran, and invalidated the database. A listing shows each
+		// table's entry in the set every connection shares, as of the
 		// transaction's start, and the other session's read put t's latest
-		// metadata there.
+		// metadata there. It shows t, which has no schema that old, at its
+		// current one.
 		{"listing", []string{"SELECT count(*) FROM lake.s.m"}, append(createAndInsert, "SELECT count(*) FROM lake.s.t"),
-			"SELECT column_name FROM duckdb_columns() WHERE database_name = 'lake' AND table_name = 't'", nil, 1},
+			"SELECT column_name FROM duckdb_columns() WHERE database_name = 'lake' AND table_name = 't'", []string{"id"}, 1},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
