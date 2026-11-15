@@ -45,7 +45,8 @@ const (
 	// the catalog functions list may be.
 	metadataTTL = 30 * time.Second
 	// changedDelay is how long after a write its table's metadata is read
-	// again; writes in between are read with it.
+	// again, unless a query that reads it comes sooner; writes in between
+	// are read with it.
 	changedDelay = 2 * time.Second
 )
 
@@ -105,8 +106,10 @@ type Manager struct {
 	metaReading bool
 	// touched are the objects read again on their own, and when.
 	touched map[key]time.Time
-	// changed are the tables to read again after changedDelay.
-	changed map[key][2]string
+	// changed are the tables to read again (see TableChanged), and
+	// reloading is held while they are read.
+	changed   map[key][2]string
+	reloading lockorder.Mutex
 }
 
 // New makes a manager for the catalog cat that eng is attached to, and
@@ -128,6 +131,7 @@ func New(ctx context.Context, cat *catalog.Client, eng *engine.Engine, log *slog
 		failed: map[key]error{}, log: log.With("component", "ddl"), touched: map[key]time.Time{}}
 	m.known.Store(&map[key]bool{})
 	m.unloaded.Store(&map[string]error{})
+	eng.OnTablesChanged(m.tablesChanged)
 	// Loading the views reads and fills in the catalog's set of tables; hold
 	// the exclusive side (see Run). Nothing else runs yet, but this keeps the
 	// rule that every sync outside a statement holds the lock.

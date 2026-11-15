@@ -143,8 +143,10 @@ type Proxy struct {
 	files     iceio.IO
 	filesErr  error
 
-	// guard checks changes (see SetGuard).
-	guard atomic.Pointer[Guard]
+	// guard checks changes (see SetGuard), and onChange is told of the
+	// tables they change (see OnTablesChanged).
+	guard    atomic.Pointer[Guard]
+	onChange atomic.Pointer[func([]Table)]
 
 	// lists are the listings the proxy keeps.
 	lists *listings
@@ -358,7 +360,8 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// A change that may make, drop or rename a name makes the listings of its
 	// namespaces stale (see staleListings): forgotten before it, so no listing
 	// begun before it is kept, and after it, so none answered while it was
-	// under way is. A change raises the versions of the tables it changes.
+	// under way is. A change raises the versions of the tables it changes,
+	// and once answered is told of (see OnTablesChanged).
 	tables, known, none := changedTables(r.Method, rest, body)
 	scopes, all := staleListings(r.Method, rest, body)
 	changed := func() {
@@ -368,7 +371,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			p.lists.forgetSome(scopes)
 		}
 		if !none {
-			p.data.bumpTables(tables, known)
+			p.data.bumpTables(tableKeys(tables), known)
 		}
 	}
 	changed()
@@ -377,6 +380,9 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	settled := func() {
 		if c.res != nil {
 			p.settlePending(r, rest, body, c.res.status, pkey, pnote)
+		}
+		if fn := p.onChange.Load(); fn != nil && known && !none && len(tables) > 0 {
+			(*fn)(tables)
 		}
 	}
 	select {
@@ -392,6 +398,18 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			changed()
 			settled()
 		}()
+	}
+}
+
+// OnTablesChanged has fn told of the tables each change DuckDB sends
+// through the proxy commits to, makes, drops or renames, as the change
+// names them, once the catalog has answered it and before DuckDB has the
+// answer: DML and DDL alike, so that what Igloo keeps of the tables'
+// metadata can follow its own statements (see ddl.Manager.TableChanged).
+// fn must not block.
+func (p *Proxy) OnTablesChanged(fn func([]Table)) {
+	if p != nil {
+		p.onChange.Store(&fn)
 	}
 }
 

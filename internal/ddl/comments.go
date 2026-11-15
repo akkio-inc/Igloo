@@ -6,11 +6,13 @@ import (
 	"fmt"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	icecat "github.com/apache/iceberg-go/catalog"
 
 	"github.com/akkio-inc/igloo/internal/catalog"
+	"github.com/akkio-inc/igloo/internal/catalogproxy"
 )
 
 // CommentTarget is what a COMMENT ON statement names.
@@ -86,8 +88,12 @@ func (m *Manager) Metadata() *catalog.Metadata {
 // reads it. Reading it loads every table's metadata, so it is read in full
 // the first time, and afterwards again in the background once it is
 // metadataTTL old, while queries see what was read last. Changes this
-// replica makes to comments and views show at once: the objects changed
-// are read again as part of the change.
+// replica makes show at once: comments and views are read again as part
+// of the change, and the tables its statements changed (see TableChanged)
+// before the query, so that information_schema.tables' LAST_ALTERED moves
+// with the statement before it: an app that rebuilt what it derived from a
+// table when that moved saw the old metadata, NULL for a table it had just
+// made, until a full read 30 seconds or more later.
 func (m *Manager) RefreshMetadata(ctx context.Context) error {
 	if m.meta.Load() == nil {
 		m.readMu.Lock()
@@ -97,6 +103,7 @@ func (m *Manager) RefreshMetadata(ctx context.Context) error {
 		}
 		return m.readMetadata(ctx)
 	}
+	m.reloadChanged()
 	m.metaMu.Lock()
 	defer m.metaMu.Unlock()
 	if time.Since(m.metaAt) < metadataTTL || m.metaReading {
@@ -156,9 +163,10 @@ func (m *Manager) readMetadata(ctx context.Context) error {
 }
 
 // TableChanged reads the metadata of the table or view schema.name again
-// in the background, after this replica wrote, created or dropped it, so
-// its size and freshness show soon. Changes that come close together are
-// read once, changedDelay after the first.
+// after this replica wrote, altered, created or dropped it, so that its
+// size and freshness show: before the next query that reads the metadata
+// (see RefreshMetadata), or in the background changedDelay after the first
+// of changes that come close together, which are read once.
 func (m *Manager) TableChanged(schema, name string) {
 	if m.meta.Load() == nil {
 		return
@@ -172,14 +180,32 @@ func (m *Manager) TableChanged(schema, name string) {
 	m.changed[keyOf(schema, name)] = [2]string{schema, name}
 }
 
-// reloadChanged reads the tables TableChanged was told about.
+// reloadChanged reads the tables TableChanged was told about, eight at a
+// time. A query that calls it waits for reads already under way as well.
 func (m *Manager) reloadChanged() {
+	m.reloading.Lock()
+	defer m.reloading.Unlock()
 	m.metaMu.Lock()
 	changed := m.changed
 	m.changed = nil
 	m.metaMu.Unlock()
+	var wg sync.WaitGroup
+	slots := make(chan struct{}, 8)
 	for _, t := range changed {
-		m.reloadTable(context.Background(), t[0], t[1], m.IsView(t[0], t[1]))
+		slots <- struct{}{}
+		wg.Go(func() {
+			defer func() { <-slots }()
+			m.reloadTable(context.Background(), t[0], t[1], m.IsView(t[0], t[1]))
+		})
+	}
+	wg.Wait()
+}
+
+// tablesChanged is told of the tables DuckDB's statements on this replica
+// changed, DML and DDL alike (see engine.OnTablesChanged).
+func (m *Manager) tablesChanged(tables []catalogproxy.Table) {
+	for _, t := range tables {
+		m.TableChanged(strings.Join(t.Namespace, "."), t.Name)
 	}
 }
 
@@ -202,7 +228,15 @@ func (m *Manager) reloadTable(ctx context.Context, schema, name string, isView b
 	}
 	m.metaMu.Lock()
 	defer m.metaMu.Unlock()
-	m.meta.Store(m.meta.Load().WithTable(schema, name, replace))
+	cur := m.meta.Load()
+	if old, ok := cur.Table(schema, name); ok && replace != nil {
+		// The statement that changed it may spell its name in another case,
+		// which the catalog finds it by, as Lakekeeper does: keep the name
+		// the catalog listed, which information_schema's views join
+		// DuckDB's listings on.
+		replace.Schema, replace.Name = old.Schema, old.Name
+	}
+	m.meta.Store(cur.WithTable(schema, name, replace))
 	m.touched[keyOf(schema, name)] = time.Now()
 }
 

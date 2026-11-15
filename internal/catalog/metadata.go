@@ -16,9 +16,9 @@ import (
 )
 
 // Metadata is what the catalog records about its schemas, tables and
-// views: their comments and columns, and for tables how big they are and
-// when their data last changed. It is read from the Iceberg metadata, so
-// it covers tables that other engines wrote too.
+// views: their comments and columns, when they last changed, and for
+// tables how big they are. It is read from the Iceberg metadata, so it
+// covers tables that other engines wrote too.
 type Metadata struct {
 	Schemas []SchemaMeta
 	// Tables are the tables and views.
@@ -43,9 +43,11 @@ type TableMeta struct {
 	Provider string
 	Comment  string
 	Columns  []ColumnMeta
-	// LastModified is when the data last changed, the current snapshot's
-	// time, or for a view when it was last replaced. Zero for a table
-	// without data.
+	// LastModified is when a table's metadata last changed, as its
+	// last-updated-ms records it: a commit of rows, a change to its columns
+	// or properties, or its creation, as Snowflake's LAST_ALTERED is the
+	// last DDL or DML; the current snapshot's time would miss every change
+	// but a commit of rows. For a view, when it was last replaced.
 	LastModified time.Time
 	// Snapshots counts a table's snapshots, which time travel can read.
 	Snapshots int
@@ -235,8 +237,10 @@ func (c *Client) TableMetadata(ctx context.Context, schema, name string, isView 
 		t.Columns = append(t.Columns, ColumnMeta{Name: f.Name, Type: duckDBType(f.Type), Comment: f.Doc})
 	}
 	t.Snapshots = len(tbl.Metadata().Snapshots())
+	if ms := tbl.Metadata().LastUpdatedMillis(); ms > 0 {
+		t.LastModified = time.UnixMilli(ms)
+	}
 	if snap := tbl.CurrentSnapshot(); snap != nil {
-		t.LastModified = time.UnixMilli(snap.TimestampMs)
 		var summary iceberg.Properties
 		if snap.Summary != nil {
 			summary = snap.Summary.Properties

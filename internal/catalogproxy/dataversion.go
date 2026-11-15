@@ -274,17 +274,26 @@ func loadKey(path string) string {
 	return tableKey(namespace(ns), unescape(name))
 }
 
+// tableKeys are the tableKeys of tables.
+func tableKeys(tables []Table) []string {
+	keys := make([]string, len(tables))
+	for i, t := range tables {
+		keys[i] = tableKey(t.Namespace, t.Name)
+	}
+	return keys
+}
+
 // changedTables returns the tables a change, a request of method to the
-// catalog's path rest with body, may change, by tableKey: ok is false
-// when it cannot tell. none says the request changes no table's rows or
-// columns, as a scan's metrics report.
-func changedTables(method, rest string, body []byte) (keys []string, ok, none bool) {
+// catalog's path rest with body, may change, as the request names them: ok
+// is false when it cannot tell. none says the request changes no table's
+// rows or columns, as a scan's metrics report.
+func changedTables(method, rest string, body []byte) (tables []Table, ok, none bool) {
 	path, _, _ := strings.Cut(rest, "?")
 	if method == http.MethodPost && strings.HasSuffix(path, "/metrics") && metricsPath.MatchString(path) {
 		return nil, true, true
 	}
 	if m := loadTablePath.FindStringSubmatch(rest); m != nil && (method == http.MethodPost || method == http.MethodDelete) {
-		return []string{tableKey(namespace(m[2]), unescape(m[3]))}, true, false
+		return []Table{{Namespace: namespace(m[2]), Name: unescape(m[3])}}, true, false
 	}
 	// Making a namespace, dropping one (only an empty one can be) or
 	// setting its properties changes no table, though it changes the
@@ -313,9 +322,9 @@ func changedTables(method, rest string, body []byte) (keys []string, ok, none bo
 			if c.Identifier == nil {
 				return nil, false, false
 			}
-			keys = append(keys, tableKey(c.Identifier.Namespace, c.Identifier.Name))
+			tables = append(tables, Table{Namespace: c.Identifier.Namespace, Name: c.Identifier.Name})
 		}
-		return keys, true, false
+		return tables, true, false
 	case method == http.MethodPost && createTablePath.MatchString(rest):
 		var c struct {
 			Name string `json:"name"`
@@ -324,7 +333,7 @@ func changedTables(method, rest string, body []byte) (keys []string, ok, none bo
 		if json.Unmarshal(body, &c) != nil || c.Name == "" {
 			return nil, false, false
 		}
-		return []string{tableKey(namespace(m[1]), c.Name)}, true, false
+		return []Table{{Namespace: namespace(m[1]), Name: c.Name}}, true, false
 	case method == http.MethodPost && renameTablePath.MatchString(rest):
 		var c struct {
 			Source      *ident `json:"source"`
@@ -333,7 +342,8 @@ func changedTables(method, rest string, body []byte) (keys []string, ok, none bo
 		if json.Unmarshal(body, &c) != nil || c.Source == nil || c.Destination == nil {
 			return nil, false, false
 		}
-		return []string{tableKey(c.Source.Namespace, c.Source.Name), tableKey(c.Destination.Namespace, c.Destination.Name)}, true, false
+		return []Table{{Namespace: c.Source.Namespace, Name: c.Source.Name}, {Namespace: c.Destination.Namespace, Name: c.Destination.Name}},
+			true, false
 	}
 	return nil, false, false
 }

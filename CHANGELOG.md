@@ -33,6 +33,19 @@ The release workflow publishes the section whose heading matches the tag
   notnull` there meant `a IS NOT NULL`; and `t semi JOIN u` was a semi join,
   where Snowflake joins `u` to `t` aliased `semi`. A select item's alias
   stays as written in the table `CREATE TABLE ... AS` makes.
+- `information_schema.tables.LAST_ALTERED`, `igloo.tables.last_altered`
+  and `SHOW OBJECTS`' `last_altered` are when a table's metadata last
+  changed, Iceberg's `last-updated-ms`, as Snowflake's `LAST_ALTERED` is the
+  last DDL or DML: `ALTER TABLE ... DROP COLUMN` and `ADD COLUMN`, `COMMENT
+  ON` and the like move it, as `INSERT` and `DELETE` do, and a table made
+  without rows has one. It was the current snapshot's time, which no DDL
+  moves, so an app that rebuilt what it derived from a table when
+  `LAST_ALTERED` moved never saw a dropped column. A replica also shows its
+  own statements' changes to the next query: right after `CREATE TABLE ...
+  AS`, and after each later `DROP COLUMN` and `INSERT`, `LAST_ALTERED` was
+  `NULL` or the old time until the replica read the catalog's metadata
+  again, 30 seconds or more later. Views keep the time they were last
+  replaced.
 
 ## [1.0.0-rc.8] - 2026-11-14
 
