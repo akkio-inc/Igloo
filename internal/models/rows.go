@@ -70,7 +70,7 @@ type rowModel interface {
 	// rowTable lays out method's table.
 	rowTable(method string, opt *RowOptions) RowTable
 	// scoreRow appends method's object for one row.
-	scoreRow(buf []byte, method string, opt *RowOptions, r *ml.RowValues) []byte
+	scoreRow(buf []byte, method string, opt *RowOptions, r *ml.RowValues) ([]byte, error)
 }
 
 func (a *Artifact) rowModel() rowModel {
@@ -181,7 +181,7 @@ func ParseScoreSpec(spec string) (sha, method string, cfg map[string]any, err er
 
 // Score appends a row method's object for one row of values, read as the
 // method's features (ToRow).
-func (m *RowMethod) Score(art *Artifact, buf []byte, r *ml.RowValues) []byte {
+func (m *RowMethod) Score(art *Artifact, buf []byte, r *ml.RowValues) ([]byte, error) {
 	return art.rowModel().scoreRow(buf, m.Method, m.opts, r)
 }
 

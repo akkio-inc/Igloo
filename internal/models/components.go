@@ -147,7 +147,7 @@ func (c *Components) rowTable(method string, _ *RowOptions) RowTable {
 
 type componentScratch struct{ vec, coords []float64 }
 
-func (c *Components) scoreRow(buf []byte, method string, opt *RowOptions, r *ml.RowValues) []byte {
+func (c *Components) scoreRow(buf []byte, method string, opt *RowOptions, r *ml.RowValues) ([]byte, error) {
 	sc, _ := c.pool.Get().(*componentScratch)
 	if sc == nil {
 		sc = &componentScratch{vec: make([]float64, c.Encoder.Width), coords: make([]float64, len(c.Model.Eigenvalues))}
@@ -162,13 +162,13 @@ func (c *Components) scoreRow(buf []byte, method string, opt *RowOptions, r *ml.
 		buf = strconv.AppendBool(buf, e > opt.Threshold)
 		buf = appendKey(buf, "mean_squared_error", false)
 		buf = appendNum(buf, e)
-		return append(buf, '}')
+		return append(buf, '}'), nil
 	}
 	for i, v := range sc.coords {
 		buf = appendKey(buf, "principal_component_"+strconv.Itoa(i+1), i == 0)
 		buf = appendNum(buf, v)
 	}
-	return append(buf, '}')
+	return append(buf, '}'), nil
 }
 
 // --- table methods ---------------------------------------------------------

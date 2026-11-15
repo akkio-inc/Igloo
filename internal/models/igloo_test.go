@@ -102,7 +102,11 @@ func scoreRows(t *testing.T, art *Artifact, method string, cfg map[string]any, t
 			}
 		}
 		toRowAny(vals, kinds, &row)
-		out = append(out, string(rm.Score(art, nil, &row)))
+		b, err := rm.Score(art, nil, &row)
+		if err != nil {
+			t.Fatal(err)
+		}
+		out = append(out, string(b))
 	}
 	return out
 }

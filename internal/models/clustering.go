@@ -197,7 +197,7 @@ type clusterScratch struct {
 	order     []int
 }
 
-func (c *Clusters) scoreRow(buf []byte, method string, opt *RowOptions, r *ml.RowValues) []byte {
+func (c *Clusters) scoreRow(buf []byte, method string, opt *RowOptions, r *ml.RowValues) ([]byte, error) {
 	sc, _ := c.pool.Get().(*clusterScratch)
 	if sc == nil {
 		sc = &clusterScratch{vec: make([]float64, c.Encoder.Width), dist: make([]float64, c.Model.K), order: make([]int, c.Model.K)}
@@ -223,7 +223,7 @@ func (c *Clusters) scoreRow(buf []byte, method string, opt *RowOptions, r *ml.Ro
 		buf = appendNum(buf, norm)
 		buf = appendKey(buf, "centroid_id", false)
 		buf = appendNum(buf, float64(nearest+1))
-		return append(buf, '}')
+		return append(buf, '}'), nil
 	}
 	buf = appendKey(buf, "centroid_id", true)
 	buf = appendNum(buf, float64(nearest+1))
@@ -239,7 +239,7 @@ func (c *Clusters) scoreRow(buf []byte, method string, opt *RowOptions, r *ml.Ro
 		buf = appendNum(buf, sc.dist[k])
 		buf = append(buf, '}')
 	}
-	return append(buf, "]}"...)
+	return append(buf, "]}"...), nil
 }
 
 // --- table methods ---------------------------------------------------------

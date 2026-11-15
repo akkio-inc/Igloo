@@ -194,7 +194,7 @@ type autoencoderScratch struct {
 	net *ml.MLPScratch
 }
 
-func (a *Autoencoder) scoreRow(buf []byte, method string, opt *RowOptions, r *ml.RowValues) []byte {
+func (a *Autoencoder) scoreRow(buf []byte, method string, opt *RowOptions, r *ml.RowValues) ([]byte, error) {
 	sc, _ := a.pool.Get().(*autoencoderScratch)
 	if sc == nil {
 		sc = &autoencoderScratch{vec: make([]float64, a.Encoder.Width), net: a.Net.NewScratch()}
@@ -223,7 +223,7 @@ func (a *Autoencoder) scoreRow(buf []byte, method string, opt *RowOptions, r *ml
 		buf = appendKey(buf, "mean_squared_error", false)
 		buf = appendNum(buf, mse)
 	}
-	return append(buf, '}')
+	return append(buf, '}'), nil
 }
 
 // --- table methods ---------------------------------------------------------

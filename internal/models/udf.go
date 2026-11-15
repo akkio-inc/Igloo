@@ -262,7 +262,10 @@ func (f *predictUDF) scoreRow(lm *lastModel, values []driver.Value) (any, error)
 	s := scratchPool.Get().(*scratch)
 	defer scratchPool.Put(s)
 	ToRow(values, lm.kinds, &s.row)
-	s.buf = lm.method.Score(lm.art, s.buf[:0], &s.row)
+	var err error
+	if s.buf, err = lm.method.Score(lm.art, s.buf[:0], &s.row); err != nil {
+		return nil, err
+	}
 	return string(s.buf), nil
 }
 
