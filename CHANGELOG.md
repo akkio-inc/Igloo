@@ -9,6 +9,8 @@ The release workflow publishes the section whose heading matches the tag
 
 ## [Unreleased]
 
+## [1.0.0-rc.11] - 2026-11-15
+
 ### Fixed
 
 - A transaction that reaches a table created after it began fails alone,
