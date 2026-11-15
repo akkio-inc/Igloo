@@ -1,0 +1,35 @@
+Let an UPDATE that matches no row by its filter alone run.
+
+DuckDB plans a statement whose filter folds to false (WHERE false, WHERE
+NULL, WHERE 1 != 1) without a scan of the table. An UPDATE, and a MERGE's
+WHEN MATCHED THEN UPDATE, then flushed the deletes it collected without
+the scan's file list, which it needs only for deletes it has, and threw an
+InternalException while the statement ran: DuckDB invalidated the whole
+database, and every connection failed until the process restarted. With no
+row to delete the flush now writes nothing, as a DELETE's already did and
+upstream's main does, and the statement updates nothing.
+
+diff --git a/src/execution/operator/iceberg_delete.cpp b/src/execution/operator/iceberg_delete.cpp
+index c46c1cc..105631f 100644
+--- a/src/execution/operator/iceberg_delete.cpp
++++ b/src/execution/operator/iceberg_delete.cpp
+@@ -263,10 +263,18 @@ void IcebergDelete::FlushDeletes(IcebergTransaction &transaction, ClientContext
+                                  IcebergDeleteGlobalState &global_state) const {
+ 	bool write_deletion_vector = table.table_info.table_metadata.iceberg_version >= 3;
+ 
++	lock_guard<mutex> guard(global_state.lock);
++	//! Igloo: with no row to delete there is nothing to write, as Finalize already knew. An UPDATE (or a
++	//! MERGE's WHEN MATCHED THEN UPDATE) whose filter DuckDB folds to false (WHERE false, WHERE NULL,
++	//! WHERE 1 != 1) is planned without a scan of the table, so without a file list, and flushed its
++	//! deletes anyway: the InternalException below, thrown while the statement ran, invalidated the
++	//! whole database.
++	if (global_state.deleted_rows.empty()) {
++		return;
++	}
+ 	if (!multi_file_list) {
+ 		throw InternalException("IcebergDelete multi_file_list is NULL");
+ 	}
+-	lock_guard<mutex> guard(global_state.lock);
+ 	for (auto &entry : global_state.deleted_rows) {
+ 		auto &filename = entry.first;
+ 		auto &deleted_rows = entry.second;

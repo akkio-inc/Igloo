@@ -29,6 +29,12 @@ The release workflow publishes the section whose heading matches the tag
   table and the transaction's start (printed before as a date in 1970) and
   asks for a restart, and the retried transaction succeeds
   (`extensions/iceberg/patches/0006` and `0007`).
+- An `UPDATE`, or a `MERGE`'s `WHEN MATCHED THEN UPDATE`, whose filter
+  DuckDB folds to false (`WHERE false`, `WHERE NULL`, `WHERE id IN (NULL)
+  AND 1 != 1`, a `MERGE` source that is empty on its face, `ON false`)
+  updates nothing and succeeds. It threw an internal error as it ran
+  (`IcebergDelete multi_file_list is NULL`), and DuckDB invalidated its
+  whole database, as above (`extensions/iceberg/patches/0008`).
 
 ## [1.0.0-rc.10] - 2026-11-15
 
