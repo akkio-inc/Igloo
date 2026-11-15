@@ -2,9 +2,10 @@
 # Runs the Go tests in a container, with a throwaway PostgreSQL for the
 # tests that need one, a throwaway MySQL that the tests of connections to
 # other databases read alongside it, DuckDB's extensions (kept in the volume
-# igloo-duckdb-extensions) and Igloo's own rb and iceberg extensions
-# (igloo-rb-extension, igloo-iceberg-extension) for the tests that use them.
-# Only Docker is required.
+# igloo-duckdb-extensions), Igloo's own rb and iceberg extensions
+# (igloo-rb-extension, igloo-iceberg-extension) for the tests that use them,
+# and XGBoost's library, which every build links (igloo-xgboost). Only Docker
+# is required.
 #
 #   scripts/test.sh [go test args...]
 set -euo pipefail
@@ -46,7 +47,8 @@ docker run -d --name "$name-mysql" --network "$name" -e MYSQL_ROOT_PASSWORD=test
 ready "$name-db" docker exec "$name-db" pg_isready -U postgres
 
 mounts=(-v "$root":/src -v igloo-go-mod:/go/pkg/mod -v igloo-go-build:/root/.cache/go-build -v igloo-duckdb-extensions:/ext
-  -v igloo-rb-extension:/rb -v igloo-iceberg-extension:/iceberg)
+  -v igloo-rb-extension:/rb -v igloo-iceberg-extension:/iceberg -v igloo-xgboost:/xgboost -e PKG_CONFIG_PATH=/xgboost/lib/pkgconfig)
+"$root/scripts/xgboost.sh"
 # Downloads only what the volume does not have yet.
 docker run --rm "${mounts[@]}" -w /src "$go_image" go run -tags duckdb_arrow ./cmd/igloo install-extensions /ext
 # Igloo's own rb extension, which the engine tests load (seconds; DuckDB's

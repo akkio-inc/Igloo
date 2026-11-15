@@ -43,7 +43,17 @@ compiler is installed). The `duckdb_arrow` build tag builds DuckDB's Arrow
 results, which the Arrow Flight SQL endpoint streams; every build needs it
 (set `GOFLAGS=-tags=duckdb_arrow` for your editor).
 
+Igloo also links XGBoost's library, which `IGLOO.ML.XGBOOST` trains with.
+Build it once, with CMake, Ninja, git and a C++ compiler (about a minute
+on 18 cores), and point pkg-config at it: cgo finds it there for every
+build, `go vet` included. On macOS it is built with OpenMP when Homebrew's
+`libomp` is installed, and otherwise without, training on one thread. Go's
+build cache does not notice the library's link flags changing: after
+building it with other ones, run `go clean -cache`.
+
 ```sh
+third_party/xgboost/build.sh ~/.cache/igloo/xgboost-lib
+export PKG_CONFIG_PATH=~/.cache/igloo/xgboost-lib/lib/pkgconfig
 go test -tags duckdb_arrow ./...
 go vet -tags duckdb_arrow ./...
 gofmt -l cmd internal    # must print nothing
@@ -70,7 +80,8 @@ TZ=UTC go test -tags duckdb_arrow ./internal/pgwire/
 
 The iceberg build also needs CMake, Ninja and pkg-config (on macOS,
 `brew install cmake ninja pkg-config`), and keeps its sources, libraries and
-compiler cache, about 5 GB, in `~/.cache/igloo/iceberg`.
+compiler cache, about 5 GB, in `~/.cache/igloo/iceberg`; XGBoost's keeps
+about 100 MB in `~/.cache/igloo/xgboost`.
 
 ### What CI checks
 
@@ -103,7 +114,7 @@ cmd/igloo/               server entry point and subcommands
 internal/                server packages: configuration, DuckDB engine, Postgres wire protocol
 extensions/rb/           Igloo's DuckDB extension (C++): exact distinct counts in roaring bitmaps
 extensions/iceberg/      DuckDB's Iceberg extension, built from source with Igloo's patches
-third_party/             patched or vendored dependencies (duckdb-go, iceberg-go, psql-wire, CRoaring)
+third_party/             patched or vendored dependencies (duckdb-go, iceberg-go, psql-wire, CRoaring), and XGBoost's build
 deploy/single-vm/        Docker Compose stack for one machine
 deploy/helm/igloo/       Helm chart
 deploy/aws, gcp, azure/  OpenTofu modules for each cloud

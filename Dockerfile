@@ -20,6 +20,25 @@ RUN --mount=type=cache,target=/root/.cache/igloo \
 FROM scratch AS iceberg-out
 COPY --from=iceberg /out/iceberg /
 
+# XGBoost's library (third_party/xgboost), which IGLOO.ML.XGBOOST trains and
+# scores with and the binary links statically: like iceberg, a stage only its
+# build script reaches, built again when its release or the script changes.
+FROM debian:bookworm AS xgboost
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      build-essential cmake ninja-build git ca-certificates ccache && \
+    rm -rf /var/lib/apt/lists/*
+COPY extensions/jobs.sh /src/extensions/
+COPY third_party/xgboost/build.sh /src/third_party/xgboost/
+RUN --mount=type=cache,target=/root/.cache/igloo \
+    /src/third_party/xgboost/build.sh /out/xgboost
+
+# The library alone, for the tests and CI's jobs: docker build --target
+# xgboost-out --output type=local,dest=DIR writes it to DIR. CI's image job
+# gives the build the one its xgboost job built in place of this stage
+# (--build-context xgboost-out=DIR).
+FROM scratch AS xgboost-out
+COPY --from=xgboost /out/xgboost /
+
 FROM golang:1.27-bookworm AS build
 WORKDIR /src
 
@@ -38,6 +57,8 @@ COPY . .
 # refuses any other file: the binary and the files cannot come from
 # different builds.
 COPY --from=iceberg /out/iceberg /out/iceberg
+COPY --from=xgboost-out / /out/xgboost
+ENV PKG_CONFIG_PATH=/out/xgboost/lib/pkgconfig
 RUN --mount=type=cache,target=/go/pkg/mod --mount=type=cache,target=/root/.cache/go-build \
     --mount=type=cache,target=/root/.cache/igloo \
     extensions/rb/build.sh /out/rb && \
