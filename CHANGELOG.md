@@ -59,6 +59,14 @@ The release workflow publishes the section whose heading matches the tag
   class does not take is refused, as in the table form. Snowflake's
   `on_error` is still ignored.
 
+### Fixed
+
+- The liveness check (`/healthz`, on servers and workers) fails once DuckDB has been
+  invalidated by a fatal error, so the orchestrator restarts the process. Before, liveness
+  answered `ok` while every statement failed with "database has been invalidated", and the
+  pod stayed up, unready, until someone restarted it. Any other DuckDB error, or a slow ping
+  under load, still only fails readiness.
+
 ## [1.0.0-rc.9] - 2026-11-14
 
 ### Fixed

@@ -659,6 +659,14 @@ func (e *Engine) loadSchemas(ctx context.Context, tables [][2]string, hold func(
 // schemaLoaders bounds how many tables' schemas LoadSchemas loads at once.
 const schemaLoaders = 16
 
+// IsFatal reports whether err is DuckDB's fatal error: after one, DuckDB
+// invalidates the database and refuses every statement until the process
+// restarts, so only a restart recovers.
+func IsFatal(err error) bool {
+	var de *duckdb.Error
+	return errors.As(err, &de) && de.Type == duckdb.ErrorTypeFatal
+}
+
 // Ping checks that DuckDB can run a query.
 func (e *Engine) Ping(ctx context.Context) error {
 	c, err := e.connector.Connect(ctx)
