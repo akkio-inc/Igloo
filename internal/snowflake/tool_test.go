@@ -10,7 +10,7 @@ import (
 	"testing"
 )
 
-var update = flag.Bool("update", false, "rewrite testdata/statements.golden")
+var update = flag.Bool("update", false, "rewrite testdata/statements.golden and keywords.go")
 
 // TestStatements translates testdata/statements.sql, a statement a line,
 // and compares the result with testdata/statements.golden, which shows

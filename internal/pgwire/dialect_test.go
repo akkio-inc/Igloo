@@ -844,3 +844,43 @@ func TestSnowflakeSemiStructuredResults(t *testing.T) {
 		}
 	}
 }
+
+// A Snowflake statement whose tables and select items are named with words
+// DuckDB keeps as keywords, as an audience report's chain of CTEs names
+// them (AUDIENCE_TOTAL at), runs through a session, in each protocol, and
+// names its columns as Snowflake does; a table made of such a select keeps
+// its columns' names as written.
+func TestSnowflakeKeywordAliases(t *testing.T) {
+	t.Parallel()
+	ts := startServer(t)
+	const report = `WITH CATEGORY_METRICS AS (SELECT 'news' AS CATEGORY, 2 AS PEOPLE UNION ALL SELECT 'sport', 3),
+AUDIENCE_TOTAL AS (SELECT 5 AS TOTAL_PEOPLE), TOTALS AS (SELECT 10 AS N),
+SHARES AS (SELECT cm.CATEGORY, cm.PEOPLE / at.TOTAL_PEOPLE share, t.N total FROM CATEGORY_METRICS cm CROSS JOIN AUDIENCE_TOTAL at CROSS JOIN TOTALS t)
+SELECT semi.CATEGORY, semi.share, semi.total, 1 year FROM SHARES semi ORDER BY 1`
+	for name, mode := range modes {
+		conn := ts.admin(t, mode)
+		mustExec(t, conn, "SET sql_dialect = 'snowflake'")
+		rows, err := conn.Query(context.Background(), report)
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		var cols []string
+		for _, f := range rows.FieldDescriptions() {
+			cols = append(cols, f.Name)
+		}
+		rows.Close()
+		if want := []string{"CATEGORY", "SHARE", "TOTAL", "YEAR"}; !slices.Equal(cols, want) {
+			t.Errorf("%s: columns %q, want %q", name, cols, want)
+		}
+		if _, got := wireRows(t, conn, report); !slices.Equal(got, []string{"news|0.4|10|1", "sport|0.6|10|1"}) {
+			t.Errorf("%s: rows %q", name, got)
+		}
+	}
+	conn := ts.admin(t, pgx.QueryExecModeSimpleProtocol)
+	mustExec(t, conn, "SET sql_dialect = 'snowflake'")
+	mustExec(t, conn, "CREATE TABLE named AS SELECT 1 year, 2 at FROM (SELECT 1 x) semi")
+	mustExec(t, conn, "SET sql_dialect = 'duckdb'")
+	if got := texts(t, conn, "SELECT column_name FROM information_schema.columns WHERE table_name = 'named' ORDER BY ordinal_position"); !slices.Equal(got, []string{"year", "at"}) {
+		t.Errorf("CREATE TABLE ... AS names its columns %q, want year and at", got)
+	}
+}

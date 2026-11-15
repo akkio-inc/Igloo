@@ -131,6 +131,12 @@ SELECT * FROM db.sch.tbl
 -- SELECT AT.total, at.n, LEFT.x, gt.y, t.at, v:at.left FROM a AS AT, b AS left, c AS gt
 SELECT "AT".total, "AT".n, "LEFT".x, gt.y, t.at, sf_get(v, '$.at.left') AS "V:AT.LEFT" FROM a AS "AT", b AS "LEFT", c AS gt
 
+-- SELECT cm.category, cm.people / at.total share FROM category_metrics cm CROSS JOIN audience_total at CROSS JOIN (SELECT 1 year, x semi FROM u) t
+SELECT cm.category, sf_div(cm.people, "AT".total) "SHARE" FROM category_metrics cm CROSS JOIN audience_total "AT" CROSS JOIN (SELECT 1 "year", x "semi" FROM u) t
+
+-- WITH at (a) AS (SELECT 1) SELECT at.a FROM at semi JOIN at anti ON semi.a = anti.a JOIN at ASOF JOIN q MATCH_CONDITION (at.a >= q.a)
+WITH "AT" (a) AS (SELECT 1) SELECT "AT".a FROM "AT" "SEMI" JOIN "AT" "ANTI" ON "SEMI".a = "ANTI".a JOIN "AT" ASOF LEFT JOIN q ON ("AT".a >= q.a)
+
 -- SET x = 10
 SET VARIABLE "x" = 10
 
@@ -172,6 +178,9 @@ DESCRIBE t
 
 -- GRANT SELECT ON TABLE t TO ROLE analyst
 GRANT SELECT ON TABLE t TO analyst
+
+-- REVOKE SELECT, INSERT ON TABLE at FROM ROLE admin
+REVOKE SELECT, INSERT ON TABLE at FROM admin
 
 -- GRANT USAGE ON WAREHOUSE wh TO ROLE analyst
 COMMAND: GRANT

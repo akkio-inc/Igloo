@@ -91,6 +91,14 @@ notices.
 - `CREATE TABLE ... AS` and views keep their columns' names as written
   (`AS total` stores `total`); reading them in Snowflake's dialect shows
   `TOTAL`.
+- A table's alias, a CTE's name, the names in their column lists and a
+  select item's alias may be words that DuckDB keeps as keywords, as in
+  Snowflake: `CROSS JOIN totals at`, `at.total`, `SELECT 1 year`. Igloo
+  quotes them for DuckDB as its keyword list (`duckdb_keywords()`) says, a
+  table's in upper case and a select item's as written, so they name what
+  the word does. `SEMI`, `ANTI` and `POSITIONAL` after a table are its
+  alias, as in Snowflake, not the start of DuckDB's joins of those kinds;
+  `AT (...)` and `ASOF JOIN` are the clauses.
 - `IDENTIFIER('db.schema.table')`, `IDENTIFIER($name)`, `TABLE('name')` and
   `TABLE($name)` name an object.
 - A three-part name's database is the catalog's name, `lake` unless
@@ -554,6 +562,10 @@ What Igloo cannot reproduce exactly, and what it does instead.
 
 - Identifiers are case-insensitive even when quoted: `"col"` and `COL` name
   the same column, where Snowflake would see two.
+- A column whose name DuckDB reserves or keeps for types and functions
+  (`AT`, `LEFT`, `SEMI`) must be quoted where a statement reads it alone
+  (`SELECT "AT" FROM t`, `ORDER BY "AT"`); Igloo quotes such a name for
+  DuckDB only as an alias or a qualifier ([names](#names)).
 - Views run with their reader's privileges, as Igloo's always do; `SECURE`
   does not hide their definition.
 - `information_schema` and `SHOW` are DuckDB's, with the Snowflake

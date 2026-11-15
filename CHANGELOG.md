@@ -23,6 +23,16 @@ The release workflow publishes the section whose heading matches the tag
   `OBJECT_CONSTRUCT`, `OBJECT_INSERT`, `ARRAY_APPEND`, `ARRAY_CONTAINS`,
   `TO_JSON`, `TO_VARIANT`, `::VARIANT` and the like. An expression's text,
   such as `x::STRING`, stays a string.
+- In the Snowflake dialect, a table's alias, a CTE's name and a select
+  item's alias written without `AS` may be any word that DuckDB keeps as a
+  keyword and Snowflake does not: Igloo quotes each where DuckDB cannot read
+  it bare, by DuckDB's own keyword list. `FROM metrics cm CROSS JOIN totals
+  at CROSS JOIN ...` failed with `syntax error at or near "CROSS"`, as DuckDB
+  read `at` as the start of its `AT (VERSION => ...)`; `SELECT 1 year` in a
+  subquery, a CTE, `CREATE TABLE ... AS` or a view failed at `year`; `a
+  notnull` there meant `a IS NOT NULL`; and `t semi JOIN u` was a semi join,
+  where Snowflake joins `u` to `t` aliased `semi`. A select item's alias
+  stays as written in the table `CREATE TABLE ... AS` makes.
 
 ## [1.0.0-rc.8] - 2026-11-14
 

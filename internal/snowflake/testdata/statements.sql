@@ -42,6 +42,8 @@ SELECT * FROM VALUES (1, 'a'), (2, 'b')
 WITH r AS (SELECT 1 AS n UNION ALL SELECT n + 1 FROM r WHERE n < 3) SELECT n FROM r
 SELECT * FROM IDENTIFIER('db.sch.tbl')
 SELECT AT.total, at.n, LEFT.x, gt.y, t.at, v:at.left FROM a AS AT, b AS left, c AS gt
+SELECT cm.category, cm.people / at.total share FROM category_metrics cm CROSS JOIN audience_total at CROSS JOIN (SELECT 1 year, x semi FROM u) t
+WITH at (a) AS (SELECT 1) SELECT at.a FROM at semi JOIN at anti ON semi.a = anti.a JOIN at ASOF JOIN q MATCH_CONDITION (at.a >= q.a)
 SET x = 10
 SELECT $x
 UNSET x
@@ -55,6 +57,7 @@ SELECT x::number(10,2), y::int, z::float, w::variant, CAST(q AS TIMESTAMP_TZ) FR
 SELECT 'it\'s', $$raw\string$$ // comment
 DESC TABLE t
 GRANT SELECT ON TABLE t TO ROLE analyst
+REVOKE SELECT, INSERT ON TABLE at FROM ROLE admin
 GRANT USAGE ON WAREHOUSE wh TO ROLE analyst
 SELECT * FROM t PIVOT (SUM(v) FOR k IN ('a', 'b'))
 SELECT * FROM t UNPIVOT (val FOR name IN (col_a, col_b))
