@@ -1,0 +1,46 @@
+Fail a transaction older than a table's metadata, not the whole database.
+
+A transaction reads an Iceberg table as the table was when the transaction
+started, and finds that state in the table's metadata log. When the table's
+latest metadata is newer than the transaction and no entry of the log is as
+old (another connection created the table since, or changed it more times
+since than the log keeps), the lookup threw an InternalException. DuckDB
+invalidates its whole database on an InternalException thrown while a
+statement runs, and a listing of the catalog (duckdb_tables(),
+information_schema, pg_catalog) runs the lookup for every table any
+connection has loaded. A pilot deployment went down this way: a transaction
+block's INSERT had Igloo list the catalog's tables to check the user's
+grants, the listing met a table another session had created and read since
+the block began, and every session failed with "database has been
+invalidated" until the process was restarted. The lookup now throws a
+TransactionException, which fails only the transaction and asks the client
+to restart it (Igloo answers SQLSTATE 40001, as for a conflicting commit),
+and names the table. The start time it printed was milliseconds read as
+microseconds, a date in 1970.
+
+diff --git a/src/catalog/rest/catalog_entry/table/iceberg_table_information.cpp b/src/catalog/rest/catalog_entry/table/iceberg_table_information.cpp
+index ebe8313..77412e7 100644
+--- a/src/catalog/rest/catalog_entry/table/iceberg_table_information.cpp
++++ b/src/catalog/rest/catalog_entry/table/iceberg_table_information.cpp
+@@ -634,9 +634,18 @@ IcebergTableMetadata IcebergTableInformation::CreateMetadataFromLog(ClientContex
+ 		}
+ 	}
+ 	if (!log_item_index.IsValid()) {
+-		throw InternalException(
+-		    "Metadata-log exists but none of the entries were valid for the current transaction start time (%s)",
+-		    Timestamp::ToString(timestamp_ms_t(transaction_start_millis)));
++		//! Igloo: the table has no metadata from before the transaction started: another connection made
++		//! it since (and changed it once more, which put its first metadata in the log), or changed it more
++		//! times since than the log keeps. That is a concurrent session's doing, not a broken invariant:
++		//! DuckDB invalidates the whole database on an InternalException thrown while a statement runs (a
++		//! listing, which reads every table's entry, here), and every connection then failed until the
++		//! process restarted. The transaction cannot see the table as of its start; a new one can. The
++		//! start is milliseconds since the epoch, which the message printed as microseconds (1970).
++		throw TransactionException(
++		    "Table %s changed after this transaction started at %s UTC, and its metadata log keeps nothing "
++		    "from before then: it was created since, or changed more times since than the log keeps. Please "
++		    "restart your transaction",
++		    GetTableKey(), Timestamp::ToString(Timestamp::FromEpochMs(transaction_start_millis)));
+ 	}
+ 
+ 	auto fs = make_shared_ptr<CachingFileSystemWrapper>(FileSystem::GetFileSystem(context), *context.db);

@@ -48,7 +48,10 @@ const stall = time.Minute
 // roundTrip is how late the catalog answers each request.
 const roundTrip = 25 * time.Millisecond
 
-func TestCatalogStress(t *testing.T) {
+// testExtension returns the iceberg extension file the tests load, or skips
+// the test without one (CI builds it).
+func testExtension(t *testing.T) string {
+	t.Helper()
 	ext := os.Getenv("IGLOO_TEST_ICEBERG_EXTENSION")
 	if ext == "" {
 		if os.Getenv("CI") != "" {
@@ -59,6 +62,44 @@ func TestCatalogStress(t *testing.T) {
 	if os.Getenv("IGLOO_TEST_EXTENSION_DIR") == "" {
 		t.Skip("IGLOO_TEST_EXTENSION_DIR is not set (the avro extension the iceberg one reads manifests with)")
 	}
+	return ext
+}
+
+// openLake opens a plain DuckDB with the iceberg extension ext loaded and
+// the catalog at endpoint attached as lake.
+func openLake(t *testing.T, ext, endpoint string) *sql.DB {
+	t.Helper()
+	connector, err := duckdb.NewConnector("?allow_unsigned_extensions=true", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	db := sql.OpenDB(connector)
+	ctx := context.Background()
+	// A DuckDB built with the extension in it, as for a run under
+	// AddressSanitizer, has it loaded already.
+	var linked bool
+	if err := db.QueryRowContext(ctx, "SELECT count(*) > 0 FROM duckdb_extensions() WHERE extension_name = 'iceberg' AND loaded").Scan(&linked); err != nil {
+		t.Fatal(err)
+	}
+	load := "LOAD '" + ext + "'"
+	if linked {
+		load = "SELECT 1"
+	}
+	for _, s := range []string{
+		"SET GLOBAL extension_directory = '" + os.Getenv("IGLOO_TEST_EXTENSION_DIR") + "'",
+		"SET GLOBAL autoinstall_known_extensions = false",
+		load,
+		"ATTACH 'wh' AS lake (TYPE iceberg, ENDPOINT '" + endpoint + "', AUTHORIZATION_TYPE 'none', ACCESS_DELEGATION_MODE 'none', PURGE_REQUESTED false, REMOVE_FILES_ON_DELETE false)",
+	} {
+		if _, err := db.ExecContext(ctx, s); err != nil {
+			t.Fatalf("%s: %v", s, err)
+		}
+	}
+	return db
+}
+
+func TestCatalogStress(t *testing.T) {
+	ext := testExtension(t)
 	run := 20 * time.Second
 	if v := os.Getenv(stressTimeEnv); v != "" {
 		d, err := time.ParseDuration(v)
@@ -130,31 +171,10 @@ func catalogStress(t *testing.T, ext string, run time.Duration) {
 	defer slow.Close()
 	endpoint := slow.URL + "/catalog"
 
-	connector, err := duckdb.NewConnector("?allow_unsigned_extensions=true", nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	db := sql.OpenDB(connector)
+	db := openLake(t, ext, endpoint)
 	defer db.Close() //nolint:errcheck
 	ctx := context.Background()
-	// A DuckDB built with the extension in it, as for a run under
-	// AddressSanitizer, has it loaded already.
-	var linked bool
-	if err := db.QueryRowContext(ctx, "SELECT count(*) > 0 FROM duckdb_extensions() WHERE extension_name = 'iceberg' AND loaded").Scan(&linked); err != nil {
-		t.Fatal(err)
-	}
-	load := "LOAD '" + ext + "'"
-	if linked {
-		load = "SELECT 1"
-	}
-	for _, s := range []string{
-		"SET GLOBAL extension_directory = '" + os.Getenv("IGLOO_TEST_EXTENSION_DIR") + "'",
-		"SET GLOBAL autoinstall_known_extensions = false",
-		load,
-		"ATTACH 'wh' AS lake (TYPE iceberg, ENDPOINT '" + endpoint + "', AUTHORIZATION_TYPE 'none', ACCESS_DELEGATION_MODE 'none', PURGE_REQUESTED false, REMOVE_FILES_ON_DELETE false)",
-		"CREATE SCHEMA lake.s",
-		"CREATE SCHEMA lake.s2",
-	} {
+	for _, s := range []string{"CREATE SCHEMA lake.s", "CREATE SCHEMA lake.s2"} {
 		if _, err := db.ExecContext(ctx, s); err != nil {
 			t.Fatalf("%s: %v", s, err)
 		}
@@ -175,16 +195,6 @@ func catalogStress(t *testing.T, ext string, run time.Duration) {
 		n    int
 		step func(conn *sql.Conn, r *rand.Rand, i int) error
 	}
-	query := func(conn *sql.Conn, q string) error {
-		rows, err := conn.QueryContext(ctx, q)
-		if err != nil {
-			return err
-		}
-		for rows.Next() {
-		}
-		rows.Close() //nolint:errcheck
-		return rows.Err()
-	}
 	do := func(conn *sql.Conn, stmts ...string) error {
 		for _, s := range stmts {
 			if _, err := conn.ExecContext(ctx, s); err != nil {
@@ -199,15 +209,15 @@ func catalogStress(t *testing.T, ext string, run time.Duration) {
 		// entry in the set.
 		{"bind", 8, func(conn *sql.Conn, r *rand.Rand, _ int) error {
 			if r.IntN(4) == 0 {
-				return query(conn, fmt.Sprintf("SELECT count(*) FROM lake.s2.u%d", r.IntN(4)))
+				return query(ctx, conn, fmt.Sprintf("SELECT count(*) FROM lake.s2.u%d", r.IntN(4)))
 			}
-			return query(conn, fmt.Sprintf("SELECT count(*), max(label) FROM lake.s.t%d", r.IntN(tables)))
+			return query(ctx, conn, fmt.Sprintf("SELECT count(*), max(label) FROM lake.s.t%d", r.IntN(tables)))
 		}},
 		{"describe", 2, func(conn *sql.Conn, r *rand.Rand, _ int) error {
-			return query(conn, fmt.Sprintf("DESCRIBE lake.s.t%d", r.IntN(tables)))
+			return query(ctx, conn, fmt.Sprintf("DESCRIBE lake.s.t%d", r.IntN(tables)))
 		}},
 		{"list", 6, func(conn *sql.Conn, r *rand.Rand, _ int) error {
-			return query(conn, listings[r.IntN(len(listings))])
+			return query(ctx, conn, listings[r.IntN(len(listings))])
 		}},
 		// Renames: each connection moves its own tables away and back.
 		{"rename", renamers, func(conn *sql.Conn, r *rand.Rand, w int) error {
@@ -343,7 +353,7 @@ func catalogStress(t *testing.T, ext string, run time.Duration) {
 		t.Fatal(err)
 	}
 	for _, n := range names {
-		if err := query(conn, "SELECT count(*) FROM lake.s."+n); err != nil {
+		if err := query(ctx, conn, "SELECT count(*) FROM lake.s."+n); err != nil {
 			t.Errorf("%s is listed but does not bind: %v", n, err)
 		}
 	}

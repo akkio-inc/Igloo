@@ -9,6 +9,26 @@ The release workflow publishes the section whose heading matches the tag
 
 ## [Unreleased]
 
+### Fixed
+
+- A transaction that reaches a table created after it began fails alone,
+  rather than taking the whole database down. When a table's latest
+  metadata was newer than a transaction and its metadata log kept nothing
+  from before the transaction started (another session created it since,
+  or changed it more times since than the log keeps), the iceberg
+  extension threw an internal error. DuckDB invalidates its database on
+  one thrown while a statement runs, as in a listing of the catalog, and
+  every session then failed with "database has been invalidated" until the
+  process restarted. Igloo lists the catalog's tables inside a session's
+  transaction to check its grants, so on a pilot deployment one
+  transaction block (`BEGIN`, a `MERGE`, an `INSERT`) took every session
+  down because another session had created and read a table since the
+  block began. The statement now fails its transaction, with a message
+  that names the table and the transaction's start (printed before as a
+  date in 1970) and asks for a restart, and the retried transaction
+  succeeds; from DuckDB's own statements the client gets SQLSTATE 40001
+  (`extensions/iceberg/patches/0006`).
+
 ## [1.0.0-rc.10] - 2026-11-15
 
 ### Added
