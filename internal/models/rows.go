@@ -33,6 +33,9 @@ type RowOptions struct {
 	// ExcludeSeen leaves out of RECOMMEND the items a user rated in
 	// training.
 	ExcludeSeen bool
+	// Margin adds an XGBoost model's raw margin to PREDICT
+	// (output_margin).
+	Margin bool
 }
 
 // RowColumn is a column the table form of a row method adds: Name, as

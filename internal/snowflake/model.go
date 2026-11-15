@@ -869,11 +869,18 @@ func (t *translator) predictRef(name []*node, method string, args *node) (*node,
 			case "INPUT_DATA":
 				input = trim(a[ix[1]+1:])
 			case "CONFIG_OBJECT":
-				if method == "PREDICT" {
-					break // on_error is all PREDICT's holds; errors always abort.
-				}
 				p := &modelParser{src: t.src, nodes: a, idx: ix}
 				v, err := p.value(trim(a[ix[1]+1:]))
+				if method == "PREDICT" {
+					// Snowflake's PREDICT takes on_error alone, which Igloo
+					// ignores (errors always abort); Igloo's classes' may take
+					// options of their own, such as an XGBoost model's
+					// output_margin.
+					if err == nil && v.Kind == ValueObject {
+						config = &v
+					}
+					break
+				}
 				if err != nil {
 					return nil, err
 				}
@@ -895,10 +902,24 @@ func (t *translator) predictRef(name []*node, method string, args *node) (*node,
 	if input == nil {
 		return nil, &Error{Code: CodeSyntax, Message: method + " needs INPUT_DATA, such as INPUT_DATA => {*}"}
 	}
-	if method != "PREDICT" {
+	var options any
+	if config != nil && config.Kind == ValueObject {
+		options = config.Any()
+		if obj, ok := options.(map[string]any); ok && method == "PREDICT" {
+			for k := range obj {
+				if strings.EqualFold(k, "on_error") {
+					delete(obj, k)
+				}
+			}
+			if len(obj) == 0 {
+				options = nil
+			}
+		}
+	}
+	if method != "PREDICT" || options != nil {
 		modelName += "!" + method
-		if config != nil && config.Kind == ValueObject {
-			b, err := json.Marshal(config.Any())
+		if options != nil {
+			b, err := json.Marshal(options)
 			if err != nil {
 				return nil, &Error{Code: CodeSyntax, Message: method + "'s CONFIG_OBJECT: " + err.Error()}
 			}

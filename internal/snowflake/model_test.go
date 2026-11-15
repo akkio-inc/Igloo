@@ -127,6 +127,9 @@ func TestModelTranslation(t *testing.T) {
 		// Row methods besides PREDICT carry their method and options.
 		`SELECT m!DETECT_ANOMALIES(INPUT_DATA => {*}, CONFIG_OBJECT => {'contamination': 0.02}):is_anomaly AS a FROM t`: `SELECT json_extract(CAST(igloo_ml_predict_ref('m!DETECT_ANOMALIES{"contamination":0.02}', '*') AS JSON), '$.is_anomaly') AS "A" FROM t`,
 		`SELECT m!EXPLAIN_PREDICT(INPUT_DATA => {*}) AS e FROM t`:                                                       `SELECT CAST(igloo_ml_predict_ref('m!EXPLAIN_PREDICT', '*') AS JSON) AS "E" FROM t`,
+		// PREDICT carries options of an Igloo class's, not Snowflake's on_error.
+		`SELECT m!PREDICT(INPUT_DATA => {*}, CONFIG_OBJECT => {'output_margin': TRUE, 'on_error': 'skip'}) AS p FROM t`: `SELECT CAST(igloo_ml_predict_ref('m!PREDICT{"output_margin":true}', '*') AS JSON) AS "P" FROM t`,
+		`SELECT m!PREDICT(INPUT_DATA => {*}, CONFIG_OBJECT => {'ON_ERROR': 'skip'}) AS p FROM t`:                        `SELECT CAST(igloo_ml_predict_ref('m', '*') AS JSON) AS "P" FROM t`,
 		`SELECT * FROM TABLE(m!PREDICT(INPUT_DATA => TABLE(t)))`:                                                        `SELECT * FROM igloo_ml_method('m!PREDICT(INPUT_DATA => TABLE(t))')`,
 	} {
 		res, err := Translate(in, Options{})

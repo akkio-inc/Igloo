@@ -43,6 +43,7 @@ type Artifact struct {
 	Components  *Components  `json:"components,omitempty"`
 	Factors     *Factors     `json:"factors,omitempty"`
 	Autoencoder *Autoencoder `json:"autoencoder,omitempty"`
+	XGBoost     *XGBoost     `json:"xgboost,omitempty"`
 }
 
 // iglooModel is a model of one of Igloo's classes.
@@ -70,6 +71,8 @@ func (a *Artifact) igloo() iglooModel {
 		return a.Factors
 	case a.Autoencoder != nil:
 		return a.Autoencoder
+	case a.XGBoost != nil:
+		return a.XGBoost
 	}
 	return nil
 }
@@ -90,6 +93,9 @@ func DecodeArtifact(blob []byte, sha string) (*Artifact, error) {
 		return nil, fmt.Errorf("model blob %s has format %d; this version of Igloo reads %d (create the model again)", sha, a.Format, format)
 	}
 	a.prepare()
+	if a.XGBoost != nil && a.XGBoost.err != nil {
+		return nil, a.XGBoost.err
+	}
 	return &a, nil
 }
 
