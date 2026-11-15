@@ -9,6 +9,56 @@ The release workflow publishes the section whose heading matches the tag
 
 ## [Unreleased]
 
+### Added
+
+- `IGLOO.ML.XGBOOST`, a model class that XGBoost's own library trains. The
+  binary links XGBoost 3.4.2, built from its repository, and passes it
+  `CONFIG_OBJECT`'s parameters by XGBoost's names as they are written, so
+  an application gets the model XGBoost's Python package trains with
+  `xgboost.train` on the same rows in the same order. On the tests' data
+  (a binary classifier, early stopping, a weighted regression and
+  `survival:aft`), the saved models are the Python package's byte for
+  byte on the platform that made the reference (macOS on arm64), with
+  every prediction, margin, SHAP value and metric the same float32; on
+  Linux (arm64, with OpenMP) two of the four models are the same bytes,
+  early stopping stops at the same round, and the rest agree within
+  2.2e-7. `TARGET_COLNAME` gives the label, or `LABEL_LOWER_BOUND_COLNAME`
+  and `LABEL_UPPER_BOUND_COLNAME` an interval (`'Infinity'::DOUBLE` for a
+  right-censored row's upper bound), and `WEIGHT_COLNAME` weights. Besides
+  XGBoost's parameters, `CONFIG_OBJECT` takes `num_boost_round`,
+  `early_stopping_rounds` (as the Python package's, on the validation
+  rows' last metric; methods then use the best iteration) and
+  `data_split_method`, `'custom'` with a boolean `data_split_col` among
+  them. Numbers, booleans and timestamps are features; text is refused, to
+  be encoded in the query, since XGBoost's own categorical support is what
+  the same model in XGBoost would use. Parameters XGBoost refuses or does
+  not use fail `CREATE` with XGBoost's message. The methods are `PREDICT`
+  (with the class probabilities of classification objectives, and the
+  margin with `'output_margin': TRUE`), `EXPLAIN_PREDICT` (XGBoost's SHAP
+  values in margin space and the bias, which add up to the margin),
+  `EVALUATE` (XGBoost's metrics), `TRAINING_INFO` (each round's training and
+  validation metrics, and the best iteration) and `FEATURE_IMPORTANCE`
+  (XGBoost's weight, gain and cover), in a query, as tables and on workers.
+  The model's blob holds XGBoost's model as XGBoost saves it (UBJSON),
+  which the Python package loads. Scoring a row with 100 trees of depth 6
+  takes 11 µs for its prediction and 41 µs for its SHAP values, on one
+  core of an Apple M5 Max (`BenchmarkPredictRow` in `internal/xgboost`).
+
+### Changed
+
+- Building Igloo needs XGBoost's library, which
+  `third_party/xgboost/build.sh` builds (75 seconds on 18 cores) and cgo
+  links by pkg-config: set `PKG_CONFIG_PATH` to its `lib/pkgconfig`. The
+  Dockerfile builds it in a stage of its own, and CI builds it once a
+  commit for each architecture, cached by XGBoost's release, and hands it
+  to the Go and image jobs. `make test` and `make lint` build it in Docker.
+- In the Snowflake dialect, `model!PREDICT(INPUT_DATA => ..., CONFIG_OBJECT
+  => {...})` in a query passes its options to an Igloo class's model, as
+  `TABLE(model!PREDICT(...))` does, rather than dropping them: an
+  `IGLOO.ML.XGBOOST` model's `output_margin` works there, and an option a
+  class does not take is refused, as in the table form. Snowflake's
+  `on_error` is still ignored.
+
 ## [1.0.0-rc.9] - 2026-11-14
 
 ### Fixed
