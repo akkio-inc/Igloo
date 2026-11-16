@@ -1847,21 +1847,36 @@ func randomFn(c *call) (*node, error) {
 	return c.out("CAST((random() - 0.5) * 18446744073709549568.0 AS BIGINT)"), nil
 }
 
-// isFloatLiteral reports whether a literal argument is a FLOAT in
-// Snowflake: written with an exponent or cast to a float type.
-func isFloatLiteral(a []*node) bool {
-	return len(a) == 1 && a[0].kind == kNumber && strings.ContainsAny(a[0].tok.text, "eE")
+// isFloat reports whether an argument, a, is a FLOAT in Snowflake: a
+// number written with an exponent, or a cast to FLOAT (::FLOAT, CAST(x AS
+// DOUBLE), TO_DOUBLE(x) and the like), signed or in parentheses or not.
+func isFloat(a []*node) bool {
+	a = trim(a)
+	if len(a) == 2 && (a[0].isOp("-") || a[0].isOp("+")) {
+		a = a[1:]
+	}
+	if len(a) != 1 {
+		return false
+	}
+	switch n := a[0]; {
+	case n.kind == kNumber:
+		return strings.ContainsAny(n.tok.text, "eE")
+	case n.isGroup('('):
+		return isFloat(n.kids)
+	default:
+		return n.float
+	}
 }
 
-// uniform translates UNIFORM(min, max, generator): an integer when min and
-// max are integers, else a float.
+// uniform translates UNIFORM(min, max, generator): a float when min or max
+// is a FLOAT, else an integer, as Snowflake reads a NUMBER with a scale too.
 func uniform(c *call) (*node, error) {
 	if err := c.argc(3, 3); err != nil {
 		return nil, err
 	}
 	c.generatorNotice(2)
 	lo, hi := c.op(0), c.op(1)
-	if isFloatLiteral(c.args[0]) || isFloatLiteral(c.args[1]) {
+	if isFloat(c.args[0]) || isFloat(c.args[1]) {
 		return c.out("(", lo, " + random() * (", hi, " - ", lo, "))"), nil
 	}
 	return c.out("CAST(floor(", lo, " + random() * (", hi, " - ", lo, " + 1)) AS BIGINT)"), nil

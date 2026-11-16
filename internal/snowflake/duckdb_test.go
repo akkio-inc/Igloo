@@ -194,6 +194,28 @@ func TestAgainstSnowflake(t *testing.T) {
 	}
 }
 
+// TestUniformOfFloats checks UNIFORM's type, which Snowflake takes from its
+// bounds: a FLOAT when either is a FLOAT (its documentation's example is
+// UNIFORM(0::FLOAT, 1::FLOAT, RANDOM())), else an integer. A float drawn
+// between two floats takes as many values as it is drawn, not the two
+// integers 0 and 1, from any cast to FLOAT, signed or not.
+func TestUniformOfFloats(t *testing.T) {
+	conn := session(t)
+	for _, c := range []runCase{
+		{name: "floats", sql: `select count(distinct a) > 90, min(a) >= 0 and max(a) <= 1, count(distinct b) > 90,
+			min(c) >= -1 and max(c) <= -0.5, count(distinct d) > 90 and max(d) <= 1e-6, count(distinct e) > 90
+			from (select uniform(0::float, 1::float, random()) a, uniform(cast(0 as double), to_double(1), random()) b,
+			uniform(-1::float, -0.5::float, random()) c, uniform(0::float, 1e-6::float, random()) d,
+			uniform(0, 1::real, random()) e from table(generator(rowcount => 100)))`,
+			want: []string{"true|true|true|true|true|true"}},
+		{name: "types", sql: `select uniform(5::float, 5::float, random()), uniform((5::double), 5, random()), uniform(5, 5e0, random()),
+			uniform(5, 5, random()), uniform(5.0, 5.0, random())`,
+			want: []string{"5|5|5|5|5"}, types: []string{"DOUBLE", "DOUBLE", "DOUBLE", "BIGINT", "BIGINT"}},
+	} {
+		t.Run(c.name, func(t *testing.T) { run(t, conn, c) })
+	}
+}
+
 // TestWideDecimalCasts checks that casts of text to NUMBER of more than 18
 // digits, which go through DECIMAL(18,s) first (see decimalCast), give
 // exactly what DuckDB's own cast to the wide DECIMAL gives, value, type and

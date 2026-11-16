@@ -438,8 +438,18 @@ func castBase(nodes []*node, start, p int) ([]*node, int, bool, error) {
 	return replace(nodes, s, p+1, cast), s, true, nil
 }
 
-// castExpr casts x to typ as Snowflake does.
+// castExpr casts x to typ as Snowflake does, marking a cast to FLOAT
+// (DuckDB's DOUBLE) as one.
 func castExpr(x []*node, typ sqlType, try bool) *node {
+	n := castValue(x, typ, try)
+	if typ.duck == "DOUBLE" {
+		n.float = true
+	}
+	return n
+}
+
+// castValue is castExpr's cast.
+func castValue(x []*node, typ sqlType, try bool) *node {
 	x = trim(x)
 	fn := "CAST("
 	if try {

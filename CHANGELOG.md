@@ -9,6 +9,15 @@ The release workflow publishes the section whose heading matches the tag
 
 ## [Unreleased]
 
+### Fixed
+
+- In the Snowflake dialect, `UNIFORM` gives a float when either bound is a
+  FLOAT written as a cast (`UNIFORM(0::FLOAT, 1::FLOAT, RANDOM())`,
+  `CAST(x AS DOUBLE)`, `TO_DOUBLE`), as Snowflake does. Only a number
+  written with an exponent counted as a float, so these gave the integers 0
+  and 1, and noise of `UNIFORM(0::FLOAT, 1e-6::FLOAT, RANDOM())` added to
+  break ties was always 0. Integer bounds still give integers.
+
 ## [1.0.0-rc.11] - 2026-11-15
 
 ### Fixed
