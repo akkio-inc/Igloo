@@ -13,9 +13,11 @@
 # different DuckDB than igloo's; it loads only into such a binary. Needs go,
 # gcc, g++, git and sha256sum, as golang:bookworm has; on macOS, the Xcode
 # command line tools.
-# DuckDB's headers are fetched once, checked against the pinned commit, into
-# $RB_CACHE (default ~/.cache/igloo); DUCKDB_HEADERS points at a src/include
-# directory to use instead.
+# DuckDB's headers, its own, its JSON extension's and those of the libraries
+# they include (rb_json.cpp runs the JSON functions' code), are fetched once,
+# checked against the pinned commit, into $RB_CACHE (default ~/.cache/igloo);
+# DUCKDB_HEADERS points at the src/include directory of a DuckDB source tree
+# to use instead.
 set -euo pipefail
 
 # DuckDB v1.5.6, which duckdb-go-bindings v0.10506.0 is built from. Bump all
@@ -55,24 +57,42 @@ if [ "$have" != "$bindings_version" ]; then
 	exit 1
 fi
 
+header_dirs=(src/include extension/json/include third_party/yyjson/include third_party/fmt/include)
 headers=${DUCKDB_HEADERS:-}
 if [ -z "$headers" ]; then
 	cache=${RB_CACHE:-${XDG_CACHE_HOME:-$HOME/.cache}/igloo}
-	headers="$cache/duckdb-$duckdb_commit/src/include"
+	checkout="$cache/duckdb-$duckdb_commit"
+	headers="$checkout/src/include"
 	if [ ! -f "$headers/duckdb.hpp" ]; then
 		mkdir -p "$cache"
 		tmp=$(mktemp -d "$cache/duckdb-fetch.XXXXXX")
 		git -c advice.detachedHead=false clone --quiet --depth 1 --filter=blob:none --sparse \
 			--branch "$duckdb_tag" https://github.com/duckdb/duckdb "$tmp/duckdb"
-		git -C "$tmp/duckdb" sparse-checkout set src/include
+		git -C "$tmp/duckdb" sparse-checkout set "${header_dirs[@]}"
 		got=$(git -C "$tmp/duckdb" rev-parse HEAD)
 		if [ "$got" != "$duckdb_commit" ]; then
 			echo "rb: DuckDB $duckdb_tag is commit $got, not the pinned $duckdb_commit" >&2
 			exit 1
 		fi
-		mv "$tmp/duckdb" "$cache/duckdb-$duckdb_commit"
+		mv "$tmp/duckdb" "$checkout"
+	else
+		# A cache from before rb read the JSON extension's headers gets
+		# them, at the commit checked when it was fetched.
+		for d in "${header_dirs[@]}"; do
+			if [ ! -d "$checkout/$d" ]; then
+				git -C "$checkout" sparse-checkout set "${header_dirs[@]}"
+				break
+			fi
+		done
 	fi
 fi
+duckdb_src=$(readlink -f "$headers/../..")
+for d in "${header_dirs[@]}"; do
+	if [ ! -d "$duckdb_src/$d" ]; then
+		echo "rb: $duckdb_src has no $d" >&2
+		exit 1
+	fi
+done
 
 # object files go in OUT_DIR/.obj, overwritten by each build
 obj="$out/.obj"
@@ -81,14 +101,16 @@ mkdir -p "$obj"
 src="$here/src"
 croaring="$root/third_party/croaring"
 gcc -std=c11 -O3 -fPIC -fvisibility=hidden -I"$croaring" -c "$croaring/roaring.c" -o "$obj/roaring.o"
-units=(rb_extension rb_aggregate rb_scalar rb_memory rb_rewrite rb_stats rb_fold rb_strings rb_divide rb_flatten rb_filecache)
+units=(rb_extension rb_aggregate rb_scalar rb_memory rb_rewrite rb_stats rb_fold rb_strings rb_divide rb_flatten rb_filecache rb_json)
 
 # Each unit's compile peaks at 0.8 GB: 1 GiB each.
 # shellcheck source=extensions/jobs.sh
 . "$here/../jobs.sh"
 jobs=$(build_jobs $((1 << 30)))
 printf '%s\n' "${units[@]}" | xargs -P "$jobs" -I{} \
-	g++ -std=c++17 -O2 -fPIC -DNDEBUG -DDUCKDB_BUILD_LOADABLE_EXTENSION -I"$headers" -I"$croaring" -I"$src" \
+	g++ -std=c++17 -O2 -fPIC -DNDEBUG -DDUCKDB_BUILD_LOADABLE_EXTENSION -I"$headers" \
+	-I"$duckdb_src/extension/json/include" -I"$duckdb_src/third_party/yyjson/include" \
+	-I"$duckdb_src/third_party/fmt/include" -I"$croaring" -I"$src" \
 	-c "$src/{}.cpp" -o "$obj/{}.o"
 
 objs=("${units[@]/#/$obj/}")

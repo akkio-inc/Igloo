@@ -106,6 +106,23 @@ string left as it was is not copied. Over tens of millions of short strings, a
 filter of `NOT trim(s) IN (...)` took 4.9 s with DuckDB's `trim` and takes
 0.65 s, against 0.3 s without `trim`.
 
+## Faster JSON lookups
+
+DuckDB's `json_extract(doc, path)` and `json_extract_string` parse `doc`
+again for every row, and compute it once only when the path and `doc` are
+both constants. A path that changes from row to row into one document, as a
+lookup of each row's key in one map joined to every row is, parses the whole
+map for each row: a target encoder's `UPDATE` of 82,658 rows, 20 columns
+each looked up in one map of some 3,000 keys (80 KB), took 56 s. At load,
+the extension has their overloads of one path, under all their names
+(`json_extract_path`, `json_extract_path_text`, `->>`), run DuckDB's own code
+built from its headers (`src/rb_json.cpp`), except that within a vector a
+row whose document is the string the row before read, or the same bytes,
+reads the document that row parsed. They give DuckDB's values, NULLs and
+errors, from the same parse. The same `UPDATE` takes 0.6 s, and 3,000
+lookups in one object of 125 KB on one thread take 1.1 ms where DuckDB's
+take 70 ms.
+
 ## Snowflake's division
 
 The Snowflake translator writes `a / b` as `sf_div(a, b)`, macros

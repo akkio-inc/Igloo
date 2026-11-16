@@ -25,6 +25,18 @@ The release workflow publishes the section whose heading matches the tag
   `*` failed or read every value when written as literals too. A negative
   index (`GET(a, -1)`, `a[-1]`) finds nothing, as in Snowflake, where it
   read from the end of the array.
+- `json_extract` and `json_extract_string` of a path that changes from row
+  to row parse a document that the rows repeat once for each vector, not
+  once for each row. A lookup of each row's key in one map joined to every
+  row, as a target encoder's `UPDATE ... FROM` reads one row of nested
+  `OBJECT_AGG` maps with `GET(GET(map, 'column'), value)`, parsed the whole
+  map for each row and column: for 82,658 rows and 20 columns of about
+  3,000 categories (an 80 KB map), on 18 cores, it took 56 s, and takes
+  0.6 s (0.17 s written as joins). The rb extension runs DuckDB's own code
+  for these functions, built from its headers, so the results and errors
+  are DuckDB's (`extensions/rb/src/rb_json.cpp`). Without the extension,
+  the Snowflake dialect's nested `GET` now reads the inner object first,
+  and the same `UPDATE` takes 3.4 s.
 
 ## [1.0.0-rc.11] - 2026-11-15
 
