@@ -9,6 +9,8 @@ The release workflow publishes the section whose heading matches the tag
 
 ## [Unreleased]
 
+## [1.0.0-rc.12] - 2026-11-16
+
 ### Fixed
 
 - In the Snowflake dialect, `UNIFORM` gives a float when either bound is a
