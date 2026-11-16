@@ -184,6 +184,18 @@ var macros = []string{
 		WHEN typeof(x) = 'VARIANT' THEN CAST(x AS JSON)
 		WHEN typeof(x) = 'VARCHAR' THEN sf_text_json(CAST(x AS VARCHAR))
 		ELSE to_json(x) END`,
+	// sf_path_step is the path that reads the key or index k, computed as
+	// a statement runs (see variant.paths): a key as a step of DuckDB's
+	// JSONPath, its backslashes and double quotes escaped, or as a JSON
+	// pointer for the keys a JSONPath cannot name, the empty key and '*';
+	// an index as a step too, and a negative one as no path (NULL), since
+	// DuckDB would count it from the end of an array, where Snowflake
+	// finds nothing. Each branch reads k as text, since DuckDB binds every
+	// branch whatever k's type.
+	`CREATE OR REPLACE TEMP MACRO sf_path_step(k) AS CASE
+		WHEN typeof(k) = 'VARCHAR' THEN CASE WHEN CAST(k AS VARCHAR) IN ('', '*') THEN '/' || CAST(k AS VARCHAR)
+			ELSE '$."' || replace(replace(CAST(k AS VARCHAR), '\', '\\'), '"', '\"') || '"' END
+		WHEN NOT starts_with(CAST(k AS VARCHAR), '-') THEN '$[' || CAST(k AS VARCHAR) || ']' END`,
 	// sf_get and sf_get_string read path p of x, as json_extract and
 	// json_extract_string do.
 	`CREATE OR REPLACE TEMP MACRO sf_get(x, p) AS CASE

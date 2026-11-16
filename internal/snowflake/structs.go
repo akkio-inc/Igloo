@@ -1656,7 +1656,7 @@ func (v *variant) structRead() (string, bool) {
 		x = v.elem
 	}
 	i := v.obj.key(v.segs[0].key)
-	rest := &variant{segs: v.segs[1:]}
+	rest := v.segs[1:]
 	json := v.obj.json(x, i)
 	str := v.obj.text(x, i)
 	if v.guard && i >= 0 && (!v.obj.general[i] || v.obj.textOnly(i)) {
@@ -1668,8 +1668,8 @@ func (v *variant) structRead() (string, bool) {
 		str = "sf_text_read(" + st + ")"
 		json = "to_json(" + str + ")"
 	}
-	if len(rest.segs) > 0 {
-		str = "json_extract_string(" + json + ", " + rest.path() + ")"
+	if len(rest) > 0 {
+		str = extractJSON(json, rest, true)
 	}
 	switch v.mode {
 	case vString:
@@ -1680,10 +1680,10 @@ func (v *variant) structRead() (string, bool) {
 		}
 		return "CAST(" + str + " AS DOUBLE)", true
 	}
-	if len(rest.segs) == 0 {
+	if len(rest) == 0 {
 		return json, true
 	}
-	return "json_extract(" + json + ", " + rest.path() + ")", true
+	return extractJSON(json, rest, false), true
 }
 
 // structColumn is the struct a read of a structFlatten's VALUE, base

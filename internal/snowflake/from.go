@@ -884,9 +884,9 @@ func (t *translator) flattenTable(g *node, alias string, cols *node, wantThis, o
 		if err != nil {
 			return nil, err
 		}
-		v := &variant{segs: segs}
 		prefix = s
-		in = seq(nil, raw("json_extract(sf_json("), in, raw("), "+v.path()+")"))
+		pre, post := (&variant{segs: segs}).reads("json_extract(", "json_extract_string(", false)
+		in = seq(nil, raw(pre+"sf_json("), in, raw(")"+post))
 	}
 	if st != nil {
 		return t.flattenStructs(st, in, alias, cols, wantThis)

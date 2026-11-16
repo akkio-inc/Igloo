@@ -17,6 +17,14 @@ The release workflow publishes the section whose heading matches the tag
   written with an exponent counted as a float, so these gave the integers 0
   and 1, and noise of `UNIFORM(0::FLOAT, 1e-6::FLOAT, RANDOM())` added to
   break ties was always 0. Integer bounds still give integers.
+- In the Snowflake dialect, `GET`, `GET_PATH`, paths (`o:"5"" x"`) and `[]`
+  read an object's key whatever its text. A key computed as the statement
+  runs, such as `GET(o, t.category)`, failed with `JSON path error` when it
+  held a double quote (`5" screen`) or ended in a backslash, and with
+  `JSON path cannot contain wildcards` when it was `*`; the keys `''` and
+  `*` failed or read every value when written as literals too. A negative
+  index (`GET(a, -1)`, `a[-1]`) finds nothing, as in Snowflake, where it
+  read from the end of the array.
 
 ## [1.0.0-rc.11] - 2026-11-15
 

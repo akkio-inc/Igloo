@@ -216,6 +216,37 @@ func TestUniformOfFloats(t *testing.T) {
 	}
 }
 
+// TestGetOfAnyKey checks that GET, GET_PATH, a path (:) and [] read an
+// object's key whatever its text: with double quotes and backslashes, which
+// a DuckDB JSONPath escapes, and the empty key and '*', which only a JSON
+// pointer can name; from an OBJECT, a VARIANT parsed from text and a column
+// of either, one level down and with the key computed from a column. A
+// negative index finds nothing, as an index past the end does.
+func TestGetOfAnyKey(t *testing.T) {
+	conn := session(t)
+	const doc = `parse_json('{"5\\" screen": 1, "a\\\\b": 2, "a\\\\": 3, "": 4, "*": 5, "x": {"5\\" screen": 6, "": 7, "*": 8}}')`
+	for _, c := range []runCase{
+		{name: "literal keys", sql: `select get(o, '5" screen'), get(o, 'a\\b'), get(o, 'a\\'), get(o, ''), get(o, '*'),
+			o:"5"" screen", o['5" screen'], o[''], o['*'], get_path(o, '"5"" screen"'), get_path(o, 'x."*"'),
+			get(get(o, 'x'), '5" screen'), get(get(o, 'x'), ''), o:x['*'], o:x[''] from (select ` + doc + ` o)`,
+			want: []string{"1|2|3|4|5|1|1|4|5|1|8|6|7|8|7"}},
+		{name: "keys of an OBJECT", sql: `select get(object_construct('5" screen', 1, '', 2, '*', 3), k) from
+			(select column1 as k from values ('5" screen'), (''), ('*'), ('none')) order by k`,
+			want: []string{"2", "3", "1", "NULL"}},
+		{name: "computed keys", sql: `select k, get(o, k), get(get(o, 'x'), k), o:x[k], get(o, '#' || k) from (select ` + doc +
+			` o), (select column1 as k from values ('5" screen'), ('a\\b'), ('a\\'), (''), ('*'), ('none')) order by k`,
+			want: []string{"|4|7|7|NULL", "*|5|8|8|NULL", `5" screen|1|6|6|NULL`, `a\|3|NULL|NULL|NULL`, `a\b|2|NULL|NULL|NULL`,
+				"none|NULL|NULL|NULL|NULL"}},
+		{name: "computed keys as text", sql: `select get(o, k)::varchar, get(get(o, 'x'), k)::int + 1 from (select ` + doc +
+			` o, '5" screen' as k)`,
+			want: []string{"1|7"}},
+		{name: "indexes", sql: `select get(a, 1), a[i], get(a, -1), a[-1], a[j], get(a, 5) from (select parse_json('[10, 20]') a, 1 i, -1 j)`,
+			want: []string{"20|20|NULL|NULL|NULL|NULL"}},
+	} {
+		t.Run(c.name, func(t *testing.T) { run(t, conn, c) })
+	}
+}
+
 // TestWideDecimalCasts checks that casts of text to NUMBER of more than 18
 // digits, which go through DECIMAL(18,s) first (see decimalCast), give
 // exactly what DuckDB's own cast to the wide DECIMAL gives, value, type and
