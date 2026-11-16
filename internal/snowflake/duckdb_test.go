@@ -247,6 +247,26 @@ func TestGetOfAnyKey(t *testing.T) {
 	}
 }
 
+// TestValuesRowsOfWords checks a FROM VALUES list whose rows after the first
+// hold only words, NULL, TRUE or FALSE, which the translation once read as
+// a parenthesized join of tables so named.
+func TestValuesRowsOfWords(t *testing.T) {
+	conn := session(t)
+	for _, c := range []runCase{
+		{name: "null", sql: `select column1 from values (1), (null) order by 1 nulls last`, want: []string{"1", "NULL"}},
+		{name: "nulls and booleans", sql: `select * from values (1, 'a'), (NULL, NULL), (2, 'b') order by 1 nulls last`,
+			want: []string{"1|a", "2|b", "NULL|NULL"}},
+		{name: "booleans", sql: `select column1, column2 from values (null, true), (false, null) order by 1 nulls last`,
+			want: []string{"false|NULL", "NULL|true"}},
+		{name: "arrays", sql: `select column1, column2 from values ('1', array_construct('a')), ('4', NULL), (NULL, NULL) order by 1 nulls last`,
+			want: []string{`1|["a"]`, "4|NULL", "NULL|NULL"}},
+		{name: "aliased and joined", sql: `select s.x, v.c from (select 1 x) s join values (1, true), (null, null) v (k, c) on s.x = v.k`,
+			want: []string{"1|true"}},
+	} {
+		t.Run(c.name, func(t *testing.T) { run(t, conn, c) })
+	}
+}
+
 // TestWideDecimalCasts checks that casts of text to NUMBER of more than 18
 // digits, which go through DECIMAL(18,s) first (see decimalCast), give
 // exactly what DuckDB's own cast to the wide DECIMAL gives, value, type and

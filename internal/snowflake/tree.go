@@ -94,7 +94,7 @@ func build(toks []token) ([]*node, error) {
 		g := stack[len(stack)-1].n
 		return nil, syntaxError(g.pos, "unclosed "+string(g.open))
 	}
-	return stack[0].nodes, nil
+	return groupValues(stack[0].nodes), nil
 }
 
 // String renders the node as DuckDB SQL.

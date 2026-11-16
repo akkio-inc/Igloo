@@ -1250,57 +1250,72 @@ func (t *translator) sample(nodes []*node) ([]*node, error) {
 // fromWords are the words after which a table reference follows.
 var fromWords = map[string]bool{"FROM": true, "JOIN": true}
 
-// values names the columns of VALUES in FROM as Snowflake does, COLUMN1,
-// COLUMN2 and so on, and puts parentheses around a FROM VALUES list.
-func (t *translator) values(nodes []*node) ([]*node, error) {
+// groupValues puts parentheses around each FROM VALUES list, at every
+// level of nodes, as the tree is built (see build): VALUES (...), (...)
+// becomes the one table reference (VALUES (...), (...)). Until then every
+// pass that reads a FROM clause would take the list for a call of VALUES
+// followed by a comma join of more table references, and read a row of
+// words, as (NULL) or (TRUE, NULL), as a parenthesized join of tables so
+// named.
+func groupValues(nodes []*node) []*node {
 	for i := 0; i < len(nodes); i++ {
-		n := nodes[i]
-		p := prevSig(nodes, i)
-		if p < 0 || !fromWords[nodes[p].word()] {
+		if nodes[i].kind == kGroup {
+			nodes[i].kids = groupValues(nodes[i].kids)
 			continue
 		}
+		p := prevSig(nodes, i)
+		if nodes[i].word() != "VALUES" || p < 0 || !fromWords[nodes[p].word()] {
+			continue
+		}
+		// FROM VALUES (...), (...) [alias]
+		end := i + 1
+		for {
+			g := nextSig(nodes, end-1)
+			if g < 0 || !nodes[g].isGroup('(') {
+				break
+			}
+			end = g + 1
+			c := nextSig(nodes, end-1)
+			if c < 0 || !nodes[c].isOp(",") {
+				break
+			}
+			if g2 := nextSig(nodes, c); g2 < 0 || !nodes[g2].isGroup('(') {
+				break
+			}
+			end = c + 1
+		}
+		grp := group(groupValues(append([]*node(nil), nodes[i:end]...))...)
+		grp.pos, grp.end = nodes[i].pos, nodes[end-1].end
+		nodes = replace(nodes, i, end, grp)
+	}
+	return nodes
+}
+
+// values names the columns of a FROM VALUES list, which groupValues put in
+// parentheses, as Snowflake does: COLUMN1, COLUMN2 and so on.
+func (t *translator) values(nodes []*node) ([]*node, error) {
+	for i := 0; i < len(nodes); i++ {
+		p := prevSig(nodes, i)
+		g := nodes[i]
+		if p < 0 || !fromWords[nodes[p].word()] || !g.isGroup('(') {
+			continue
+		}
+		idx := sig(g.kids)
+		if len(idx) < 2 || g.kids[idx[0]].word() != "VALUES" || !g.kids[idx[1]].isGroup('(') {
+			continue
+		}
+		ncols := len(splitArgs(g.kids[idx[1]].kids))
+		names := make([]string, ncols)
+		for k := range names {
+			names[k] = "column" + itoa(k+1)
+		}
+		colList := "(" + strings.Join(names, ", ") + ")"
+		alias, aliasEnd, cols := tableAlias(nodes, i)
 		switch {
-		case n.word() == "VALUES":
-			// FROM VALUES (...), (...) [alias]
-			end := i + 1
-			for {
-				g := nextSig(nodes, end-1)
-				if g < 0 || !nodes[g].isGroup('(') {
-					break
-				}
-				end = g + 1
-				c := nextSig(nodes, end-1)
-				if c < 0 || !nodes[c].isOp(",") {
-					break
-				}
-				if g2 := nextSig(nodes, c); g2 < 0 || !nodes[g2].isGroup('(') {
-					break
-				}
-				end = c + 1
-			}
-			grp := group(nodes[i:end]...)
-			grp.pos, grp.end = nodes[i].pos, nodes[end-1].end
-			nodes = replace(nodes, i, end, grp)
-			fallthrough
-		case nodes[i].isGroup('('):
-			g := nodes[i]
-			idx := sig(g.kids)
-			if len(idx) < 2 || g.kids[idx[0]].word() != "VALUES" || !g.kids[idx[1]].isGroup('(') {
-				continue
-			}
-			ncols := len(splitArgs(g.kids[idx[1]].kids))
-			names := make([]string, ncols)
-			for k := range names {
-				names[k] = "column" + itoa(k+1)
-			}
-			colList := "(" + strings.Join(names, ", ") + ")"
-			alias, aliasEnd, cols := tableAlias(nodes, i)
-			switch {
-			case alias == "":
-				nodes = replace(nodes, i+1, i+1, raw(" AS _sf_values"+colList))
-			case cols == nil:
-				nodes = replace(nodes, aliasEnd, aliasEnd, raw(colList))
-			}
+		case alias == "":
+			nodes = replace(nodes, i+1, i+1, raw(" AS _sf_values"+colList))
+		case cols == nil:
+			nodes = replace(nodes, aliasEnd, aliasEnd, raw(colList))
 		}
 	}
 	return nodes, nil

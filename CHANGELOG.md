@@ -37,6 +37,10 @@ The release workflow publishes the section whose heading matches the tag
   are DuckDB's (`extensions/rb/src/rb_json.cpp`). Without the extension,
   the Snowflake dialect's nested `GET` now reads the inner object first,
   and the same `UPDATE` takes 3.4 s.
+- In the Snowflake dialect, a `FROM VALUES` row after the first that holds
+  only words, `(NULL)`, `(NULL, NULL)` or `(TRUE)`, is a row of values. It
+  was read as a parenthesized join of tables named `NULL` and failed with
+  `Referenced column "NULL" was not found`.
 
 ## [1.0.0-rc.11] - 2026-11-15
 
