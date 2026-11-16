@@ -41,6 +41,15 @@ The release workflow publishes the section whose heading matches the tag
   only words, `(NULL)`, `(NULL, NULL)` or `(TRUE)`, is a row of values. It
   was read as a parenthesized join of tables named `NULL` and failed with
   `Referenced column "NULL" was not found`.
+- `ALTER TABLE` keeps the comments on a table's columns, which the
+  Iceberg schema holds as its fields' docs. `ADD COLUMN`, `DROP COLUMN`,
+  `RENAME COLUMN`, a change of a column's type and `DROP NOT NULL` each
+  commit a copy of the current schema with one column changed, and the
+  iceberg extension wrote that copy without any field's doc: one change
+  erased every column's comment, so an app that keeps tags in column
+  comments lost all of a wide table's tags when it renamed one column. A
+  renamed column now keeps its own comment, and the others keep theirs
+  (`extensions/iceberg/patches/0009`).
 
 ## [1.0.0-rc.11] - 2026-11-15
 
