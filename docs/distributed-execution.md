@@ -836,7 +836,7 @@ cheapest, so it never takes a way that another beats on both time and cost
 them). Where every way looks short of memory by its estimate it takes the one
 with the most memory, not the replica: tasks spill, and run again over more
 partitions with more memory each, and a report so estimated at a hundred
-times the data, which 16 workers took 521 to 825 s over, ran on the replica
+times the data, which 16 workers run in 461 s, ran on the replica
 until it was cancelled at 632 s, 302 GB spilled. A way costs its machines' seconds at their prices an hour
 (`IGLOO_WORKER_PRICE_PER_HOUR`, `IGLOO_LARGE_WORKER_PRICE_PER_HOUR` and
 `IGLOO_PRICE_PER_HOUR` for the replica, or else the list price of the
@@ -945,8 +945,8 @@ logarithms, where scaling the whole estimate was within 1.25. A statement that
 failed on a number of workers, or on the large worker, in the last day (a
 worker out of memory, a read that failed) is taken to need one and a half
 times as long as it ran there before it failed, so that other ways weigh
-against it: one that took 729 s on 16 workers, and then failed there after
-2,078 s, is taken to need 3,117 s there. The query history records where a
+against it: a report that 16 workers run in under 600 s was taken to need
+3,117 s there after it failed there at 2,078 s. The query history records where a
 statement failed, and replicas read it when they start. One that
 ran on a quarter of the workers it would run on now, as in an earlier
 session on a smaller fleet, is tried on all of them, at most once a day,
@@ -1143,7 +1143,7 @@ workers' error. One that auto mode ran on the [large
 worker](#a-large-worker) runs on the other workers instead, as a statement
 forced onto them does: at a hundred times the data, a report of 250 GB
 whose large worker failed ran on the coordinator, spilled 167 GB and was
-killed after 9 minutes, where 16 workers took 729 s. Workers stay
+killed after 9 minutes, where 16 workers take under 600 s. Workers stay
 up while a statement that ran tasks on them runs on the coordinator, and
 count as idle from when it ends. An error in the data itself, such as a failed cast
 or a division by zero, is the statement's error, as it would be on one
@@ -1601,7 +1601,7 @@ where the small workers cannot run it: the spill curve holds for most
 reports but runs far short for some, and at a hundred times the data a
 report whose working set was 5.3 times the large worker's room, estimated
 at 217 s there, spilling 2.5 times as long, ran past 1,800 s there, where
-16 workers ran it in 729 s (at ten times the data it spilled 11 times as
+16 workers run it in under 600 s (at ten times the data it spilled 11 times as
 long on one machine). The small workers share a working set over their
 partitions instead. Auto mode runs a statement there when
 that estimate is within a fifth of the fastest way and the cheapest of
