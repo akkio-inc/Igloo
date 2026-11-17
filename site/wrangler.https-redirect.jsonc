@@ -1,0 +1,18 @@
+// Redirects http://igloodb.com and http://www.igloodb.com to HTTPS. The routes
+// name the http:// scheme, so this Worker runs only for plain-HTTP requests, in
+// front of the website's custom domains (wrangler.igloodb.jsonc). Deploy it once
+// with `npx wrangler deploy --config wrangler.https-redirect.jsonc` from this
+// directory, in the Cloudflare account that holds the domain. Turning on
+// "Always Use HTTPS" for the zone does the same job, and then this Worker can be
+// deleted.
+{
+  "name": "igloo-https-redirect",
+  "main": "./redirect/worker.js",
+  "compatibility_date": "2026-10-01",
+  "workers_dev": false,
+  "preview_urls": false,
+  "routes": [
+    { "pattern": "http://igloodb.com/*", "zone_name": "igloodb.com" },
+    { "pattern": "http://www.igloodb.com/*", "zone_name": "igloodb.com" }
+  ]
+}
