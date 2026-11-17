@@ -9,7 +9,259 @@ The release workflow publishes the section whose heading matches the tag
 
 ## [Unreleased]
 
-First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
+## [1.0.0-rc.12] - 2026-11-16
+
+### Fixed
+
+- In the Snowflake dialect, `UNIFORM` gives a float when either bound is a
+  FLOAT written as a cast (`UNIFORM(0::FLOAT, 1::FLOAT, RANDOM())`,
+  `CAST(x AS DOUBLE)`, `TO_DOUBLE`), as Snowflake does. Only a number
+  written with an exponent counted as a float, so these gave the integers 0
+  and 1, and noise of `UNIFORM(0::FLOAT, 1e-6::FLOAT, RANDOM())` added to
+  break ties was always 0. Integer bounds still give integers.
+- In the Snowflake dialect, `GET`, `GET_PATH`, paths (`o:"5"" x"`) and `[]`
+  read an object's key whatever its text. A key computed as the statement
+  runs, such as `GET(o, t.category)`, failed with `JSON path error` when it
+  held a double quote (`5" screen`) or ended in a backslash, and with
+  `JSON path cannot contain wildcards` when it was `*`; the keys `''` and
+  `*` failed or read every value when written as literals too. A negative
+  index (`GET(a, -1)`, `a[-1]`) finds nothing, as in Snowflake, where it
+  read from the end of the array.
+- `json_extract` and `json_extract_string` of a path that changes from row
+  to row parse a document that the rows repeat once for each vector, not
+  once for each row. A lookup of each row's key in one map joined to every
+  row, as a target encoder's `UPDATE ... FROM` reads one row of nested
+  `OBJECT_AGG` maps with `GET(GET(map, 'column'), value)`, parsed the whole
+  map for each row and column: for 82,658 rows and 20 columns of about
+  3,000 categories (an 80 KB map), on 18 cores, it took 56 s, and takes
+  0.6 s (0.17 s written as joins). The rb extension runs DuckDB's own code
+  for these functions, built from its headers, so the results and errors
+  are DuckDB's (`extensions/rb/src/rb_json.cpp`). Without the extension,
+  the Snowflake dialect's nested `GET` now reads the inner object first,
+  and the same `UPDATE` takes 3.4 s.
+- In the Snowflake dialect, a `FROM VALUES` row after the first that holds
+  only words, `(NULL)`, `(NULL, NULL)` or `(TRUE)`, is a row of values. It
+  was read as a parenthesized join of tables named `NULL` and failed with
+  `Referenced column "NULL" was not found`.
+- `ALTER TABLE` keeps the comments on a table's columns, which the
+  Iceberg schema holds as its fields' docs. `ADD COLUMN`, `DROP COLUMN`,
+  `RENAME COLUMN`, a change of a column's type and `DROP NOT NULL` each
+  commit a copy of the current schema with one column changed, and the
+  iceberg extension wrote that copy without any field's doc: one change
+  erased every column's comment, so an app that keeps tags in column
+  comments lost all of a wide table's tags when it renamed one column. A
+  renamed column now keeps its own comment, and the others keep theirs
+  (`extensions/iceberg/patches/0009`).
+
+## [1.0.0-rc.11] - 2026-11-15
+
+### Fixed
+
+- A transaction that reaches a table created after it began fails alone,
+  rather than taking the whole database down. When a table's latest
+  metadata was newer than a transaction and its metadata log kept nothing
+  from before the transaction started (another session created it since,
+  or changed it more times since than the log keeps), the iceberg
+  extension threw an internal error. DuckDB invalidates its database on
+  one thrown while a statement runs, as in a listing of the catalog, and
+  every session then failed with "database has been invalidated" until the
+  process restarted. Igloo lists the catalog's tables inside a session's
+  transaction to check its grants, so on a pilot deployment one
+  transaction block (`BEGIN`, a `MERGE`, an `INSERT`) took every session
+  down because another session had created and read a table since the
+  block began. A listing now shows such a table at its current schema, so
+  that block commits. A statement that reads or writes the table itself
+  fails its transaction with SQLSTATE 40001 and a message that names the
+  table and the transaction's start (printed before as a date in 1970) and
+  asks for a restart, and the retried transaction succeeds
+  (`extensions/iceberg/patches/0006` and `0007`).
+- An `UPDATE`, or a `MERGE`'s `WHEN MATCHED THEN UPDATE`, whose filter
+  DuckDB folds to false (`WHERE false`, `WHERE NULL`, `WHERE id IN (NULL)
+  AND 1 != 1`, a `MERGE` source that is empty on its face, `ON false`)
+  updates nothing and succeeds. It threw an internal error as it ran
+  (`IcebergDelete multi_file_list is NULL`), and DuckDB invalidated its
+  whole database, as above (`extensions/iceberg/patches/0008`).
+
+## [1.0.0-rc.10] - 2026-11-15
+
+### Added
+
+- `IGLOO.ML.XGBOOST`, a model class that XGBoost's own library trains. The
+  binary links XGBoost 3.4.2, built from its repository, and passes it
+  `CONFIG_OBJECT`'s parameters by XGBoost's names as they are written, so
+  an application gets the model XGBoost's Python package trains with
+  `xgboost.train` on the same rows in the same order. On the tests' data
+  (a binary classifier, early stopping, a weighted regression and
+  `survival:aft`), the saved models are the Python package's byte for
+  byte on the platform that made the reference (macOS on arm64), with
+  every prediction, margin, SHAP value and metric the same float32; on
+  Linux (arm64, with OpenMP) two of the four models are the same bytes,
+  early stopping stops at the same round, and the rest agree within
+  2.2e-7. `TARGET_COLNAME` gives the label, or `LABEL_LOWER_BOUND_COLNAME`
+  and `LABEL_UPPER_BOUND_COLNAME` an interval (`'Infinity'::DOUBLE` for a
+  right-censored row's upper bound), and `WEIGHT_COLNAME` weights. Besides
+  XGBoost's parameters, `CONFIG_OBJECT` takes `num_boost_round`,
+  `early_stopping_rounds` (as the Python package's, on the validation
+  rows' last metric; methods then use the best iteration) and
+  `data_split_method`, `'custom'` with a boolean `data_split_col` among
+  them. Numbers, booleans and timestamps are features; text is refused, to
+  be encoded in the query, since XGBoost's own categorical support is what
+  the same model in XGBoost would use. Parameters XGBoost refuses or does
+  not use fail `CREATE` with XGBoost's message. The methods are `PREDICT`
+  (with the class probabilities of classification objectives, and the
+  margin with `'output_margin': TRUE`), `EXPLAIN_PREDICT` (XGBoost's SHAP
+  values in margin space and the bias, which add up to the margin),
+  `EVALUATE` (XGBoost's metrics), `TRAINING_INFO` (each round's training and
+  validation metrics, and the best iteration) and `FEATURE_IMPORTANCE`
+  (XGBoost's weight, gain and cover), in a query, as tables and on workers.
+  The model's blob holds XGBoost's model as XGBoost saves it (UBJSON),
+  which the Python package loads. Scoring a row with 100 trees of depth 6
+  takes 11 µs for its prediction and 41 µs for its SHAP values, on one
+  core of an Apple M5 Max (`BenchmarkPredictRow` in `internal/xgboost`).
+
+### Changed
+
+- Building Igloo needs XGBoost's library, which
+  `third_party/xgboost/build.sh` builds (75 seconds on 18 cores) and cgo
+  links by pkg-config: set `PKG_CONFIG_PATH` to its `lib/pkgconfig`. The
+  Dockerfile builds it in a stage of its own, and CI builds it once a
+  commit for each architecture, cached by XGBoost's release, and hands it
+  to the Go and image jobs. `make test` and `make lint` build it in Docker.
+- In the Snowflake dialect, `model!PREDICT(INPUT_DATA => ..., CONFIG_OBJECT
+  => {...})` in a query passes its options to an Igloo class's model, as
+  `TABLE(model!PREDICT(...))` does, rather than dropping them: an
+  `IGLOO.ML.XGBOOST` model's `output_margin` works there, and an option a
+  class does not take is refused, as in the table form. Snowflake's
+  `on_error` is still ignored.
+
+### Fixed
+
+- The liveness check (`/healthz`, on servers and workers) fails once DuckDB has been
+  invalidated by a fatal error, so the orchestrator restarts the process. Before, liveness
+  answered `ok` while every statement failed with "database has been invalidated", and the
+  pod stayed up, unready, until someone restarted it. Any other DuckDB error, or a slow ping
+  under load, still only fails readiness.
+
+## [1.0.0-rc.9] - 2026-11-14
+
+### Fixed
+
+- In the Snowflake dialect, the functions that build an `ARRAY` or an
+  `OBJECT` take a `VARCHAR` column, as Igloo holds a `VARIANT` column copied
+  from Snowflake, as `TYPEOF` and paths read it: the JSON text of an object
+  or an array as that object or array, any other text as a string.
+  `ARRAY_AGG(LOCATION) WITHIN GROUP (ORDER BY ...)` of such a column sent
+  `["{\"zip_code\":\"55603\"}", ...]`, a list of strings, where Snowflake
+  and `ARRAY_AGG(PARSE_JSON(LOCATION))` send `[{"zip_code":"55603"}, ...]`.
+  The same holds for every function that takes such a column into a value
+  it builds: `ARRAY_UNIQUE_AGG`, `OBJECT_AGG`, `ARRAY_CONSTRUCT`, `[...]`,
+  `OBJECT_CONSTRUCT`, `OBJECT_INSERT`, `ARRAY_APPEND`, `ARRAY_CONTAINS`,
+  `TO_JSON`, `TO_VARIANT`, `::VARIANT` and the like. An expression's text,
+  such as `x::STRING`, stays a string.
+- In the Snowflake dialect, a table's alias, a CTE's name and a select
+  item's alias written without `AS` may be any word that DuckDB keeps as a
+  keyword and Snowflake does not: Igloo quotes each where DuckDB cannot read
+  it bare, by DuckDB's own keyword list. `FROM metrics cm CROSS JOIN totals
+  at CROSS JOIN ...` failed with `syntax error at or near "CROSS"`, as DuckDB
+  read `at` as the start of its `AT (VERSION => ...)`; `SELECT 1 year` in a
+  subquery, a CTE, `CREATE TABLE ... AS` or a view failed at `year`; `a
+  notnull` there meant `a IS NOT NULL`; and `t semi JOIN u` was a semi join,
+  where Snowflake joins `u` to `t` aliased `semi`. A select item's alias
+  stays as written in the table `CREATE TABLE ... AS` makes.
+- `information_schema.tables.LAST_ALTERED`, `igloo.tables.last_altered`
+  and `SHOW OBJECTS`' `last_altered` are when a table's metadata last
+  changed, Iceberg's `last-updated-ms`, as Snowflake's `LAST_ALTERED` is the
+  last DDL or DML: `ALTER TABLE ... DROP COLUMN` and `ADD COLUMN`, `COMMENT
+  ON` and the like move it, as `INSERT` and `DELETE` do, and a table made
+  without rows has one. It was the current snapshot's time, which no DDL
+  moves, so an app that rebuilt what it derived from a table when
+  `LAST_ALTERED` moved never saw a dropped column. A replica also shows its
+  own statements' changes to the next query: right after `CREATE TABLE ...
+  AS`, and after each later `DROP COLUMN` and `INSERT`, `LAST_ALTERED` was
+  `NULL` or the old time until the replica read the catalog's metadata
+  again, 30 seconds or more later. Views keep the time they were last
+  replaced.
+
+## [1.0.0-rc.8] - 2026-11-14
+
+### Changed
+
+- `IGLOO.ML.KMEANS` trains by e-means (arXiv 2611.09501), mini-batch k-means
+  with exponentially decayed centroids, from k-means++ centroids, for
+  `max_iterations` epochs (now default 5). On held-out rows it matched or
+  beat Lloyd's iterations at every cluster count from 3 to 100 (0.9% lower
+  loss at 16 clusters, 2.4% at 32), in about the same time from 16 clusters
+  up and at most twice the time below. `kmeans_init_method` also takes
+  `'random'`, and `early_stop` and `min_rel_progress` no longer change
+  training. `TRAINING_INFO` has a row for each epoch.
+
+### Fixed
+
+- In DuckDB's dialect, `approx_count_distinct` counts as `APPROX_COUNT_DISTINCT`
+  does in Snowflake's, so both dialects give the same counts. It was DuckDB's
+  own HyperLogLog of 64 registers, which errs by about 13%: a column profile
+  counted 6 categories as 5 and 1,000 values as 1,249, and was off by 15% on
+  average over 40 columns of 100,000 values, by up to 40%. It now counts with
+  DataSketches' HyperLogLog of 4,096 registers, as Snowflake's dialect does:
+  6, 1,020, and 1.8% on average. In a select with `GROUP BY` and as a window
+  function it counts exactly, as `count(DISTINCT x)`. A select item without
+  an alias that is the call of a column keeps the column name DuckDB gave it.
+- In the Snowflake dialect, `FLATTEN` joined with `JOIN`, `INNER JOIN` or
+  `LEFT [OUTER] JOIN` and no `ON`, as Snowflake writes it, runs: `LEFT JOIN
+  LATERAL FLATTEN(input => t.info, outer => true) f WHERE ...` failed with
+  `syntax error at or near "WHERE"`, or near whatever else followed the
+  join. `SPLIT_TO_TABLE` and `GENERATOR` joined so run too. A `LEFT JOIN`
+  keeps a row for which `FLATTEN` gives no rows, with `NULL`s, as `OUTER =>
+  TRUE` does.
+- In the Snowflake dialect, selecting an `ARRAY` or `OBJECT` column sends the
+  array or object it holds, as every other `ARRAY` and `OBJECT` goes out:
+  one `json` value whose objects and arrays are objects and arrays. Their
+  elements went out as strings of their JSON text, so after `CREATE TABLE t
+  AS SELECT ARRAY_AGG(OBJECT_CONSTRUCT('zip_code', z)) AS zips ...`,
+  `SELECT zips FROM t` sent `["{\"zip_code\":\"55603\"}"]`, which a client
+  reads as a list of strings, where the `ARRAY_AGG` itself sent
+  `[{"zip_code":"55603"}]`. DuckDB's dialect sends them as before.
+
+## [1.0.0-rc.6] - 2026-11-14
+
+### Fixed
+
+- In the Snowflake dialect, `UPDATE` and `MERGE` accept the target's name or
+  alias on the columns `SET` assigns, as Snowflake does: `UPDATE t SET t.a = 1`
+  and `MERGE ... WHEN MATCHED THEN UPDATE SET m.ver = m.ver + 1` failed with
+  `Qualified column names in UPDATE .. SET not supported`.
+
+## [1.0.0-rc.4] - 2026-11-13
+
+### Fixed
+
+- The catalog views (`information_schema.columns`, `pg_attribute`,
+  `duckdb_columns()`) list the columns an `ALTER TABLE` changed as soon as it
+  commits, in every session. They listed a table as a statement had last
+  loaded it, so a client that reflected after its DDL, as SQLAlchemy and
+  Alembic do, saw the old columns until a later statement loaded the table,
+  and ten `ADD COLUMN`s in a row listed the first nine.
+- With credentials from the AWS chain (IAM roles for service accounts),
+  statements and commits no longer fail with `Catalog write-write conflict on
+  alter with "igloo_storage"` when the credentials expire. DuckDB replaced
+  them inside the transaction of whichever statement found them expired, and
+  two sessions doing so at once conflicted. Igloo now replaces them every 10
+  minutes, outside every transaction.
+- Igloo's own reads of table files with credentials from the AWS chain, such
+  as planning statements for workers and maintenance, no longer go without
+  credentials for the last minute of each set's life. Its refresh ahead of
+  their expiry asked the AWS SDK's cache, which gave the same credentials back
+  until they had expired.
+- The image builds on a machine of 6 GB. Its two C++ extensions ran a
+  compile a core, or, for rb, all eleven at once, and the compiler was killed
+  for memory. Each build now runs as many compiles at once as memory holds:
+  1 GiB each for rb, and 2 GiB each for DuckDB and the iceberg extension. In
+  6 GB on 4 cores the iceberg build took 26 minutes and peaked at 2.9 GB.
+
+## [1.0.0-rc.2] - 2026-11-11
+
+Igloo's first published release: an open-source SQL data warehouse that runs
+in your own cloud account or on your own hardware.
 
 ### SQL and tables
 
@@ -2620,6 +2872,14 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
 
 ### Fixed
 
+- A refresh of a view counting distinct values decides once where its query
+  runs. It planned the query to decide whether to keep a state, and planned it
+  again to run it; in between, a short earlier run on workers or another
+  statement starting on the replica could change auto mode's choice, and a view
+  it had decided to keep on this replica ran its partial aggregates on workers.
+  The refresh now runs the plan it decided with, and where that plan keeps the
+  query on this replica, its partial aggregates run there too.
+
 - A cancel always stops the statement. A statement is prepared, readied
   and run in steps, and a cancel request, the console's cancel, the client
   going or the memory watch stopped the step running then. It was lost as a
@@ -2776,8 +3036,8 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   written into them, and longer text assigned in one call a chunk. On 4
   million synthetic rows from 32 files, merged rows read through DuckDB
   take about as long as DuckDB's sort of the same rows, three times faster
-  than before. A coordinator of fewer than 4 cores, or DuckDB threads, has
-  DuckDB sort the rows instead, which is faster there.
+  than before. A coordinator of fewer than 8 cores (logical CPUs), or DuckDB
+  threads, has DuckDB sort the rows instead, which is as fast or faster there.
 - A worker told to stop, by a Spot Instance's interruption notice or by
   SIGTERM, keeps serving the exchange files on its disk until the
   statements that read them end, or its deadline passes (ten seconds
@@ -3427,4 +3687,5 @@ First release. Move this section under `## [1.0.0] - YYYY-MM-DD` when tagging.
   Igloo process uses the directory, which it tells by a lock that each
   process holds there (docs/operations.md#spill-directory).
 
-[Unreleased]: https://github.com/akkio-inc/Igloo/commits/main
+[Unreleased]: https://github.com/akkio-inc/Igloo/compare/v1.0.0-rc.2...HEAD
+[1.0.0-rc.2]: https://github.com/akkio-inc/Igloo/releases/tag/v1.0.0-rc.2

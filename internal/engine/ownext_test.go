@@ -14,6 +14,7 @@ import (
 	"sort"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/duckdb/duckdb-go/v2"
 
@@ -327,6 +328,173 @@ func TestRBStringsMatchDuckDB(t *testing.T) {
 			if strings.Join(got, "\n") != strings.Join(want, "\n") {
 				t.Errorf("%s: the extension's differ from DuckDB's", q)
 			}
+		}
+	}
+}
+
+// TestRBJSONExtractMatchesDuckDB checks the extension's json_extract and
+// json_extract_string of one path, and their other names (rb_json.cpp),
+// against DuckDB's own, in a database without it: the same text, NULLs and
+// errors, for documents that repeat from row to row, a large one, one that
+// differs from it in one byte, ones of 12 bytes or fewer, which DuckDB keeps
+// inside the string, scalars and NULL; read from a table's rows, from a
+// constant, from a one-row subquery joined to every row and from a hash
+// join; with paths that change from row to row (JSONPath, JSON pointer,
+// bare keys, integers, NULL, the empty path) and constant ones, wildcards
+// included.
+func TestRBJSONExtractMatchesDuckDB(t *testing.T) {
+	ctx := context.Background()
+	fast, plain := nativeAndMacros(t)
+	var keys []string
+	for i := 0; i < 300; i++ {
+		keys = append(keys, fmt.Sprintf(`"k%d": [%d, "v%d"]`, i, i, i))
+	}
+	big := `{"k1": {"k2": [5, 6]}, ` + strings.Join(keys, ", ") +
+		`, "5\" x": [1, {"y": null}], "": "empty", "*": "star", "a\\b": true, "n": null, "z": 1}`
+	big2 := strings.Replace(big, `"z": 1}`, `"z": 2}`, 1) // the same size, one byte apart
+	docs := []string{big, big, big, big2, big2, big, `{"k1":1}`, `{"k1":1}`, big, `[1, 2, {"k1": 3}]`, `"str"`, `42`,
+		`null`, `{"k1": {"k2": [5, 6]}}`, "NULL", big, big2, big}
+	paths := []string{`$.k1`, `$."5\" x"[1].y`, `$."5\" x"`, `/`, `/*`, `k1`, `$[2].k1`, `$[#-1]`, `/0`, `$.k1.k2[1]`,
+		"NULL", ``, `$.n`, `$.missing`, `$."a\\b"`, `$.k299[1]`, `5" x`}
+	quote := func(s string) string {
+		if s == "NULL" {
+			return s
+		}
+		return "'" + strings.ReplaceAll(s, "'", "''") + "'"
+	}
+	var rows []string
+	for d, doc := range docs {
+		for p, path := range paths {
+			rows = append(rows, fmt.Sprintf("(%d, %s, %s, %d)", d*len(paths)+p, quote(doc), quote(path), []int{0, 1, 2, -1}[p%4]))
+		}
+	}
+	setup := []string{
+		// Enough rows for several vectors, each document's rows next to each other.
+		"CREATE TEMP TABLE jdocs AS SELECT r * 10000 + k AS i, d, CAST(d AS JSON) AS j, p, CASE WHEN n < 0 THEN NULL ELSE n END AS n " +
+			"FROM (VALUES " + strings.Join(rows, ", ") + ") v(k, d, p, n), range(10) r(r) ORDER BY i",
+		"CREATE TEMP TABLE jdims AS SELECT * FROM (VALUES (0, " + quote(big) + "), (1, " + quote(big2) + "), (2, '[1, 2]')) v(id, d)",
+	}
+	for _, conn := range []*duckdb.Conn{fast, plain} {
+		for _, s := range setup {
+			if _, err := conn.ExecContext(ctx, s, nil); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	text := func(fn, doc, path string) string { return "CAST(" + fn + "(" + doc + ", " + path + ") AS VARCHAR)" }
+	var row []string
+	for _, fn := range []string{"json_extract", "json_extract_string", "json_extract_path", "json_extract_path_text"} {
+		row = append(row, text(fn, "d", "p"), text(fn, "j", "p"), text(fn, "d", "n"), text(fn, "j", "n"))
+	}
+	row = append(row, "d ->> p", "j ->> n")
+	for _, path := range []string{`'$.k1'`, `'$."5\" x"'`, `'$.*'`, `'$..k2'`, `'/k1'`, `'k299'`, `''`} {
+		row = append(row, text("json_extract", "d", path), text("json_extract_string", "j", path))
+	}
+	cols := strings.Join(row, ", ")
+	for _, q := range []string{
+		"SELECT i, " + cols + " FROM jdocs ORDER BY i",
+		"SELECT i, " + text("json_extract", quote(big), "p") + ", " + text("json_extract_string", quote(big), "p") +
+			", " + text("json_extract", quote(big), "n") + " FROM jdocs ORDER BY i",
+		"SELECT x.i, " + text("json_extract", "m.d", "x.p") + ", " + text("json_extract_string", "m.d", "x.p") + ", " +
+			text("json_extract", "CASE WHEN x.i % 3 = 0 THEN m.d ELSE x.d END", "x.p") + " FROM jdocs x, (SELECT " +
+			quote(big) + " AS d) m ORDER BY 1",
+		"SELECT x.i, " + text("json_extract", "dd.d", "x.p") + ", " + text("json_extract_string", "dd.d", "x.n") +
+			" FROM jdocs x JOIN jdims dd ON dd.id = x.i % 3 ORDER BY 1",
+	} {
+		got, want := queryRows(t, fast, q, "rb"), queryRows(t, plain, q, "plain")
+		if len(got) != len(want) {
+			t.Fatalf("%.200s: %d rows, DuckDB's %d", q, len(got), len(want))
+		}
+		for i := range got {
+			if got[i] != want[i] {
+				t.Errorf("%.200s:\nrow %d: %s\nDuckDB: %s", q, i, got[i], want[i])
+				break
+			}
+		}
+	}
+	// Errors: a document that is not JSON, after documents that are and
+	// before one again, and a path that is not one.
+	for _, q := range []string{
+		"SELECT json_extract(d, p) FROM (VALUES ('{\"a\": 1}', '$.a'), ('{\"a\": 1}', '$.b'), ('{\"a\": not json', '$.a'), ('[1]', '$[0]')) v(d, p)",
+		"SELECT json_extract_string(d, p) FROM (VALUES (" + quote(big) + ", '$.k1'), (" + quote(big) + ", '$.'), (" +
+			quote(big) + ", '$.k2')) v(d, p)",
+		"SELECT json_extract(d, p) FROM (VALUES (" + quote(big) + ", '$.*'), (" + quote(big) + ", '$.k1')) v(d, p)",
+	} {
+		_, gerr := queryAll(ctx, fast, q)
+		_, werr := queryAll(ctx, plain, q)
+		if gerr == nil || werr == nil || gerr.Error() != werr.Error() {
+			t.Errorf("%.120s: %v, DuckDB's %v", q, gerr, werr)
+		}
+	}
+}
+
+// queryAll runs q to its end and returns its rows or its error.
+func queryAll(ctx context.Context, conn *duckdb.Conn, q string) ([]string, error) {
+	rows, err := conn.QueryContext(ctx, q, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close() //nolint:errcheck
+	dest := make([]driver.Value, len(rows.Columns()))
+	var out []string
+	for {
+		if err := rows.Next(dest); err == io.EOF {
+			return out, nil
+		} else if err != nil {
+			return out, err
+		}
+		vals := make([]string, len(dest))
+		for j, v := range dest {
+			vals[j] = render(v)
+		}
+		out = append(out, strings.Join(vals, "\t"))
+	}
+}
+
+// TestRBJSONExtractParsesARepeatedDocumentOnce checks that the extension's
+// json_extract and json_extract_string, under each of their names, parse a
+// document that every row reads once, where the rows' paths differ, as a
+// lookup of each row's key in one map joined to every row does: DuckDB's
+// parse it for each row. 3,000 lookups in an object of 400 keys and 125 KB,
+// on one thread, take a tenth of DuckDB's time or less (on an M-series Mac,
+// 1.5 ms against 70 ms).
+func TestRBJSONExtractParsesARepeatedDocumentOnce(t *testing.T) {
+	ctx := context.Background()
+	fast, plain := nativeAndMacros(t)
+	for _, conn := range []*duckdb.Conn{fast, plain} {
+		for _, s := range []string{
+			"SET threads = 1",
+			"CREATE TEMP TABLE lookups AS SELECT '$.k' || (hash(i) % 400) AS p FROM range(3000) r(i)",
+			"CREATE TEMP TABLE maps AS SELECT to_json(map_from_entries(list({'k': 'k' || i, 'v': repeat('x', 300)}))) AS m FROM range(400) r(i)",
+		} {
+			if _, err := conn.ExecContext(ctx, s, nil); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	timed := func(conn *duckdb.Conn, q string) (string, time.Duration) {
+		best := time.Duration(1 << 62)
+		var got string
+		for range 2 {
+			start := time.Now()
+			r, err := firstRow(ctx, conn, q)
+			if err != nil {
+				t.Fatalf("%s: %v", q, err)
+			}
+			got, best = r, min(best, time.Since(start))
+		}
+		return got, best
+	}
+	for _, fn := range []string{"json_extract", "json_extract_path", "json_extract_string", "json_extract_path_text"} {
+		q := "SELECT count(" + fn + "(maps.m, lookups.p)), max(length(CAST(" + fn + "(maps.m, lookups.p) AS VARCHAR))) FROM lookups, maps"
+		got, took := timed(fast, q)
+		want, duck := timed(plain, q)
+		if got != want {
+			t.Fatalf("%s: %s, DuckDB's %s", fn, got, want)
+		}
+		t.Logf("%s: %s, DuckDB's %s", fn, took, duck)
+		if took*10 > duck {
+			t.Errorf("%s: %s, DuckDB's %s: the document is parsed for each row", fn, took, duck)
 		}
 	}
 }

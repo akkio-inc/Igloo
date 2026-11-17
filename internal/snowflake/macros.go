@@ -141,17 +141,21 @@ var macros = []string{
 	// typeof is a constant, so a view keeps working, and is as fast, when
 	// its table's column changes from JSON text to a list.
 	//
-	// sf_elem reads an element or value of such a list or map: the JSON
-	// text of an object or array as that object or array, so that objects
-	// in an ARRAY keep their paths, anything else as a string, and NULL
-	// as JSON null.
-	`CREATE OR REPLACE TEMP MACRO sf_elem(e) AS CASE WHEN e IS NULL THEN CAST('null' AS JSON)
-		WHEN (starts_with(e, '{') OR starts_with(e, '[')) AND json_valid(e) THEN CAST(e AS JSON) ELSE to_json(e) END`,
+	// sf_semi_text says text e holds a semi-structured value: it is the
+	// JSON text of an object or an array. Igloo reads text so wherever it
+	// may hold one: an element or value of such a list or map, and a
+	// VARCHAR column given to a function that builds a value, as a VARIANT
+	// column copied from Snowflake is held (see sf_to_json). sf_text_json
+	// reads text by it: such text as that object or array, so that objects
+	// in an ARRAY keep their paths, anything else as a string, and NULL as
+	// NULL. sf_elem reads an element or value, NULL as JSON null.
+	`CREATE OR REPLACE TEMP MACRO sf_semi_text(e) AS (starts_with(e, '{') OR starts_with(e, '[')) AND json_valid(e)`,
+	`CREATE OR REPLACE TEMP MACRO sf_text_json(e) AS CASE WHEN sf_semi_text(e) THEN CAST(e AS JSON) ELSE to_json(e) END`,
+	`CREATE OR REPLACE TEMP MACRO sf_elem(e) AS coalesce(sf_text_json(e), CAST('null' AS JSON))`,
 	// sf_elem_string reads it as text, as json_extract_string reads what
 	// sf_elem makes of it: an object's or an array's JSON text as DuckDB
 	// writes it, anything else as itself, without making JSON of a string.
-	`CREATE OR REPLACE TEMP MACRO sf_elem_string(e) AS
-		CASE WHEN (starts_with(e, '{') OR starts_with(e, '[')) AND json_valid(e) THEN json_extract_string(e, '$') ELSE e END`,
+	`CREATE OR REPLACE TEMP MACRO sf_elem_string(e) AS CASE WHEN sf_semi_text(e) THEN json_extract_string(e, '$') ELSE e END`,
 	// A list or a map of strings as JSON, read by sf_elem; when no element
 	// is an object's or an array's text, to_json alone, three times faster.
 	`CREATE OR REPLACE TEMP MACRO sf_strings_json(x) AS
@@ -167,14 +171,31 @@ var macros = []string{
 		WHEN typeof(x) = 'MAP(VARCHAR, VARCHAR)' THEN sf_map_json(CAST(x AS MAP(VARCHAR, VARCHAR)))
 		ELSE CAST(x AS JSON) END`,
 	// sf_to_json is a column passed to a function that builds JSON (an
-	// OBJECT_CONSTRUCT's value, an ARRAY_CONSTRUCT's element), as JSON the
-	// way those functions take it: a list or map of strings as above, text
-	// as a string, JSON as itself.
+	// OBJECT_CONSTRUCT's value, an ARRAY_CONSTRUCT's element, ARRAY_AGG's
+	// argument, TO_JSON's, ::VARIANT), as JSON the way those functions take
+	// it: a list or map of strings as above, JSON as itself, and text as
+	// sf_text_json reads it, which TYPEOF and paths agree with: a VARCHAR
+	// column may be a VARIANT column copied from Snowflake, the JSON text of
+	// its values, and ARRAY_AGG of one gives its objects, as Snowflake does,
+	// not strings of their text.
 	`CREATE OR REPLACE TEMP MACRO sf_to_json(x) AS CASE
 		WHEN typeof(x) = 'VARCHAR[]' THEN sf_strings_json(CAST(x AS VARCHAR[]))
 		WHEN typeof(x) = 'MAP(VARCHAR, VARCHAR)' THEN sf_map_json(CAST(x AS MAP(VARCHAR, VARCHAR)))
 		WHEN typeof(x) = 'VARIANT' THEN CAST(x AS JSON)
+		WHEN typeof(x) = 'VARCHAR' THEN sf_text_json(CAST(x AS VARCHAR))
 		ELSE to_json(x) END`,
+	// sf_path_step is the path that reads the key or index k, computed as
+	// a statement runs (see variant.paths): a key as a step of DuckDB's
+	// JSONPath, its backslashes and double quotes escaped, or as a JSON
+	// pointer for the keys a JSONPath cannot name, the empty key and '*';
+	// an index as a step too, and a negative one as no path (NULL), since
+	// DuckDB would count it from the end of an array, where Snowflake
+	// finds nothing. Each branch reads k as text, since DuckDB binds every
+	// branch whatever k's type.
+	`CREATE OR REPLACE TEMP MACRO sf_path_step(k) AS CASE
+		WHEN typeof(k) = 'VARCHAR' THEN CASE WHEN CAST(k AS VARCHAR) IN ('', '*') THEN '/' || CAST(k AS VARCHAR)
+			ELSE '$."' || replace(replace(CAST(k AS VARCHAR), '\', '\\'), '"', '\"') || '"' END
+		WHEN NOT starts_with(CAST(k AS VARCHAR), '-') THEN '$[' || CAST(k AS VARCHAR) || ']' END`,
 	// sf_get and sf_get_string read path p of x, as json_extract and
 	// json_extract_string do.
 	`CREATE OR REPLACE TEMP MACRO sf_get(x, p) AS CASE
@@ -253,13 +274,17 @@ var macros = []string{
 	`CREATE OR REPLACE TEMP MACRO sf_parts_this(l, j, m) AS repeat([sf_parts_json(l, j)], len(sf_parts_values(l, j, m)))`,
 	// A key's value as three parts: a list of strings l as above, a string s,
 	// which a VARCHAR is in OBJECT_CONSTRUCT, and JSON j otherwise, of a
-	// column as sf_to_json takes it (sf_other_part) or of any other value
-	// as to_json does (sf_expr_part). sf_fields_json and sf_fields_string
-	// read the three as JSON and as text.
+	// column as sf_to_json takes it (sf_column_string_part, sf_other_part:
+	// text that holds an object or an array is JSON) or of any other value
+	// as to_json does (sf_string_part, sf_expr_part). sf_fields_json and
+	// sf_fields_string read the three as JSON and as text.
 	`CREATE OR REPLACE TEMP MACRO sf_string_part(x) AS CASE WHEN typeof(x) = 'VARCHAR' THEN CAST(x AS VARCHAR) END`,
-	`CREATE OR REPLACE TEMP MACRO sf_other_part(x) AS CASE WHEN typeof(x) NOT IN ('VARCHAR[]', 'VARCHAR') THEN sf_to_json(x) END`,
+	`CREATE OR REPLACE TEMP MACRO sf_column_string_part(x) AS CASE
+		WHEN typeof(x) = 'VARCHAR' AND NOT sf_semi_text(CAST(x AS VARCHAR)) THEN CAST(x AS VARCHAR) END`,
+	`CREATE OR REPLACE TEMP MACRO sf_other_part(x) AS CASE
+		WHEN typeof(x) <> 'VARCHAR[]' AND (typeof(x) <> 'VARCHAR' OR sf_semi_text(CAST(x AS VARCHAR))) THEN sf_to_json(x) END`,
 	`CREATE OR REPLACE TEMP MACRO sf_other_part_keep_null(x) AS CASE
-		WHEN typeof(x) NOT IN ('VARCHAR[]', 'VARCHAR') THEN coalesce(sf_to_json(x), CAST('null' AS JSON))
+		WHEN typeof(x) <> 'VARCHAR[]' AND (typeof(x) <> 'VARCHAR' OR sf_semi_text(CAST(x AS VARCHAR))) THEN coalesce(sf_to_json(x), CAST('null' AS JSON))
 		WHEN x IS NULL THEN CAST('null' AS JSON) END`,
 	`CREATE OR REPLACE TEMP MACRO sf_expr_part(x) AS CASE WHEN typeof(x) <> 'VARCHAR' THEN to_json(x) END`,
 	`CREATE OR REPLACE TEMP MACRO sf_expr_part_keep_null(x) AS CASE

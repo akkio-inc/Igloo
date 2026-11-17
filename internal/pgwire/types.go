@@ -8,6 +8,7 @@ import (
 	"math/big"
 	"regexp"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/duckdb/duckdb-go/v2"
@@ -68,6 +69,69 @@ func wireType(t duckdb.Type, alias string) (uint32, encoder) {
 	default:
 		return pgtype.TextOID, toText
 	}
+}
+
+// snowflakeEncoder is how a statement translated from Snowflake's dialect
+// sends a column of t, when that differs from wireType's, and nil
+// otherwise: a list or a map of strings, Igloo's ARRAY and OBJECT columns,
+// whose elements and values hold an object or an array as its JSON text
+// (see docs/snowflake-sql.md). wireType sends them as JSON of the strings,
+// so that a client reads such an element as a string of JSON text
+// (["{\"zip\":\"55603\"}"]); Snowflake sends the ARRAY or OBJECT itself, as
+// TO_JSON and ::VARIANT read the column (sf_elem): [{"zip":"55603"}]. The
+// statement's other ARRAYs and OBJECTs are JSON already, and DuckDB's own
+// lists, structs and maps hold their values as typed.
+func snowflakeEncoder(t duckdb.TypeInfo) encoder {
+	if t == nil || t.Alias() != "" {
+		return nil
+	}
+	switch d := t.Details().(type) {
+	case *duckdb.ListDetails:
+		if isText(d.Child) {
+			return toSemiJSON
+		}
+	case *duckdb.MapDetails:
+		if isText(d.Key) && isText(d.Value) {
+			return toSemiJSON
+		}
+	}
+	return nil
+}
+
+// isText reports whether t is VARCHAR, not JSON.
+func isText(t duckdb.TypeInfo) bool {
+	return t.InternalType() == duckdb.TYPE_VARCHAR && t.Alias() == ""
+}
+
+// toSemiJSON writes a list or a map of strings as the ARRAY or OBJECT they
+// hold (see snowflakeEncoder).
+func toSemiJSON(v any) (any, error) {
+	switch t := v.(type) {
+	case []any:
+		out := make([]any, len(t))
+		for i, e := range t {
+			out[i] = semiElement(e)
+		}
+		return toJSON(out)
+	case duckdb.OrderedMap:
+		out := make(map[string]any, t.Len())
+		keys, values := t.Keys(), t.Values()
+		for i := range keys {
+			out[fmt.Sprint(keys[i])] = semiElement(values[i])
+		}
+		return toJSON(out)
+	}
+	return toJSON(v)
+}
+
+// semiElement is an element or value of a list or map of strings as JSON,
+// as sf_elem reads it: the JSON text of an object or an array as that
+// object or array, anything else as a string, and NULL as JSON null.
+func semiElement(e any) any {
+	if s, ok := e.(string); ok && (strings.HasPrefix(s, "{") || strings.HasPrefix(s, "[")) && json.Valid([]byte(s)) {
+		return json.RawMessage(s)
+	}
+	return e
 }
 
 // newTypeMap returns the types values are encoded with: pgx's, but with

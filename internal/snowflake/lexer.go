@@ -37,6 +37,10 @@ type token struct {
 	pos, end int
 	// raw marks a PostgreSQL E'...' string, which is passed on as written.
 	raw bool
+	// bare marks a quoted identifier that the statement wrote as a word,
+	// quoted because DuckDB would read the word as a keyword (see
+	// quoteKeywordNames): Snowflake's name is the word's.
+	bare bool
 }
 
 // lex splits Snowflake SQL into tokens. It follows Snowflake's lexical

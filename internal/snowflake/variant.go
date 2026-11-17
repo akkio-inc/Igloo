@@ -62,31 +62,85 @@ type variant struct {
 
 var plainKey = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 
-// path renders the variant's JSONPath as a SQL expression.
-func (v *variant) path() string {
+// pathKey writes key as a step of DuckDB's JSONPath, ."key" with its
+// backslashes and double quotes escaped, as DuckDB reads them back.
+func pathKey(key string) string {
+	if plainKey.MatchString(key) {
+		return "." + key
+	}
+	return `."` + strings.NewReplacer(`\`, `\\`, `"`, `\"`).Replace(key) + `"`
+}
+
+// paths renders the variant's path as the paths of the json_extract calls
+// that read it one after another, each a SQL expression. DuckDB's JSONPath
+// cannot name the empty key and '*' ('$.""' is an error and '$."*"' reads
+// every value), which a JSON pointer, '/' or '/*', reads alone. A key or
+// index computed as the statement runs is read alone too, by the path
+// sf_path_step writes for it on each row, a pointer for those two keys, so
+// that no other step is read as a pointer reads it: a pointer reads an
+// index of an object as a key, and a key of digits of an array as an
+// index, where Snowflake finds nothing.
+func (v *variant) paths() []string {
 	var parts []string
-	var lit strings.Builder
-	lit.WriteByte('$')
+	lit := "$"
+	flush := func() {
+		if lit != "$" {
+			parts = append(parts, quoteString(lit))
+			lit = "$"
+		}
+	}
 	for _, s := range v.segs {
 		switch {
 		case s.dyn != nil:
-			parts = append(parts, quoteString(lit.String()))
-			lit.Reset()
-			e := "(" + s.dyn.String() + ")"
-			parts = append(parts, "CASE WHEN typeof("+e+") = 'VARCHAR' THEN '.\"' || "+e+
-				" || '\"' ELSE '[' || CAST("+e+" AS VARCHAR) || ']' END")
+			flush()
+			parts = append(parts, "sf_path_step("+s.dyn.String()+")")
 		case s.isIndex:
-			lit.WriteString("[" + strconv.Itoa(s.index) + "]")
-		case plainKey.MatchString(s.key):
-			lit.WriteString("." + s.key)
+			lit += "[" + strconv.Itoa(s.index) + "]"
+		case s.key == "" || s.key == "*":
+			flush()
+			parts = append(parts, quoteString("/"+s.key))
 		default:
-			lit.WriteString(`."` + strings.ReplaceAll(s.key, `"`, `\"`) + `"`)
+			lit += pathKey(s.key)
 		}
 	}
-	if lit.Len() > 0 || len(parts) == 0 {
-		parts = append(parts, quoteString(lit.String()))
+	flush()
+	if len(parts) == 0 {
+		parts = append(parts, quoteString("$"))
 	}
-	return strings.Join(parts, " || ")
+	return parts
+}
+
+// extract writes the reads of the variant's path from base: json_extract,
+// or json_extract_string for the last when str is set. first and
+// firstString are the functions of the first read, which reads base.
+func (v *variant) extract(base, first, firstString string, str bool) string {
+	pre, post := v.reads(first, firstString, str)
+	return pre + base + post
+}
+
+// reads is extract's text before and after base.
+func (v *variant) reads(first, firstString string, str bool) (pre, post string) {
+	parts := v.paths()
+	for i, p := range parts {
+		fn := "json_extract("
+		switch {
+		case i == 0 && i == len(parts)-1 && str:
+			fn = firstString
+		case i == 0:
+			fn = first
+		case i == len(parts)-1 && str:
+			fn = "json_extract_string("
+		}
+		pre = fn + pre
+		post += ", " + p + ")"
+	}
+	return pre, post
+}
+
+// extractJSON writes the reads of path segs from base, a JSON value, as
+// JSON, or as text when str is set.
+func extractJSON(base string, segs []pathSeg, str bool) string {
+	return (&variant{segs: segs}).extract(base, "json_extract(", "json_extract_string(", str)
 }
 
 // render writes the variant in DuckDB SQL for its mode. A path into a
@@ -127,7 +181,7 @@ func (v *variant) render() string {
 	if v.column {
 		extract, extractString = "sf_get(", "sf_get_string("
 	}
-	str := extractString + base + ", " + v.path() + ")"
+	str := v.extract(base, extract, extractString, true)
 	switch v.mode {
 	case vString:
 		return str
@@ -140,5 +194,5 @@ func (v *variant) render() string {
 	if v.json && len(v.segs) == 0 {
 		return base
 	}
-	return extract + base + ", " + v.path() + ")"
+	return v.extract(base, extract, extractString, false)
 }

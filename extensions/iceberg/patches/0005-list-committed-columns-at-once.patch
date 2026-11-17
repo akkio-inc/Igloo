@@ -1,0 +1,83 @@
+List a table's new columns as soon as the commit that changed them lands.
+
+A table's entry in its schema's table set is the table as a bind last loaded
+it. Binds load the table again every time; listings (duckdb_columns(), and
+the information_schema and pg_catalog views over it) show the entry as it is.
+After a commit that changed a table's columns or properties, the entry still
+held the table from before the commit, so an ALTER TABLE's columns showed in
+listings only once a later statement happened to bind the table: ten ADD
+COLUMNs in a row listed the first nine, and SQLAlchemy's reflection, which
+reads the listings right after its DDL, saw the old shape. Once such a commit
+lands, the entry is replaced by one not loaded yet, which the next bind loads;
+Igloo loads unloaded tables before every statement that lists columns.
+
+diff --git a/src/catalog/rest/transaction/iceberg_transaction.cpp b/src/catalog/rest/transaction/iceberg_transaction.cpp
+index 3f333ac..89056df 100644
+--- a/src/catalog/rest/transaction/iceberg_transaction.cpp
++++ b/src/catalog/rest/transaction/iceberg_transaction.cpp
+@@ -474,6 +474,46 @@ void IcebergTransaction::Commit() {
+ 	temp_con.Rollback();
+ }
+ 
++//! Igloo: whether a commit of table changes what the catalog's listings (duckdb_columns(),
++//! information_schema, pg_catalog) show of it: its columns, which a new current schema changes, or its
++//! properties, which hold its comment.
++static bool ChangesListedTable(const IcebergTableInformation &table) {
++	if (!table.transaction_data) {
++		return false;
++	}
++	auto &transaction_data = *table.transaction_data;
++	if (transaction_data.set_schema_id) {
++		return true;
++	}
++	for (auto &update : transaction_data.updates) {
++		if (update->type == IcebergTableUpdateType::SET_PROPERTIES ||
++		    update->type == IcebergTableUpdateType::REMOVE_PROPERTIES) {
++			return true;
++		}
++	}
++	return false;
++}
++
++//! Igloo: once a commit that changed table's columns or properties has landed, the schema's table set
++//! holds the table as a bind last loaded it, from before the commit. Binds load a table again every
++//! time, and so saw the change at once, but listings show the set's entry as it is: the columns of an
++//! ALTER TABLE showed only once a later statement happened to bind the table, and ten ADD COLUMNs in a
++//! row listed the first nine. The entry is replaced by one not loaded yet, which listings show as they
++//! show a table no statement has used, until a bind loads it, as Igloo does before every statement that
++//! lists columns. Transactions holding the old entry keep it alive.
++static void ForgetListedTable(const IcebergTableInformation &table) {
++	if (!ChangesListedTable(table)) {
++		return;
++	}
++	auto &tables = table.schema.tables;
++	lock_guard<mutex> guard(tables.GetEntryLock());
++	auto &entries = tables.GetEntriesMutable();
++	auto it = entries.find(table.name);
++	if (it != entries.end()) {
++		it->second = make_shared_ptr<IcebergTableInformation>(table.catalog, table.schema, table.name);
++	}
++}
++
+ void IcebergTransaction::DoTableUpdates(IcebergTransactionAlterUpdate &alter_update, ClientContext &context) {
+ 	if (!alter_update.HasUpdates()) {
+ 		return;
+@@ -504,6 +544,7 @@ void IcebergTransaction::DoTableUpdates(IcebergTransactionAlterUpdate &alter_upd
+ 		IRCAPI::CommitMultiTableUpdate(context, catalog, transaction_json);
+ 		for (auto &it : alter_update.updated_tables) {
+ 			alter_update.committed_tables.insert(it.first);
++			ForgetListedTable(it.second);
+ 		}
+ 	} else {
+ 		D_ASSERT(catalog.supported_urls.count("POST /v1/{prefix}/namespaces/{namespace}/tables/{table}"));
+@@ -515,6 +556,10 @@ void IcebergTransaction::DoTableUpdates(IcebergTransactionAlterUpdate &alter_upd
+ 			IRCAPI::CommitTableUpdate(context, catalog, table_change.identifier._namespace.value,
+ 			                          table_change.identifier.name, transaction_json);
+ 			alter_update.committed_tables.insert(it.first);
++			auto updated = alter_update.updated_tables.find(it.first);
++			if (updated != alter_update.updated_tables.end()) {
++				ForgetListedTable(updated->second);
++			}
+ 		}
+ 	}
+ 	auto &ic_catalog = catalog.Cast<IcebergCatalog>();

@@ -43,6 +43,12 @@ func TestHLLSketches(t *testing.T) {
 		query, exact string
 	}{
 		{`SELECT ` + approx("l_partkey") + ` FROM lineitem`, `SELECT count(DISTINCT l_partkey) FROM lineitem`},
+		// A column profile, as DuckDB's approx_count_distinct counts it
+		// too: sketches beside other aggregates, the last of a FILTER, which
+		// becomes a condition of its CASE.
+		{`SELECT count(l_partkey), ` + approx("l_suppkey") + `, CAST(coalesce(round(datasketch_hll_estimate(datasketch_hll(12, CASE WHEN (l_quantity > 10) AND ` +
+			`l_partkey IS NOT NULL THEN hash(l_partkey) END))), 0) AS BIGINT) FROM lineitem`,
+			`SELECT count(l_partkey), count(DISTINCT l_suppkey), count(DISTINCT l_partkey) FILTER (WHERE l_quantity > 10) FROM lineitem`},
 		{`SELECT l_returnflag, ` + approx("l_orderkey") + ` FROM lineitem GROUP BY 1 ORDER BY 1`,
 			`SELECT l_returnflag, count(DISTINCT l_orderkey) FROM lineitem GROUP BY 1 ORDER BY 1`},
 		{`SELECT l_suppkey % 40 AS b, datasketch_hll_estimate(datasketch_hll(12, hash(l_partkey))) FROM lineitem GROUP BY 1 ORDER BY 1`,

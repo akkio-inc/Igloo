@@ -972,7 +972,7 @@ func (s *Supervised) rowTable(method string, _ *RowOptions) RowTable {
 		RowColumn{"approximation_error", "$.approximation_error", "DOUBLE"})}
 }
 
-func (s *Supervised) scoreRow(buf []byte, method string, opt *RowOptions, r *ml.RowValues) []byte {
+func (s *Supervised) scoreRow(buf []byte, method string, opt *RowOptions, r *ml.RowValues) ([]byte, error) {
 	sc := s.scratch()
 	defer s.pool.Put(sc)
 	out := sc.pred
@@ -1014,7 +1014,7 @@ func (s *Supervised) scoreRow(buf []byte, method string, opt *RowOptions, r *ml.
 		buf = appendKey(buf, "approximation_error", false)
 		buf = append(buf, '0')
 	}
-	return append(buf, '}')
+	return append(buf, '}'), nil
 }
 
 // attributions explains a row's prediction of class k (or its value): the

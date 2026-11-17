@@ -113,6 +113,27 @@ func TestProvider(t *testing.T) {
 	}
 }
 
+// TestRefreshThroughTheSDKCache runs the provider over the chain as the SDK
+// resolves it, wrapped in its credentials cache, which hands out what it
+// holds until that has expired. Refreshes ahead of the expiry got the same
+// credentials back, and every caller failed for the last validMargin of
+// their life.
+func TestRefreshThroughTheSDKCache(t *testing.T) {
+	defer func(m time.Duration) { validMargin = m }(validMargin)
+	validMargin = 300 * time.Millisecond
+	chain := &fakeChain{life: 2 * time.Second}
+	cache := aws.NewCredentialsCache(chain)
+	p := New(func(context.Context) (aws.CredentialsProvider, error) { return cache, nil }, nil)
+	start := time.Now()
+	for time.Since(start) < 5*time.Second {
+		if n := retrieveAll(p, 1, time.Second); n > 0 {
+			t.Fatalf("a caller got no credentials %v in, with credentials that last %v (%d fetches)",
+				time.Since(start).Round(time.Millisecond), chain.life, chain.calls.Load())
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
 // imds is a fake EC2 instance metadata service handing out an instance
 // profile's credentials, its answers to their requests delayed by delay
 // after the first, as under load.

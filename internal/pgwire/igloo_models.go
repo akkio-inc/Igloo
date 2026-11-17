@@ -31,6 +31,10 @@ func (s *Server) trainIglooModel(ctx context.Context, sess *session, user auth.U
 	case models.ClassFactorization:
 		args = append(args, "USER_COLNAME", "ITEM_COLNAME", "RATING_COLNAME")
 	case models.ClassKMeans, models.ClassPCA, models.ClassAutoencoder:
+	case models.ClassXGBoost:
+		// A target, or an interval label's two bounds, which package
+		// models checks.
+		args = append(args, "TARGET_COLNAME", "LABEL_LOWER_BOUND_COLNAME", "LABEL_UPPER_BOUND_COLNAME", "WEIGHT_COLNAME")
 	default:
 		args = append(args, "TARGET_COLNAME")
 	}
@@ -42,9 +46,10 @@ func (s *Server) trainIglooModel(ctx context.Context, sess *session, user auth.U
 	for _, p := range []struct {
 		name string
 		dst  *string
-	}{{"TARGET_COLNAME", &a.Target}, {"USER_COLNAME", &a.User}, {"ITEM_COLNAME", &a.Item}, {"RATING_COLNAME", &a.Rating}} {
+	}{{"TARGET_COLNAME", &a.Target}, {"USER_COLNAME", &a.User}, {"ITEM_COLNAME", &a.Item}, {"RATING_COLNAME", &a.Rating},
+		{"LABEL_LOWER_BOUND_COLNAME", &a.Lower}, {"LABEL_UPPER_BOUND_COLNAME", &a.Upper}, {"WEIGHT_COLNAME", &a.Weight}} {
 		if slices.Contains(args, p.name) {
-			if *p.dst, err = stringArg(call, p.name, true); err != nil {
+			if *p.dst, err = stringArg(call, p.name, st.Class != models.ClassXGBoost); err != nil {
 				return nil, "", "", err
 			}
 		}

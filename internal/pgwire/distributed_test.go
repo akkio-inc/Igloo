@@ -21,6 +21,7 @@ import (
 	icebergio "github.com/apache/iceberg-go/io"
 	"github.com/duckdb/duckdb-go/v2"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 	wire "github.com/jeroenrinzema/psql-wire"
 
 	"github.com/akkio-inc/igloo/internal/audit"
@@ -1305,6 +1306,37 @@ func TestDistributedFlatten(t *testing.T) {
 	}
 	if n := workers(3); n != 0 {
 		t.Errorf("with a session's own FLATTEN macros, FLATTEN ran on %d workers", n)
+	}
+}
+
+// A statement in Snowflake's dialect that runs on workers sends an ARRAY
+// column as one that runs here does: the array it holds, its objects as
+// objects (see presentAsSnowflake), where the coordinator's statement that
+// combines the workers' results is prepared apart.
+func TestDistributedSemiStructuredResults(t *testing.T) {
+	t.Parallel()
+	ds := startDistServer(t, 2)
+	mustExec(t, ds.admin, `CREATE TABLE lake.public.tagged AS SELECT i AS id, ['{"k":' || (i % 2) || '}', 'x'] AS tags FROM range(3000) t(i)`)
+	conn := ds.testServer.admin(t, pgx.QueryExecModeSimpleProtocol)
+	ctx := context.Background()
+	mustExec(t, conn, "SET search_path = 'lake.public,memory.main'")
+	const query = `SELECT tags, COUNT(*) AS n FROM tagged GROUP BY tags ORDER BY 1`
+	want := []string{`[{"k":0},"x"]|1500`, `[{"k":1},"x"]|1500`}
+	for _, on := range []string{"off", "on"} {
+		mustExec(t, conn, "RESET sql_dialect")
+		mustExec(t, conn, "SET distributed_execution = "+on)
+		mustExec(t, conn, "SET sql_dialect = 'snowflake'")
+		oids, rows := wireRows(t, conn, query)
+		if !slices.Equal(oids, []uint32{pgtype.JSONOID, pgtype.Int8OID}) || !slices.Equal(rows, want) {
+			t.Errorf("distributed_execution = %s: %v %q, want %q", on, oids, rows, want)
+		}
+	}
+	qs, err := ds.history.Queries(ctx, audit.Viewer{All: true}, audit.Page{Limit: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(qs) == 0 || !strings.Contains(qs[0].Text, "GROUP BY tags") || qs[0].Workers != 2 {
+		t.Errorf("the last run is not the query on 2 workers: %+v", qs[:min(len(qs), 1)])
 	}
 }
 

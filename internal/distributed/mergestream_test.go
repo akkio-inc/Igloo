@@ -126,7 +126,7 @@ func TestMergeReader(t *testing.T) {
 // nothing.
 func TestStreamedMerge(t *testing.T) {
 	h := behaviorsHarness(t)
-	h.co.opts.Cores = mergeCores // enough to merge on (see mergesKeepUp)
+	h.co.opts.Cores = MergeCores // enough to merge on (see mergesKeepUp)
 	ctx := context.Background()
 	if err := RegisterMerged(h.session); err != nil {
 		t.Fatal(err)

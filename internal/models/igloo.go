@@ -21,11 +21,12 @@ const (
 	ClassAutoencoder      = "IGLOO.ML.AUTOENCODER"
 	ClassAutoMLClassifier = "IGLOO.ML.AUTOML_CLASSIFIER"
 	ClassAutoMLRegressor  = "IGLOO.ML.AUTOML_REGRESSOR"
+	ClassXGBoost          = "IGLOO.ML.XGBOOST"
 )
 
 // IglooClasses are Igloo's classes, in the order the docs list them.
 var IglooClasses = []string{ClassRegression, ClassIglooClassifier, ClassKMeans, ClassPCA, ClassFactorization,
-	ClassDNNClassifier, ClassDNNRegressor, ClassAutoencoder, ClassAutoMLClassifier, ClassAutoMLRegressor}
+	ClassDNNClassifier, ClassDNNRegressor, ClassAutoencoder, ClassAutoMLClassifier, ClassAutoMLRegressor, ClassXGBoost}
 
 // IsIgloo reports whether class is one of Igloo's own.
 func IsIgloo(class string) bool { return strings.HasPrefix(class, "IGLOO.ML.") }
@@ -53,11 +54,14 @@ func TrainRowLimit(cols int) int {
 
 // IglooArgs are CREATE IGLOO.ML.<class>'s arguments besides INPUT_DATA:
 // TARGET_COLNAME; MATRIX_FACTORIZATION's USER_COLNAME, ITEM_COLNAME and
-// RATING_COLNAME; CONFIG_OBJECT, as JSON values.
+// RATING_COLNAME; XGBOOST's LABEL_LOWER_BOUND_COLNAME,
+// LABEL_UPPER_BOUND_COLNAME and WEIGHT_COLNAME; CONFIG_OBJECT, as JSON
+// values.
 type IglooArgs struct {
-	Target             string
-	User, Item, Rating string
-	Config             map[string]any
+	Target               string
+	User, Item, Rating   string
+	Lower, Upper, Weight string
+	Config               map[string]any
 	// Sampled says the input was sampled down to Rows rows of Total.
 	Sampled     bool
 	Total, Rows int
@@ -90,6 +94,8 @@ func TrainIgloo(class string, t *Table, a IglooArgs) (*Artifact, map[string]any,
 		art.Factors, err = trainFactorization(t, a, cfg)
 	case ClassAutoencoder:
 		art.Autoencoder, err = trainAutoencoder(t, a, cfg)
+	case ClassXGBoost:
+		art.XGBoost, err = trainXGBoost(t, a, cfg)
 	default:
 		return nil, nil, inputErr("%s is not one of Igloo's classes", class)
 	}
@@ -419,12 +425,14 @@ func checkOptions(class string, m map[string]any) error {
 		_, _, err = alsOptions(cfg)
 	case ClassAutoencoder:
 		_, err = readNetOptions(cfg, []int{1})
+	case ClassXGBoost:
+		_, err = readXGBoostOptions(cfg)
 	}
 	if err != nil {
 		return err
 	}
 	switch class {
-	case ClassKMeans, ClassPCA:
+	case ClassKMeans, ClassPCA, ClassXGBoost:
 	default:
 		if _, err := readSplit(cfg); err != nil {
 			return err

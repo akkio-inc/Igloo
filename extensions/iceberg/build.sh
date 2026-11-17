@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Builds Igloo's iceberg extension, iceberg.duckdb_extension, for this Linux
-# machine's architecture, and its SHA-256 beside it:
+# Builds Igloo's iceberg extension, iceberg.duckdb_extension, for this
+# machine's system (Linux or macOS) and architecture, and its SHA-256 beside
+# it:
 #
 #   extensions/iceberg/build.sh OUT_DIR
 #
@@ -14,7 +15,9 @@
 # The sources, vcpkg's packages, the build tree and the compiler cache stay in
 # $ICEBERG_CACHE (default ~/.cache/igloo/iceberg): the first build takes half
 # an hour on a few cores, later ones minutes. It needs the tools the
-# Dockerfile's iceberg stage installs, and is usually run there.
+# Dockerfile's iceberg stage installs, and is usually run there; on macOS,
+# the Xcode command line tools, CMake, Ninja and pkg-config, and ccache if
+# it is there.
 set -euo pipefail
 
 # DuckDB-Iceberg as DuckDB v1.5.6 builds it (.github/config/extensions/iceberg.cmake),
@@ -95,11 +98,18 @@ export VCPKG_TOOLCHAIN_PATH="$vcpkg/scripts/buildsystems/vcpkg.cmake"
 export VCPKG_DEFAULT_BINARY_CACHE="$cache/vcpkg-binary"
 export CCACHE_DIR="$cache/ccache"
 export GEN=ninja
+# DuckDB's and the dependencies' compiles, at 2 GiB each.
+# shellcheck source=extensions/jobs.sh
+. "$here/../jobs.sh"
+jobs=$(build_jobs $((2 << 30)))
+export CMAKE_BUILD_PARALLEL_LEVEL=$jobs VCPKG_MAX_CONCURRENCY=$jobs
+echo "iceberg: $jobs compiles at once"
 mkdir -p "$VCPKG_DEFAULT_BINARY_CACHE"
 # DuckDB's CMake caches C++11 before the extension asks for the C++14 it is
 # written in. No shell or test runner: only the extension is wanted.
 make -C "$src" release EXT_FLAGS="-DCMAKE_CXX_STANDARD=14 -DBUILD_SHELL=0 -DBUILD_UNITTESTS=0"
 
 cp "$src/build/release/extension/iceberg/iceberg.duckdb_extension" "$out/iceberg.duckdb_extension"
-sha256sum "$out/iceberg.duckdb_extension" | cut -d' ' -f1 >"$out/iceberg.duckdb_extension.sha256"
+if command -v sha256sum >/dev/null; then sha256=(sha256sum); else sha256=(shasum -a 256); fi
+"${sha256[@]}" "$out/iceberg.duckdb_extension" | cut -d' ' -f1 >"$out/iceberg.duckdb_extension.sha256"
 echo "built $out/iceberg.duckdb_extension (DuckDB $duckdb_tag): $(cat "$out/iceberg.duckdb_extension.sha256")"

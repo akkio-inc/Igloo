@@ -18,7 +18,8 @@ test: ## Run the Go tests (starts a throwaway Postgres)
 	scripts/test.sh
 
 lint: ## Check formatting and run go vet
-	docker run --rm -v "$(CURDIR)":/src -v igloo-go-mod:/go/pkg/mod -w /src $(GO_IMAGE) \
+	scripts/xgboost.sh
+	docker run --rm -v "$(CURDIR)":/src -v igloo-go-mod:/go/pkg/mod -v igloo-xgboost:/xgboost -e PKG_CONFIG_PATH=/xgboost/lib/pkgconfig -w /src $(GO_IMAGE) \
 		sh -c 'test -z "$$(gofmt -l cmd internal)" || { gofmt -l cmd internal; exit 1; }; go vet -tags duckdb_arrow ./...'
 
 migrate-test: ## Run the migration report's unit tests (migrate/; no warehouse needed)

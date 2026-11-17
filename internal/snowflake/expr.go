@@ -25,7 +25,8 @@ func (t *translator) seq(nodes []*node, top bool) ([]*node, error) {
 	}
 	for _, pass := range []func([]*node) ([]*node, error){
 		t.clauses, t.literals, t.calls, t.tableFunctions, t.sample, t.values, t.paths, t.casts, t.variantModes,
-		t.operators, t.implicitCasts, t.divisions, t.pivots, t.orderBy, t.top, t.recursiveCTE, t.structWhere, t.valueWhere, t.guardAI,
+		t.operators, t.implicitCasts, t.divisions, t.pivots, t.orderBy, t.top, t.recursiveCTE, t.structWhere, t.valueWhere, t.lateralOn,
+		t.guardAI,
 	} {
 		if nodes, err = pass(nodes); err != nil {
 			return nil, err
@@ -437,8 +438,18 @@ func castBase(nodes []*node, start, p int) ([]*node, int, bool, error) {
 	return replace(nodes, s, p+1, cast), s, true, nil
 }
 
-// castExpr casts x to typ as Snowflake does.
+// castExpr casts x to typ as Snowflake does, marking a cast to FLOAT
+// (DuckDB's DOUBLE) as one.
 func castExpr(x []*node, typ sqlType, try bool) *node {
+	n := castValue(x, typ, try)
+	if typ.duck == "DOUBLE" {
+		n.float = true
+	}
+	return n
+}
+
+// castValue is castExpr's cast.
+func castValue(x []*node, typ sqlType, try bool) *node {
 	x = trim(x)
 	fn := "CAST("
 	if try {
@@ -960,10 +971,12 @@ func orderAliases(nodes []*node) map[string][]*node {
 // aliasKey is the name n gives, as Snowflake compares names: an unquoted
 // word upper-cased, a quoted identifier as it is.
 func aliasKey(n *node) (string, bool) {
-	switch n.kind {
-	case kWord:
+	switch {
+	case n.kind == kWord:
 		return strings.ToUpper(n.tok.text), true
-	case kQuoted:
+	case n.kind == kQuoted && n.tok.bare:
+		return strings.ToUpper(n.tok.val), true
+	case n.kind == kQuoted:
 		return n.tok.val, true
 	}
 	return "", false
@@ -1275,20 +1288,37 @@ func namesResult(nodes []*node, idx []int) bool {
 // upperAlias writes a select item's unquoted alias, if it has one, as a
 // quoted name in upper case.
 func upperAlias(item []*node) {
+	i, _ := selectAlias(item)
+	if i < 0 {
+		return
+	}
+	last := item[i]
+	name, _, _ := last.name()
+	upper := strings.ToUpper(name)
+	item[i] = &node{kind: kQuoted, tok: token{kind: kQuoted, text: quoteIdent(upper), val: upper, pos: last.pos, end: last.end},
+		pos: last.pos, end: last.end}
+}
+
+// selectAlias returns the index in item, a select item, of its alias
+// written unquoted, or quoted only for DuckDB (see token.bare), and whether
+// it is written without AS; -1 when there is none.
+func selectAlias(item []*node) (int, bool) {
 	idx := sig(item)
 	if len(idx) < 2 {
-		return
+		return -1, false
 	}
 	last := item[idx[len(idx)-1]]
 	before := item[idx[len(idx)-2]]
-	if last.kind != kWord || expressionEndWords[last.word()] && before.word() != "AS" {
-		return
+	if last.kind != kWord && !(last.kind == kQuoted && last.tok.bare) || expressionEndWords[last.word()] && before.word() != "AS" {
+		return -1, false
 	}
-	if before.word() == "AS" || endsOperand(before) && !before.isOp(".") {
-		upper := strings.ToUpper(last.tok.text)
-		item[idx[len(idx)-1]] = &node{kind: kQuoted, tok: token{kind: kQuoted, text: quoteIdent(upper), val: upper, pos: last.pos, end: last.end},
-			pos: last.pos, end: last.end}
+	switch {
+	case before.word() == "AS":
+		return idx[len(idx)-1], false
+	case endsOperand(before) && !before.isOp("."):
+		return idx[len(idx)-1], true
 	}
+	return -1, false
 }
 
 // expressionName returns the name Snowflake gives a select item without

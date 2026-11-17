@@ -35,7 +35,7 @@ import (
 // floating-point numbers (NaN last), text and BLOBs by their bytes, without
 // a collation, dates, times, timestamps, decimals and booleans; where the
 // session keeps the order rows are read in (preserve_insertion_order); and on
-// a coordinator of mergeCores cores and DuckDB threads or more. Otherwise the
+// a coordinator of MergeCores cores and DuckDB threads or more. Otherwise the
 // coordinator sorts, as before.
 //
 // A plan whose session reads the merge as it is made (Plan.StreamMerged)
@@ -156,14 +156,16 @@ type resolvedKey struct {
 	desc, nullsFirst bool
 }
 
-// mergeCores is the fewest cores, and DuckDB threads, on which the
-// coordinator merges a stage's sorted rows; on fewer, DuckDB sorts them, as
-// one machine does. The merge decodes each file and merges groups of them on
-// goroutines of their own, and DuckDB copies the merged rows in: 4 million
+// MergeCores is the fewest cores (logical CPUs), and DuckDB threads, on which
+// the coordinator merges a stage's sorted rows; on fewer, DuckDB sorts them,
+// as one machine does. The merge decodes each file and merges groups of them
+// on goroutines of their own, and DuckDB copies the merged rows in: 4 million
 // rows from 32 sorted files, read through DuckDB as a statement reads them,
-// took 1.03 times DuckDB's own sort of them on 4 cores and 0.98 on 16, but 1.5
-// on 2 and 1.8 on 1.
-const mergeCores = 4
+// took 0.98 times DuckDB's own sort of them on 16 cores and 1.03 to 1.07 on 4
+// without hyperthreads, but 1.26 on CI's 4 vCPUs, which are 2 cores'
+// hyperthreads, 1.5 on 2 cores and 1.8 on 1. Below 8 logical CPUs it is at
+// best even with DuckDB's sort.
+const MergeCores = 8
 
 // mergesKeepUp says a merge of sorted rows keeps up with DuckDB's sort of
 // them on cores cores (0 for those Go may use) and threads DuckDB threads (0
@@ -175,7 +177,7 @@ func mergesKeepUp(cores, threads int) bool {
 	if threads <= 0 {
 		threads = cores
 	}
-	return min(cores, threads) >= mergeCores
+	return min(cores, threads) >= MergeCores
 }
 
 // resolveMerge works out how keys order a stage's rows, of columns cols,

@@ -4,7 +4,9 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 )
@@ -159,4 +161,65 @@ func TestTablesVersion(t *testing.T) {
 	step("a namespace dropped", func() { send(http.MethodDelete, "namespaces/staging", "") }, false)
 	step("a view", func() { send(http.MethodPost, "namespaces/sales/views", `{"name": "v"}`) }, true)
 	step("Invalidate", p.Invalidate, true)
+}
+
+// TestOnTablesChanged checks that the proxy tells of the tables each change
+// commits to, makes, renames or drops, as the change names them, before the
+// change's answer goes out, and of none for loads, scans' metrics, changes
+// to namespaces and changes whose tables it cannot tell.
+func TestOnTablesChanged(t *testing.T) {
+	catalog := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"metadata-location": "s3://w/` + r.URL.Path + `/metadata/1.json", "metadata": {"format-version": 2}}`))
+	}))
+	t.Cleanup(catalog.Close)
+	p, err := New(Options{Catalog: catalog.URL + "/catalog"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = p.Close() })
+	var mu sync.Mutex
+	var told []string
+	p.OnTablesChanged(func(tables []Table) {
+		mu.Lock()
+		defer mu.Unlock()
+		for _, tb := range tables {
+			told = append(told, strings.Join(tb.Namespace, ".")+"."+tb.Name)
+		}
+	})
+	for _, c := range []struct {
+		what, method, path, body string
+		want                     []string
+	}{
+		{"a load", http.MethodGet, "namespaces/sales/tables/carts", "", nil},
+		{"a scan's metrics", http.MethodPost, "namespaces/sales/tables/carts/metrics", `{}`, nil},
+		{"a commit", http.MethodPost, "namespaces/sales/tables/Carts", `{"updates": []}`, []string{"sales.Carts"}},
+		{"a table made", http.MethodPost, "namespaces/sales/tables", `{"name": "Returns"}`, []string{"sales.Returns"}},
+		{"a commit of a transaction", http.MethodPost, "transactions/commit",
+			`{"table-changes": [{"identifier": {"namespace": ["sales"], "name": "carts"}}, {"identifier": {"namespace": ["a", "b"], "name": "c"}}]}`,
+			[]string{"sales.carts", "a.b.c"}},
+		{"a rename", http.MethodPost, "tables/rename",
+			`{"source": {"namespace": ["sales"], "name": "carts"}, "destination": {"namespace": ["sales"], "name": "old_carts"}}`,
+			[]string{"sales.carts", "sales.old_carts"}},
+		{"a drop", http.MethodDelete, "namespaces/sales/tables/old_carts", "", []string{"sales.old_carts"}},
+		{"a namespace made", http.MethodPost, "namespaces", `{"namespace": ["staging"]}`, nil},
+		{"a view", http.MethodPost, "namespaces/sales/views", `{"name": "v"}`, nil},
+	} {
+		mu.Lock()
+		told = nil
+		mu.Unlock()
+		req, _ := http.NewRequest(c.method, p.URL()+"/v1/w/"+c.path, strings.NewReader(c.body))
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, _ = io.Copy(io.Discard, resp.Body)
+		_ = resp.Body.Close()
+		mu.Lock()
+		if !slices.Equal(told, c.want) {
+			t.Errorf("%s: told of %q, want %q", c.what, told, c.want)
+		}
+		mu.Unlock()
+	}
 }

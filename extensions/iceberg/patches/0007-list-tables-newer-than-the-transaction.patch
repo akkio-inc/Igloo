@@ -1,0 +1,66 @@
+List a table created after the transaction started at its current schema.
+
+A listing of the catalog (duckdb_tables(), duckdb_columns(),
+information_schema, pg_catalog) shows each table any connection has loaded
+at its schema as of the transaction's start, as a bind sees it. A table
+created since has no schema that old: patch 0006 makes a bind of it fail the
+transaction, and a listing failed the same way. Igloo lists the catalog's
+tables on a session's own connection to check its statements' grants,
+whenever DDL has run since the last listing, so a transaction block failed
+its next statement whenever another session had created and read a table
+since the block began, whatever tables the statement used. A listing, which
+shows the catalog's tables as they are now, now shows such a table at its
+current schema; a statement that reads or writes it still fails the
+transaction.
+
+diff --git a/src/catalog/rest/catalog_entry/table/iceberg_table_information.cpp b/src/catalog/rest/catalog_entry/table/iceberg_table_information.cpp
+index 77412e7..b313625 100644
+--- a/src/catalog/rest/catalog_entry/table/iceberg_table_information.cpp
++++ b/src/catalog/rest/catalog_entry/table/iceberg_table_information.cpp
+@@ -542,6 +542,20 @@ optional_ptr<CatalogEntry> IcebergTableInformation::GetLatestSchema(ClientContex
+ 	return GetSchemaVersion(context, nullptr);
+ }
+ 
++optional_ptr<CatalogEntry> IcebergTableInformation::GetListedSchema(ClientContext &context) {
++	//! Igloo: a listing shows the catalog's tables as they are now, each at its schema as of the
++	//! transaction's start, as a bind sees it. A table created since has no schema that old, and a bind
++	//! of it fails the transaction (see CreateMetadataFromLog); a listing shows its current schema
++	//! instead. Igloo lists the catalog's tables to check a statement's grants, on the session's own
++	//! connection, so failing the listing failed every statement of a transaction older than any table
++	//! another session had created and read since.
++	try {
++		return GetLatestSchema(context);
++	} catch (TransactionException &) {
++		return schema_versions[table_metadata.GetCurrentSchemaId()].get();
++	}
++}
++
+ string IcebergTableInformation::GetTableKey(const vector<string> &namespace_items, const string &table_name) {
+ 	if (namespace_items.empty()) {
+ 		return table_name;
+diff --git a/src/catalog/rest/iceberg_table_set.cpp b/src/catalog/rest/iceberg_table_set.cpp
+index 5992c49..d942e12 100644
+--- a/src/catalog/rest/iceberg_table_set.cpp
++++ b/src/catalog/rest/iceberg_table_set.cpp
+@@ -101,7 +101,7 @@ void IcebergTableSet::Scan(ClientContext &context, const std::function<void(Cata
+ 			// The table has already been resolved (e.g. via DESCRIBE or a scan), so its full schema -
+ 			// including column comments mapped from the Iceberg field 'doc' - is available. Surface the
+ 			// resolved entry instead of the placeholder so listings reflect the real columns.
+-			auto resolved = table_info.GetLatestSchema(context);
++			auto resolved = table_info.GetListedSchema(context);
+ 			if (resolved) {
+ 				callback(*resolved);
+ 				continue;
+diff --git a/src/include/catalog/rest/catalog_entry/table/iceberg_table_information.hpp b/src/include/catalog/rest/catalog_entry/table/iceberg_table_information.hpp
+index ecc75dc..4931baf 100644
+--- a/src/include/catalog/rest/catalog_entry/table/iceberg_table_information.hpp
++++ b/src/include/catalog/rest/catalog_entry/table/iceberg_table_information.hpp
+@@ -39,6 +39,8 @@ public:
+ 
+ public:
+ 	optional_ptr<CatalogEntry> GetLatestSchema(ClientContext &context);
++	//! Igloo: the schema a listing of the catalog shows of the table (see IcebergTableSet::Scan).
++	optional_ptr<CatalogEntry> GetListedSchema(ClientContext &context);
+ 	idx_t GetIcebergVersion() const;
+ 	optional_ptr<CatalogEntry> GetSchemaVersion(ClientContext &context, optional_ptr<BoundAtClause> at);
+ 	optional_ptr<CatalogEntry> CreateSchemaVersion(const IcebergTableSchema &table_schema);

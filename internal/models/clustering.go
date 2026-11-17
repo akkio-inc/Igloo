@@ -10,9 +10,10 @@ import (
 )
 
 // KMEANS: k-means clustering of the rows' features, standardized and one
-// hot encoded, seeded by k-means++; the number of clusters given, or the
-// one of 2 to 10 whose Davies-Bouldin index is lowest. Rows far from their
-// centroid, for the distances of its own training rows, are anomalies.
+// hot encoded, trained by e-means (package ml) from k-means++ centroids;
+// the number of clusters given, or the one of 2 to 10 whose Davies-Bouldin
+// index is lowest. Rows far from their centroid, for the distances of its
+// own training rows, are anomalies.
 
 // Clusters is an IGLOO.ML.KMEANS model.
 type Clusters struct {
@@ -46,30 +47,30 @@ func (c *Clusters) summary(out map[string]any) {
 const autoClusters = 10
 
 // kmeansOptions reads KMEANS's options: standardize_features, num_clusters
-// (0 to pick), and the iterations'.
-func kmeansOptions(cfg *config) (standardize bool, k int, p ml.KMeansParams, err error) {
+// (0 to pick), and e-means'. max_iterations is its epochs. It runs them
+// all on its schedule, so early_stop and min_rel_progress, which
+// BigQuery ML's Lloyd iterations take, are checked but change nothing.
+func kmeansOptions(cfg *config) (standardize bool, k int, p ml.EMeansParams, err error) {
 	if standardize, err = cfg.boolean("standardize_features", true); err != nil {
 		return
 	}
 	if k, err = cfg.integer("num_clusters", 0, 2, 100); err != nil {
 		return
 	}
-	if p.Iterations, err = cfg.integer("max_iterations", 20, 1, 1000); err != nil {
+	if p.Epochs, err = cfg.integer("max_iterations", 5, 1, 1000); err != nil {
 		return
 	}
-	if p.MinRelProgress, err = cfg.num("min_rel_progress", 0.01, 0, 1); err != nil {
+	if _, err = cfg.num("min_rel_progress", 0.01, 0, 1); err != nil {
 		return
 	}
-	stop, err := cfg.boolean("early_stop", true)
+	if _, err = cfg.boolean("early_stop", true); err != nil {
+		return
+	}
+	start, err := cfg.str("kmeans_init_method", "kmeans++", "kmeans++", "random")
 	if err != nil {
 		return
 	}
-	if !stop {
-		p.MinRelProgress = 1e-12
-	}
-	if err = cfg.accept("kmeans_init_method", "kmeans++"); err != nil {
-		return
-	}
+	p.RandomStart = start == "random"
 	if err = cfg.accept("distance_type", "euclidean"); err != nil {
 		return
 	}
@@ -106,7 +107,7 @@ func trainKMeans(t *Table, a IglooArgs, cfg *config) (*Clusters, error) {
 	if n < k {
 		return nil, inputErr("num_clusters is %d but INPUT_DATA has %d rows", k, n)
 	}
-	km, info, err := ml.TrainKMeans(X, n, d, k, p)
+	km, info, err := ml.TrainEMeans(X, n, d, k, p)
 	if err != nil {
 		return nil, inputErr("%v", err)
 	}
@@ -134,7 +135,7 @@ func trainKMeans(t *Table, a IglooArgs, cfg *config) (*Clusters, error) {
 
 // bestK picks the number of clusters, from 2 to 10, whose clustering of
 // up to 20,000 of the rows has the lowest Davies-Bouldin index.
-func bestK(X []float64, n, d int, p ml.KMeansParams, hyper map[string]any) (int, error) {
+func bestK(X []float64, n, d int, p ml.EMeansParams, hyper map[string]any) (int, error) {
 	rows := sampleRows(n, 20_000)
 	sx := make([]float64, 0, len(rows)*d)
 	for _, r := range rows {
@@ -143,7 +144,7 @@ func bestK(X []float64, n, d int, p ml.KMeansParams, hyper map[string]any) (int,
 	best, bestDB := 0, math.Inf(1)
 	tried := map[string]any{}
 	for k := 2; k <= min(autoClusters, len(rows)-1); k++ {
-		km, _, err := ml.TrainKMeans(sx, len(rows), d, k, p)
+		km, _, err := ml.TrainEMeans(sx, len(rows), d, k, p)
 		if err != nil {
 			return 0, err
 		}
@@ -196,7 +197,7 @@ type clusterScratch struct {
 	order     []int
 }
 
-func (c *Clusters) scoreRow(buf []byte, method string, opt *RowOptions, r *ml.RowValues) []byte {
+func (c *Clusters) scoreRow(buf []byte, method string, opt *RowOptions, r *ml.RowValues) ([]byte, error) {
 	sc, _ := c.pool.Get().(*clusterScratch)
 	if sc == nil {
 		sc = &clusterScratch{vec: make([]float64, c.Encoder.Width), dist: make([]float64, c.Model.K), order: make([]int, c.Model.K)}
@@ -222,7 +223,7 @@ func (c *Clusters) scoreRow(buf []byte, method string, opt *RowOptions, r *ml.Ro
 		buf = appendNum(buf, norm)
 		buf = appendKey(buf, "centroid_id", false)
 		buf = appendNum(buf, float64(nearest+1))
-		return append(buf, '}')
+		return append(buf, '}'), nil
 	}
 	buf = appendKey(buf, "centroid_id", true)
 	buf = appendNum(buf, float64(nearest+1))
@@ -238,7 +239,7 @@ func (c *Clusters) scoreRow(buf []byte, method string, opt *RowOptions, r *ml.Ro
 		buf = appendNum(buf, sc.dist[k])
 		buf = append(buf, '}')
 	}
-	return append(buf, "]}"...)
+	return append(buf, "]}"...), nil
 }
 
 // --- table methods ---------------------------------------------------------

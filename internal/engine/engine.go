@@ -139,6 +139,8 @@ type Engine struct {
 	// bgOver is what the process holds past what the two DuckDBs hold (see
 	// balance).
 	bgOver atomic.Int64
+	// stopCredentials stops refreshStorageCredentials, if it runs.
+	stopCredentials func()
 }
 
 // OpenPartitionFiles is how many files of a partitioned write DuckDB keeps
@@ -180,6 +182,9 @@ func Open(ctx context.Context, cfg config.Config, log *slog.Logger, opts ...Opti
 		}
 		release()
 		return nil, err
+	}
+	if cfg.Catalog.URI != "" {
+		e.refreshStorageCredentials(cfg.Storage)
 	}
 	if e.cache != nil && !e.isBackground {
 		// The first DuckDB keeps the cache they share to its size.
@@ -442,6 +447,10 @@ func (e *Engine) TablesVersion(loads []catalogproxy.Load) uint64 { return e.prox
 // changed (see catalogproxy.Proxy.TableVersion).
 func (e *Engine) TableVersion(schema, name string) uint64 { return e.proxy.TableVersion(schema, name) }
 
+// OnTablesChanged has fn told of the catalog's tables that DuckDB's
+// statements change (see catalogproxy.Proxy.OnTablesChanged).
+func (e *Engine) OnTablesChanged(fn func([]catalogproxy.Table)) { e.proxy.OnTablesChanged(fn) }
+
 // RecordLoads records the catalog's tables DuckDB loads until the func it
 // returns is called, which returns them (see catalogproxy's RecordLoads).
 func (e *Engine) RecordLoads() func() []catalogproxy.Load { return e.proxy.RecordLoads() }
@@ -521,7 +530,15 @@ func (e *Engine) ForgetTable(schema, name, as string) (stop func()) {
 // an Iceberg table's schema the first time the table is used and until then
 // lists a placeholder column named "__"; tools that browse schemas would
 // see only that. Loaded schemas are shared by all sessions, so this costs
-// one catalog request per table not yet used.
+// one catalog request per table not yet used. A commit that changes a
+// table's columns or comment turns it back into a placeholder (see
+// extensions/iceberg's patch 0005), so the next listing loads it again.
+//
+// conn is the session's, and lists the placeholders its statement would
+// see; the tables load on connections of their own. In a transaction that
+// has already bound a table, a bind answers from what the transaction
+// loaded and replaces nothing that listings show, so loading on conn left a
+// table another session had changed listed as its placeholder.
 func (e *Engine) LoadSchemas(ctx context.Context, conn *duckdb.Conn) error {
 	if e.catalog == "" {
 		return nil
@@ -530,7 +547,7 @@ func (e *Engine) LoadSchemas(ctx context.Context, conn *duckdb.Conn) error {
 	if err != nil {
 		return err
 	}
-	return e.loadSchemas(ctx, conn, tables, nil)
+	return e.loadSchemas(ctx, tables, nil)
 }
 
 // WarmSchemas loads, in the background of a replica that has just started,
@@ -555,7 +572,7 @@ func (e *Engine) WarmSchemas(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	return e.loadSchemas(ctx, conn, tables, e.CatalogShare)
+	return e.loadSchemas(ctx, tables, e.CatalogShare)
 }
 
 // placeholders lists the Iceberg tables whose schemas DuckDB has not loaded
@@ -581,18 +598,18 @@ func (e *Engine) placeholders(ctx context.Context, conn *duckdb.Conn) ([][2]stri
 	}
 }
 
-// loadSchemas loads tables' schemas. hold, if set, is taken around each
-// load (see WarmSchemas); otherwise the caller keeps the rest of Igloo off
-// the catalog meanwhile (see CatalogLock).
-func (e *Engine) loadSchemas(ctx context.Context, conn *duckdb.Conn, tables [][2]string, hold func() func()) error {
+// loadSchemas loads tables' schemas, on connections of its own, outside
+// any transaction. hold, if set, is taken around each load (see
+// WarmSchemas); otherwise the caller keeps the rest of Igloo off the
+// catalog meanwhile (see CatalogLock).
+func (e *Engine) loadSchemas(ctx context.Context, tables [][2]string, hold func() func()) error {
 	if len(tables) == 0 {
 		return nil
 	}
 	// Each load waits on the catalog and on object storage, so they run
-	// side by side, on conn and connections of their own: a catalog of
-	// hundreds of tables took seconds one at a time. Loading binds the
-	// table, which DuckDB-Iceberg's own lock keeps safe alongside other
-	// binds.
+	// side by side: a catalog of hundreds of tables took seconds one at a
+	// time. Loading binds the table, which DuckDB-Iceberg's own lock keeps
+	// safe alongside other binds.
 	jobs := make(chan [2]string)
 	var (
 		mu   lockorder.Mutex
@@ -618,10 +635,12 @@ func (e *Engine) loadSchemas(ctx context.Context, conn *duckdb.Conn, tables [][2
 			}
 		}
 	}
-	wg.Go(func() { load(conn) })
-	for range min(len(tables), schemaLoaders) - 1 {
+	for i := range min(len(tables), schemaLoaders) {
 		c, err := e.connector.Connect(ctx)
 		if err != nil {
+			if i == 0 {
+				return fmt.Errorf("load schemas: %w", err)
+			}
 			break
 		}
 		wg.Go(func() {
@@ -639,6 +658,14 @@ func (e *Engine) loadSchemas(ctx context.Context, conn *duckdb.Conn, tables [][2
 
 // schemaLoaders bounds how many tables' schemas LoadSchemas loads at once.
 const schemaLoaders = 16
+
+// IsFatal reports whether err is DuckDB's fatal error: after one, DuckDB
+// invalidates the database and refuses every statement until the process
+// restarts, so only a restart recovers.
+func IsFatal(err error) bool {
+	var de *duckdb.Error
+	return errors.As(err, &de) && de.Type == duckdb.ErrorTypeFatal
+}
 
 // Ping checks that DuckDB can run a query.
 func (e *Engine) Ping(ctx context.Context) error {
@@ -674,6 +701,9 @@ func (e *Engine) HoldCommit(schema, name, dir string) *catalogproxy.CommitHold {
 // closes, deleting its spill files, as the last connection to it closes.
 func (e *Engine) Close() error {
 	var err error
+	if e.stopCredentials != nil {
+		e.stopCredentials()
+	}
 	e.bgMu.Lock()
 	if e.bg != nil {
 		close(e.bgStop)
@@ -1077,28 +1107,90 @@ func storageStatements(s config.Storage) []string {
 		}
 
 	default:
-		opts := []string{
-			"TYPE s3",
-			"REGION " + literal(s.S3.Region),
-			"URL_STYLE " + literal(s.S3.URLStyle),
-			fmt.Sprintf("USE_SSL %t", s.S3.UseSSL),
-		}
-		if s.S3.Endpoint != "" {
-			opts = append(opts, "ENDPOINT "+literal(s.S3.Endpoint))
-		}
-		if s.S3.AccessKeyID != "" {
-			opts = append(opts, "KEY_ID "+literal(s.S3.AccessKeyID), "SECRET "+literal(s.S3.SecretAccessKey))
-		} else {
-			// IAM roles for service accounts, instance profiles, env vars.
-			// Those credentials expire (after an hour for IRSA), so DuckDB
-			// must fetch new ones as they do.
+		if s.S3.AccessKeyID == "" {
 			stmts = append(stmts, "LOAD aws")
-			opts = append(opts, "PROVIDER credential_chain", "REFRESH auto")
 		}
-		stmts = append(stmts, secret(scope, opts...))
+		stmts = append(stmts, s3Secret(s))
 	}
 
 	return stmts
+}
+
+// s3Secret registers the credentials of S3 storage: its keys, or else those
+// the AWS default chain (IAM roles for service accounts, instance profiles,
+// the environment) gives as it runs. The chain's credentials expire, an hour
+// after they are issued for IRSA, so Igloo runs it again well before that,
+// outside every transaction (see refreshStorageCredentials).
+//
+// The secret has no REFRESH auto. With it, DuckDB made the secret again
+// itself when object storage refused a request, inside the transaction of
+// the statement that sent it, and a secret is a catalog entry: of two
+// sessions whose transactions met the expired credentials, the second
+// failed with "Catalog write-write conflict on alter with "igloo_storage"",
+// in a statement or in its COMMIT ("Failed to commit Iceberg transaction").
+// And the refresh was undone with every transaction that rolled back, every
+// Iceberg commit's own among them.
+func s3Secret(s config.Storage) string {
+	opts := []string{
+		"TYPE s3",
+		"REGION " + literal(s.S3.Region),
+		"URL_STYLE " + literal(s.S3.URLStyle),
+		fmt.Sprintf("USE_SSL %t", s.S3.UseSSL),
+	}
+	if s.S3.Endpoint != "" {
+		opts = append(opts, "ENDPOINT "+literal(s.S3.Endpoint))
+	}
+	if s.S3.AccessKeyID != "" {
+		opts = append(opts, "KEY_ID "+literal(s.S3.AccessKeyID), "SECRET "+literal(s.S3.SecretAccessKey))
+	} else {
+		opts = append(opts, "PROVIDER credential_chain")
+	}
+	return secret(storageScope(s), opts...)
+}
+
+// storageCredentialsEvery is how often Igloo makes the storage secret again
+// when its credentials come from the AWS default chain. A transaction sees
+// the secret as it was when the transaction began, so one that began just
+// before a refresh holds credentials that are at most this old: with IRSA's
+// hour, it may run for 50 minutes before they expire. A variable, for tests.
+var storageCredentialsEvery = 10 * time.Minute
+
+// refreshStorageCredentials makes the storage secret again, from the AWS
+// default chain, every storageCredentialsEvery until Close, on a connection
+// of its own in a transaction of its own, so that DuckDB never needs to,
+// inside a user's (see s3Secret). It is the secret's one writer, so its
+// replacements never conflict. A failed one keeps the secret held, whose
+// credentials outlast several more tries.
+func (e *Engine) refreshStorageCredentials(s config.Storage) {
+	if s.Type == config.StorageGCS || s.Type == config.StorageAzure || s.S3.AccessKeyID != "" {
+		return
+	}
+	stmt := s3Secret(s)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	e.stopCredentials = func() {
+		cancel()
+		<-done
+	}
+	go func() {
+		defer close(done)
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(storageCredentialsEvery):
+			}
+			c, err := e.connector.Connect(ctx)
+			if err == nil {
+				_, err = c.(*duckdb.Conn).ExecContext(ctx, stmt, nil)
+				err = errors.Join(err, c.Close())
+			}
+			if err != nil && ctx.Err() == nil {
+				// Never echo the statement: secrets' statements can hold keys.
+				e.log.Warn("could not refresh the object storage credentials; keeping those held", "err", err)
+			}
+		}
+	}()
 }
 
 // useAzureIdentity has DuckDB ask this process for an Azure identity's tokens, where it

@@ -20,8 +20,9 @@ type node struct {
 	// pos and end are the node's span in the statement as written.
 	pos, end int
 	// json, str and num say a translated expression is known to be JSON,
-	// VARCHAR or a number, and notNull that it is never NULL.
-	json, str, num, notNull bool
+	// VARCHAR or a number, float that it is a FLOAT (a cast to one), and
+	// notNull that it is never NULL.
+	json, str, num, float, notNull bool
 	// sel, when set, says the node is a call of MIN or MAX (see typed).
 	sel *selector
 	// elems, when set, are the elements of the array constant the node
@@ -93,7 +94,7 @@ func build(toks []token) ([]*node, error) {
 		g := stack[len(stack)-1].n
 		return nil, syntaxError(g.pos, "unclosed "+string(g.open))
 	}
-	return stack[0].nodes, nil
+	return groupValues(stack[0].nodes), nil
 }
 
 // String renders the node as DuckDB SQL.

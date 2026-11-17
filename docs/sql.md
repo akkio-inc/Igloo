@@ -17,6 +17,18 @@ Sketches for deduplicated reach, geometry and H3 functions, and DuckDB's
 approximate and statistical functions are described in
 [media analytics](media-analytics.md).
 
+`approx_count_distinct(x)` counts as `APPROX_COUNT_DISTINCT` does in
+[Snowflake's dialect](snowflake-sql.md), with DataSketches' HyperLogLog of
+4,096 registers: within about 1.6%, as Snowflake, and exactly up to about
+300 values. DuckDB's own has 64 registers and errs by about 13%. It counted
+a column of 6 categories as 5 and one of 1,000 values as 1,249, where Igloo
+counts 6 and 1,020, and was off by 15% on average over 40 columns of 100,000
+values, where Igloo is off by 1.8%. In a `SELECT` with `GROUP BY` and as a
+window function it counts exactly, as `count(DISTINCT x)`. A call keeps
+DuckDB's estimate in a select item without an alias that is more than the
+call of a column, since DuckDB names the column after the item, and with an
+`ORDER BY`, a parameter or a volatile function inside it.
+
 `COUNT(*) OVER ()`, the number of rows of the result beside each row (as in
 a table preview), makes DuckDB hold every row before it returns the first.
 Where it is the number of rows the `FROM` and `WHERE` produce, Igloo counts

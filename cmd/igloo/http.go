@@ -40,8 +40,13 @@ const gatewayAgent = "igloo-gateway"
 
 func (h *health) handler(reg *prometheus.Registry) http.Handler {
 	mux := http.NewServeMux()
-	// Liveness: the process is running and serving HTTP.
-	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
+	// Liveness: the process is running and serving HTTP, and its DuckDB is
+	// usable (see live).
+	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
+		if err := live(r.Context(), h.engine.Ping); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
 		_, _ = fmt.Fprintln(w, "ok")
 	})
 	// Readiness: queries can run, users can log in, the catalog answers.
@@ -68,6 +73,20 @@ func (h *health) handler(reg *prometheus.Registry) http.Handler {
 		_ = json.NewEncoder(w).Encode(report)
 	})
 	return mux
+}
+
+// live fails only when DuckDB has been invalidated by a fatal error, which
+// nothing but a restart recovers: the readiness check then fails forever
+// while the process keeps serving, so the pod would stay up and refuse every
+// query. Any other ping error, or a ping slower than its bound under load, is
+// left to readiness, so a busy server is not restarted.
+func live(ctx context.Context, ping func(context.Context) error) error {
+	ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	if err := ping(ctx); engine.IsFatal(err) {
+		return fmt.Errorf("engine: %w", err)
+	}
+	return nil
 }
 
 // nextDue is when the soonest task, pipe or materialized view is due, if

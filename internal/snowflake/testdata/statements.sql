@@ -21,6 +21,10 @@ SELECT v:a.b[0]::string, v:c, v['d'] FROM t WHERE v:type = 'click' AND v:n > 5
 SELECT GET(v, 'a'), GET_PATH(v, 'a.b[0]'), ARRAY_SIZE(v:items), ARRAY_CONTAINS(1::variant, arr) FROM t
 SELECT f.value:name::string, f.index FROM t, LATERAL FLATTEN(input => t.items) f
 SELECT s.value FROM TABLE(SPLIT_TO_TABLE('a,b', ',')) s
+SELECT f.key, SUM(f.value:count::integer) AS events FROM t LEFT JOIN LATERAL FLATTEN(input => t.info, outer => true) f WHERE t.d BETWEEN '2000-01-01' AND '2050-01-01' GROUP BY f.key
+SELECT f.value FROM t JOIN LATERAL FLATTEN(input => t.items) f
+SELECT f.value FROM t INNER JOIN LATERAL FLATTEN(input => t.items) f WHERE t.id > 1
+SELECT s.value FROM t LEFT OUTER JOIN TABLE(SPLIT_TO_TABLE(t.s, ',')) s
 SELECT SPLIT(s, ','), SPLIT_PART(s, ',', 0), STRTOK(s, ' ', 2) FROM t
 SELECT REGEXP_SUBSTR(s, '[0-9]+', 1, 2), REGEXP_LIKE(s, 'a.*'), s RLIKE 'b+', REGEXP_REPLACE(s, 'a', 'b') FROM t
 SELECT CHARINDEX('b', s), POSITION('b', s), LEN(s), LEFT(s, 2), SQUARE(n) FROM t
@@ -38,6 +42,8 @@ SELECT * FROM VALUES (1, 'a'), (2, 'b')
 WITH r AS (SELECT 1 AS n UNION ALL SELECT n + 1 FROM r WHERE n < 3) SELECT n FROM r
 SELECT * FROM IDENTIFIER('db.sch.tbl')
 SELECT AT.total, at.n, LEFT.x, gt.y, t.at, v:at.left FROM a AS AT, b AS left, c AS gt
+SELECT cm.category, cm.people / at.total share FROM category_metrics cm CROSS JOIN audience_total at CROSS JOIN (SELECT 1 year, x semi FROM u) t
+WITH at (a) AS (SELECT 1) SELECT at.a FROM at semi JOIN at anti ON semi.a = anti.a JOIN at ASOF JOIN q MATCH_CONDITION (at.a >= q.a)
 SET x = 10
 SELECT $x
 UNSET x
@@ -51,6 +57,7 @@ SELECT x::number(10,2), y::int, z::float, w::variant, CAST(q AS TIMESTAMP_TZ) FR
 SELECT 'it\'s', $$raw\string$$ // comment
 DESC TABLE t
 GRANT SELECT ON TABLE t TO ROLE analyst
+REVOKE SELECT, INSERT ON TABLE at FROM ROLE admin
 GRANT USAGE ON WAREHOUSE wh TO ROLE analyst
 SELECT * FROM t PIVOT (SUM(v) FOR k IN ('a', 'b'))
 SELECT * FROM t UNPIVOT (val FOR name IN (col_a, col_b))

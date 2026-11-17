@@ -194,6 +194,79 @@ func TestAgainstSnowflake(t *testing.T) {
 	}
 }
 
+// TestUniformOfFloats checks UNIFORM's type, which Snowflake takes from its
+// bounds: a FLOAT when either is a FLOAT (its documentation's example is
+// UNIFORM(0::FLOAT, 1::FLOAT, RANDOM())), else an integer. A float drawn
+// between two floats takes as many values as it is drawn, not the two
+// integers 0 and 1, from any cast to FLOAT, signed or not.
+func TestUniformOfFloats(t *testing.T) {
+	conn := session(t)
+	for _, c := range []runCase{
+		{name: "floats", sql: `select count(distinct a) > 90, min(a) >= 0 and max(a) <= 1, count(distinct b) > 90,
+			min(c) >= -1 and max(c) <= -0.5, count(distinct d) > 90 and max(d) <= 1e-6, count(distinct e) > 90
+			from (select uniform(0::float, 1::float, random()) a, uniform(cast(0 as double), to_double(1), random()) b,
+			uniform(-1::float, -0.5::float, random()) c, uniform(0::float, 1e-6::float, random()) d,
+			uniform(0, 1::real, random()) e from table(generator(rowcount => 100)))`,
+			want: []string{"true|true|true|true|true|true"}},
+		{name: "types", sql: `select uniform(5::float, 5::float, random()), uniform((5::double), 5, random()), uniform(5, 5e0, random()),
+			uniform(5, 5, random()), uniform(5.0, 5.0, random())`,
+			want: []string{"5|5|5|5|5"}, types: []string{"DOUBLE", "DOUBLE", "DOUBLE", "BIGINT", "BIGINT"}},
+	} {
+		t.Run(c.name, func(t *testing.T) { run(t, conn, c) })
+	}
+}
+
+// TestGetOfAnyKey checks that GET, GET_PATH, a path (:) and [] read an
+// object's key whatever its text: with double quotes and backslashes, which
+// a DuckDB JSONPath escapes, and the empty key and '*', which only a JSON
+// pointer can name; from an OBJECT, a VARIANT parsed from text and a column
+// of either, one level down and with the key computed from a column. A
+// negative index finds nothing, as an index past the end does.
+func TestGetOfAnyKey(t *testing.T) {
+	conn := session(t)
+	const doc = `parse_json('{"5\\" screen": 1, "a\\\\b": 2, "a\\\\": 3, "": 4, "*": 5, "x": {"5\\" screen": 6, "": 7, "*": 8}}')`
+	for _, c := range []runCase{
+		{name: "literal keys", sql: `select get(o, '5" screen'), get(o, 'a\\b'), get(o, 'a\\'), get(o, ''), get(o, '*'),
+			o:"5"" screen", o['5" screen'], o[''], o['*'], get_path(o, '"5"" screen"'), get_path(o, 'x."*"'),
+			get(get(o, 'x'), '5" screen'), get(get(o, 'x'), ''), o:x['*'], o:x[''] from (select ` + doc + ` o)`,
+			want: []string{"1|2|3|4|5|1|1|4|5|1|8|6|7|8|7"}},
+		{name: "keys of an OBJECT", sql: `select get(object_construct('5" screen', 1, '', 2, '*', 3), k) from
+			(select column1 as k from values ('5" screen'), (''), ('*'), ('none')) order by k`,
+			want: []string{"2", "3", "1", "NULL"}},
+		{name: "computed keys", sql: `select k, get(o, k), get(get(o, 'x'), k), o:x[k], get(o, '#' || k) from (select ` + doc +
+			` o), (select column1 as k from values ('5" screen'), ('a\\b'), ('a\\'), (''), ('*'), ('none')) order by k`,
+			want: []string{"|4|7|7|NULL", "*|5|8|8|NULL", `5" screen|1|6|6|NULL`, `a\|3|NULL|NULL|NULL`, `a\b|2|NULL|NULL|NULL`,
+				"none|NULL|NULL|NULL|NULL"}},
+		{name: "computed keys as text", sql: `select get(o, k)::varchar, get(get(o, 'x'), k)::int + 1 from (select ` + doc +
+			` o, '5" screen' as k)`,
+			want: []string{"1|7"}},
+		{name: "indexes", sql: `select get(a, 1), a[i], get(a, -1), a[-1], a[j], get(a, 5) from (select parse_json('[10, 20]') a, 1 i, -1 j)`,
+			want: []string{"20|20|NULL|NULL|NULL|NULL"}},
+	} {
+		t.Run(c.name, func(t *testing.T) { run(t, conn, c) })
+	}
+}
+
+// TestValuesRowsOfWords checks a FROM VALUES list whose rows after the first
+// hold only words, NULL, TRUE or FALSE, which the translation once read as
+// a parenthesized join of tables so named.
+func TestValuesRowsOfWords(t *testing.T) {
+	conn := session(t)
+	for _, c := range []runCase{
+		{name: "null", sql: `select column1 from values (1), (null) order by 1 nulls last`, want: []string{"1", "NULL"}},
+		{name: "nulls and booleans", sql: `select * from values (1, 'a'), (NULL, NULL), (2, 'b') order by 1 nulls last`,
+			want: []string{"1|a", "2|b", "NULL|NULL"}},
+		{name: "booleans", sql: `select column1, column2 from values (null, true), (false, null) order by 1 nulls last`,
+			want: []string{"false|NULL", "NULL|true"}},
+		{name: "arrays", sql: `select column1, column2 from values ('1', array_construct('a')), ('4', NULL), (NULL, NULL) order by 1 nulls last`,
+			want: []string{`1|["a"]`, "4|NULL", "NULL|NULL"}},
+		{name: "aliased and joined", sql: `select s.x, v.c from (select 1 x) s join values (1, true), (null, null) v (k, c) on s.x = v.k`,
+			want: []string{"1|true"}},
+	} {
+		t.Run(c.name, func(t *testing.T) { run(t, conn, c) })
+	}
+}
+
 // TestWideDecimalCasts checks that casts of text to NUMBER of more than 18
 // digits, which go through DECIMAL(18,s) first (see decimalCast), give
 // exactly what DuckDB's own cast to the wide DECIMAL gives, value, type and
@@ -404,5 +477,45 @@ func TestLikeAnyContains(t *testing.T) {
 		if got != want {
 			t.Errorf("%s: %s, want %s", v, got, want)
 		}
+	}
+}
+
+// TestAssignedColumnsLoseTheirTable checks that UPDATE and MERGE, written as
+// Snowflake takes them with the target's alias on the columns SET assigns, run
+// on DuckDB, and that only the assigned column loses its table.
+func TestAssignedColumnsLoseTheirTable(t *testing.T) {
+	conn := session(t)
+	ctx := context.Background()
+	for _, s := range []string{
+		"CREATE TABLE meta (audience_id VARCHAR, ver BIGINT, size BIGINT)",
+		"INSERT INTO meta VALUES ('a', 1, 3)",
+	} {
+		if _, err := conn.ExecContext(ctx, s); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, in := range []string{
+		"MERGE INTO meta AS m USING (SELECT 'a' AS audience_id) AS s ON m.audience_id = s.audience_id " +
+			"WHEN MATCHED THEN UPDATE SET m.ver = m.ver + 1, size = 5 " +
+			"WHEN NOT MATCHED THEN INSERT (audience_id, ver, size) VALUES ('a', 0, 5)",
+		"UPDATE meta AS m SET m.ver = m.ver * 10, \"M\".size = m.size + 1 WHERE m.audience_id = 'a'",
+	} {
+		res, err := Translate(in, Options{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(res.SQL, "m.ver") {
+			t.Errorf("the value lost its qualifier: %s", res.SQL)
+		}
+		if _, err := conn.ExecContext(ctx, res.SQL); err != nil {
+			t.Fatalf("%v\n%s", err, res.SQL)
+		}
+	}
+	var ver, size int
+	if err := conn.QueryRowContext(ctx, "SELECT ver, size FROM meta").Scan(&ver, &size); err != nil {
+		t.Fatal(err)
+	}
+	if ver != 20 || size != 6 {
+		t.Errorf("got ver %d size %d, want 20 and 6", ver, size)
 	}
 }

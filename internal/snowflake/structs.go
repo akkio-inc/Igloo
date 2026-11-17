@@ -1587,8 +1587,10 @@ func hoistStructs(nodes []*node, removed map[*node]bool, hoists []*hoist) ([]*no
 // strings as the list, and anything else as the one of the three that its
 // type makes it, when DuckDB binds the statement (see sf_list_part): a list
 // of strings only for a column, as Igloo's ARRAY columns are, and JSON as
-// OBJECT_CONSTRUCT takes it. NULL in all three for a value OBJECT_CONSTRUCT
-// leaves out; JSON null for a NULL that OBJECT_CONSTRUCT_KEEP_NULL keeps.
+// OBJECT_CONSTRUCT takes it, a column's text that holds an object or an
+// array among it (see sf_to_json). NULL in all three for a value
+// OBJECT_CONSTRUCT leaves out; JSON null for a NULL that
+// OBJECT_CONSTRUCT_KEEP_NULL keeps.
 func structParts(x *node, keep bool) (list, str, json *node) {
 	null := raw("NULL")
 	if keep {
@@ -1616,7 +1618,7 @@ func structParts(x *node, keep bool) (list, str, json *node) {
 		return seq(nil, append(kids, raw("]"))...), raw("NULL"), raw("NULL")
 	}
 	if c := jsonArgColumn(x); c != nil {
-		return seq(nil, raw("sf_list_part("), c, raw(")")), seq(nil, raw("sf_string_part("), c, raw(")")),
+		return seq(nil, raw("sf_list_part("), c, raw(")")), seq(nil, raw("sf_column_string_part("), c, raw(")")),
 			seq(nil, raw("sf_other_part"+suffix), c, raw(")"))
 	}
 	return raw("NULL"), seq(nil, raw("sf_string_part("), x, raw(")")), seq(nil, raw("sf_expr_part"+suffix), x, raw(")"))
@@ -1654,7 +1656,7 @@ func (v *variant) structRead() (string, bool) {
 		x = v.elem
 	}
 	i := v.obj.key(v.segs[0].key)
-	rest := &variant{segs: v.segs[1:]}
+	rest := v.segs[1:]
 	json := v.obj.json(x, i)
 	str := v.obj.text(x, i)
 	if v.guard && i >= 0 && (!v.obj.general[i] || v.obj.textOnly(i)) {
@@ -1666,8 +1668,8 @@ func (v *variant) structRead() (string, bool) {
 		str = "sf_text_read(" + st + ")"
 		json = "to_json(" + str + ")"
 	}
-	if len(rest.segs) > 0 {
-		str = "json_extract_string(" + json + ", " + rest.path() + ")"
+	if len(rest) > 0 {
+		str = extractJSON(json, rest, true)
 	}
 	switch v.mode {
 	case vString:
@@ -1678,10 +1680,10 @@ func (v *variant) structRead() (string, bool) {
 		}
 		return "CAST(" + str + " AS DOUBLE)", true
 	}
-	if len(rest.segs) == 0 {
+	if len(rest) == 0 {
 		return json, true
 	}
-	return "json_extract(" + json + ", " + rest.path() + ")", true
+	return extractJSON(json, rest, false), true
 }
 
 // structColumn is the struct a read of a structFlatten's VALUE, base

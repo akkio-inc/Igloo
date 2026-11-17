@@ -160,8 +160,8 @@ sends the client each batch as it merges it, rather than once it has merged
 them all. The merge runs on several cores: each worker's file is decoded
 apart, groups of up to eight files are merged at once, and the groups'
 rows merged in turn, ahead of DuckDB reading them. It merges on a
-coordinator of 4 cores and DuckDB threads or more; on fewer, DuckDB sorts
-the gathered rows, which is faster there. It merges by
+coordinator of 8 cores (logical CPUs) and DuckDB threads or more; on fewer,
+DuckDB sorts the gathered rows, which is as fast or faster there. It merges by
 columns of numbers, text and `BLOB`s (by their bytes), dates, times,
 timestamps, decimals and booleans, the result's columns or the groups and
 aggregates they show, in the session's default order and `NULLS` order.
@@ -286,10 +286,11 @@ In detail, a part runs distributed when:
   HyperLogLog sketches combine too: `datasketch_hll(k, x)` and
   `datasketch_hll_union(k, sketch)` of a constant `k`, which is what
   Snowflake's `HLL_ACCUMULATE` and `HLL_COMBINE` become, and
-  `APPROX_COUNT_DISTINCT` and `HLL` without `GROUP BY` (with it, they count
-  `DISTINCT` values exactly, as above). Each worker sketches its share's values and the
-  final stage merges the sketches, so the estimate is one machine's, within
-  the sketch's error, and no values cross.
+  `APPROX_COUNT_DISTINCT` (in either dialect) and `HLL` without `GROUP BY`
+  (with it, they count `DISTINCT` values exactly, as above). Each worker
+  sketches its share's values and the final stage merges the sketches, so
+  the estimate is one machine's, within the sketch's error, and no values
+  cross.
   `GROUP BY` may use positions, aliases, `ALL`, `ROLLUP`, `CUBE` and
   `GROUPING SETS`. A scalar subquery that stands on its own, in the select
   list, `HAVING` or `ORDER BY` of an aggregation (`count(*) / (SELECT
@@ -347,9 +348,9 @@ In detail, a part runs distributed when:
   its source to, every task lists itself beside its share of the source.
 
 Everything else runs on one machine: median and other aggregates that do
-not combine (`median`, `quantile`, `approx_count_distinct`, `string_agg`,
-`list(x ORDER BY y)`), except over a relation workers compute, which is then
-partitioned by the groups so that each worker computes whole groups;
+not combine (`median`, `quantile`, `string_agg`, `list(x ORDER BY y)`),
+except over a relation workers compute, which is then partitioned by the
+groups so that each worker computes whole groups;
 aggregates over `DISTINCT` values of unrelated
 expressions in one `SELECT` (`count(DISTINCT a), count(DISTINCT b)`),
 window functions over rows but those of the next section, a large table read again in a correlated

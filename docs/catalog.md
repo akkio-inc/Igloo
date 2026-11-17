@@ -116,15 +116,20 @@ Owners show in `igloo.tables` (`table_owner`, `owner_type`),
 `igloo.tables` reads each table's size and freshness from its Iceberg
 metadata: `row_count`, `bytes` and `file_count` of its current snapshot,
 `snapshot_count`, the snapshots that time travel can read, and
-`last_altered`, when its data last changed. They cover tables other engines
-write too. `row_count` is the rows a query reads: rows that updates,
+`last_altered`, when its metadata last changed (Iceberg's
+`last-updated-ms`): a write of rows, a change to its columns or properties
+such as `ALTER TABLE ... DROP COLUMN` or `COMMENT ON`, or its creation, as
+Snowflake's `LAST_ALTERED` is the last DDL or DML. They cover tables other
+engines write too. `row_count` is the rows a query reads: rows that updates,
 deletes and materialized view refreshes deleted are not counted, though
 they stay in the table's files until maintenance rewrites them. While a
 table has equality deletes, which some engines such as Flink write,
 `row_count` is `NULL`: which rows those delete, only a query can count. Each replica reads every table's metadata when a query first
 needs it, then again in the background every 30 seconds while queries use
-it; tables written on the replica are read again a couple of seconds after
-the write.
+it. A table that a statement on the replica writes, alters, creates or
+drops through DuckDB, or replaces, is read again before the next query
+that shows it, so that query sees the change; changes through other
+replicas and engines show within the 30 seconds.
 
 ## External tables and connections
 
@@ -310,7 +315,7 @@ them. Like lineage, events need the query history on.
 | `provider` | For an external table, the Delta Sharing provider it reads |
 | `row_count`, `bytes`, `file_count` | Of its current snapshot, for tables: the rows a query reads, without deleted rows (`NULL` while it has equality deletes), and its data files and their size |
 | `snapshot_count` | Snapshots time travel can read, for tables |
-| `last_altered` | When its data last changed, or a view was last replaced |
+| `last_altered` | When a table's metadata last changed: its rows, its columns or properties, or its creation; when a view was last replaced |
 | `clustering_key` | Its [clustering key](sql.md#sort-orders-and-clustering), as Snowflake shows one: `LINEAR(customer_id, day DESC)`; `NULL` for tables without one |
 
 | View | Columns |

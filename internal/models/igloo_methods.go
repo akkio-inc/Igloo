@@ -31,6 +31,7 @@ var iglooTableMethods = map[string][]string{
 	ClassAutoMLRegressor: {"EVALUATE", "GLOBAL_EXPLAIN", "FEATURE_IMPORTANCE", "WEIGHTS", "TRAINING_INFO", "TRIAL_INFO"},
 	ClassAutoMLClassifier: {"EVALUATE", "CONFUSION_MATRIX", "ROC_CURVE", "GLOBAL_EXPLAIN", "FEATURE_IMPORTANCE", "WEIGHTS",
 		"TRAINING_INFO", "TRIAL_INFO"},
+	ClassXGBoost: {"EVALUATE", "FEATURE_IMPORTANCE", "TRAINING_INFO"},
 }
 
 // iglooRowMethods lists each class's row methods, for messages; a model's
@@ -46,6 +47,7 @@ var iglooRowMethods = map[string][]string{
 	ClassAutoencoder:      {"PREDICT", "RECONSTRUCTION_LOSS", "DETECT_ANOMALIES"},
 	ClassAutoMLRegressor:  {"PREDICT", "EXPLAIN_PREDICT"},
 	ClassAutoMLClassifier: {"PREDICT", "EXPLAIN_PREDICT"},
+	ClassXGBoost:          {"PREDICT", "EXPLAIN_PREDICT"},
 }
 
 // IsRowMethodOf reports whether method is a row method of class.
@@ -74,6 +76,9 @@ func iglooMethodColumns(class, method string) ([]ResultColumn, bool) {
 				"NORMALIZED_DISCOUNTED_CUMULATIVE_GAIN", KindDouble, "AVERAGE_RANK", KindDouble)...), true
 		case ClassAutoencoder:
 			return columns("MEAN_ABSOLUTE_ERROR", KindDouble, "MEAN_SQUARED_ERROR", KindDouble, "MEAN_SQUARED_LOG_ERROR", KindDouble), true
+		case ClassXGBoost:
+			// XGBoost's metrics are its objective's or eval_metric's: a row each.
+			return columns("METRIC", KindText, "VALUE", KindDouble), true
 		}
 	case "CONFUSION_MATRIX":
 		return columns("EXPECTED_LABEL", KindText, "PREDICTED_LABEL", KindText, "COUNT", KindBigint), true
@@ -88,6 +93,10 @@ func iglooMethodColumns(class, method string) ([]ResultColumn, bool) {
 		return columns("CLASS", KindText, "PROCESSED_INPUT", KindText, "CATEGORY", KindText, "WEIGHT", KindDouble,
 			"STANDARD_ERROR", KindDouble, "P_VALUE", KindDouble), true
 	case "TRAINING_INFO":
+		if class == ClassXGBoost {
+			return columns("ITERATION", KindBigint, "METRIC", KindText, "TRAINING_VALUE", KindDouble, "VALIDATION_VALUE", KindDouble,
+				"IS_BEST_ITERATION", KindBoolean), true
+		}
 		return trainingInfoColumns, true
 	case "TRIAL_INFO":
 		return columns("TRIAL_ID", KindBigint, "ALGORITHM", KindText, "HYPERPARAMETERS", KindVariant, "STATUS", KindText,
@@ -141,6 +150,9 @@ func (a *Artifact) EvaluateOn(t *Table) (*Result, error) {
 	}
 	if e == nil {
 		return nil, inputErr("nothing to evaluate")
+	}
+	if a.XGBoost != nil {
+		return xgbEvaluation(cols, e), nil
 	}
 	return &Result{Columns: cols, Rows: [][]any{evaluationRow(e, cols)}}, nil
 }

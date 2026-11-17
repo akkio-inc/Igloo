@@ -27,7 +27,8 @@ CALL demo.conversion!SHOW_GLOBAL_EVALUATION_METRICS();
 
 Igloo has classes of its own too, `IGLOO.ML.<class>`, which bring
 BigQuery ML's model types with the same statements (see
-[Igloo's classes](#igloos-classes-bigquery-mls-model-types)).
+[Igloo's classes](#igloos-classes-bigquery-mls-model-types)), and
+`IGLOO.ML.XGBOOST`, which trains [XGBoost](#xgboost)'s own models.
 
 Besides the classes, Databricks' `ai_predict_class` and `ai_predict_value`
 train a model and score rows in one query, keeping no model (see
@@ -401,14 +402,15 @@ SELECT * FROM TABLE(demo.value_model!EVALUATE());
 | `PCA` | `IGLOO.ML.PCA` | `'num_principal_components'` or `'pca_explained_variance_ratio'` |
 | `MATRIX_FACTORIZATION` | `IGLOO.ML.MATRIX_FACTORIZATION` | `USER_COLNAME`, `ITEM_COLNAME`, `RATING_COLNAME` arguments; `'feedback_type'` |
 | `AUTOENCODER` | `IGLOO.ML.AUTOENCODER` | `'hidden_units'`, the narrowest the latent space |
+| `XGBOOST` imports | `IGLOO.ML.XGBOOST` trains XGBoost's own models | XGBoost's parameters by their names |
 | `ARIMA_PLUS`, `ARIMA_PLUS_XREG` | `SNOWFLAKE.ML.FORECAST` | a different method, with intervals |
 | `CONTRIBUTION_ANALYSIS` | `SNOWFLAKE.ML.TOP_INSIGHTS` | |
-| `DNN_LINEAR_COMBINED_*`, `TENSORFLOW`, `ONNX`, `XGBOOST` imports, remote models, `TRANSFORM` | not supported | train from a query that computes the features |
+| `DNN_LINEAR_COMBINED_*`, `TENSORFLOW`, `ONNX`, remote models, `TRANSFORM` | not supported | train from a query that computes the features |
 
 | BigQuery function | Igloo method | Classes |
 |---|---|---|
 | `ML.PREDICT` | `PREDICT` | all |
-| `ML.EXPLAIN_PREDICT` | `EXPLAIN_PREDICT` | `REGRESSION`, `CLASSIFICATION`, and the `AUTOML` classes but for a network |
+| `ML.EXPLAIN_PREDICT` | `EXPLAIN_PREDICT` | `REGRESSION`, `CLASSIFICATION`, `XGBOOST`, and the `AUTOML` classes but for a network |
 | `ML.DETECT_ANOMALIES` | `DETECT_ANOMALIES` | `KMEANS`, `PCA`, `AUTOENCODER` |
 | `ML.RECONSTRUCTION_LOSS` | `RECONSTRUCTION_LOSS` | `AUTOENCODER` |
 | `ML.CENTROIDS` | `CENTROIDS` | `KMEANS` |
@@ -419,7 +421,7 @@ SELECT * FROM TABLE(demo.value_model!EVALUATE());
 | `ML.GLOBAL_EXPLAIN` | `GLOBAL_EXPLAIN` | the regressions and classifiers |
 | `ML.FEATURE_IMPORTANCE` | `FEATURE_IMPORTANCE` | tree models |
 | `ML.WEIGHTS`, `ML.ADVANCED_WEIGHTS` | `WEIGHTS` | linear and logistic models |
-| `ML.TRAINING_INFO` | `TRAINING_INFO` | boosted trees, networks (`AUTOENCODER` too), `KMEANS`, `MATRIX_FACTORIZATION` |
+| `ML.TRAINING_INFO` | `TRAINING_INFO` | boosted trees (`XGBOOST` too), networks (`AUTOENCODER` too), `KMEANS`, `MATRIX_FACTORIZATION` |
 | `ML.TRIAL_INFO` | `TRIAL_INFO` | the `AUTOML` classes |
 
 ### Row methods and table methods
@@ -590,14 +592,18 @@ WHERE is_anomaly;
 ```
 
 k-means clustering of every column, numbers standardized
-(`'standardize_features'`, default `TRUE`) and categories one hot, seeded
-by k-means++ and refined by Lloyd's iterations (`max_iterations`, default
-20, until the mean squared distance improves by less than
-`min_rel_progress`, 0.01, unless `'early_stop': FALSE`). Without
-`num_clusters` (2 to 100), Igloo clusters up to 20,000 of the rows into 2
-to 10 clusters and keeps the number whose Davies-Bouldin index is lowest;
-the model's `hyperparameters` record each. `kmeans_init_method` is
-`'kmeans++'` and `distance_type` `'euclidean'`; others are refused.
+(`'standardize_features'`, default `TRUE`) and categories one hot,
+trained by [e-means](https://arxiv.org/abs/2611.09501): mini-batch
+k-means whose centroids are exponentially decayed means of the rows
+assigned to them, for `max_iterations` epochs (default 5). It starts from
+k-means++ centroids, or with `'kmeans_init_method': 'random'` from rows
+drawn at random, as the paper does; with few clusters a random start can
+put two centroids in one group. `early_stop` and `min_rel_progress` are
+accepted and change nothing: e-means runs every epoch on its schedule.
+Without `num_clusters` (2 to 100), Igloo clusters up to 20,000 of the rows
+into 2 to 10 clusters and keeps the number whose Davies-Bouldin index is
+lowest; the model's `hyperparameters` record each. `distance_type` is
+`'euclidean'`; others are refused.
 
 | Method | Returns |
 |---|---|
@@ -605,7 +611,7 @@ the model's `hyperparameters` record each. `kmeans_init_method` is
 | `DETECT_ANOMALIES` | `is_anomaly`, `normalized_distance` (the distance to the nearest centroid divided by the mean distance of its training rows) and `centroid_id`; `CONFIG_OBJECT => {'contamination': x}` (more than 0, at most 0.5) is the share of training rows that would be anomalies, which sets the threshold |
 | `EVALUATE` | `davies_bouldin_index` and `mean_squared_distance` (in standardized units), on the training rows or on `INPUT_DATA` |
 | `CENTROIDS` | `centroid_id`, `feature`, `numerical_value` (in the feature's own units), and for categories `category` and `categorical_value`, the share of the cluster's rows in it |
-| `TRAINING_INFO` | each iteration's mean squared distance, as `loss` |
+| `TRAINING_INFO` | each epoch's mean squared distance, as `loss`, then the final centroids' |
 
 ### PCA
 
@@ -693,6 +699,125 @@ the DNN classes'. Rows held out by `data_split_method` measure it.
 | `DETECT_ANOMALIES` | `is_anomaly` and `mean_squared_error`, against the training rows' errors by `CONFIG_OBJECT => {'contamination': x}` |
 | `EVALUATE` | the three errors' means, on the held-out rows (or the training rows without them) or on `INPUT_DATA` |
 | `TRAINING_INFO` | each epoch's training and validation loss |
+
+### XGBOOST
+
+```sql
+CREATE [ OR REPLACE ] IGLOO.ML.XGBOOST [ IF NOT EXISTS ] name(
+    INPUT_DATA => <table, view or query>,
+    TARGET_COLNAME => '<column>'
+      | LABEL_LOWER_BOUND_COLNAME => '<column>', LABEL_UPPER_BOUND_COLNAME => '<column>',
+    [ WEIGHT_COLNAME => '<column>', ]
+    [ CONFIG_OBJECT => { <XGBoost's parameters>, 'num_boost_round': n, 'early_stopping_rounds': n,
+                         'data_split_method': ..., ... } ]
+)
+```
+
+A model trained by [XGBoost](https://xgboost.ai/) itself. Igloo links
+XGBoost's library, release 3.4.2, and gives it `CONFIG_OBJECT`'s
+parameters as they are written, so the model is the one XGBoost's Python
+package trains with `xgboost.train` on the same rows in the same order,
+with the same parameters. Built for the same platform, the two save the
+same model byte for byte, with the same predictions, metrics and SHAP
+values. Across platforms, as between XGBoost's own builds, compilers round
+a float otherwise now and then (predictions agree within about 1e-7), and
+`subsample` and the `colsample_` parameters draw other rows and columns:
+XGBoost draws them with the C++ standard library, which macOS and Linux
+implement differently. Give `INPUT_DATA`'s query an `ORDER BY` for a model
+that does not depend on how the rows are stored.
+
+A binary classifier, with early stopping on rows a column marks:
+
+```sql
+CREATE IGLOO.ML.XGBOOST demo.converts_xgb(
+    INPUT_DATA => SYSTEM$QUERY_REFERENCE('SELECT spend, visits, returning, converted, holdout
+                                          FROM demo.lead_features ORDER BY person_id'),
+    TARGET_COLNAME => 'converted',
+    CONFIG_OBJECT => {'objective': 'binary:logistic', 'eval_metric': ['logloss', 'auc'],
+                      'eta': 0.1, 'max_depth': 4, 'subsample': 0.8, 'seed': 7,
+                      'num_boost_round': 500, 'early_stopping_rounds': 20,
+                      'data_split_method': 'custom', 'data_split_col': 'holdout'});
+
+SELECT person_id, demo.converts_xgb!PREDICT(INPUT_DATA => {*}):probability:True::FLOAT AS p_convert
+FROM demo.new_leads;
+
+SELECT * FROM TABLE(demo.converts_xgb!EVALUATE());
+```
+
+Survival times, of which some are right-censored, by accelerated failure
+time:
+
+```sql
+CREATE IGLOO.ML.XGBOOST demo.churn_time(
+    INPUT_DATA => SYSTEM$QUERY_REFERENCE($$
+        SELECT tenure_months, seats, support_tickets,
+               days_active AS days_lower,
+               CASE WHEN churned THEN days_active ELSE 'Infinity'::DOUBLE END AS days_upper
+        FROM demo.accounts ORDER BY account_id$$),
+    LABEL_LOWER_BOUND_COLNAME => 'days_lower', LABEL_UPPER_BOUND_COLNAME => 'days_upper',
+    CONFIG_OBJECT => {'objective': 'survival:aft', 'eval_metric': 'aft-nloglik',
+                      'aft_loss_distribution': 'normal', 'aft_loss_distribution_scale': 1.0,
+                      'tree_method': 'hist', 'learning_rate': 0.05, 'max_depth': 3, 'num_boost_round': 200});
+
+SELECT account_id, predicted_label AS expected_days
+FROM TABLE(demo.churn_time!PREDICT(INPUT_DATA => TABLE(demo.accounts)));
+```
+
+- **Parameters.** `CONFIG_OBJECT`'s keys are XGBoost's parameters, by
+  XGBoost's names (`objective`, `eval_metric`, `eta` or `learning_rate`,
+  `max_depth`, `lambda`, `alpha`, `min_child_weight`, `subsample`,
+  `colsample_bytree`, `scale_pos_weight`, `base_score`, `seed`,
+  `tree_method`, `aft_loss_distribution`, and any other XGBoost takes),
+  passed to XGBoost as its Python package passes them: an `eval_metric`
+  array as several metrics, `monotone_constraints`' array as `(1,0,-1)`.
+  Defaults are XGBoost's (`reg:squarederror`, an `eta` of 0.3, a
+  `max_depth` of 6). XGBoost refuses a value it does not take, and Igloo
+  refuses a parameter XGBoost does not use, such as `n_estimators`, which
+  `xgboost.train` ignores, both with XGBoost's message.
+- **Training options**, which are not XGBoost's: `num_boost_round` (default
+  10, as `xgboost.train`'s); `early_stopping_rounds`, which stops training
+  once the validation rows' last metric (the last `eval_metric`, or the
+  objective's) has not improved for that many rounds, as the Python
+  package's early stopping does, maximizing AUC, NDCG, MAP and precision
+  and minimizing the rest; and the validation rows, by
+  `data_split_method`: `'no_split'` (the default: every row trains, as in
+  `xgboost.train`), `'random'` and `'auto_split'` as for the other classes
+  (above), or `'custom'` with `data_split_col`, a boolean column that is
+  `TRUE` for the validation rows and is not a feature. Validation rows do
+  not train. With early stopping, the model keeps the rounds after the
+  best, as XGBoost does, records the best as XGBoost's `best_iteration` and
+  `best_score`, and its methods use the trees up to it.
+- **Labels.** `TARGET_COLNAME` is a number, or a boolean (1 and 0), which
+  XGBoost takes as it is: 0 and 1 for the `binary:` objectives, 0 to
+  `num_class` - 1 for the `multi:` ones. Rows whose target is `NULL` are
+  left out; text is refused (map classes to numbers in the query). For
+  `survival:aft`, `LABEL_LOWER_BOUND_COLNAME` and
+  `LABEL_UPPER_BOUND_COLNAME` give each row's interval instead: an
+  uncensored row's bounds are equal, a right-censored row's upper bound is
+  `'Infinity'::DOUBLE`, a left-censored row's lower bound 0, and a `NULL`
+  bound is refused. `WEIGHT_COLNAME` weighs each row.
+- **Features** are every other column, as XGBoost's float32s: numbers,
+  booleans as 1 and 0, timestamps and dates as seconds since 1970, `NULL`
+  as missing. Text is refused rather than encoded: XGBoost's own
+  categorical support is what the same model in XGBoost would use, and
+  Igloo's encodings would make another model. Encode categories as numbers
+  in `INPUT_DATA`'s query (`region = 'south' AS south`).
+- Training runs on the replica that runs `CREATE`, on every core (XGBoost's
+  `nthread` to use fewer), and scoring a row at a time as the query reads
+  rows, on [workers](distributed-execution.md) too, as for the other
+  classes. Inputs are sampled as theirs are (see [Training](#training)).
+
+| Method | Returns |
+|---|---|
+| `PREDICT` | `{"value": v}`, XGBoost's prediction (a probability, a value, a class's number, or an array of them for an objective with several), with `class` and `probability` (`{"0": p, "1": p, ...}`, booleans' as `False` and `True`) for the classification objectives (`binary:hinge` has no probability); `CONFIG_OBJECT => {'output_margin': TRUE}` adds `margin`, the raw score before the objective's transformation. As a table, `predicted_<target>` (a classifier's class, of the target's type) and `predicted_<target>_probs` (JSON), and `predicted_<target>_margin` with `output_margin`; an interval label's model names them after `label` |
+| `EXPLAIN_PREDICT` | the prediction with `top_feature_attributions` (the `top_k_features` largest, default 5), `baseline_prediction_value` and `prediction_value`: XGBoost's SHAP values (`pred_contribs`), in margin space, which with the bias, the baseline, add up to the margin, `prediction_value`; `approximation_error` is how far they miss it, by float32 rounding. A binary objective's attributions are those of class 1's log-odds, whichever class a row is predicted; a multiclass model's are its predicted class's. A table adds `probability` for classes |
+| `EVALUATE` | `metric` and `value`: XGBoost's metrics (`eval_metric`'s, or the objective's) on the validation rows at the best iteration, or on `INPUT_DATA`'s rows, which hold the label's columns |
+| `TRAINING_INFO` | `iteration` (XGBoost's, from 0), `metric`, `training_value`, `validation_value`, `is_best_iteration`: each metric of each round, as XGBoost measured it |
+| `FEATURE_IMPORTANCE` | `feature`, `importance_weight` (splits), `importance_gain`, `importance_cover`: XGBoost's weight, gain and cover (averages over a feature's splits) of the trees the model predicts with, every feature, largest gain first |
+
+The model's blob holds the booster as XGBoost saves it (Universal Binary
+JSON, which `xgboost.Booster(model_file=...)` loads), with the features in
+their order, the label's columns, the best iteration and the parameters.
 
 ### Differences from BigQuery
 
@@ -951,7 +1076,9 @@ multiclass, regression and quantile objectives), with LightGBM's methods
 for speed and accuracy, and SHAP values to explain them; random forests,
 linear and logistic regressions, networks, k-means, PCA and alternating
 least squares for Igloo's classes. It is Igloo's own Apache-2.0 code and
-needs nothing besides Igloo.
+needs nothing besides Igloo. `IGLOO.ML.XGBOOST` is the one class trained by
+another engine, XGBoost's own library (Apache-2.0), which the binary links
+([above](#xgboost)).
 
 - **Training** happens on the replica that runs `CREATE`, from the rows of
   its input in memory: up to 200 million values (rows times columns),
@@ -978,7 +1105,9 @@ needs nothing besides Igloo.
 - **Models are repeatable.** The same rows, in any order, train the same
   model, with the same blob and SHA-256: the engine puts rows in an order
   of their own before training, and adds in a fixed order whatever the
-  threads.
+  threads. `IGLOO.ML.XGBOOST` trains on the rows in the order its input
+  gives them, as XGBoost does: the same rows in the same order train the
+  same model.
 
 On one machine (18 cores), creating each of Igloo's classes on a million
 rows of 50 features (40 numbers, and 10 categories of 20 to 110 values,

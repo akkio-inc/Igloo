@@ -174,6 +174,18 @@ wait_ready() {
   pass "all pods Ready, $want igloo replicas"
 }
 
+# wait_service: wait until the admin logs in through the SQL Service. Ready pods reach
+# clients through it a moment later: a reinstall gives the Service a new address, and a
+# change of its selector new endpoints, and either refuses connections until kube-proxy
+# routes it.
+wait_service() {
+  local deadline=$((SECONDS + 60))
+  until sql "$FULLNAME" igloo "$(admin_password)" "SELECT 1" >/dev/null 2>&1; do
+    ((SECONDS < deadline)) || fail "igloo pods are Ready, but the Service refused logins for 60 s"
+    sleep 1
+  done
+}
+
 admin_password() {
   k get secret "$FULLNAME" -o jsonpath='{.data.admin-password}' | base64 -d
 }
@@ -545,6 +557,7 @@ check_uninstalled
 log "Reinstalling finds the data again"
 helm_install install
 wait_ready 2
+wait_service
 [[ "$(admin_password)" == "$ADMIN_PASSWORD" ]] || fail "the admin password changed on reinstall"
 pass "admin password unchanged after reinstall"
 expect_eq "rows after reinstall" "$(sql "$FULLNAME" igloo "$ADMIN_PASSWORD" "SELECT count(*) FROM e2e_items")" "3"
@@ -625,6 +638,7 @@ helm_install upgrade
 k wait --for=delete pod --selector "app.kubernetes.io/instance=$RELEASE,app.kubernetes.io/component=gateway" \
   --timeout="$TIMEOUT" >/dev/null 2>&1 || true
 wait_ready 2
+wait_service
 expect_eq "the SQL Service selects" \
   "$(k get service "$FULLNAME" -o jsonpath='{.spec.selector.app\.kubernetes\.io/component}')" "server"
 left=$(k get "deployment/$FULLNAME-gateway" "serviceaccount/$FULLNAME-gateway" "role/$FULLNAME-gateway" \

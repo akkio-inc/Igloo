@@ -355,7 +355,7 @@ export function createCatalog(app) {
     const stats = [
       ['Rows', own ? num(o.row_count) : ''],
       ['Size', own ? fmtBytes(o.bytes) : '', o.file_count ? plural(Number(o.file_count), 'file') : null],
-      [isView ? 'Last replaced' : 'Data last changed', own || isView ? (o.last_altered ? fmtAgo(o.last_altered) : 'never') : '',
+      [isView ? 'Last replaced' : 'Last changed', own || isView ? (o.last_altered ? fmtAgo(o.last_altered) : 'never') : '',
         o.last_altered ? fmtTime(o.last_altered) : null],
       ['Snapshots', own ? num(o.snapshot_count) : '', own ? 'kept for time travel' : null],
       ['Reads, 30 days', num(u.reads_30d) || '0', u.last_read ? `last ${fmtAgo(u.last_read)}` : null],

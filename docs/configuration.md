@@ -189,7 +189,7 @@ storage type. It is required whenever `IGLOO_CATALOG_URI` is set.
 | `IGLOO_S3_REGION` | `us-east-1` | |
 | `IGLOO_S3_URL_STYLE` | `vhost` | `path` for most self-hosted stores |
 | `IGLOO_S3_USE_SSL` | `true` | |
-| `IGLOO_S3_ACCESS_KEY_ID`, `IGLOO_S3_SECRET_ACCESS_KEY` | | Static keys. Empty uses the AWS credential chain (IAM roles for service accounts, instance profiles, environment): Igloo fetches credentials from it once for the process, and again in the background ahead of their expiry, so statements never wait on the instance metadata service; DuckDB fetches its own, again when a request finds them expired. |
+| `IGLOO_S3_ACCESS_KEY_ID`, `IGLOO_S3_SECRET_ACCESS_KEY` | | Static keys. Empty uses the AWS credential chain (IAM roles for service accounts, instance profiles, environment): Igloo fetches credentials from it once for the process, and again in the background ahead of their expiry, so statements never wait on the instance metadata service; DuckDB's are fetched again every 10 minutes, outside every transaction. |
 | `IGLOO_S3_STS_ROLE_ARN` | | IAM role Igloo assumes to hand [other engines](external-engines.md#amazon-s3) credentials limited to one table. Without it, engines on AWS get table metadata but no storage credentials. S3-compatible stores need none: Igloo calls STS on `IGLOO_S3_ENDPOINT` with its own keys. Igloo also makes with it the credentials [workers write tables' files](distributed-execution.md#workers-writing-tables) with, limited to a task's directory. |
 
 With static keys, the catalog uses the same keys. Without them it uses its own

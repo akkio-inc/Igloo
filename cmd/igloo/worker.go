@@ -118,7 +118,15 @@ func serveWorker() error {
 	var httpSrv *http.Server
 	if cfg.HTTPAddr != "" {
 		mux := http.NewServeMux()
-		mux.HandleFunc("GET /healthz", func(rw http.ResponseWriter, _ *http.Request) { _, _ = fmt.Fprintln(rw, "ok") })
+		// Liveness fails only when the worker's DuckDB has been invalidated,
+		// as on the server (see live).
+		mux.HandleFunc("GET /healthz", func(rw http.ResponseWriter, r *http.Request) {
+			if err := live(r.Context(), eng.Ping); err != nil {
+				http.Error(rw, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			_, _ = fmt.Fprintln(rw, "ok")
+		})
 		mux.HandleFunc("GET /readyz", func(rw http.ResponseWriter, r *http.Request) {
 			ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
 			defer cancel()

@@ -2568,6 +2568,7 @@ func (s *Server) preparedQuery(ctx context.Context, sess *session, user auth.Use
 		for i, c := range tr.columns(st.columns) {
 			st.names[i] = c.Name
 		}
+		st.presentAsSnowflake()
 	}
 
 	sess.open[ps] = st
@@ -2920,9 +2921,10 @@ func (s *Server) readyStatement(ctx context.Context, sess *session, st *statemen
 
 // rewrite points the names in text that Igloo serves itself (PostgreSQL's
 // catalog and settings, the history views, the catalog's views) at where
-// they are, computes aggregates over whole results without holding them (see
-// rewriteWholeCounts), and counts distinct pairs a row each (see
-// rewritePairCounts).
+// they are, counts approx_count_distinct as Snowflake's
+// APPROX_COUNT_DISTINCT (see rewriteApproxCounts), computes aggregates over
+// whole results without holding them (see rewriteWholeCounts), and counts
+// distinct pairs a row each (see rewritePairCounts).
 func (s *Server) rewrite(ctx context.Context, sess *session, user auth.User, text string) string {
 	query, _ := s.rewriteCounting(ctx, sess, user, text, false)
 	return query
@@ -2940,6 +2942,9 @@ func (s *Server) rewriteCounting(ctx context.Context, sess *session, user auth.U
 	if readsMetadata.MatchString(query) {
 		s.refreshMetadata(ctx, sess)
 	}
+	// First, so that the counts after see what a translation from
+	// Snowflake's dialect would have written.
+	query = s.rewriteApproxCounts(ctx, sess, query)
 	var counts *idCounts
 	if ids {
 		query, counts = s.rewriteIDCounts(ctx, sess, query)

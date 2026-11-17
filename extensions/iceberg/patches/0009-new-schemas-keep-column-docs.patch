@@ -1,0 +1,44 @@
+Keep the columns' docs in every schema the extension writes.
+
+ALTER TABLE's ADD, DROP and RENAME COLUMN, and a change of a column's
+type, copy the table's current schema, change one column and commit the
+copy as a new schema. The copy kept each field's doc, the column's
+comment, but neither writer of a schema's JSON wrote it: the copy that
+goes into the add-schema update (AddNamedField) and the update itself as
+it is sent to the catalog (AddStructField). So a change to one column
+dropped the comments of every column of the table, and apps that keep
+tags in column comments lost all of a table's tags with any change to its
+columns. Both now write a field's doc, nested fields' included.
+
+diff --git a/src/catalog/rest/api/iceberg_create_table_request.cpp b/src/catalog/rest/api/iceberg_create_table_request.cpp
+index 2484293..391da53 100644
+--- a/src/catalog/rest/api/iceberg_create_table_request.cpp
++++ b/src/catalog/rest/api/iceberg_create_table_request.cpp
+@@ -130,6 +130,12 @@ static void AddUnnamedField(yyjson_mut_doc *doc, yyjson_mut_val *field_obj, cons
+ static void AddNamedField(yyjson_mut_doc *doc, yyjson_mut_val *field_obj, const IcebergColumnDefinition &column) {
+ 	yyjson_mut_obj_add_strcpy(doc, field_obj, "name", column.name.c_str());
+ 	yyjson_mut_obj_add_uint(doc, field_obj, "id", column.id);
++	//! Igloo: a field keeps its doc, the column's comment. Every new schema (ADD, DROP and RENAME COLUMN, a change
++	//! of type) is the current one copied through here, so without it a change to one column dropped the comments
++	//! of every column.
++	if (!column.doc.empty()) {
++		yyjson_mut_obj_add_strncpy(doc, field_obj, "doc", column.doc.c_str(), column.doc.size());
++	}
+ 	if (column.type.id() != LogicalTypeId::VARIANT && column.type.IsNested()) {
+ 		auto type_obj = yyjson_mut_obj_add_obj(doc, field_obj, "type");
+ 		AddUnnamedField(doc, type_obj, column);
+diff --git a/src/core/metadata/schema/iceberg_table_schema.cpp b/src/core/metadata/schema/iceberg_table_schema.cpp
+index b85b269..c155486 100644
+--- a/src/core/metadata/schema/iceberg_table_schema.cpp
++++ b/src/core/metadata/schema/iceberg_table_schema.cpp
+@@ -174,6 +174,10 @@ static void AddStructField(yyjson_mut_doc *doc, yyjson_mut_val *field_obj,
+ 	yyjson_mut_obj_add_uint(doc, field_obj, "id", column.id);
+ 	yyjson_mut_obj_add_strcpy(doc, field_obj, "name", column.name.c_str());
+ 	yyjson_mut_obj_add_bool(doc, field_obj, "required", column.required);
++	//! Igloo: the doc goes to the catalog with the field, as AddNamedField writes it (iceberg_create_table_request.cpp).
++	if (column.has_doc) {
++		yyjson_mut_obj_add_strncpy(doc, field_obj, "doc", column.doc.c_str(), column.doc.size());
++	}
+ 	if (!column.type->has_primitive_type) {
+ 		auto type_obj = yyjson_mut_obj_add_obj(doc, field_obj, "type");
+ 		AddUnnamedField(doc, type_obj, *column.type);

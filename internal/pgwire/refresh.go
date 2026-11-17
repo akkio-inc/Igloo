@@ -196,36 +196,63 @@ type refresher struct {
 	// what that took, for the history.
 	placement string
 	parts     distParts
-	// stateless says it refreshes in full and keeps no state, though it could
-	// (see bitmapsOnWorkers).
+	// stateless says it refreshes in full and keeps no state, though it could,
+	// and whole is its query, prepared as rebuild runs it and planned on
+	// workers; here, otherwise, why its query runs on this replica, which the
+	// queries of a full refresh follow. Where a view counting distinct values
+	// runs its query is decided once, by bitmapsOnWorkers.
 	stateless bool
+	whole     *statement
+	here      *distParts
 }
 
 // rebuild replaces the view's rows with its query's, the query on workers
 // where auto mode would run it there as a read by the view's owner (see
 // fill), the view written from their results.
 func (r *refresher) rebuild(ctx context.Context) (int64, error) {
-	return r.fill(ctx, "the query", r.query, r.rebuildWriter, func(ctx context.Context, source string) (int64, error) {
+	src := r.whole
+	r.whole = nil
+	if src == nil {
+		src = r.rebuildSource(ctx)
+	}
+	return r.fill(ctx, "the query", r.query, src, func(ctx context.Context, source string) (int64, error) {
 		return r.replaceRows(ctx, "SELECT * FROM ("+source+") AS refresh")
 	})
 }
 
+// rebuildSource is the view's query as rebuild runs it (see fillSource),
+// with how workers would write the view's rows, or nil.
+func (r *refresher) rebuildSource(ctx context.Context) *statement {
+	src := r.source(ctx, r.query)
+	if src != nil {
+		src.writer = r.rebuildWriter(ctx, src)
+	}
+	return src
+}
+
+// source prepares query, one of the refresh's that reads its tables in
+// full, for workers (see fillSource), or returns nil. Where the refresh
+// decided its query runs on this replica, it runs there too.
+func (r *refresher) source(ctx context.Context, query string) *statement {
+	src := r.s.fillSource(ctx, r.sess, &statement{access: r.access, guard: r.guard}, query)
+	if src != nil && r.here != nil {
+		src.decided = &placement{here: *r.here}
+	}
+	return src
+}
+
 // fill runs query, one of the refresh's that reads its tables in full, and
 // writes its rows with write, given query or the SQL that combines workers'
-// results of it: on workers where auto mode would run it there as a read by
-// the view's owner, as a client's CREATE TABLE ... AS runs (see fillOn), and
-// on workers too once it runs out of memory here. writer, if set, is how
-// workers would write the rows themselves. what names the query in the log,
-// which says where each ran.
-func (r *refresher) fill(ctx context.Context, what, query string, writer func(context.Context, *statement) *tableWrite,
+// results of it: from src (see source), on workers where auto mode would run
+// it there as a read by the view's owner, as a client's CREATE TABLE ... AS
+// runs (see fillOn), and on workers too once it runs out of memory here;
+// without src, here. what names the query in the log, which says where each
+// ran.
+func (r *refresher) fill(ctx context.Context, what, query string, src *statement,
 	write func(ctx context.Context, source string) (int64, error)) (int64, error) {
 	start := time.Now()
 	f := &stagedFill{s: r.s, sess: r.sess, ctx: ctx}
 	defer f.close()
-	src := r.s.fillSource(ctx, r.sess, &statement{access: r.access, guard: r.guard}, query)
-	if src != nil && writer != nil {
-		src.writer = writer(ctx, src)
-	}
 	rows, parts, _, err := r.s.fillOn(f, src, func(ctx context.Context) (int64, error) { return write(ctx, query) }, write)
 	took := time.Since(cmp.Or(parts.since, start))
 	if err == nil && parts.key != "" {
@@ -316,9 +343,19 @@ func (r *refresher) run(ctx context.Context) (refreshResult, error) {
 	if r.st.Mode == refreshFull {
 		why = "its REFRESH_MODE is FULL"
 	}
-	if why == "" && r.st.Mode != refreshIncremental && r.bitmapsOnWorkers(ctx) {
-		why, r.stateless = bitmapsOnWorkers, true
-		r.st.Incremental, r.st.Reason = false, why
+	defer func() {
+		if r.whole != nil {
+			_ = r.whole.close()
+		}
+	}()
+	if why == "" && r.st.Mode != refreshIncremental {
+		switch onWorkers, err := r.bitmapsOnWorkers(ctx); {
+		case err != nil:
+			return refreshResult{}, err
+		case onWorkers:
+			why, r.stateless = bitmapsOnWorkers, true
+			r.st.Incremental, r.st.Reason = false, why
+		}
 	}
 	if why == "" {
 		why = r.baseline(ctx)
@@ -441,19 +478,33 @@ const bitmapsOnWorkers = "it counts distinct values, and workers run its query w
 // their rate; refreshed in full, its query on 16 workers took 41 to 140 s,
 // and the dashboards ran their best. So it runs on workers and keeps no
 // state, and goes on incrementally only where workers would not run it.
-func (r *refresher) bitmapsOnWorkers(ctx context.Context) bool {
+//
+// It decides where the refresh's queries run, once: the query, planned as
+// rebuild runs it, runs by that plan (r.whole), and where auto mode keeps it
+// on this replica, a full refresh's queries run here too (r.here). Each
+// planned again, by then the history of its runs, or the statements running
+// beside it, could say otherwise: a view auto mode kept here, to go on from
+// its state, ran its partial aggregates on workers.
+func (r *refresher) bitmapsOnWorkers(ctx context.Context) (bool, error) {
 	if r.plan == nil || !r.plan.Grouped || !r.plan.Bitmaps() || r.s.dist == nil {
-		return false
+		return false, nil
 	}
-	src := r.s.fillSource(ctx, r.sess, &statement{access: r.access, guard: r.guard}, r.query)
+	src := r.rebuildSource(ctx)
 	if src == nil {
-		return false
+		return false, nil
 	}
-	defer src.close() //nolint:errcheck
 	user := r.sess.currentUser()
-	env := &sessionEnv{s: r.s, sess: r.sess, user: user, st: src}
-	_, err := r.s.dist.Plan(ctx, src.query, env, sessionMode(r.sess, user))
-	return err == nil
+	plan, here, done, err := r.s.planDistributed(ctx, r.sess, user, src, sessionMode(r.sess, user))
+	if plan == nil {
+		_ = src.close()
+		if done {
+			return false, err
+		}
+		r.here = &here
+		return false, nil
+	}
+	src.decided, r.whole = &placement{plan: plan}, src
+	return true, nil
 }
 
 // planQuery plans the query, and loads its tables' current snapshots. It
@@ -1010,7 +1061,7 @@ func (r *refresher) full(ctx context.Context, why string) (refreshResult, error)
 	if err := r.makeTemp(ctx, "TABLE", "__igloo_full", partials); err != nil {
 		return refreshResult{}, err
 	}
-	if _, err := r.fill(ctx, "its partial aggregates", partials, nil, func(ctx context.Context, source string) (int64, error) {
+	if _, err := r.fill(ctx, "its partial aggregates", partials, r.source(ctx, partials), func(ctx context.Context, source string) (int64, error) {
 		return r.exec(ctx, "INSERT INTO temp.main.__igloo_full SELECT * FROM ("+source+") AS full_partials")
 	}); err != nil {
 		return refreshResult{}, err

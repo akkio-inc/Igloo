@@ -1993,8 +1993,9 @@ func (st *statement) adopt(ctx context.Context, conn *duckdb.Conn, text string) 
 		return pgerror.WithCode(errors.New("cannot apply policies to this statement: they change its result's columns"),
 			codes.FeatureNotSupported)
 	}
+	fresh.presentAs(st)
 	old := st.stmt
-	st.stmt, st.query, st.prepared, st.encoders, st.columns = fresh.stmt, text, fresh.prepared, fresh.encoders, fresh.columns
+	st.stmt, st.query, st.prepared, st.encoders, st.types, st.columns = fresh.stmt, text, fresh.prepared, fresh.encoders, fresh.types, fresh.columns
 	return old.Close()
 }
 

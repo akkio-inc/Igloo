@@ -75,10 +75,15 @@ func TestS3WithoutKeysUsesCredentialChain(t *testing.T) {
 		Type: config.StorageS3,
 		S3:   config.S3{Region: "us-west-2", URLStyle: "vhost", UseSSL: true},
 	}))
-	for _, want := range []string{"LOAD aws", "PROVIDER credential_chain", "REFRESH auto", "USE_SSL true"} {
+	for _, want := range []string{"LOAD aws", "PROVIDER credential_chain", "USE_SSL true"} {
 		if !strings.Contains(got, want) {
 			t.Errorf("missing %q in\n%s", want, got)
 		}
+	}
+	// DuckDB never refreshes it, inside a user's transaction: Igloo does,
+	// outside every one (see TestStorageCredentialsRefreshOutsideTransactions).
+	if strings.Contains(got, "REFRESH") {
+		t.Errorf("the secret refreshes itself:\n%s", got)
 	}
 }
 

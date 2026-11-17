@@ -364,7 +364,7 @@ func (f *Factors) index(m map[string]int, r *ml.RowValues, j int) int {
 	return -1
 }
 
-func (f *Factors) scoreRow(buf []byte, method string, opt *RowOptions, r *ml.RowValues) []byte {
+func (f *Factors) scoreRow(buf []byte, method string, opt *RowOptions, r *ml.RowValues) ([]byte, error) {
 	u := f.index(f.userIndex, r, 0)
 	if method == "PREDICT" {
 		i := f.index(f.itemIndex, r, 1)
@@ -374,7 +374,7 @@ func (f *Factors) scoreRow(buf []byte, method string, opt *RowOptions, r *ml.Row
 		} else {
 			buf = appendNum(buf, f.Model.Predict(u, i))
 		}
-		return append(buf, '}')
+		return append(buf, '}'), nil
 	}
 	buf = append(buf, `{"recommendations":[`...)
 	for k, s := range f.topItems(u, opt) {
@@ -387,7 +387,7 @@ func (f *Factors) scoreRow(buf []byte, method string, opt *RowOptions, r *ml.Row
 		buf = appendNum(buf, s.score)
 		buf = append(buf, '}')
 	}
-	return append(buf, "]}"...)
+	return append(buf, "]}"...), nil
 }
 
 type scored struct {

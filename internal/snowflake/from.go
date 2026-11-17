@@ -271,6 +271,9 @@ func (t *translator) tableFunctions(nodes []*node) ([]*node, error) {
 		if alias != "" && aliasEnd > end {
 			end = aliasEnd
 		}
+		if !removed[out] {
+			t.tableOuts[out] = true
+		}
 		out.pos, out.end = nodes[start].pos, nodes[end-1].end
 		nodes = replace(nodes, start, end, out)
 		i = start
@@ -360,6 +363,41 @@ func whereOn(nodes []*node, flats []flattened, moved func(flatten, open, close *
 		moved(nodes[last], open, close)
 	}
 	return append(out, nodes[end:]...)
+}
+
+// lateralOn gives each table function that tableFunctions translated,
+// joined with JOIN, INNER JOIN or LEFT [OUTER] JOIN without a condition,
+// the ON true that DuckDB needs. Snowflake joins a table function so, its
+// rows those it gives for each row before it, as after a comma, and
+// refuses a condition there ("lateral table function called with OUTER
+// JOIN syntax or a join predicate"); DuckDB refuses a join without ON or
+// USING other than a CROSS, NATURAL or POSITIONAL one ("syntax error at or
+// near WHERE"). A LEFT JOIN keeps a row before it for which the function
+// gives no rows, with NULLs, as FLATTEN's OUTER => TRUE does. It runs
+// after whereOn and structWhere, which may make a WHERE the join's ON.
+func (t *translator) lateralOn(nodes []*node) ([]*node, error) {
+	for k := 0; k < len(nodes); k++ {
+		if !t.tableOuts[nodes[k]] {
+			continue
+		}
+		j := prevSig(nodes, k)
+		if j < 0 || nodes[j].word() != "JOIN" {
+			continue
+		}
+		p := prevSig(nodes, j)
+		if p >= 0 && nodes[p].word() == "OUTER" {
+			p = prevSig(nodes, p)
+		}
+		if p >= 0 && nodes[p].word() != "LEFT" && nodes[p].word() != "INNER" && joinEndWords[nodes[p].word()] {
+			continue // CROSS, NATURAL, RIGHT, FULL, ASOF
+		}
+		if q := nextSig(nodes, k); q >= 0 && (nodes[q].word() == "ON" || nodes[q].word() == "USING" ||
+			nodes[q].kind == kRaw && strings.HasPrefix(strings.TrimSpace(nodes[q].text), "ON ")) {
+			continue // as written, or a WHERE made its ON
+		}
+		nodes = replace(nodes, k+1, k+1, raw(" ON true"))
+	}
+	return nodes, nil
 }
 
 // whereClause finds, at one level of a statement, a select's SELECT, FROM
@@ -846,9 +884,9 @@ func (t *translator) flattenTable(g *node, alias string, cols *node, wantThis, o
 		if err != nil {
 			return nil, err
 		}
-		v := &variant{segs: segs}
 		prefix = s
-		in = seq(nil, raw("json_extract(sf_json("), in, raw("), "+v.path()+")"))
+		pre, post := (&variant{segs: segs}).reads("json_extract(", "json_extract_string(", false)
+		in = seq(nil, raw(pre+"sf_json("), in, raw(")"+post))
 	}
 	if st != nil {
 		return t.flattenStructs(st, in, alias, cols, wantThis)
@@ -1212,57 +1250,72 @@ func (t *translator) sample(nodes []*node) ([]*node, error) {
 // fromWords are the words after which a table reference follows.
 var fromWords = map[string]bool{"FROM": true, "JOIN": true}
 
-// values names the columns of VALUES in FROM as Snowflake does, COLUMN1,
-// COLUMN2 and so on, and puts parentheses around a FROM VALUES list.
-func (t *translator) values(nodes []*node) ([]*node, error) {
+// groupValues puts parentheses around each FROM VALUES list, at every
+// level of nodes, as the tree is built (see build): VALUES (...), (...)
+// becomes the one table reference (VALUES (...), (...)). Until then every
+// pass that reads a FROM clause would take the list for a call of VALUES
+// followed by a comma join of more table references, and read a row of
+// words, as (NULL) or (TRUE, NULL), as a parenthesized join of tables so
+// named.
+func groupValues(nodes []*node) []*node {
 	for i := 0; i < len(nodes); i++ {
-		n := nodes[i]
-		p := prevSig(nodes, i)
-		if p < 0 || !fromWords[nodes[p].word()] {
+		if nodes[i].kind == kGroup {
+			nodes[i].kids = groupValues(nodes[i].kids)
 			continue
 		}
+		p := prevSig(nodes, i)
+		if nodes[i].word() != "VALUES" || p < 0 || !fromWords[nodes[p].word()] {
+			continue
+		}
+		// FROM VALUES (...), (...) [alias]
+		end := i + 1
+		for {
+			g := nextSig(nodes, end-1)
+			if g < 0 || !nodes[g].isGroup('(') {
+				break
+			}
+			end = g + 1
+			c := nextSig(nodes, end-1)
+			if c < 0 || !nodes[c].isOp(",") {
+				break
+			}
+			if g2 := nextSig(nodes, c); g2 < 0 || !nodes[g2].isGroup('(') {
+				break
+			}
+			end = c + 1
+		}
+		grp := group(groupValues(append([]*node(nil), nodes[i:end]...))...)
+		grp.pos, grp.end = nodes[i].pos, nodes[end-1].end
+		nodes = replace(nodes, i, end, grp)
+	}
+	return nodes
+}
+
+// values names the columns of a FROM VALUES list, which groupValues put in
+// parentheses, as Snowflake does: COLUMN1, COLUMN2 and so on.
+func (t *translator) values(nodes []*node) ([]*node, error) {
+	for i := 0; i < len(nodes); i++ {
+		p := prevSig(nodes, i)
+		g := nodes[i]
+		if p < 0 || !fromWords[nodes[p].word()] || !g.isGroup('(') {
+			continue
+		}
+		idx := sig(g.kids)
+		if len(idx) < 2 || g.kids[idx[0]].word() != "VALUES" || !g.kids[idx[1]].isGroup('(') {
+			continue
+		}
+		ncols := len(splitArgs(g.kids[idx[1]].kids))
+		names := make([]string, ncols)
+		for k := range names {
+			names[k] = "column" + itoa(k+1)
+		}
+		colList := "(" + strings.Join(names, ", ") + ")"
+		alias, aliasEnd, cols := tableAlias(nodes, i)
 		switch {
-		case n.word() == "VALUES":
-			// FROM VALUES (...), (...) [alias]
-			end := i + 1
-			for {
-				g := nextSig(nodes, end-1)
-				if g < 0 || !nodes[g].isGroup('(') {
-					break
-				}
-				end = g + 1
-				c := nextSig(nodes, end-1)
-				if c < 0 || !nodes[c].isOp(",") {
-					break
-				}
-				if g2 := nextSig(nodes, c); g2 < 0 || !nodes[g2].isGroup('(') {
-					break
-				}
-				end = c + 1
-			}
-			grp := group(nodes[i:end]...)
-			grp.pos, grp.end = nodes[i].pos, nodes[end-1].end
-			nodes = replace(nodes, i, end, grp)
-			fallthrough
-		case nodes[i].isGroup('('):
-			g := nodes[i]
-			idx := sig(g.kids)
-			if len(idx) < 2 || g.kids[idx[0]].word() != "VALUES" || !g.kids[idx[1]].isGroup('(') {
-				continue
-			}
-			ncols := len(splitArgs(g.kids[idx[1]].kids))
-			names := make([]string, ncols)
-			for k := range names {
-				names[k] = "column" + itoa(k+1)
-			}
-			colList := "(" + strings.Join(names, ", ") + ")"
-			alias, aliasEnd, cols := tableAlias(nodes, i)
-			switch {
-			case alias == "":
-				nodes = replace(nodes, i+1, i+1, raw(" AS _sf_values"+colList))
-			case cols == nil:
-				nodes = replace(nodes, aliasEnd, aliasEnd, raw(colList))
-			}
+		case alias == "":
+			nodes = replace(nodes, i+1, i+1, raw(" AS _sf_values"+colList))
+		case cols == nil:
+			nodes = replace(nodes, aliasEnd, aliasEnd, raw(colList))
 		}
 	}
 	return nodes, nil

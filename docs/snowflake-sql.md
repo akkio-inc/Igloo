@@ -91,6 +91,14 @@ notices.
 - `CREATE TABLE ... AS` and views keep their columns' names as written
   (`AS total` stores `total`); reading them in Snowflake's dialect shows
   `TOTAL`.
+- A table's alias, a CTE's name, the names in their column lists and a
+  select item's alias may be words that DuckDB keeps as keywords, as in
+  Snowflake: `CROSS JOIN totals at`, `at.total`, `SELECT 1 year`. Igloo
+  quotes them for DuckDB as its keyword list (`duckdb_keywords()`) says, a
+  table's in upper case and a select item's as written, so they name what
+  the word does. `SEMI`, `ANTI` and `POSITIONAL` after a table are its
+  alias, as in Snowflake, not the start of DuckDB's joins of those kinds;
+  `AT (...)` and `ASOF JOIN` are the clauses.
 - `IDENTIFIER('db.schema.table')`, `IDENTIFIER($name)`, `TABLE('name')` and
   `TABLE($name)` name an object.
 - A three-part name's database is the catalog's name, `lake` unless
@@ -136,7 +144,11 @@ JSON and JSON text alike.
   `ARRAY_FLATTEN`, `ARRAY_GENERATE_RANGE`, `SPLIT`, `STRTOK_TO_ARRAY`.
 - `[LATERAL] FLATTEN(input => ..., path => ..., outer => ..., recursive =>
   ..., mode => ...)` and `TABLE(FLATTEN(...))`, with the columns `SEQ`,
-  `KEY`, `PATH`, `INDEX`, `VALUE` and `THIS`. `FLATTEN` of an `ARRAY` or
+  `KEY`, `PATH`, `INDEX`, `VALUE` and `THIS`. It joins after a comma or
+  with `JOIN`, `INNER JOIN` or `LEFT [OUTER] JOIN`, without `ON` as
+  Snowflake writes it, and `SPLIT_TO_TABLE` and `GENERATOR` join so too; a
+  `LEFT JOIN` keeps a row for which `FLATTEN` gives no rows, with `NULL`s,
+  as `OUTER => TRUE` does. `FLATTEN` of an `ARRAY` or
   `OBJECT` column unnests its list or map directly, and `FLATTEN` of an
   array constant (`[OBJECT_CONSTRUCT(...), ...]`, `ARRAY_CONSTRUCT(...)`)
   unnests its elements without building the array: over 15 million
@@ -227,7 +239,14 @@ array reads as that object or array, so paths into an `ARRAY` of objects
 (`f.value:name`) work; one that is a number or a boolean reads as a string,
 which compares, casts and sums as the number (see [known
 differences](#known-differences)). A `VARIANT` column, or JSON text in any
-`VARCHAR` column, reads as the JSON it holds.
+`VARCHAR` column, reads as the JSON it holds. A function that builds a
+value of such a column (`ARRAY_AGG`, `OBJECT_AGG`, `ARRAY_CONSTRUCT`,
+`OBJECT_CONSTRUCT`, `TO_JSON`, `::VARIANT` and the others) takes its text
+as an element of an `ARRAY` column reads: the JSON text of an object or an
+array as that object or array, any other text as a string. So
+`ARRAY_AGG(location)` of a `VARIANT` column copied from Snowflake gives its
+objects, `[{"zip_code":"55603"}, ...]`, as in Snowflake. Text an expression
+computes, such as `x::STRING`, stays a string.
 
 `CREATE TABLE ... AS SELECT` makes `ARRAY` and `OBJECT` columns of what is
 known to be one: `ARRAY_AGG`, `ARRAY_CONSTRUCT`, `[...]`, `SPLIT`,
@@ -236,6 +255,22 @@ known to be one: `ARRAY_AGG`, `ARRAY_CONSTRUCT`, `[...]`, `SPLIT`,
 query's `SELECT` (not of a `UNION`'s). Any other semi-structured value,
 `PARSE_JSON(...)` among them, makes a `VARIANT` column, the JSON text of its
 values; cast it to `ARRAY` or `OBJECT` for a list or a map.
+
+A statement in Snowflake's dialect sends each `ARRAY` and `OBJECT` value to
+the client as one value of PostgreSQL's `json` type, the JSON text of the
+whole array or object, whether it computes the value or selects a column
+that holds it; a `VARIANT` value it computes (`PARSE_JSON(s)`, `v:a`) is
+`json` too, and a `VARIANT` column of an Iceberg table, which holds its
+values' JSON text, is sent as that text (`text`). An `ARRAY` or `OBJECT`
+column goes out as `TO_JSON` reads it, its elements' objects and arrays as
+objects and arrays: after `CREATE TABLE t AS SELECT
+ARRAY_AGG(OBJECT_CONSTRUCT('zip_code', z)) AS zips ...`, `SELECT zips FROM
+t` sends `[{"zip_code":"55603"}]`, as the `ARRAY_AGG` itself does. In
+DuckDB's dialect the same column arrives as JSON of its strings,
+`["{\"zip_code\":\"55603\"}"]`. Structured `ARRAY(type)`, `OBJECT(...)` and
+`MAP(...)` columns are `json` too, their values as typed, except that
+`ARRAY(VARCHAR)` and `MAP(VARCHAR, VARCHAR)`, the same DuckDB types as
+`ARRAY` and `OBJECT` columns, go out as those do.
 
 ### Functions
 
@@ -449,12 +484,17 @@ What Igloo cannot reproduce exactly, and what it does instead.
 - Objects list their keys in alphabetical order, as Snowflake shows them;
   `OBJECT_CONSTRUCT_KEEP_NULL` and `OBJECT_INSERT` keep `null` values.
 - An `ARRAY` or `OBJECT` column holds numbers and booleans as their text
-  (`["1","true"]`): `TYPEOF(a[0])` is `VARCHAR` and `TO_JSON(a)` shows
-  them quoted, where Snowflake shows `INTEGER` and `[1,true]`. Comparing,
-  casting and summing them gives the number. Selecting such a column
-  shows objects and arrays inside it as their JSON text in quotes;
-  `TO_JSON(a)` and `a::VARIANT` show them as objects and arrays. Store a
-  value whose types matter in a `VARIANT` column.
+  (`["1","true"]`): `TYPEOF(a[0])` is `VARCHAR`, and `TO_JSON(a)` and
+  selecting the column show them quoted, where Snowflake shows `INTEGER`
+  and `[1,true]`. Comparing, casting and summing them gives the number.
+  Objects and arrays inside it read and show as objects and arrays. Store
+  a value whose types matter in a `VARIANT` column.
+- A `VARIANT` column and a `VARCHAR` column are both text in Iceberg, so
+  Igloo reads a `VARCHAR` column that holds the JSON text of an object or an
+  array as that object or array, also where it builds a value of it:
+  `ARRAY_AGG(s)` of a `VARCHAR` column `s` that holds `{"k":1}` gives
+  `[{"k":1}]`, where Snowflake gives `["{\"k\":1}"]`. Cast the column
+  (`s::STRING`) to build of it as a string.
 - A masking policy on an `ARRAY` or `OBJECT` column returns its type, as
   the column holds it: Igloo casts what its expression returns, so
   `OBJECT_CONSTRUCT(...)` works.
@@ -493,7 +533,8 @@ What Igloo cannot reproduce exactly, and what it does instead.
   standard deviation), exact up to about 300 values. Their results
   differ from Snowflake's within that error. In a select with `GROUP BY`
   and as window functions they count exactly, as `COUNT(DISTINCT)`.
-  DuckDB's own `approx_count_distinct` has 64 registers and errs by about
+  `approx_count_distinct` in DuckDB's dialect counts the same way (see
+  [SQL](sql.md#dialect)); DuckDB's own has 64 registers and errs by about
   13%.
   `APPROX_PERCENTILE` is DuckDB's `approx_quantile`, approximate within its
   own error. `APPROX_TOP_K` counts exactly.
@@ -506,9 +547,9 @@ What Igloo cannot reproduce exactly, and what it does instead.
 - `APPROX_COUNT_DISTINCT` and `HLL` count exactly when grouped, since a
   sketch per group is slower than `COUNT(DISTINCT x)` with many groups (13
   s rather than 0.5 s for 7.9 million groups of 37 million rows). Ungrouped,
-  as when profiling columns, the sketch is as fast as DuckDB's
+  as when profiling columns, the sketch is as fast as DuckDB's own
   `approx_count_distinct`. Grouped by a few thousand groups or fewer,
-  counting exactly takes up to three times as long as DuckDB's
+  counting exactly takes up to three times as long as DuckDB's own
   approximation (0.8 s rather than 0.24 s for 270 groups of 37 million
   rows).
 - Statements whose translations call the `sf_` macros (`FLATTEN`,
@@ -521,6 +562,10 @@ What Igloo cannot reproduce exactly, and what it does instead.
 
 - Identifiers are case-insensitive even when quoted: `"col"` and `COL` name
   the same column, where Snowflake would see two.
+- A column whose name DuckDB reserves or keeps for types and functions
+  (`AT`, `LEFT`, `SEMI`) must be quoted where a statement reads it alone
+  (`SELECT "AT" FROM t`, `ORDER BY "AT"`); Igloo quotes such a name for
+  DuckDB only as an alias or a qualifier ([names](#names)).
 - Views run with their reader's privileges, as Igloo's always do; `SECURE`
   does not hide their definition.
 - `information_schema` and `SHOW` are DuckDB's, with the Snowflake

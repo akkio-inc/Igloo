@@ -186,9 +186,28 @@ expect() {
   if [ "$got" = "$want" ]; then pass "$name"; else fail "$name: got [$got], want [$want]"; fi
 }
 
+# history_settled waits, up to 15 s, until the query history holds every
+# statement run so far. It is written in the background, about once a second,
+# in the order statements end: once a statement run now shows, those before
+# it do.
+history_settled() {
+  local marker="history settled $RANDOM$RANDOM" deadline=$((SECONDS + 15))
+  psql_admin -c "/* $marker */ SELECT 1" >/dev/null || true
+  until [ "$(psql_admin -c "SELECT count(*) FROM igloo.query_history WHERE query_text LIKE '/* $marker */%'")" -ge 1 ] 2>/dev/null ||
+    [ "$SECONDS" -ge "$deadline" ]; do
+    sleep 0.5
+  done
+}
+
+# workers_of CONDITION: how many workers ran the latest statement the query
+# history holds WHERE CONDITION.
+workers_of() {
+  history_settled
+  psql_admin -c "SELECT workers FROM igloo.query_history WHERE $1 ORDER BY start_time DESC LIMIT 1" || true
+}
+
 echo "query history"
-# History is written in the background, about once a second.
-sleep 3
+history_settled
 got="$(psql_admin -c "SELECT count(DISTINCT query_text) FROM igloo.query_history WHERE workers = $workers")"
 if [ "${got:-0}" -ge 12 ]; then pass "history shows $got statements run by $workers workers"; else fail "history shows $got statements run by $workers workers"; fi
 expect "statements run on one machine show 0 workers" "0" \
@@ -200,11 +219,10 @@ psql_admin -c "CREATE USER nora WITH PASSWORD 'nora-password-1' ROLE none; GRANT
 got="$(psql_as nora nora-password-1 -c "SET distributed_execution = 'on'" \
   -c "SELECT l_returnflag, count(*) FROM lineitem GROUP BY 1 ORDER BY 1" | grep -v '^SET$' | head -1)"
 if [[ "$got" == A\|* ]]; then pass "a granted table runs distributed"; else fail "granted table: $got"; fi
-sleep 2
 # She is no admin: forcing it uses running workers only, as many as the
 # table's size calls for, one here.
-expect "the history shows it ran on one worker" "1" \
-  "SELECT workers FROM igloo.query_history WHERE user_name = 'nora' AND query_text LIKE 'SELECT l_returnflag%' ORDER BY start_time DESC LIMIT 1"
+got="$(workers_of "user_name = 'nora' AND query_text LIKE 'SELECT l_returnflag%'")"
+if [ "$got" = 1 ]; then pass "the history shows it ran on one worker"; else fail "the history shows it ran on [$got] workers, want 1"; fi
 got="$(psql_as nora nora-password-1 -c "SET distributed_execution = 'on'" \
   -c "SELECT count(*) FROM lineitem JOIN orders ON l_orderkey = o_orderkey" || true)"
 if grep -q "permission denied" <<<"$got"; then pass "an ungranted table is refused"; else fail "ungranted table: $got"; fi
@@ -261,8 +279,7 @@ query="SELECT l_returnflag, count(*), sum(l_quantity) FROM clones.lineitem GROUP
 want="$(psql_admin -c "SET distributed_execution = 'off'" -c "$query" | grep -v '^SET$')"
 got="$(psql_admin -c "SET distributed_execution = 'on'" -c "/* clone */ $query" | grep -v '^SET$')"
 if [ -n "$want" ] && [ "$got" = "$want" ]; then pass "a clone returns its source's rows"; else fail "clone: [$got], want [$want]"; fi
-sleep 2
-got="$(psql_admin -c "SELECT workers FROM igloo.query_history WHERE query_text LIKE '/* clone */%' ORDER BY start_time DESC LIMIT 1")"
+got="$(workers_of "query_text LIKE '/* clone */%'")"
 if [ "${got:-0}" -ge 1 ]; then pass "and runs on workers"; else fail "a clone ran on $got workers"; fi
 
 echo "snapshot isolation"
@@ -294,7 +311,7 @@ if [ "$(cat "$work/iso")" = "$want" ]; then
 else
   fail "after a concurrent commit: [$(cat "$work/iso")], want [$want]"
 fi
-sleep 2
+history_settled
 got="$(psql_admin -c "SELECT q.workers, q.end_time > d.end_time FROM igloo.query_history q, igloo.query_history d
   WHERE q.query_text LIKE '/* iso */%' AND d.query_text LIKE 'DELETE FROM iso%' ORDER BY q.start_time DESC LIMIT 1")"
 case "$got" in
@@ -332,8 +349,7 @@ check_distributed() {
   else
     fail "$name: [$got], want [$want]"
   fi
-  sleep 2
-  got="$(psql_admin -c "SELECT workers FROM igloo.query_history WHERE query_text LIKE '$pattern' ORDER BY start_time DESC LIMIT 1")"
+  got="$(workers_of "query_text LIKE '$pattern'")"
   if [ "${got:-0}" -ge 1 ]; then pass "and runs on workers"; else fail "$name ran on $got workers"; fi
 }
 check_distributed "a table with lists, maps and structs" nested "$nested_query"
@@ -460,7 +476,7 @@ check_report() {
     fail "$name results differ"
     diff <(echo "$want") <(echo "$got") | head -6
   fi
-  sleep 2
+  history_settled
   got="$(psql_admin -c "SELECT workers, stages, exchanges FROM igloo.query_history
     WHERE query_text LIKE '/* $tag */%' ORDER BY start_time DESC LIMIT 1")"
   IFS='|' read -r workers stages exchanges <<<"$got"
@@ -614,7 +630,7 @@ fi
 echo "IGLOO_MEMORY_LIMIT=2GB" >>"$env_file"
 compose up -d --no-build --wait igloo >/dev/null
 psql_admin -c "CREATE TABLE written_wide_auto AS $slow_copy" >"$work/written_wide_auto" 2>&1 || true
-ran_on="$(psql_admin -c "SELECT workers FROM igloo.query_history WHERE query_text LIKE 'CREATE TABLE written_wide_auto%' ORDER BY start_time DESC LIMIT 1")"
+ran_on="$(workers_of "query_text LIKE 'CREATE TABLE written_wide_auto%'")"
 if [ "${ran_on:-0}" -gt 0 ] 2>/dev/null; then
   pass "wide rows on a small replica: on $ran_on workers, from the first run"
 else
@@ -694,8 +710,7 @@ query="SELECT l_returnflag, count(*), sum(l_quantity) FROM lineitem GROUP BY 1 O
 want="$(psql_admin -c "SET distributed_execution = 'off'" -c "$query" | grep -v '^SET$')"
 got="$(psql_admin -c "SET distributed_execution = 'on'" -c "/* compacted */ $query" | grep -v '^SET$')"
 if [ "$got" = "$want" ]; then pass "a compacted table returns the same rows"; else fail "compacted: [$got], want [$want]"; fi
-sleep 2
-got="$(psql_admin -c "SELECT workers FROM igloo.query_history WHERE query_text LIKE '/* compacted */%' ORDER BY start_time DESC LIMIT 1")"
+got="$(workers_of "query_text LIKE '/* compacted */%'")"
 if [ "${got:-0}" -ge 1 ]; then pass "and runs on workers"; else fail "a compacted table ran on $got workers"; fi
 # Compaction writes the nested columns' files anew.
 check_distributed "a compacted table with nested columns" nested_compacted "$nested_query"
@@ -714,8 +729,7 @@ echo "policies"
 got="$(psql_admin -c "SET distributed_execution = 'on'" \
   -c "/* masked */ SELECT count(DISTINCT name), min(name), max(name), max(nation) FROM contacts" | grep -v '^SET$')"
 if [ "$got" = "1|***|***|4" ]; then pass "a protected table returns what its policies let through"; else fail "protected table: [$got]"; fi
-sleep 2
-got="$(psql_admin -c "SELECT workers FROM igloo.query_history WHERE query_text LIKE '/* masked */%' ORDER BY start_time DESC LIMIT 1")"
+got="$(workers_of "query_text LIKE '/* masked */%'")"
 if [ "${got:-0}" -ge 1 ]; then pass "and runs on workers"; else fail "a protected table ran on $got workers"; fi
 
 echo "worker endpoint"
