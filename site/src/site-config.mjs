@@ -16,6 +16,19 @@ export const SITE_URL = process.env.SITE_URL || undefined;
 export const NOINDEX_META = { tag: 'meta', attrs: { name: 'robots', content: 'noindex, nofollow' } };
 
 /**
+ * Ownership tags for search engines' webmaster tools, by the origin they
+ * verify. They go on the home page of that origin's public build and must stay
+ * there: a search engine drops the verification once its tag is gone.
+ */
+const VERIFICATION = {
+	'https://igloodb.com': [
+		{ name: 'google-site-verification', content: 'OGmtsWm7IQNNrSZFgnPYNj3DN4fvaNIeLV5RXDmEWZU' },
+	],
+};
+
+export const SITE_VERIFICATION = (SITE_PUBLIC && VERIFICATION[SITE_URL]) || [];
+
+/**
  * A path on the site as the absolute URL that link previews (Open Graph,
  * Twitter cards) need. Without SITE_URL it stays a path, which some previews
  * cannot follow: set SITE_URL when building a site that will be shared.
