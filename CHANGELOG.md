@@ -9,6 +9,13 @@ The release workflow publishes the section whose heading matches the tag
 
 ## [Unreleased]
 
+### Fixed
+
+- `make up` in a shallow clone made at a release's own commit, while that
+  release's image was not published yet, found no release to start: such a
+  clone holds that one tag. A shallow clone now always takes the tags of
+  the repository it came from.
+
 ## [1.0.0-rc.13] - 2026-11-19
 
 ### Changed

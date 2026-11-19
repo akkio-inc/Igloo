@@ -23,10 +23,14 @@ unpublished() {
 
 if [ "$image" = release ]; then
   # The newest release tag this checkout holds whose image is published. A
-  # shallow clone holds no tags, and takes those of the repository it came
-  # from. A release sorts above its own candidates: 1.0.0 above 1.0.0-rc.12.
-  tags="$(git -C "$here" -c versionsort.suffix=- tag --merged HEAD --sort=-v:refname --list 'v[0-9]*' 2>/dev/null |
-    head -n 5)"
+  # shallow clone holds at most the tag of the commit it is at, and takes
+  # those of the repository it came from. A release sorts above its own
+  # candidates: 1.0.0 above 1.0.0-rc.12.
+  tags=
+  if [ "$(git -C "$here" rev-parse --is-shallow-repository 2>/dev/null)" != true ]; then
+    tags="$(git -C "$here" -c versionsort.suffix=- tag --merged HEAD --sort=-v:refname --list 'v[0-9]*' 2>/dev/null |
+      head -n 5)"
+  fi
   if [ -z "$tags" ]; then
     tags="$(git -C "$here" -c versionsort.suffix=- ls-remote --tags --refs --sort=-v:refname origin 'v[0-9]*' 2>/dev/null |
       head -n 5 | sed 's|.*refs/tags/||')"
