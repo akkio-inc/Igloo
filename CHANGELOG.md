@@ -36,6 +36,12 @@ The release workflow publishes the section whose heading matches the tag
   of one account's costliest query shapes through a connection, 30 ran
   where 17 had, and none was refused while another statement held the
   lock, where 13 had been.
+- A Snowflake connection whose tables Snowflake has not finished listing
+  when Igloo starts says which schemas were left and what to do, in
+  `SHOW CONNECTIONS` and the log: `Snowflake had yet to list the tables of 2
+  of the database's 43 schemas (...); name the schemas to attach in the
+  connection's schema option`. It said only `no answer in the time Igloo
+  gives connections at startup`.
 - A cancel request stops a statement on a server without TLS when the
   client asked for TLS first, as psql's Ctrl-C and psycopg's `cancel_safe`
   do with libpq 17 or later and the default `sslmode=prefer`. The request

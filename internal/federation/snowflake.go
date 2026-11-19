@@ -263,8 +263,10 @@ func snowflakeSessionParams(c Connection) map[string]*string {
 type sfBackend interface {
 	// check signs in and makes sure the database and warehouse can be used.
 	check(ctx context.Context) error
-	// loadCatalog reads the database's schemas, tables and columns.
-	loadCatalog(ctx context.Context, warn func(msg string, args ...any)) (*sfCatalog, error)
+	// loadCatalog reads the database's schemas, tables and columns. It
+	// calls listing as it goes, with the schemas it has yet to list and
+	// how many there are.
+	loadCatalog(ctx context.Context, warn func(msg string, args ...any), listing func(left []string, total int)) (*sfCatalog, error)
 	// query runs a SELECT the gateway wrote (see sfClient.query).
 	query(ctx context.Context, q string, timeout time.Duration) (*sfResult, error)
 	close()

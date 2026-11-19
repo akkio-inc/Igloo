@@ -22,7 +22,7 @@ func TestSnowflakeLiveThroughput(t *testing.T) {
 	cl := newSnowflakeClient(c, secrets)
 	defer cl.close()
 	ctx := context.Background()
-	cat, err := cl.loadCatalog(ctx, func(string, ...any) {})
+	cat, err := cl.loadCatalog(ctx, func(string, ...any) {}, func([]string, int) {})
 	if err != nil {
 		t.Fatal(err)
 	}

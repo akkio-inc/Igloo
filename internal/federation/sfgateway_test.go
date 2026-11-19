@@ -46,8 +46,10 @@ func (f *fakeSnowflake) check(context.Context) error {
 	return f.down
 }
 
-func (f *fakeSnowflake) loadCatalog(ctx context.Context, _ func(string, ...any)) (*sfCatalog, error) {
+func (f *fakeSnowflake) loadCatalog(ctx context.Context, _ func(string, ...any), listing func([]string, int)) (*sfCatalog, error) {
 	if f.slow {
+		// One schema of three takes Snowflake too long to list.
+		listing([]string{"RAW"}, 3)
 		<-ctx.Done()
 		return nil, ctx.Err()
 	}
@@ -595,7 +597,9 @@ func TestSnowflakeSlow(t *testing.T) {
 		t.Fatal("attached")
 	}
 	st, err := m.List(context.Background())
-	if err != nil || len(st) != 1 || st[0].State != "failed" || !strings.Contains(st[0].Detail, "no answer") {
+	// The reason says which schemas were not listed in time, and what to do.
+	if err != nil || len(st) != 1 || st[0].State != "failed" || !strings.Contains(st[0].Detail, "no answer") ||
+		!strings.Contains(st[0].Detail, "1 of the database's 3 schemas (RAW); name the schemas to attach in the connection's schema option") {
 		t.Errorf("%+v %v", st, err)
 	}
 	expect(t, eng, "SELECT 42", "42")

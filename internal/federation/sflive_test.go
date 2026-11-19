@@ -112,7 +112,7 @@ func TestSnowflakeLiveCatalog(t *testing.T) {
 	cl := newSnowflakeClient(c, secrets)
 	defer cl.close()
 	started := time.Now()
-	cat, err := cl.loadCatalog(context.Background(), func(string, ...any) {})
+	cat, err := cl.loadCatalog(context.Background(), func(string, ...any) {}, func([]string, int) {})
 	if err != nil {
 		t.Fatal(err)
 	}
