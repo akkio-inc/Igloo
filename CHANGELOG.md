@@ -15,6 +15,17 @@ The release workflow publishes the section whose heading matches the tag
   release's image was not published yet, found no release to start: such a
   clone holds that one tag. A shallow clone now always takes the tags of
   the repository it came from.
+- A statement stops reading Snowflake's tables through a connection when it
+  is canceled, by its `statement_timeout`, a cancel request or the memory
+  watch, and Snowflake stops working on its queries. With a 15 s timeout, a
+  read of a table of 36 million rows ended 181 s after the timeout, once
+  Snowflake had delivered every row, and its client's connection was closed
+  at 45 s; it ends at 15.0 s, as a `UNION ALL` and a join of two such
+  tables do, and a cancel request stops one at once. The same statement run
+  by two sessions at once stopped at its timeout for the one that had one
+  and finished for the other. DuckDB's postgres extension, which reads
+  these tables, does not look for a cancel while it waits for a table's
+  rows, so Igloo now ends the statement's reads itself.
 
 ## [1.0.0-rc.13] - 2026-11-19
 

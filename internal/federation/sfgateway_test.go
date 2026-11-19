@@ -5,6 +5,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"log/slog"
 	"net"
 	"regexp"
 	"strings"
@@ -16,6 +18,7 @@ import (
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/apache/arrow-go/v18/arrow/memory"
+	"github.com/duckdb/duckdb-go/v2"
 )
 
 // fakeSnowflake stands in for Snowflake behind a gateway: it serves a
@@ -33,6 +36,9 @@ type fakeSnowflake struct {
 	slow bool
 	// answer returns a query's result batches.
 	answer func(ctx context.Context, q string) ([][]arrow.Record, error)
+	// batches, when set, answers in place of answer, with batches that
+	// download as the test has them.
+	batches func(ctx context.Context, q string) ([]sfBatch, error)
 
 	mu      sync.Mutex
 	queries []string
@@ -65,11 +71,16 @@ func (f *fakeSnowflake) query(ctx context.Context, q string, timeout time.Durati
 		ctx, cancel = context.WithTimeout(ctx, timeout)
 		defer cancel()
 	}
+	res := &sfResult{queryID: "fake"}
+	if f.batches != nil {
+		var err error
+		res.batches, err = f.batches(ctx, q)
+		return res, err
+	}
 	batches, err := f.answer(ctx, q)
 	if err != nil {
 		return nil, err
 	}
-	res := &sfResult{queryID: "fake"}
 	for _, b := range batches {
 		res.batches = append(res.batches, fakeBatch(b))
 	}
@@ -447,6 +458,221 @@ func TestSnowflakeScansOfOneStatement(t *testing.T) {
 	expect(t, eng, "SELECT count(*), count(id) FROM sf.tpch.t1", "2|1")
 	if q := fake.sent(); len(q) != 5 {
 		t.Errorf("a scan sent Snowflake %d queries, want 1: %q", len(q)-4, q[4:])
+	}
+}
+
+// waitingBatch is a batch whose download waits, as one Snowflake is slow to
+// deliver does.
+type waitingBatch struct {
+	rec  arrow.Record
+	wait func(context.Context) error
+}
+
+func (b waitingBatch) fetch(ctx context.Context) ([]arrow.Record, error) {
+	if err := b.wait(ctx); err != nil {
+		return nil, err
+	}
+	b.rec.Retain()
+	return []arrow.Record{b.rec}, nil
+}
+
+// TestSnowflakeScansEndWithTheirStatement checks that the scans of a
+// canceled statement end with it, and no other's. DuckDB's postgres
+// extension looks for no interrupt while it waits for a scan's rows, and
+// reads the rest of every scan before its connection takes another command:
+// with a timeout of 60 s, statements through a Snowflake connection ended up
+// to 161 s after it, their DuckDB connections busy and Snowflake still at
+// work. A linked DuckDB connection (Manager.LinkScans) has its scans ended
+// when its statement's context ends, while the same scans, of the same
+// table at the same time, go on for other connections, linked or not.
+func TestSnowflakeScansEndWithTheirStatement(t *testing.T) {
+	installExtensions(t)
+	cols := t1Columns(t)
+	const (
+		one = "SELECT count(id) FROM sf.tpch.t1 WHERE amt < 0"
+		two = "SELECT count(*) FROM (SELECT id FROM sf.tpch.t1 WHERE amt < 0 UNION ALL SELECT id FROM sf.tpch.t1 WHERE f > 1)"
+	)
+	for _, tc := range []struct {
+		name string
+		// streams says Snowflake answers at once and delivers the result
+		// slowly; otherwise it never answers.
+		streams bool
+		sql     string
+		scans   int32
+		want    string
+	}{
+		{"one scan Snowflake never answers", false, one, 1, "1"},
+		{"two scans Snowflake never answers", false, two, 2, "4"},
+		{"one scan Snowflake delivers slowly", true, one, 1, "4"},
+		{"two scans Snowflake delivers slowly", true, two, 2, "16"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fake := &fakeSnowflake{cat: testCatalog(t)}
+			// started counts the scans that reached Snowflake, and ended
+			// those whose context ended while they waited for it.
+			var started, ended atomic.Int32
+			release := make(chan struct{})
+			fake.batches = func(ctx context.Context, q string) ([]sfBatch, error) {
+				started.Add(1)
+				var once sync.Once
+				wait := func(ctx context.Context) error {
+					select {
+					case <-release:
+						return nil
+					case <-ctx.Done():
+						once.Do(func() { ended.Add(1) })
+						return context.Cause(ctx)
+					}
+				}
+				rec := recordFor(t, cols, q, 2)
+				if !tc.streams {
+					if err := wait(ctx); err != nil {
+						return nil, err
+					}
+					return []sfBatch{fakeBatch{rec}}, nil
+				}
+				out := []sfBatch{fakeBatch{rec}}
+				for range 3 {
+					out = append(out, waitingBatch{rec, wait})
+				}
+				return out, nil
+			}
+			open := openSnowflake
+			openSnowflake = func(Connection, string) sfBackend { return fake }
+			t.Cleanup(func() { openSnowflake = open })
+			store := NewMemoryStore()
+			c := New("sf", Snowflake)
+			c.Account, c.User, c.Database, c.Password = "myorg-acct", "u", "db", "pw"
+			c.QueryTimeout = time.Minute
+			if err := store.Create(context.Background(), c); err != nil {
+				t.Fatal(err)
+			}
+			m, eng := startEngine(t, store)
+			connect := func(link bool) *duckdb.Conn {
+				conn, err := eng.Connect(context.Background())
+				if err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(func() { _ = conn.Close() })
+				if link {
+					unlink, err := m.LinkScans(context.Background(), conn)
+					if err != nil {
+						t.Fatal(err)
+					}
+					t.Cleanup(unlink)
+				}
+				return conn
+			}
+			type answer struct {
+				got string
+				err error
+			}
+			run := func(ctx context.Context, conn *duckdb.Conn) chan answer {
+				done := make(chan answer, 1)
+				go func() {
+					got, err := queryOn(ctx, conn, tc.sql)
+					done <- answer{got, err}
+				}()
+				return done
+			}
+			reached := func(n int32) {
+				t.Helper()
+				for deadline := time.Now().Add(10 * time.Second); started.Load() < n && time.Now().Before(deadline); {
+					time.Sleep(5 * time.Millisecond)
+				}
+				if got := started.Load(); got != n {
+					t.Fatalf("%d scans reached Snowflake, want %d", got, n)
+				}
+			}
+
+			// The same statement for two other connections, one linked and
+			// one not, then for the one that is canceled.
+			others := []chan answer{run(context.Background(), connect(true)), run(context.Background(), connect(false))}
+			reached(2 * tc.scans)
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			canceled := run(ctx, connect(true))
+			reached(3 * tc.scans)
+			time.Sleep(300 * time.Millisecond)
+			cancel()
+			at := time.Now()
+			select {
+			case a := <-canceled:
+				if a.err == nil {
+					t.Errorf("the canceled statement returned %q", a.got)
+				}
+				if d := time.Since(at); d > 5*time.Second {
+					t.Errorf("the canceled statement returned %s after its cancel", d)
+				}
+			case <-time.After(20 * time.Second):
+				t.Error("the canceled statement had not returned 20 s after its cancel")
+			}
+			// Its scans ended at Snowflake, and only its.
+			time.Sleep(200 * time.Millisecond)
+			if n := ended.Load(); n != tc.scans {
+				t.Errorf("%d scans ended at Snowflake, want the canceled statement's %d", n, tc.scans)
+			}
+			close(release)
+			for _, other := range others {
+				select {
+				case a := <-other:
+					if a.err != nil || a.got != tc.want {
+						t.Errorf("another connection's statement: got %q, %v; want %q", a.got, a.err, tc.want)
+					}
+				case <-time.After(20 * time.Second):
+					t.Fatal("another connection's statement did not return")
+				}
+			}
+			// The canceled connection runs its next statement, whose scans
+			// nothing ends.
+			if got, err := queryOn(context.Background(), connect(true), tc.sql); err != nil || got != tc.want {
+				t.Errorf("a statement after the canceled one: got %q, %v; want %q", got, err, tc.want)
+			}
+		})
+	}
+}
+
+// TestScanTags checks the tags LinkScans hands out: each a pg_pages_per_task
+// that gives the gateway's tables two tasks at a time, none handed out twice
+// at once, and a connection left unlinked when none is free or no Snowflake
+// connection is attached.
+func TestScanTags(t *testing.T) {
+	m := NewManager(NewMemoryStore(), Options{}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if tag := m.takeScanTag(); tag != 0 {
+		t.Errorf("tag %d with no Snowflake connection attached", tag)
+	}
+	m.attached["sf"] = &attachment{ep: &sfGateway{}}
+	seen := map[int]bool{}
+	for range scanTagMax - scanTagMin + 1 {
+		tag := m.takeScanTag()
+		if tag < scanTagMin || tag > scanTagMax || seen[tag] || scanPages/tag != 2 || tag >= 1000 {
+			t.Fatalf("tag %d: taken before %v, or not one that gives %d pages two tasks, or the extension's default", tag, seen[tag], scanPages)
+		}
+		seen[tag] = true
+	}
+	if tag := m.takeScanTag(); tag != 0 {
+		t.Errorf("tag %d with every tag taken", tag)
+	}
+	m.tagsFree = append(m.tagsFree, 700, 800)
+	if a, b, c := m.takeScanTag(), m.takeScanTag(), m.takeScanTag(); a != 700 || b != 800 || c != 0 {
+		t.Errorf("tags %d, %d, %d after 700 and 800 were given back, want them and then none", a, b, c)
+	}
+
+	// The tag of a scan is where its first task's pages end.
+	for st, want := range map[string]int{
+		`COPY (SELECT "ID" FROM "TPCH"."T1" WHERE ctid BETWEEN '(0,0)'::tid AND '(700,0)'::tid) TO STDOUT (FORMAT "binary");`:        700,
+		`COPY (SELECT "ID" FROM "TPCH"."T1" WHERE ctid BETWEEN '(700,0)'::tid AND '(1400,0)'::tid) TO STDOUT (FORMAT "binary");`:     0,
+		`COPY (SELECT "ID" FROM "TPCH"."T1" WHERE ctid BETWEEN '(0,0)'::tid AND '(1000,0)'::tid) TO STDOUT (FORMAT "binary");`:       0,
+		`COPY (SELECT "ID" FROM "TPCH"."T1" WHERE ctid BETWEEN '(0,0)'::tid AND '(4294967295,0)'::tid) TO STDOUT (FORMAT "binary");`: 0,
+		`COPY (SELECT "ID" FROM "TPCH"."T1" LIMIT 5) TO STDOUT (FORMAT "binary");`:                                                   0,
+	} {
+		q, err := parseScan(st)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := q.scanTag(); got != want {
+			t.Errorf("tag %d of %s, want %d", got, st, want)
+		}
 	}
 }
 

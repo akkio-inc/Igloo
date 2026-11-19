@@ -144,7 +144,12 @@ func query(t *testing.T, eng *engine.Engine, sql string) (string, error) {
 		t.Fatal(err)
 	}
 	defer conn.Close() //nolint:errcheck
-	rows, err := conn.QueryContext(context.Background(), sql, nil)
+	return queryOn(context.Background(), conn, sql)
+}
+
+// queryOn runs sql on conn under ctx and returns its rows, one a line.
+func queryOn(ctx context.Context, conn *duckdb.Conn, sql string) (string, error) {
+	rows, err := conn.QueryContext(ctx, sql, nil)
 	if err != nil {
 		return "", err
 	}

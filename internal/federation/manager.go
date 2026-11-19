@@ -88,6 +88,12 @@ type Manager struct {
 	// started is set once Attach ran: connections created after that wait
 	// for a restart.
 	started bool
+	// tagsTaken counts the scan tags handed out for the first time, and
+	// tagsFree are those given back, oldest first (see LinkScans).
+	tagsTaken int
+	tagsFree  []int
+	// tagsOut logs, once, that a connection found no tag left.
+	tagsOut sync.Once
 }
 
 // attachment is a connection DuckDB attached.
@@ -138,6 +144,92 @@ func NewManager(store Store, opts Options, log *slog.Logger) *Manager {
 		m.SetConnect(opts.Connect)
 	}
 	return m
+}
+
+// LinkScans has the scans that conn's statements read through Snowflake
+// connections end when Igloo stops conn's query: when the context a
+// statement runs under ends (its statement timeout, a cancel request, the
+// memory watch), and by Conn.Interrupt. DuckDB's postgres extension, which
+// reads them, looks for no interrupt while it waits for a scan's rows, and
+// reads the rest of every scan before its connection to the gateway takes
+// another command: a canceled statement went on until Snowflake had
+// answered each of its scans in full, its DuckDB connection busy and
+// Snowflake's warehouse at work for nobody.
+//
+// conn gets a tag of its own, which the extension writes into the scans it
+// starts for conn's statements (see scanTagMin), and an interrupt hook that
+// ends the scans with that tag, whoever else reads the same table at the
+// time. unlink gives the tag back, once conn runs nothing more.
+//
+// A connection is not linked when no Snowflake connection is attached, or
+// when every tag is taken (scanTagMax-scanTagMin+1 connections at once):
+// its statements stop as they did, when Snowflake has answered. A scan the
+// extension reads in one task has no tag either: one whose LIMIT DuckDB
+// gave it.
+func (m *Manager) LinkScans(ctx context.Context, conn *duckdb.Conn) (unlink func(), err error) {
+	tag := m.takeScanTag()
+	if tag == 0 {
+		return func() {}, nil
+	}
+	unlink = sync.OnceFunc(func() {
+		m.mu.Lock()
+		m.tagsFree = append(m.tagsFree, tag)
+		m.mu.Unlock()
+	})
+	if err := exec(ctx, conn, fmt.Sprintf("SET pg_pages_per_task = %d", tag)); err != nil {
+		unlink()
+		return nil, fmt.Errorf("link the connection's scans: %w", err)
+	}
+	conn.SetInterruptHook(func() { m.cancelScans(tag) })
+	return unlink, nil
+}
+
+// takeScanTag returns a tag no DuckDB connection has, or 0 when there is
+// none or no Snowflake connection is attached. A tag given back is used
+// again only after those never used and those given back before it.
+func (m *Manager) takeScanTag() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if len(m.gatewaysLocked()) == 0 {
+		return 0
+	}
+	if tag := scanTagMin + m.tagsTaken; tag <= scanTagMax {
+		m.tagsTaken++
+		return tag
+	}
+	if len(m.tagsFree) == 0 {
+		m.tagsOut.Do(func() {
+			m.log.Warn("no scan tag is free for a new session: if one of its statements is canceled, what it reads "+
+				"through Snowflake connections ends only when Snowflake has answered", "tags", scanTagMax-scanTagMin+1)
+		})
+		return 0
+	}
+	tag := m.tagsFree[0]
+	m.tagsFree = m.tagsFree[1:]
+	return tag
+}
+
+// gatewaysLocked returns the gateways of the Snowflake connections
+// attached. m.mu is held.
+func (m *Manager) gatewaysLocked() []*sfGateway {
+	var out []*sfGateway
+	for _, a := range m.attached {
+		if g, ok := a.ep.(*sfGateway); ok {
+			out = append(out, g)
+		}
+	}
+	return out
+}
+
+// cancelScans ends the scans running for the DuckDB connection with that
+// tag (see LinkScans).
+func (m *Manager) cancelScans(tag int) {
+	m.mu.Lock()
+	gateways := m.gatewaysLocked()
+	m.mu.Unlock()
+	for _, g := range gateways {
+		g.cancelScans(tag)
+	}
 }
 
 // SetConnect gives the manager a way to open DuckDB connections once the
