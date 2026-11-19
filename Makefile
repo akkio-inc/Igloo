@@ -9,7 +9,7 @@ VERSION  ?= dev
 # benchmark's tests run on.
 PYTHON_IMAGE := python:3.12-slim
 
-.PHONY: help test lint migrate-test bench-test e2e e2e-distributed bi-e2e engines-e2e sharing-e2e helm-e2e build env up down reset logs psql load-tpch tpch site site-dev
+.PHONY: help test lint migrate-test bench-test e2e e2e-distributed bi-e2e engines-e2e sharing-e2e helm-e2e build env up dev down reset logs psql load-tpch tpch site site-dev
 
 help: ## List targets
 	@grep -E '^[a-z0-9-]+:.*## ' $(MAKEFILE_LIST) | awk -F ':.*## ' '{printf "  %-10s %s\n", $$1, $$2}'
@@ -54,7 +54,12 @@ build: ## Build the igloo:dev image (VERSION=1.2.3 to stamp a version)
 env: ## Create deploy/single-vm/.env with random secrets
 	deploy/single-vm/init-env.sh
 
-up: env ## Start the single-machine stack
+up: env ## Start the single-machine stack on the released image (IMAGE=... for another)
+	deploy/single-vm/use-image.sh $(or $(IMAGE),release)
+	$(COMPOSE) up -d --no-build --wait
+
+dev: env ## Build Igloo from this checkout and start the stack on it
+	deploy/single-vm/use-image.sh igloo:dev
 	$(COMPOSE) up -d --build --wait
 
 down: ## Stop the stack, keeping data

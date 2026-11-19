@@ -70,9 +70,12 @@ Licensed under [Apache 2.0](LICENSE).
 Requires Docker with Compose v2.20 or later.
 
 ```sh
-make up      # generates deploy/single-vm/.env with random secrets and starts the stack
+make up      # starts the latest release, with random secrets in deploy/single-vm/.env
 make psql    # SQL shell as the admin user
 ```
+
+The first `make up` downloads the release's images, about 2 GB on disk, and
+takes about two minutes on a fast connection.
 
 ```sql
 CREATE TABLE events (id INTEGER, kind VARCHAR, at_time TIMESTAMP);
