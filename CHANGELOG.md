@@ -26,6 +26,16 @@ The release workflow publishes the section whose heading matches the tag
 
 ### Fixed
 
+- A statement that reads two or more tables through one Snowflake
+  connection, such as a join of two Snowflake tables, reads them as it
+  runs. Each table was downloaded whole, one after the other, before the
+  statement started: for as long as that took, neither the statement's
+  timeout nor a cancel request stopped it, the tables waited in memory, and
+  new sessions waited for the catalog lock the statement held
+  (`cannot open a session: waited 30s for the catalog lock`). Replaying 40
+  of one account's costliest query shapes through a connection, 30 ran
+  where 17 had, and none was refused while another statement held the
+  lock, where 13 had been.
 - A cancel request stops a statement on a server without TLS when the
   client asked for TLS first, as psql's Ctrl-C and psycopg's `cancel_safe`
   do with libpq 17 or later and the default `sslmode=prefer`. The request

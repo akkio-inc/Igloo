@@ -370,6 +370,84 @@ func TestSnowflakeGateway(t *testing.T) {
 	}
 }
 
+// TestSnowflakeScansOfOneStatement checks that a statement that reads a
+// connection more than once reads its tables as it runs. The postgres
+// extension downloads every table of such a statement whole, one after the
+// other, before the statement starts, unless the tables have the pages to
+// scan in parallel (see scanPages): a join of two Snowflake tables held both
+// in memory, and for as long as the downloads took neither its timeout nor a
+// cancel request stopped it, and logins waited for the catalog lock it held.
+func TestSnowflakeScansOfOneStatement(t *testing.T) {
+	installExtensions(t)
+	cols := t1Columns(t)
+	fake := &fakeSnowflake{cat: testCatalog(t)}
+	var running, most atomic.Int32
+	release := make(chan struct{})
+	fake.answer = func(ctx context.Context, q string) ([][]arrow.Record, error) {
+		n := running.Add(1)
+		defer running.Add(-1)
+		for m := most.Load(); n > m && !most.CompareAndSwap(m, n); m = most.Load() {
+		}
+		select {
+		case <-release:
+		case <-ctx.Done():
+			return nil, context.Cause(ctx)
+		}
+		if strings.HasPrefix(q, "SELECT COUNT(*)") {
+			return [][]arrow.Record{{countRecord(2)}}, nil
+		}
+		return [][]arrow.Record{{recordFor(t, cols, q, 2)}}, nil
+	}
+	open := openSnowflake
+	openSnowflake = func(Connection, string) sfBackend { return fake }
+	t.Cleanup(func() { openSnowflake = open })
+	store := NewMemoryStore()
+	c := New("sf", Snowflake)
+	c.Account, c.User, c.Database, c.Password = "myorg-acct", "u", "db", "pw"
+	c.QueryTimeout = time.Minute
+	if err := store.Create(context.Background(), c); err != nil {
+		t.Fatal(err)
+	}
+	_, eng := startEngine(t, store)
+
+	// Both scans of a statement reach Snowflake while it runs: here at the
+	// same time, as the halves of a UNION ALL run together.
+	const union = "SELECT count(*) FROM (SELECT id FROM sf.tpch.t1 WHERE amt < 0 UNION ALL SELECT id FROM sf.tpch.t1 WHERE f > 1)"
+	const join = "SELECT count(*) FROM sf.tpch.t1 a JOIN sf.tpch.t1 b ON a.id = b.id WHERE a.amt < 0 AND b.f > 1"
+	type answer struct {
+		got string
+		err error
+	}
+	done := make(chan answer, 1)
+	go func() {
+		got, err := query(t, eng, union)
+		done <- answer{got, err}
+	}()
+	for deadline := time.Now().Add(5 * time.Second); most.Load() < 2 && time.Now().Before(deadline); {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if n := most.Load(); n != 2 {
+		t.Errorf("Snowflake ran %d of the statement's 2 scans at once", n)
+	}
+	close(release)
+	if a := <-done; a.err != nil || a.got != "4" {
+		t.Errorf("%s: got %q, %v; want 4", union, a.got, a.err)
+	}
+	// One query a scan: the second task of a scan asks Snowflake nothing.
+	if q := fake.sent(); len(q) != 2 {
+		t.Errorf("the statement sent Snowflake %d queries, want 2: %q", len(q), q)
+	}
+	expect(t, eng, join, "1")
+	if q := fake.sent(); len(q) != 4 {
+		t.Errorf("the join sent Snowflake %d queries, want 2: %q", len(q)-2, q[2:])
+	}
+	// A scan alone still reads its table once.
+	expect(t, eng, "SELECT count(*), count(id) FROM sf.tpch.t1", "2|1")
+	if q := fake.sent(); len(q) != 5 {
+		t.Errorf("a scan sent Snowflake %d queries, want 1: %q", len(q)-4, q[4:])
+	}
+}
+
 // countingBatch is a batch of one record that counts its downloads.
 type countingBatch struct {
 	rec arrow.Record
