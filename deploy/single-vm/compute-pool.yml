@@ -35,6 +35,7 @@ services:
       - ${IGLOO_REPORTING_SPILL_DIR:-igloo-reporting-spill}:/var/lib/igloo/tmp
       - igloo-reporting-cache:/var/lib/igloo/cache
       - ./tls:/tls:ro
+      - ./secrets:/secrets:ro
     depends_on:
       igloo:
         condition: service_healthy

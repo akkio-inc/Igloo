@@ -7,9 +7,16 @@
 # Build output
 /bin/
 
+# The migration report's Python environment (docs/migrating.md)
+/.venv/
+
 # TLS material for the single-machine stack
 deploy/single-vm/tls/*
 !deploy/single-vm/tls/README
+
+# Connections' key and password files for the single-machine stack
+deploy/single-vm/secrets/*
+!deploy/single-vm/secrets/README
 
 # OpenTofu working state (never commit state: it contains secrets)
 .terraform/

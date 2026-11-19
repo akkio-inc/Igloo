@@ -58,6 +58,10 @@ class MapperTest(unittest.TestCase):
         self.assertEqual(self.mapper("SHOP.STAGE.*=lake.marts.*").namespace("SHOP", "STAGE"), "lake.marts")
         self.assertIsNone(self.mapper().namespace("SHOP", "NOPE"))
         self.assertIsNone(self.mapper().namespace(None, None))
+        # A rule for a whole database names schemas Igloo may not have.
+        whole = self.mapper("SHOP.*.*=lake.*.*")
+        self.assertEqual(whole.namespace("SHOP", "SALES"), "lake.sales")
+        self.assertIsNone(whole.namespace("SHOP", "NOT_ATTACHED"))
 
 
 class CoverageTest(unittest.TestCase):

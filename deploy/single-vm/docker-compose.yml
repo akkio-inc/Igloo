@@ -57,6 +57,7 @@ services:
       IGLOO_S3_ACCESS_KEY_ID: ${S3_ACCESS_KEY_ID:-}
       IGLOO_S3_SECRET_ACCESS_KEY: ${S3_SECRET_ACCESS_KEY:-}
       IGLOO_S3_STS_ROLE_ARN: ${S3_STS_ROLE_ARN:-}
+      IGLOO_CONNECTION_SECRETS_DIR: /secrets
       IGLOO_TLS_CERT_FILE: ${IGLOO_TLS_CERT_FILE:-}
       IGLOO_TLS_KEY_FILE: ${IGLOO_TLS_KEY_FILE:-}
       IGLOO_LOG_FORMAT: ${IGLOO_LOG_FORMAT:-text}
@@ -140,6 +141,8 @@ services:
       # restarts (docs/operations.md#read-cache).
       - igloo-cache:/var/lib/igloo/cache
       - ./tls:/tls:ro
+      # Key and password files that connections name (docs/federation.md).
+      - ./secrets:/secrets:ro
     depends_on:
       postgres:
         condition: service_healthy

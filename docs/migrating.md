@@ -8,21 +8,110 @@ same queries on Igloo against Igloo's copies of the tables, re-runs a small
 sample on the source to compare results, and writes a report.
 
 ```sh
-pip install -r migrate/requirements.txt
+python3 -m venv .venv                 # Python 3.11 or later
+.venv/bin/pip install -r migrate/requirements.txt
 export SNOWFLAKE_ACCOUNT=myorg-myaccount SNOWFLAKE_USER=IGLOO_MIGRATE \
   SNOWFLAKE_PRIVATE_KEY_FILE=~/.snowflake/igloo_migrate.p8 \
   SNOWFLAKE_ROLE=IGLOO_MIGRATE SNOWFLAKE_WAREHOUSE=IGLOO_MIGRATE_WH
 export IGLOO_PASSWORD=...
-python -m migrate report --source snowflake --since 30d \
+.venv/bin/python -m migrate report --source snowflake --since 30d \
   --igloo 'host=igloo.example.com port=5432 user=migrate dbname=igloo sslmode=require' \
   --map 'PROD.ANALYTICS.*=lake.analytics.*' \
   --out ~/igloo-migration
 ```
 
-Then open `~/igloo-migration/report.html`. Run it from the repository's root,
-with Python 3.12. It reads both sides and writes to neither
+Then open `~/igloo-migration/report.html`. Run it from the repository's root.
+It reads both sides and writes to neither
 (see [what it runs](#what-it-runs)), and keeps query text out of the report
 unless asked (see [privacy](#privacy)).
+
+## Your first report
+
+From the [quick start](../README.md#quick-start) to a report on your own
+Snowflake queries, with no data copied: Igloo reads the tables in Snowflake
+through a [connection](federation.md#snowflake), so you see which of your
+queries run on Igloo, and that their results match, before you move
+anything.
+
+1. **Give the tool a Snowflake user** with a key pair and the
+   [grants below](#grants) (a [key pair](federation.md#key-pairs) takes two
+   `openssl` commands).
+
+2. **Connect Igloo to the database.** Put the private key where the stack
+   reads connections' keys, and create the connection as the admin
+   (`make psql`):
+
+   ```sh
+   cp ~/.snowflake/igloo_migrate.p8 deploy/single-vm/secrets/
+   chmod 644 deploy/single-vm/secrets/igloo_migrate.p8
+   ```
+
+   ```sql
+   CREATE CONNECTION wh TYPE snowflake WITH (
+     account 'myorg-myaccount', user 'IGLOO_MIGRATE', private_key_secret 'igloo_migrate.p8',
+     warehouse 'IGLOO_MIGRATE_WH', role 'IGLOO_MIGRATE', database 'PROD',
+     schema 'ANALYTICS, MARTS');
+   ```
+
+   Name the schemas your queries read in `schema`: Igloo lists the tables
+   and columns of every schema it attaches when it starts, and Snowflake
+   takes minutes to list a schema of tens of thousands of columns. A
+   connection is attached when Igloo starts, so restart it; the tables are
+   then in the catalog `wh` (`SHOW CONNECTIONS` says why if they are not):
+
+   ```sh
+   docker compose --project-directory deploy/single-vm restart igloo
+   ```
+
+   ```sql
+   SELECT table_schema, count(*) FROM information_schema.tables
+   WHERE table_catalog = 'wh' GROUP BY ALL;
+   ```
+
+3. **Run the report** on a few days of history and its 40 costliest
+   queries, from the repository's root, with the quick start's address and
+   admin password:
+
+   ```sh
+   python3 -m venv .venv                 # Python 3.11 or later
+   .venv/bin/pip install -r migrate/requirements.txt
+   export SNOWFLAKE_ACCOUNT=myorg-myaccount SNOWFLAKE_USER=IGLOO_MIGRATE \
+     SNOWFLAKE_PRIVATE_KEY_FILE=~/.snowflake/igloo_migrate.p8 \
+     SNOWFLAKE_ROLE=IGLOO_MIGRATE SNOWFLAKE_WAREHOUSE=IGLOO_MIGRATE_WH
+   export IGLOO_PASSWORD="$(grep '^IGLOO_ADMIN_PASSWORD=' deploy/single-vm/.env | cut -d= -f2-)"
+   .venv/bin/python -m migrate report --source snowflake --since 3d \
+     --igloo 'host=127.0.0.1 port=5433 user=igloo dbname=igloo' \
+     --map 'PROD.*.*=wh.*.*' --statement-types SELECT --sample 40 --compare 5 \
+     --timeout 60 --out ~/igloo-migration
+   ```
+
+   On a laptop, with an X-Small warehouse for the tool, this took 18
+   minutes on three days of one account's history, 13,905 executions in
+   3,171 shapes: 25 seconds of warehouse time to read the history, the rest
+   to replay 40 shapes through the connection and re-run 5 on Snowflake,
+   for an estimated 0.045 credits.
+
+4. **Copy the tables that matter, and run it again.** Through the
+   connection, every replayed query reads its tables from Snowflake over
+   the network, on the connection's warehouse. The report's tables section
+   lists the tables the workload reads most; copy those into Igloo and map
+   them first (the first `--map` rule that matches a table wins). The
+   history saved by the first run is reused:
+
+   ```sql
+   CREATE SCHEMA analytics;
+   CREATE TABLE analytics.orders AS SELECT * FROM wh.analytics.orders;
+   ```
+
+   ```sh
+   .venv/bin/python -m migrate report --source snowflake --from-extract ~/igloo-migration \
+     --igloo 'host=127.0.0.1 port=5433 user=igloo dbname=igloo' \
+     --map 'PROD.ANALYTICS.ORDERS=lake.analytics.orders' --map 'PROD.*.*=wh.*.*' \
+     --statement-types SELECT --sample 40 --compare 5 --timeout 60 --out ~/igloo-migration-2
+   ```
+
+The rest of this page is the reference: what the tool reads and runs on each
+side, the grants it needs, and how to read the report.
 
 ## What it does
 
@@ -259,8 +348,9 @@ schema (`--scratch-schema`, `igloo_migrate_scratch`), and each `CTAS` to a
 new table there. The tool checks, from the rewritten statement, that its
 only target is in the scratch schema before running it, and drops the
 scratch table afterwards unless `--keep-scratch` is given. `DDL` and
-`other` statements (`SHOW`, `GRANT`, `CALL`, `COPY`, session settings) are
-never replayed.
+`other` statements (`SHOW`, `GRANT`, `CALL`, `COPY`, session settings, and
+queries that only call Snowflake's system functions, such as
+`SELECT SYSTEM$CANCEL_ALL_QUERIES(...)`) are never replayed.
 
 ## Privacy
 

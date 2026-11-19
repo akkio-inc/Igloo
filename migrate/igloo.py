@@ -128,6 +128,21 @@ class Igloo:
             conn.execute(f"SET sql_dialect = '{dialect}'")
         return conn
 
+    def check(self) -> str:
+        """Igloo's version; exits saying why if Igloo cannot be reached."""
+        import psycopg
+
+        try:
+            return self.conn().execute("SELECT version()").fetchone()[0]
+        except psycopg.Error as e:
+            # libpq's message: the first line is "connection failed: ...".
+            why = " ".join(str(e).split())
+            hint = "Check the host and port in --igloo; the quick start listens on 127.0.0.1, port 5433."
+            if re.search(r"password|authentication", why, re.I):
+                hint = ("The password comes from IGLOO_PASSWORD (or PGPASSWORD); the quick start's is "
+                        "IGLOO_ADMIN_PASSWORD in deploy/single-vm/.env, for the user igloo.")
+            raise SystemExit(f"cannot connect to Igloo (--igloo): {why}\n{hint}") from None
+
     def conn(self, dialect: str | None = None):
         c = self.conns.get(dialect)
         if c is None or c.closed or c.broken:

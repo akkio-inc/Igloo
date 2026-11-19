@@ -102,6 +102,10 @@ def classify(source_type: str | None, sql: str, dialect: str, tree: exp.Expressi
     """One of CLASSES, from the source's statement type where it is
     unambiguous and otherwise from the text."""
     st = (source_type or "").upper().replace(" ", "_")
+    if "SYSTEM$" in sql.upper():
+        tree = tree if tree is not None else try_parse(sql, dialect)
+        if tree is not None and _operates_source(tree):
+            return "other"
     if st in SOURCE_TYPES:
         return SOURCE_TYPES[st]
     if st.startswith(("CREATE_", "ALTER_", "DROP_", "RENAME_")):
@@ -129,6 +133,21 @@ def classify(source_type: str | None, sql: str, dialect: str, tree: exp.Expressi
 
 def _strip_leading_comments(sql: str) -> str:
     return re.sub(r"^(\s|--[^\n]*|//[^\n]*|/\*.*?\*/)+", "", sql, flags=re.S)
+
+
+def _operates_source(tree: exp.Expression) -> bool:
+    """Whether the statement is a call that operates the source, written as
+    a query: it reads nothing and selects only Snowflake's system functions,
+    as SELECT SYSTEM$CANCEL_ALL_QUERIES(123) does. Such calls are no part of
+    the workload to move, as SHOW, CALL and session settings are not."""
+    if not isinstance(tree, exp.Select) or tree.find(exp.From, exp.Table, exp.Subquery) is not None:
+        return False
+
+    def system(e: exp.Expression) -> bool:
+        e = e.unalias()
+        name = e.name if isinstance(e, exp.Anonymous) else (e.sql_name() if isinstance(e, exp.Func) else "")
+        return name.upper().startswith("SYSTEM$")
+    return bool(tree.expressions) and all(system(e) for e in tree.expressions)
 
 
 def _class_of_tree(tree: exp.Expression) -> str:

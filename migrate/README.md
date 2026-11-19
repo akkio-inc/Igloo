@@ -10,14 +10,17 @@ describes what it reads, the grants it needs, what it runs, its privacy
 defaults and how to read the report.
 
 ```sh
-pip install -r migrate/requirements.txt
-python -m migrate report --source snowflake --since 30d \
+python3 -m venv .venv                 # Python 3.11 or later
+.venv/bin/pip install -r migrate/requirements.txt
+.venv/bin/python -m migrate report --source snowflake --since 30d \
   --igloo 'host=igloo.example.com port=5432 user=migrate dbname=igloo' \
   --map 'PROD.ANALYTICS.*=lake.analytics.*' --out ~/igloo-migration
 ```
 
 Write `--out` outside the repository (the tool refuses a directory inside
-it): the extract holds query text as the source recorded it.
+it): the extract holds query text as the source recorded it. To go from the
+quick start to a report on your own Snowflake queries with no data copied,
+follow [your first report](../docs/migrating.md#your-first-report).
 
 ## Layout
 

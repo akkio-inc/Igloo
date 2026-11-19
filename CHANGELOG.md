@@ -23,6 +23,34 @@ The release workflow publishes the section whose heading matches the tag
   runs another image. `make dev` builds Igloo from the checkout and starts
   the stack on that, as `make up` did; `make up` says so when the checkout's
   Igloo differs from the release.
+- The migration report (`python -m migrate report`) signs in to Igloo and
+  to the source before it reads the query history, and says in one line
+  what is wrong: a refused password, with where the quick start's is; the
+  Snowflake settings that are missing, all of them at once; a Python older
+  than 3.11. A wrong Igloo password used to show a Python traceback after
+  the history had been read, minutes in.
+- The migration report sets a statement's search path only to a schema
+  Igloo has. With a rule for a whole database, such as
+  `--map 'PROD.*.*=wh.*.*'`, and a connection that attaches some of its
+  schemas, a statement run in a session of another schema failed on `SET
+  search_path` before it ran, whatever tables it named.
+- The migration report counts a query that only calls Snowflake's system
+  functions, such as `SELECT SYSTEM$CANCEL_ALL_QUERIES(...)`, as an `other`
+  statement, which is not replayed, as it does `SHOW` and `CALL`. Snowflake
+  records these as `SELECT`, and each failed on Igloo for want of the
+  function: in three days of one account's history, one such call run 7,374
+  times was 57% of the executions the report showed as failing on Igloo.
+
+### Added
+
+- The migration guide has a path from the quick start to a first report on
+  your own Snowflake queries with no data copied
+  ([your first report](docs/migrating.md#your-first-report)): a connection
+  to the Snowflake database, the report through it, then copies of the
+  tables the workload reads most.
+- The single-machine stack reads connections' key and password files from
+  `deploy/single-vm/secrets` (`IGLOO_CONNECTION_SECRETS_DIR`), so
+  `private_key_secret` and `password_secret` work there.
 
 ### Fixed
 
