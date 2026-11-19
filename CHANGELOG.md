@@ -9,6 +9,8 @@ The release workflow publishes the section whose heading matches the tag
 
 ## [Unreleased]
 
+## [1.0.0-rc.13] - 2026-11-19
+
 ### Changed
 
 - `make up` starts the single-machine stack on the released image, where it
