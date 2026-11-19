@@ -94,6 +94,12 @@ class Mapper:
         for rule in self.rules:
             target = rule.apply(probe)
             if target is not None:
+                # A rule such as PROD.*.*=wh.*.* also names schemas Igloo
+                # does not have, where the connection attaches only some:
+                # SET search_path to one fails, and the statement with it,
+                # though its own tables may all be named in full.
+                if not any(k[:2] == target[:2] for k in self.tables):
+                    return None
                 return f"{target[0]}.{target[1]}"
         if any(k[0] == self.lake and k[1] == schema.lower() for k in self.tables):
             return f"{self.lake}.{schema.lower()}"

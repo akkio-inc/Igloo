@@ -291,7 +291,7 @@ const showLimit = 10000
 
 // loadCatalog reads the schemas, tables and columns of the connection's
 // database, or of its schemas when the connection names some.
-func (cl *sfClient) loadCatalog(ctx context.Context, warn func(msg string, args ...any)) (*sfCatalog, error) {
+func (cl *sfClient) loadCatalog(ctx context.Context, warn func(msg string, args ...any), listing func(left []string, total int)) (*sfCatalog, error) {
 	conn, err := cl.session(ctx)
 	if err != nil {
 		return nil, err
@@ -327,6 +327,9 @@ func (cl *sfClient) loadCatalog(ctx context.Context, warn func(msg string, args 
 	sem := make(chan struct{}, 8)
 	errs := make([]error, len(cat.schemas))
 	var wg sync.WaitGroup
+	var mu sync.Mutex
+	left := slices.Clone(names)
+	listing(slices.Clone(left), len(names))
 	for i, s := range cat.schemas {
 		wg.Add(1)
 		go func() {
@@ -334,6 +337,10 @@ func (cl *sfClient) loadCatalog(ctx context.Context, warn func(msg string, args 
 			sem <- struct{}{}
 			defer func() { <-sem }()
 			errs[i] = cl.loadSchema(ctx, s, warn)
+			mu.Lock()
+			left = slices.DeleteFunc(left, func(n string) bool { return n == s.name })
+			listing(slices.Clone(left), len(names))
+			mu.Unlock()
 		}()
 	}
 	wg.Wait()

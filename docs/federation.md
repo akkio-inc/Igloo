@@ -658,7 +658,9 @@ ALTER USER IGLOO_READER SET RSA_PUBLIC_KEY = 'MIIBIjANBgkqh...';
 ```
 
 Put `wh-key.p8` in `IGLOO_CONNECTION_SECRETS_DIR` (a mounted Kubernetes
-Secret, say) and name it with `private_key_secret`. Igloo reads it at every
+Secret, say; on the single-machine stack, the folder
+`deploy/single-vm/secrets`, with the file readable to the container:
+`chmod 644`) and name it with `private_key_secret`. Igloo reads it at every
 sign-in, so a new key takes effect there without a change in Igloo:
 Snowflake holds two public keys per user (`RSA_PUBLIC_KEY_2`) for rotating
 without a gap. Encrypted private keys are not supported. A key given with

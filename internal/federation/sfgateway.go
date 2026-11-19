@@ -57,6 +57,19 @@ import (
 // gatewayVersion is the server version the gateway reports.
 const gatewayVersion = "17.0"
 
+// scanPages is how many pages the gateway says every table has: twice what
+// the extension gives one task of a scan (its pg_pages_per_task, 1000), so a
+// scan has two tasks. A table of fewer pages the extension reads in one
+// task, and a statement that scans the connection more than once (a join of
+// two Snowflake tables) then has every such table downloaded whole, one
+// after the other, in the call that prepares the statement: before it
+// starts, where neither its timeout nor a cancel request stops it, with the
+// tables held in memory and the catalog lock held for as long as Snowflake
+// takes. Scans of two tasks run with the statement, each on connections of
+// its own. The task whose pages start at 0 reads the table; the other reads
+// nothing (see copyOut).
+const scanPages = 2000
+
 // scanPrefetch is how many result batches of one scan may be downloading,
 // downloaded or being sent to DuckDB at once (see sharedPrefetch).
 const scanPrefetch = 8
@@ -74,6 +87,10 @@ type sfGateway struct {
 	// ctx ends when the gateway closes, ending its scans.
 	ctx  context.Context
 	stop context.CancelFunc
+	// listingLeft are the schemas a refresh has yet to list, of
+	// listingTotal (see waitingOn).
+	listingLeft  []string
+	listingTotal int
 	// failures and lastErr are as the proxy's (see proxy.signedIn).
 	failures atomic.Int32
 	lastErr  atomic.Pointer[string]
@@ -144,7 +161,11 @@ func (g *sfGateway) refresh(ctx context.Context) error {
 		return err
 	}
 	g.signedIn(nil)
-	cat, err := cl.loadCatalog(ctx, g.log.Warn)
+	cat, err := cl.loadCatalog(ctx, g.log.Warn, func(left []string, total int) {
+		g.mu.Lock()
+		g.listingLeft, g.listingTotal = left, total
+		g.mu.Unlock()
+	})
 	if err != nil {
 		return err
 	}
@@ -152,6 +173,24 @@ func (g *sfGateway) refresh(ctx context.Context) error {
 	g.catalog = cat
 	g.mu.Unlock()
 	return nil
+}
+
+// waitingOn says what a probe that has not answered yet is doing, for the
+// reason a connection is left out when Igloo starts: Snowflake takes
+// minutes to list the columns of a schema of tens of thousands of them.
+func (g *sfGateway) waitingOn() string {
+	g.mu.Lock()
+	left, total := g.listingLeft, g.listingTotal
+	g.mu.Unlock()
+	if len(left) == 0 {
+		return ""
+	}
+	names := left
+	if len(names) > 5 {
+		names = append(slices.Clone(names[:5]), "...")
+	}
+	return fmt.Sprintf("Snowflake had yet to list the tables of %d of the database's %d schemas (%s); name the schemas to "+
+		"attach in the connection's schema option", len(left), total, strings.Join(names, ", "))
 }
 
 // catalogTimeout bounds reading the list of tables: query_timeout, or, for
@@ -761,7 +800,7 @@ func (s *sfSession) tables(st string) error {
 				if c.notNull {
 					notNull = "t"
 				}
-				s.row(str(strconv.Itoa(sc.oid)), str(t.pgName), str("0"), str(c.pgName), str(typ), str(strconv.Itoa(mod)),
+				s.row(str(strconv.Itoa(sc.oid)), str(t.pgName), str(strconv.Itoa(scanPages)), str(c.pgName), str(typ), str(strconv.Itoa(mod)),
 					str(strconv.Itoa(c.typ.dims())), str(strconv.Itoa(i+1)), str(notNull), nil, nil, nil, str("pg_catalog"),
 					optional(c.comment), optional(t.comment))
 				n++
@@ -797,9 +836,6 @@ func (s *sfSession) copyOut(ctx context.Context, st string) error {
 	if err != nil {
 		return failf("0A000", "unsupported scan: %v", err)
 	}
-	if q.ctid && (q.ctidFrom != 0 || q.ctidTo != fullCTID) {
-		return failf("0A000", "parallel scans are not supported")
-	}
 	cat, err := s.loadedCatalog()
 	if err != nil {
 		return err
@@ -807,6 +843,12 @@ func (s *sfSession) copyOut(ctx context.Context, st string) error {
 	scan, err := planScan(cat, q)
 	if err != nil {
 		return failf("42P01", "%v", err)
+	}
+	if q.ctid && q.ctidFrom != 0 {
+		// A task of a scan other than its first, which reads the table
+		// (see scanPages).
+		s.copyStart(max(1, len(scan.columns)))
+		return s.copyEnd(0, false)
 	}
 	ctx, cancel := context.WithCancelCause(ctx)
 	defer cancel(nil)

@@ -27,6 +27,20 @@ class ClassifyTest(unittest.TestCase):
         self.assertEqual(statements.classify(None, "SELECT FROM WHERE (", "snowflake"), "SELECT")
         self.assertEqual(statements.classify(None, "", "snowflake"), "other")
 
+    def test_calls_that_operate_the_source_are_not_queries(self):
+        # Snowflake records them as SELECT; they are no part of the workload.
+        for sql in ("SELECT SYSTEM$CANCEL_ALL_QUERIES(123)", "select system$wait(5) as w",
+                    "SELECT SYSTEM$CANCEL_QUERY('01a'), SYSTEM$ABORT_SESSION(7)"):
+            with self.subTest(sql=sql):
+                self.assertEqual(statements.classify("SELECT", sql, "snowflake"), "other")
+                self.assertEqual(statements.classify(None, sql, "snowflake"), "other")
+        # A query of data that calls one is a query, and fails on Igloo
+        # naming the function.
+        for sql in ("SELECT SYSTEM$TYPEOF(v) FROM t", "SELECT 1, SYSTEM$WAIT(1)",
+                    "SELECT x FROM (SELECT SYSTEM$WAIT(1) AS x)", "SELECT 'SYSTEM$WAIT(1)'"):
+            with self.subTest(sql=sql):
+                self.assertEqual(statements.classify("SELECT", sql, "snowflake"), "SELECT")
+
 
 class TablesTest(unittest.TestCase):
     def refs(self, sql, dialect="snowflake", db="SHOP", schema="SALES"):

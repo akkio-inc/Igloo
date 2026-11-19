@@ -68,6 +68,11 @@ otherwise unchanged except for these patches:
   sent, one for `Row` and as many as `EncodedRows` was given (the
   iterator's value, which was empty), and `RowLimit` is how many the
   client's Execute still takes.
+- `handshake.go`, `sslUnsupported`: a CancelRequest that follows a declined
+  SSLRequest cancels the statement. It used to end the connection with an
+  error, so on a server without TLS a client on libpq 17 or later with the
+  default `sslmode=prefer` (psql's Ctrl-C, psycopg's `cancel_safe`) could
+  not cancel anything.
 
 Drop this copy and the `replace` directive once a psql-wire release includes
 equivalent fixes.

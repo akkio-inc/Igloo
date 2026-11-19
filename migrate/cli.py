@@ -18,7 +18,7 @@ import re
 import sys
 from dataclasses import asdict
 
-from . import cost, inventory, replay, report, statements, workload
+from . import cost, inventory, replay, report, sqltext, statements, workload
 from .igloo import Igloo
 from .sources import Extract, Filters, Rerun
 
@@ -57,16 +57,21 @@ def check_out(out: pathlib.Path) -> pathlib.Path:
 
 
 def connect_source(args, pricing):
-    if args.source == "snowflake":
-        from .sources.snowflake import Snowflake
+    try:
+        if args.source == "snowflake":
+            from .sources.snowflake import Snowflake
 
-        return Snowflake.connect(args.timeout, pricing, args.source_warehouse)
-    from .sources.databricks import Databricks
+            return Snowflake.connect(args.timeout, pricing, args.source_warehouse)
+        from .sources.databricks import Databricks
 
-    ns = tuple(args.default_namespace.split(".", 1)) if args.default_namespace else None
-    if ns and len(ns) == 1:
-        ns = (ns[0], None)
-    return Databricks.connect(args.timeout, pricing, args.source_warehouse, ns)
+        ns = tuple(args.default_namespace.split(".", 1)) if args.default_namespace else None
+        if ns and len(ns) == 1:
+            ns = (ns[0], None)
+        return Databricks.connect(args.timeout, pricing, args.source_warehouse, ns)
+    except ImportError as e:
+        raise SystemExit(f"{e}; install the tool's packages first: pip install -r migrate/requirements.txt") from None
+    except Exception as e:  # noqa: BLE001 - whatever the source's driver raises
+        raise SystemExit(f"cannot connect to {args.source}: {sqltext.first_line(str(e)) or type(e).__name__}") from None
 
 
 def filters(args, now) -> Filters:
@@ -118,7 +123,15 @@ def cmd_report(args):
     now = dt.datetime.now(dt.timezone.utc)
     pricing = load_pricing(args.pricing, args.set)
     f = filters(args, now)
-    src = None if args.no_source else connect_source(args, pricing)
+    # Both ends before the history is read, which takes minutes: a wrong
+    # password should not cost them.
+    igloo = Igloo(args.igloo, args.timeout)
+    version = igloo.check()
+    try:
+        src = None if args.no_source else connect_source(args, pricing)
+    except BaseException:
+        igloo.close()
+        raise
     dialect = {"snowflake": "snowflake", "databricks": "databricks"}[args.source]
     try:
         if args.from_extract:
@@ -134,90 +147,86 @@ def cmd_report(args):
         if f.classes:
             shapes = [s for s in shapes if s.cls in f.classes]
         log(f"{len(shapes)} shapes")
-        return _report(args, out, now, pricing, f, src, dialect, ex, shapes)
+        return _report(args, out, now, pricing, f, src, dialect, ex, shapes, igloo, version)
     finally:
+        igloo.close()
         if src is not None:
             src.close()
 
 
-def _report(args, out, now, pricing, f, src, dialect, ex, shapes):
-    igloo = Igloo(args.igloo, args.timeout)
+def _report(args, out, now, pricing, f, src, dialect, ex, shapes, igloo, version):
+    tables, lake = igloo.tables()
+    native, native_err = (None, "turned off by --no-native-dialect") if args.no_native_dialect else \
+        igloo.native_dialect(args.source)
+    log(f"igloo: {len(tables)} tables; native {args.source} dialect: {native or 'not available'}")
+    rules = [inventory.Rule.parse(m, lake) for m in args.map]
+    mapper = inventory.Mapper(tables, lake, rules)
+
+    refs = {r.key: r for s in shapes for r in s.reads + s.writes if r.kind == "table" and r.resolved}
+    info = src.table_info(refs.values()) if src is not None else {}
+    uses = inventory.table_uses(shapes, mapper, info)
+    uses_by_key = {u.key: u for u in uses}
+
+    scratch = (lake, args.scratch_schema) if args.replay_writes else None
+    settings = replay.Settings(dialect, native, args.max_compare_rows, args.replay_writes, scratch,
+                               args.keep_scratch)
+    if args.replay_writes:
+        # An admin may have created it for a user who cannot create schemas.
+        found = igloo.conn().execute("SELECT 1 FROM information_schema.schemata WHERE catalog_name = %s AND "
+                                     "schema_name = %s", scratch).fetchone()
+        if not found:
+            igloo.conn().execute(f"CREATE SCHEMA {inventory.qualified(scratch)}")
+    results, chosen, coverages = replay.plan(shapes, mapper, settings, args.sample, args.sample_by, args.seed)
+    log(f"replaying {len(chosen)} shapes on Igloo")
+    with open(out / "replay.jsonl", "w") as rf:
+        for i, s in enumerate(chosen, 1):
+            r = replay.replay(s, coverages[s.id], igloo, settings, results[s.id])
+            rf.write(json.dumps({"shape": s.id, **r.to_dict()}, default=str) + "\n")
+            log(f"  [{i}/{len(chosen)}] {s.id} {s.cls}: {r.outcome}"
+                + (f" ({r.failure.error_class})" if r.outcome == "failed" and r.failure else ""))
+
+    # Every query that ran: its row count against the history's.
+    for s in chosen:
+        r = results[s.id]
+        if s.cls == "SELECT" and r.best is not None:
+            r.comparison = {"history": replay.history_check(s, r.best, uses_by_key)}
+    _compare_on_source(args, src, chosen, results, uses_by_key)
+
+    # The period the history covers, which a source may have shortened.
+    start, end = f.start, f.end
     try:
-        version = igloo.conn().execute("SELECT version()").fetchone()[0]
-        tables, lake = igloo.tables()
-        native, native_err = (None, "turned off by --no-native-dialect") if args.no_native_dialect else \
-            igloo.native_dialect(args.source)
-        log(f"igloo: {len(tables)} tables; native {args.source} dialect: {native or 'not available'}")
-        rules = [inventory.Rule.parse(m, lake) for m in args.map]
-        mapper = inventory.Mapper(tables, lake, rules)
-
-        refs = {r.key: r for s in shapes for r in s.reads + s.writes if r.kind == "table" and r.resolved}
-        info = src.table_info(refs.values()) if src is not None else {}
-        uses = inventory.table_uses(shapes, mapper, info)
-        uses_by_key = {u.key: u for u in uses}
-
-        scratch = (lake, args.scratch_schema) if args.replay_writes else None
-        settings = replay.Settings(dialect, native, args.max_compare_rows, args.replay_writes, scratch,
-                                   args.keep_scratch)
-        if args.replay_writes:
-            # An admin may have created it for a user who cannot create schemas.
-            found = igloo.conn().execute("SELECT 1 FROM information_schema.schemata WHERE catalog_name = %s AND "
-                                         "schema_name = %s", scratch).fetchone()
-            if not found:
-                igloo.conn().execute(f"CREATE SCHEMA {inventory.qualified(scratch)}")
-        results, chosen, coverages = replay.plan(shapes, mapper, settings, args.sample, args.sample_by, args.seed)
-        log(f"replaying {len(chosen)} shapes on Igloo")
-        with open(out / "replay.jsonl", "w") as rf:
-            for i, s in enumerate(chosen, 1):
-                r = replay.replay(s, coverages[s.id], igloo, settings, results[s.id])
-                rf.write(json.dumps({"shape": s.id, **r.to_dict()}, default=str) + "\n")
-                log(f"  [{i}/{len(chosen)}] {s.id} {s.cls}: {r.outcome}"
-                    + (f" ({r.failure.error_class})" if r.outcome == "failed" and r.failure else ""))
-
-        # Every query that ran: its row count against the history's.
-        for s in chosen:
-            r = results[s.id]
-            if s.cls == "SELECT" and r.best is not None:
-                r.comparison = {"history": replay.history_check(s, r.best, uses_by_key)}
-        _compare_on_source(args, src, chosen, results, uses_by_key)
-
-        # The period the history covers, which a source may have shortened.
-        start, end = f.start, f.end
-        try:
-            start = parse_time(ex.meta["start"], now)
-            end = parse_time(ex.meta["end"], now)
-        except (KeyError, TypeError, ValueError):
-            pass
-        spend = src.spend(start, end) if src is not None else None
-        machine = args.igloo_machine
-        price = args.igloo_price_per_hour
-        if price is None and machine:
-            price = pricing.get("igloo", {}).get("instance_per_hour", {}).get(machine)
-        period_hours = (end - start).total_seconds() / 3600
-        cost_section = cost.section(shapes, results, spend, pricing, args.source, src.unit if src else
-                                    ("credits" if args.source == "snowflake" else "DBUs"), period_hours, machine,
-                                    price, src.meter if src else None)
-        conninfo = _address(args.igloo)
-        rep = report.build(
-            shapes=shapes, results=results, uses=uses, meta=ex.meta,
-            igloo_info={"version": version, "address": conninfo, "catalog": lake, "tables": len(tables),
-                        "native_dialect": native, "native_dialect_error": native_err},
-            settings={"generated": now.isoformat(timespec="seconds"), "source": args.source,
-                      "since": args.since, "until": args.until, "users": f.users, "roles": f.roles,
-                      "warehouses": f.warehouses, "statement_types": f.classes, "max_groups": f.max_groups,
-                      "sample": args.sample, "sample_by": args.sample_by, "timeout_seconds": args.timeout,
-                      "map": args.map, "replay_writes": args.replay_writes, "compare": args.compare,
-                      "source_budget": _budget(args), "max_compare_rows": args.max_compare_rows,
-                      "digits": 10, "igloo_machine": machine, "igloo_price_per_hour": price,
-                      "show_literals": args.show_literals, "from_extract": str(args.from_extract or "") or None},
-            cost=cost_section, dialect=dialect, show_literals=args.show_literals)
-        (out / "report.json").write_text(json.dumps(rep, indent=2, default=str) + "\n")
-        (out / "report.md").write_text(report.markdown(rep))
-        (out / "report.html").write_text(report.render_html(rep))
-        log(f"wrote {out / 'report.html'}, report.md and report.json")
-        return rep
-    finally:
-        igloo.close()
+        start = parse_time(ex.meta["start"], now)
+        end = parse_time(ex.meta["end"], now)
+    except (KeyError, TypeError, ValueError):
+        pass
+    spend = src.spend(start, end) if src is not None else None
+    machine = args.igloo_machine
+    price = args.igloo_price_per_hour
+    if price is None and machine:
+        price = pricing.get("igloo", {}).get("instance_per_hour", {}).get(machine)
+    period_hours = (end - start).total_seconds() / 3600
+    cost_section = cost.section(shapes, results, spend, pricing, args.source, src.unit if src else
+                                ("credits" if args.source == "snowflake" else "DBUs"), period_hours, machine,
+                                price, src.meter if src else None)
+    conninfo = _address(args.igloo)
+    rep = report.build(
+        shapes=shapes, results=results, uses=uses, meta=ex.meta,
+        igloo_info={"version": version, "address": conninfo, "catalog": lake, "tables": len(tables),
+                    "native_dialect": native, "native_dialect_error": native_err},
+        settings={"generated": now.isoformat(timespec="seconds"), "source": args.source,
+                  "since": args.since, "until": args.until, "users": f.users, "roles": f.roles,
+                  "warehouses": f.warehouses, "statement_types": f.classes, "max_groups": f.max_groups,
+                  "sample": args.sample, "sample_by": args.sample_by, "timeout_seconds": args.timeout,
+                  "map": args.map, "replay_writes": args.replay_writes, "compare": args.compare,
+                  "source_budget": _budget(args), "max_compare_rows": args.max_compare_rows,
+                  "digits": 10, "igloo_machine": machine, "igloo_price_per_hour": price,
+                  "show_literals": args.show_literals, "from_extract": str(args.from_extract or "") or None},
+        cost=cost_section, dialect=dialect, show_literals=args.show_literals)
+    (out / "report.json").write_text(json.dumps(rep, indent=2, default=str) + "\n")
+    (out / "report.md").write_text(report.markdown(rep))
+    (out / "report.html").write_text(report.render_html(rep))
+    log(f"wrote {out / 'report.html'}, report.md and report.json")
+    return rep
 
 
 def _budget(args) -> float:

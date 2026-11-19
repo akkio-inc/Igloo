@@ -873,6 +873,53 @@ func TestCancel(t *testing.T) {
 	}
 }
 
+// libpq 17 and later (psql's Ctrl-C, psycopg's cancel_safe) open a cancel
+// connection the way they open any other: with sslmode=prefer, the default,
+// an SSLRequest comes first, and the CancelRequest follows the answer.
+func TestCancelAfterDeclinedSSLRequest(t *testing.T) {
+	t.Parallel()
+	ts := startServer(t)
+	conn := ts.admin(t, pgx.QueryExecModeSimpleProtocol)
+	pid, secret := conn.PgConn().PID(), conn.PgConn().SecretKey()
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := conn.Exec(context.Background(), "SELECT count(*) FROM range(10000000000) a, range(10) b WHERE a.range % 7 = b.range")
+		done <- err
+	}()
+	time.Sleep(300 * time.Millisecond)
+
+	raw, err := net.DialTimeout("tcp", ts.addr, 2*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer raw.Close() //nolint:errcheck
+	_ = raw.SetDeadline(time.Now().Add(5 * time.Second))
+	sslRequest := binary.BigEndian.AppendUint32(binary.BigEndian.AppendUint32(nil, 8), 80877103)
+	if _, err := raw.Write(sslRequest); err != nil {
+		t.Fatal(err)
+	}
+	answer := make([]byte, 1)
+	if _, err := io.ReadFull(raw, answer); err != nil || answer[0] != 'N' {
+		t.Fatalf("SSLRequest answered %q, %v; want N", answer, err)
+	}
+	cancelRequest := binary.BigEndian.AppendUint32(binary.BigEndian.AppendUint32(nil, 16), 80877102)
+	cancelRequest = binary.BigEndian.AppendUint32(cancelRequest, pid)
+	cancelRequest = append(cancelRequest, secret...)
+	if _, err := raw.Write(cancelRequest); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("query was not canceled")
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the statement was still running 10s after the cancel request")
+	}
+}
+
 func TestStatementCacheReleasesReplacedStatements(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()

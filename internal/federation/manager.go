@@ -279,6 +279,11 @@ func (m *Manager) Attach(ctx context.Context, conn *duckdb.Conn) error {
 	for i, probe := range probes {
 		if probe != nil {
 			errs[i] = awaitProbe(wait, probe)
+			if w, ok := proxies[i].(interface{ waitingOn() string }); ok && errors.Is(errs[i], errNoAnswer) {
+				if what := w.waitingOn(); what != "" {
+					errs[i] = fmt.Errorf("%w: %s", errNoAnswer, what)
+				}
+			}
 		}
 	}
 
@@ -370,9 +375,13 @@ func awaitProbe(ctx context.Context, probe <-chan error) error {
 	case err := <-probe:
 		return err
 	default:
-		return errors.New("no answer in the time Igloo gives connections at startup")
+		return errNoAnswer
 	}
 }
+
+// errNoAnswer leaves out a connection whose probe has not returned by
+// shortly before the startup's deadline.
+var errNoAnswer = errors.New("no answer in the time Igloo gives connections at startup")
 
 // attach attaches one connection through its proxy and loads its list of
 // tables, so that listing tables (information_schema, psql's \dt) never

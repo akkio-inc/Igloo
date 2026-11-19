@@ -23,6 +23,58 @@ The release workflow publishes the section whose heading matches the tag
   runs another image. `make dev` builds Igloo from the checkout and starts
   the stack on that, as `make up` did; `make up` says so when the checkout's
   Igloo differs from the release.
+- The migration report (`python -m migrate report`) signs in to Igloo and
+  to the source before it reads the query history, and says in one line
+  what is wrong: a refused password, with where the quick start's is; the
+  Snowflake settings that are missing, all of them at once; a Python older
+  than 3.11. A wrong Igloo password used to show a Python traceback after
+  the history had been read, minutes in.
+- The migration report sets a statement's search path only to a schema
+  Igloo has. With a rule for a whole database, such as
+  `--map 'PROD.*.*=wh.*.*'`, and a connection that attaches some of its
+  schemas, a statement run in a session of another schema failed on `SET
+  search_path` before it ran, whatever tables it named.
+- The migration report counts a query that only calls Snowflake's system
+  functions, such as `SELECT SYSTEM$CANCEL_ALL_QUERIES(...)`, as an `other`
+  statement, which is not replayed, as it does `SHOW` and `CALL`. Snowflake
+  records these as `SELECT`, and each failed on Igloo for want of the
+  function: in three days of one account's history, one such call run 7,374
+  times was 57% of the executions the report showed as failing on Igloo.
+
+### Added
+
+- The migration guide has a path from the quick start to a first report on
+  your own Snowflake queries with no data copied
+  ([your first report](docs/migrating.md#your-first-report)): a connection
+  to the Snowflake database, the report through it, then copies of the
+  tables the workload reads most.
+- The single-machine stack reads connections' key and password files from
+  `deploy/single-vm/secrets` (`IGLOO_CONNECTION_SECRETS_DIR`), so
+  `private_key_secret` and `password_secret` work there.
+
+### Fixed
+
+- A statement that reads two or more tables through one Snowflake
+  connection, such as a join of two Snowflake tables, reads them as it
+  runs. Each table was downloaded whole, one after the other, before the
+  statement started: for as long as that took, neither the statement's
+  timeout nor a cancel request stopped it, the tables waited in memory, and
+  new sessions waited for the catalog lock the statement held
+  (`cannot open a session: waited 30s for the catalog lock`). Replaying 40
+  of one account's costliest query shapes through a connection, 30 ran
+  where 17 had, and none was refused while another statement held the
+  lock, where 13 had been.
+- A Snowflake connection whose tables Snowflake has not finished listing
+  when Igloo starts says which schemas were left and what to do, in
+  `SHOW CONNECTIONS` and the log: `Snowflake had yet to list the tables of 2
+  of the database's 43 schemas (...); name the schemas to attach in the
+  connection's schema option`. It said only `no answer in the time Igloo
+  gives connections at startup`.
+- A cancel request stops a statement on a server without TLS when the
+  client asked for TLS first, as psql's Ctrl-C and psycopg's `cancel_safe`
+  do with libpq 17 or later and the default `sslmode=prefer`. The request
+  was dropped with `unexpected cancel version after upgrading the client
+  connection`, and the statement ran on to its end or its timeout.
 
 ## [1.0.0-rc.12] - 2026-11-16
 

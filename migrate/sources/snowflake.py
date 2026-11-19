@@ -263,9 +263,16 @@ class Snowflake:
 
         env = os.environ
         warehouse = warehouse or env.get("SNOWFLAKE_WAREHOUSE")
+        missing = [name for name in ("SNOWFLAKE_ACCOUNT", "SNOWFLAKE_USER") if not env.get(name)]
+        if not any(env.get(name) for name in ("SNOWFLAKE_PRIVATE_KEY_FILE", "SNOWFLAKE_TOKEN_FILE", "SNOWFLAKE_PASSWORD")):
+            missing.append("SNOWFLAKE_PRIVATE_KEY_FILE (or SNOWFLAKE_TOKEN_FILE, or SNOWFLAKE_PASSWORD)")
         if not warehouse:
-            raise SystemExit("set SNOWFLAKE_WAREHOUSE (or --source-warehouse): without it the tool's statements would "
-                             "run on the user's default warehouse")
+            # Without it the tool's statements would run on the user's
+            # default warehouse.
+            missing.append("SNOWFLAKE_WAREHOUSE (or --source-warehouse)")
+        if missing:
+            raise SystemExit("set " + ", ".join(missing) + ": the tool reads Snowflake's connection settings from the "
+                             "environment")
         kwargs = {
             "account": env["SNOWFLAKE_ACCOUNT"], "user": env["SNOWFLAKE_USER"], "warehouse": warehouse,
             "login_timeout": 60, "network_timeout": timeout + 60,

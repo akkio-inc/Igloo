@@ -3,7 +3,6 @@ package wire
 import (
 	"context"
 	"crypto/tls"
-	"errors"
 	"fmt"
 	"log/slog"
 	"maps"
@@ -345,13 +344,11 @@ func (srv *Server) sslUnsupported(conn net.Conn, reader *buffer.Reader, version 
 		return conn, reader, version, err
 	}
 
+	// What follows may be a CancelRequest: libpq 17 and later open a cancel
+	// connection like any other, SSLRequest first. Handshake handles it.
 	version, err = srv.readVersion(reader)
 	if err != nil {
 		return conn, reader, version, err
-	}
-
-	if version == types.VersionCancel {
-		return conn, reader, version, errors.New("unexpected cancel version after upgrading the client connection")
 	}
 
 	return conn, reader, version, nil
