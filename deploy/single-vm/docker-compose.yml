@@ -19,8 +19,9 @@ services:
   # The SQL endpoint and web console. Connect with any Postgres client or
   # Arrow Flight SQL client, or open http://127.0.0.1:8443 in a browser.
   igloo:
-    # `make up` builds from this checkout. To run a released image instead,
-    # set IGLOO_IMAGE in .env and start with `docker compose up -d --no-build`.
+    # IGLOO_IMAGE in .env is the image this runs. `make up` sets it to the
+    # release this checkout is at, and `make dev` to igloo:dev, which it
+    # builds from this checkout (use-image.sh).
     build:
       context: ../..
     image: ${IGLOO_IMAGE:-igloo:dev}

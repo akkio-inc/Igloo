@@ -9,6 +9,21 @@ The release workflow publishes the section whose heading matches the tag
 
 ## [Unreleased]
 
+### Changed
+
+- `make up` starts the single-machine stack on the released image, where it
+  built Igloo from source first, which takes CI about 50 minutes without a
+  cache. From a new clone on an Apple laptop with none of the five images
+  present, `make up` took 125 seconds and the first query answered 3 seconds
+  later, on 1.0.0-rc.12. It runs the newest release the checkout holds (a
+  shallow clone, which holds no tags, asks the repository it came from),
+  and writes that image to `IGLOO_IMAGE` in `deploy/single-vm/.env`, which
+  every later `docker compose` command reads, so `make psql` and
+  `make load-tpch` leave the running stack as it is. `make up IMAGE=<image>`
+  runs another image. `make dev` builds Igloo from the checkout and starts
+  the stack on that, as `make up` did; `make up` says so when the checkout's
+  Igloo differs from the release.
+
 ## [1.0.0-rc.12] - 2026-11-16
 
 ### Fixed

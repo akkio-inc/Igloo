@@ -22,7 +22,8 @@ its tools in containers.
 | `make migrate-test` | Run the [migration report's](migrate/README.md) unit tests in a Python container |
 | `make bench-test` | Run the [benchmark's](bench/README.md) unit tests in a Python container |
 | `make build` | Build the `igloo:dev` image |
-| `make up` | Start the single-machine stack: Igloo, the Lakekeeper catalog, PostgreSQL and local object storage |
+| `make up` | Start the single-machine stack on the released image this checkout is at: Igloo, the Lakekeeper catalog, PostgreSQL and local object storage. It does not run your changes |
+| `make dev` | Build Igloo from this checkout and start the stack on it. `make psql` and the other commands then use that build, until the next `make up` |
 | `make psql` | Open a SQL shell on the running stack |
 | `make helm-e2e` | Install the Helm chart on a throwaway kind cluster and test it end to end |
 | `make e2e` | Start an isolated copy of the stack and run `scripts/e2e.sh` against it, including the JDBC, psycopg, PyIceberg, notebook (SQLAlchemy, pandas, polars) and dbt checks in `scripts/clients/` |
