@@ -24,6 +24,14 @@ The release workflow publishes the section whose heading matches the tag
   the stack on that, as `make up` did; `make up` says so when the checkout's
   Igloo differs from the release.
 
+### Fixed
+
+- A cancel request stops a statement on a server without TLS when the
+  client asked for TLS first, as psql's Ctrl-C and psycopg's `cancel_safe`
+  do with libpq 17 or later and the default `sslmode=prefer`. The request
+  was dropped with `unexpected cancel version after upgrading the client
+  connection`, and the statement ran on to its end or its timeout.
+
 ## [1.0.0-rc.12] - 2026-11-16
 
 ### Fixed
