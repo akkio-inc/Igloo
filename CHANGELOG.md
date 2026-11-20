@@ -9,6 +9,33 @@ The release workflow publishes the section whose heading matches the tag
 
 ## [Unreleased]
 
+### Fixed
+
+- A statement stops reading a MySQL connection's table as soon as it no
+  longer needs it, and MySQL stops working on it: when it is canceled, when
+  it has the rows it asked for and when it fails, as statements through
+  Snowflake and PostgreSQL connections do. DuckDB's `mysql` extension ends
+  such a read with MySQL's `KILL QUERY`, which names a session by its ID.
+  Igloo now gives every session an ID of its own and has MySQL kill the
+  query of the session named, and no other. Until now the ID was that of
+  whichever session of the connection had signed in to MySQL last, mostly
+  another one: the read ran to its end, and a statement of that other
+  session failed in its place (`Failed to fetch result row for MySQL
+  query`). Over a 20-million-row table that takes 2.7 s to read, a `LIMIT
+  10` above a filter Igloo applies, an `EXISTS` and a statement that fails
+  on its first row each returned after 2.7 s and return after 0.1 s, and one
+  with a `statement_timeout` of 200 ms ended at 2.7 s and ends at 0.3 s.
+  Over a view whose rows MySQL is slow to produce, 43 s to read, the first
+  three took 43 s and take 0.06 s; under the timeout the client's
+  connection was closed 30 s later, and the statement now ends at 3.8 s
+  with the timeout's error. A transaction block reads on after a statement
+  that left a read early, from the snapshot it began with: MySQL fails only
+  the query it kills.
+- A transaction block keeps its session with MySQL, and its snapshot, when
+  the connection's settings change after the block's first read failed.
+  Igloo took such a session to have no transaction open and moved it to a
+  new one, where the rest of the block read outside its transaction.
+
 ## [1.0.0-rc.16] - 2026-11-20
 
 ### Changed

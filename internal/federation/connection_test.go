@@ -510,7 +510,7 @@ func TestMySQLPasswords(t *testing.T) {
 		t.Error("an unsupported method was accepted")
 	}
 	g := &mysqlGreeting{version: "8.4.0", connID: 7, caps: capProtocol41 | capSecureConnection | capPluginAuth, charset: 45, status: 2}
-	parsed, err := parseGreeting(buildGreeting(g, scramble, g.caps))
+	parsed, err := parseGreeting(buildGreeting(g, scramble, g.caps, 7))
 	if err != nil || parsed.version != "8.4.0" || !bytes.Equal(parsed.scramble, scramble) || parsed.plugin != nativePasswordPlugin ||
 		parsed.connID != 7 {
 		t.Errorf("greeting round trip: %+v %v", parsed, err)
