@@ -9,6 +9,18 @@ The release workflow publishes the section whose heading matches the tag
 
 ## [Unreleased]
 
+### Changed
+
+- Igloo's build of DuckDB's Iceberg extension (`extensions/iceberg`) no
+  longer compiles DuckDB. The extension carried a copy of DuckDB of its own;
+  it now takes DuckDB's functions from the igloo binary that loads it, as
+  Igloo's rb and postgres extensions do, and its build compiles its own
+  sources and DuckDB's mbedtls, which no binary exports. Built from nothing
+  in CI, it took 24 minutes on arm64 and 34 on amd64, and takes 9 to 15,
+  over half of them the libraries it links (the AWS SDK and OpenSSL most of
+  all); the image's file went from 46 MB to 19 MB on arm64 and from 51 MB
+  to 21 MB on amd64.
+
 ### Fixed
 
 - A statement stops reading a PostgreSQL connection's tables as soon as it no

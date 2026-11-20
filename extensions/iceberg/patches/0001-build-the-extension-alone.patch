@@ -1,15 +1,16 @@
 Build the iceberg extension alone.
 
-DuckDB-Iceberg's own build configuration also builds, from git, the avro,
-ducklake and aws extensions its tests load. Igloo loads the official avro
-extension from its pack, and needs neither of the others; avro at that
-commit does not build with Debian's GCC 12 either.
+DuckDB-Iceberg's own build configuration also loads the json, tpch and icu
+extensions and, from git, the avro, ducklake and aws extensions, all for its
+tests. Igloo's build compiles the iceberg extension's target and nothing
+else, and would fetch and configure the rest for nothing. Igloo loads the
+official avro extension from its pack.
 
 diff --git a/extension_config.cmake b/extension_config.cmake
-index 891e25a9c..6bbfc2ca4 100644
+index 891e25a..a3477fc 100644
 --- a/extension_config.cmake
 +++ b/extension_config.cmake
-@@ -1,41 +1,7 @@
+@@ -1,41 +1,6 @@
 -# This file is included by DuckDB's build system. It specifies which extension to load
 -if (NOT EMSCRIPTEN)
 -  duckdb_extension_load(avro
@@ -27,10 +28,10 @@ index 891e25a9c..6bbfc2ca4 100644
 -endif()
 -
 -
-+# Igloo's build of the iceberg extension against DuckDB v1.5.6: json, which it
-+# builds with, and iceberg from this tree, with Igloo's patches. The avro
+-duckdb_extension_load(json)
++# Igloo's build of the iceberg extension against DuckDB v1.5.6: the extension
++# from this tree, with Igloo's patches, and nothing its tests load. The avro
 +# extension it reads manifests with at run time is the pack's.
- duckdb_extension_load(json)
  duckdb_extension_load(iceberg
      SOURCE_DIR ${CMAKE_CURRENT_LIST_DIR}
 -    LOAD_TESTS

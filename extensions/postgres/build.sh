@@ -27,8 +27,8 @@ set -euo pipefail
 # DuckDB-Postgres as DuckDB v1.5.6 builds it
 # (.github/config/extensions/postgres_scanner.cmake), the database-connector
 # submodule that commit pins, and the vcpkg DuckDB's extension tooling builds
-# extensions with (extension-ci-tools, as extensions/iceberg/build.sh pins
-# it). Bump them together with extensions/rb's DuckDB.
+# extensions with (extension-ci-tools at 72e76e99; extensions/iceberg/build.sh
+# builds with the same one). Bump them together with extensions/rb's DuckDB.
 postgres_commit=318dabb2474fc3789b0199301a2e661e19c1b4fc
 connector_commit=0a8505f775dae7bb30edd37f848d5975bf72884e
 duckdb_tag=v1.5.6

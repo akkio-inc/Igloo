@@ -6,25 +6,27 @@
 #   extensions/iceberg/build.sh OUT_DIR
 #
 # It is DuckDB's iceberg extension (DuckDB-Iceberg) at the commit DuckDB
-# v1.5.6 ships, with Igloo's patches (patches/, applied in order), built as
-# DuckDB's extension tooling builds it. Like rb, it links no DuckDB of its
-# own: it loads only into a binary that exports v1.5.6's symbols, as igloo
-# does. Its libraries (the AWS SDK, curl, OpenSSL, Avro, roaring) come from
-# vcpkg at the commit DuckDB-Iceberg names.
+# v1.5.6 ships, with Igloo's patches (patches/, applied in order), built by
+# DuckDB's own build with the extension's own configuration. Like rb, it
+# links no DuckDB of its own (EXTENSION_STATIC_BUILD=0, as DuckDB's build
+# calls it): it loads only into a binary that exports v1.5.6's symbols, as
+# igloo does, and the build compiles the extension's own sources and, of
+# DuckDB's, only the mbedtls no binary exports (patches/0010). Its libraries
+# (the AWS SDK, curl, OpenSSL, Avro, roaring) come from vcpkg at the commit
+# DuckDB-Iceberg names.
 #
 # The sources, vcpkg's packages, the build tree and the compiler cache stay in
-# $ICEBERG_CACHE (default ~/.cache/igloo/iceberg): the first build takes half
-# an hour on a few cores, later ones minutes. It needs the tools the
-# Dockerfile's iceberg stage installs, and is usually run there; on macOS,
-# the Xcode command line tools, CMake, Ninja and pkg-config, and ccache if
-# it is there.
+# $ICEBERG_CACHE (default ~/.cache/igloo/iceberg): the first build takes 10
+# to 15 minutes on four cores, over half of them vcpkg building those
+# libraries, later ones seconds. It needs the tools the Dockerfile's iceberg
+# stage installs, and is usually run there; on macOS, the Xcode command line
+# tools, CMake, Ninja and pkg-config, and ccache if it is there.
 set -euo pipefail
 
-# DuckDB-Iceberg as DuckDB v1.5.6 builds it (.github/config/extensions/iceberg.cmake),
-# the extension tooling that commit pins, and the vcpkg its vcpkg.json names
-# as builtin-baseline. Bump them together with extensions/rb's DuckDB.
+# DuckDB-Iceberg as DuckDB v1.5.6 builds it (.github/config/extensions/iceberg.cmake)
+# and the vcpkg its vcpkg.json names as builtin-baseline. Bump them together
+# with extensions/rb's DuckDB.
 iceberg_commit=890b78a9cfae380396b435b033c27cdbdad04e42
-ci_tools_commit=72e76e99cd7fee45a99739cd118ec2db64e034ec
 duckdb_tag=v1.5.6
 duckdb_commit=069cc9f9b5be802405797faecc284961b07c70ef
 vcpkg_commit=84bab45d415d22042bd0b9081aea57f362da3f35
@@ -59,7 +61,6 @@ fetch() {
 }
 
 fetch "$cache/duckdb-iceberg-$iceberg_commit" https://github.com/duckdb/duckdb-iceberg "$iceberg_commit"
-fetch "$cache/extension-ci-tools-$ci_tools_commit" https://github.com/duckdb/extension-ci-tools "$ci_tools_commit"
 duckdb="$cache/duckdb-$duckdb_commit"
 if [ "$(git -C "$duckdb" rev-parse HEAD 2>/dev/null)" != "$duckdb_commit" ]; then
 	git -c advice.detachedHead=false clone -q --depth 1 --branch "$duckdb_tag" https://github.com/duckdb/duckdb "$duckdb.tmp"
@@ -79,13 +80,13 @@ fi
 
 # The patched tree. Only files whose content differs are copied, with a new
 # modification time, so the build tree recompiles exactly what changed,
-# a file a dropped patch puts back included.
+# a file a dropped patch puts back included. The folders of DuckDB-Iceberg's
+# submodules stay out: this script's earlier versions kept links there, and
+# would put new ones inside a folder.
 src="$cache/src"
 mkdir -p "$src"
-rsync -rlc --delete --exclude /build --exclude /duckdb --exclude /extension-ci-tools \
+rsync -rlc --delete --exclude /duckdb --exclude /extension-ci-tools \
 	"$cache/duckdb-iceberg-$iceberg_commit/" "$src/"
-ln -sfn "$duckdb" "$src/duckdb"
-ln -sfn "$cache/extension-ci-tools-$ci_tools_commit" "$src/extension-ci-tools"
 for p in "$here"/patches/*.patch; do
 	(cd "$src" && git apply "$p") || {
 		echo "iceberg: $(basename "$p") does not apply" >&2
@@ -94,22 +95,28 @@ for p in "$here"/patches/*.patch; do
 done
 
 export VCPKG_ROOT="$vcpkg"
-export VCPKG_TOOLCHAIN_PATH="$vcpkg/scripts/buildsystems/vcpkg.cmake"
 export VCPKG_DEFAULT_BINARY_CACHE="$cache/vcpkg-binary"
 export CCACHE_DIR="$cache/ccache"
-export GEN=ninja
-# DuckDB's and the dependencies' compiles, at 2 GiB each.
+# The dependencies' compiles and the extension's, at 2 GiB each.
 # shellcheck source=extensions/jobs.sh
 . "$here/../jobs.sh"
 jobs=$(build_jobs $((2 << 30)))
 export CMAKE_BUILD_PARALLEL_LEVEL=$jobs VCPKG_MAX_CONCURRENCY=$jobs
 echo "iceberg: $jobs compiles at once"
 mkdir -p "$VCPKG_DEFAULT_BINARY_CACHE"
-# DuckDB's CMake caches C++11 before the extension asks for the C++14 it is
-# written in. No shell or test runner: only the extension is wanted.
-make -C "$src" release EXT_FLAGS="-DCMAKE_CXX_STANDARD=14 -DBUILD_SHELL=0 -DBUILD_UNITTESTS=0"
+# DuckDB's build, of the extension's target alone: with EXTENSION_STATIC_BUILD
+# off the extension does not link DuckDB, so nothing of DuckDB's is compiled
+# but its mbedtls and the program that names the platform in the extension's
+# footer. DuckDB's CMake caches C++11 before the extension asks for the C++14
+# it is written in.
+build="$cache/build"
+cmake -G Ninja -S "$duckdb" -B "$build" -DCMAKE_BUILD_TYPE=Release \
+	-DEXTENSION_STATIC_BUILD=0 -DDUCKDB_EXTENSION_CONFIGS="$src/extension_config.cmake" \
+	-DCMAKE_CXX_STANDARD=14 -DBUILD_SHELL=0 -DBUILD_UNITTESTS=0 \
+	-DVCPKG_BUILD=1 -DCMAKE_TOOLCHAIN_FILE="$vcpkg/scripts/buildsystems/vcpkg.cmake" -DVCPKG_MANIFEST_DIR="$src"
+cmake --build "$build" --target iceberg_loadable_extension
 
-cp "$src/build/release/extension/iceberg/iceberg.duckdb_extension" "$out/iceberg.duckdb_extension"
+cp "$build/extension/iceberg/iceberg.duckdb_extension" "$out/iceberg.duckdb_extension"
 if command -v sha256sum >/dev/null; then sha256=(sha256sum); else sha256=(shasum -a 256); fi
 "${sha256[@]}" "$out/iceberg.duckdb_extension" | cut -d' ' -f1 >"$out/iceberg.duckdb_extension.sha256"
 echo "built $out/iceberg.duckdb_extension (DuckDB $duckdb_tag): $(cat "$out/iceberg.duckdb_extension.sha256")"

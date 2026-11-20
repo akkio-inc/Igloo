@@ -30,14 +30,14 @@ env:
 
 jobs:
   # Igloo's build of DuckDB's Iceberg extension (extensions/iceberg), which
-  # the tests and the image use: the Dockerfile's iceberg stage, in a job of
-  # its own because built cold it takes most of an hour. Its cache holds it
-  # until the build script or the patches change, and the Go jobs take the
-  # file it built as an artifact.
+  # the tests and the image use: the Dockerfile's iceberg stage, built once
+  # for each architecture, 10 to 15 minutes cold, over half of them vcpkg's
+  # libraries. Its cache holds it until the build script or the patches
+  # change, and the Go jobs take the file it built as an artifact.
   iceberg:
     name: Iceberg extension (${{ matrix.arch }})
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 120
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -315,9 +315,11 @@ jobs:
     # Each architecture builds on its own native runner: cross-compiling cgo
     # and DuckDB under QEMU is slow and fragile.
     runs-on: ${{ matrix.runner }}
-    # amd64 took 44.9 minutes in 1.0.0-rc.6's release and passed 45 in
-    # rc.7's, which was cancelled: with the Actions cache near its limit the
-    # build can miss its cache and compile DuckDB again.
+    # A build that misses the extension jobs' caches, as one that starts
+    # right after those jobs can, builds the extensions again and takes 15
+    # to 25 minutes in all. It took 45 while the iceberg extension's build
+    # compiled DuckDB (amd64 in 1.0.0-rc.6's release, and past its limit of
+    # 45 in rc.7's).
     timeout-minutes: 75
     strategy:
       fail-fast: false
@@ -377,7 +379,7 @@ jobs:
         run: docker run --rm igloo:ci check-extensions
 
       # The end-to-end jobs test this image instead of building their own,
-      # which takes an hour without this job's cache.
+      # a quarter of an hour or more without this job's cache.
       - name: Save the image for the end-to-end jobs
         if: matrix.arch == 'amd64'
         run: docker save igloo:ci | gzip -1 >"$RUNNER_TEMP/igloo-ci.tar.gz"

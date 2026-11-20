@@ -3,7 +3,9 @@
 # DuckDB's Iceberg extension with Igloo's patches (extensions/iceberg). It has
 # a stage of its own, which only its build script and patches reach, so that
 # changing the rest of Igloo does not build it again; the cache keeps vcpkg's
-# packages and the compiler's work between builds of it.
+# packages and the compiler's work between builds of it. It compiles nothing
+# of DuckDB's but its mbedtls, and takes 10 to 15 minutes on four cores, over
+# half of them vcpkg's libraries (the AWS SDK and OpenSSL most of all).
 FROM debian:bookworm AS iceberg
 RUN apt-get update && apt-get install -y --no-install-recommends \
       build-essential cmake ninja-build pkg-config autoconf automake autoconf-archive libtool \

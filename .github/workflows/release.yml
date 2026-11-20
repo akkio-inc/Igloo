@@ -80,7 +80,7 @@ jobs:
     # is signed, until CI has passed (see publish).
     needs: [prepare]
     runs-on: ${{ matrix.runner }}
-    # Without a cache, the iceberg extension alone takes up to an hour.
+    # Without a cache, the iceberg extension alone takes 10 to 15 minutes.
     timeout-minutes: 120
     permissions:
       contents: read
