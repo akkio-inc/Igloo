@@ -38,7 +38,11 @@ use `CREATE TABLE ... AS SELECT` from the connection.
 
 The extensions are DuckDB's own core extensions, built for linux/amd64 and
 linux/arm64 and baked into the image like the others; Igloo loads them only
-when a connection needs them. The extensions are MIT-licensed. The
+when a connection needs them. The `postgres` extension, which PostgreSQL
+and Snowflake connections are attached with, is built with the image from
+DuckDB's source with Igloo's patches
+([`extensions/postgres`](../extensions/postgres)), which end a scan as soon
+as its statement no longer needs it. The extensions are MIT-licensed. The
 `postgres` extension links libpq (PostgreSQL License); the `mysql` extension
 links MariaDB Connector/C, which is LGPL-2.1. Snowflake's Go driver,
 [gosnowflake](https://github.com/snowflakedb/gosnowflake), is under the
@@ -559,6 +563,14 @@ from showing a password, and lets Igloo:
   working while one is down;
 - give up on a database that stops answering, after `query_timeout`, instead
   of leaving DuckDB waiting;
+- stop a PostgreSQL scan at the database once its statement no longer
+  needs it: a statement canceled by its `statement_timeout`, a cancel
+  request or the memory watch, one that fails, and one that has the rows
+  it asked for, as a `LIMIT` above a filter Igloo applies has. Igloo has
+  PostgreSQL cancel the scan's query, in that session alone, and the
+  statement returns then. Each scan runs inside a savepoint, which keeps
+  the canceled query from failing its transaction: a transaction block
+  reads on after such a statement, from the snapshot it began with;
 - make every remote session read-only, and refuse requests for local files.
 
 Startup checks every connection's database at once, so it waits at most
@@ -589,7 +601,14 @@ read](#how-iceberg-rest-catalogs-are-read).
   remote tables into Iceberg with `CREATE TABLE AS` and refresh them on a
   schedule.
 - PostgreSQL tables are read in the binary `COPY` format, large ones in
-  parallel by page range (PostgreSQL 14 and later) under one snapshot.
+  parallel by page range (PostgreSQL 14 and later) under one snapshot. A
+  view, a partitioned table and a table PostgreSQL has not analyzed yet are
+  read as one query.
+- A statement that needs no more of a PostgreSQL scan ends it at the
+  database, so a `LIMIT` above a filter Igloo applies, an `EXISTS` and a
+  canceled statement cost the database what was read by then, whatever is
+  read: a `LIMIT 10` above a filter over a view of a 30-million-row table
+  returns in 0.1 s, where reading the view takes 3.8 s.
 - DuckDB keeps a pool of sessions per connection and reuses them, so most
   queries do not sign in again; listing tables costs the remote database
   nothing.
@@ -718,11 +737,16 @@ just enough of PostgreSQL's protocol for the extension and nothing more:
   ahead, a part taking up to about 160 MB. `count(*)` becomes
   `COUNT(*)` in Snowflake, which Snowflake answers from its metadata
   without a warehouse when there is no filter.
-- **Timeouts.** Signing in is bounded by `connect_timeout`; Snowflake stops
-  a query at `query_timeout` itself (its `STATEMENT_TIMEOUT_IN_SECONDS`),
-  and Igloo cancels it there too, so the warehouse does not go on working
-  for nothing. The sessions are tagged `QUERY_TAG = 'igloo connection
-  <name>'`, so Snowflake's query history shows each query Igloo sent:
+- **Timeouts and cancels.** Signing in is bounded by `connect_timeout`;
+  Snowflake stops a query at `query_timeout` itself (its
+  `STATEMENT_TIMEOUT_IN_SECONDS`), and Igloo cancels it there too, so the
+  warehouse does not go on working for nothing. A statement that no longer
+  needs a scan cancels the scan's Snowflake query at once and returns: one
+  canceled by its `statement_timeout`, a cancel request or the memory
+  watch, one that fails, and one that has the rows it asked for, as a
+  `LIMIT` above a filter Igloo applies has. The sessions are tagged
+  `QUERY_TAG = 'igloo connection <name>'`, so Snowflake's query history
+  shows each query Igloo sent:
 
   ```sql
   SELECT start_time, query_text, execution_status, total_elapsed_time

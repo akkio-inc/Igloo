@@ -1,0 +1,18 @@
+Build with Debian's GCC 12.
+
+GCC 12 moves a returned local into a unique_ptr of another type, here one
+to const, only when told to, in the C++11 DuckDB is built in.
+
+diff --git a/src/storage/postgres_secret_storage.cpp b/src/storage/postgres_secret_storage.cpp
+index 302b78a..d81736c 100644
+--- a/src/storage/postgres_secret_storage.cpp
++++ b/src/storage/postgres_secret_storage.cpp
+@@ -172,7 +172,7 @@ unique_ptr<const BaseSecret> PostgresSecretStorage::DeserializeSecret(PostgresCa
+ 	auto secret = secret_manager.DeserializeSecret(deserializer, secret_name);
+ 	deserializer.End();
+ 
+-	return secret;
++	return std::move(secret);
+ }
+ 
+ unique_ptr<SecretEntry> PostgresSecretStorage::StoreSecret(unique_ptr<const BaseSecret> secret,

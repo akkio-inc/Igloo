@@ -2,10 +2,10 @@
 # Runs the Go tests in a container, with a throwaway PostgreSQL for the
 # tests that need one, a throwaway MySQL that the tests of connections to
 # other databases read alongside it, DuckDB's extensions (kept in the volume
-# igloo-duckdb-extensions), Igloo's own rb and iceberg extensions
-# (igloo-rb-extension, igloo-iceberg-extension) for the tests that use them,
-# and XGBoost's library, which every build links (igloo-xgboost). Only Docker
-# is required.
+# igloo-duckdb-extensions), Igloo's own rb, iceberg and postgres extensions
+# (igloo-rb-extension, igloo-iceberg-extension, igloo-postgres-extension) for
+# the tests that use them, and XGBoost's library, which every build links
+# (igloo-xgboost). Only Docker is required.
 #
 #   scripts/test.sh [go test args...]
 set -euo pipefail
@@ -47,7 +47,8 @@ docker run -d --name "$name-mysql" --network "$name" -e MYSQL_ROOT_PASSWORD=test
 ready "$name-db" docker exec "$name-db" pg_isready -U postgres
 
 mounts=(-v "$root":/src -v igloo-go-mod:/go/pkg/mod -v igloo-go-build:/root/.cache/go-build -v igloo-duckdb-extensions:/ext
-  -v igloo-rb-extension:/rb -v igloo-iceberg-extension:/iceberg -v igloo-xgboost:/xgboost -e PKG_CONFIG_PATH=/xgboost/lib/pkgconfig)
+  -v igloo-rb-extension:/rb -v igloo-iceberg-extension:/iceberg -v igloo-postgres-extension:/postgres
+  -v igloo-xgboost:/xgboost -e PKG_CONFIG_PATH=/xgboost/lib/pkgconfig)
 "$root/scripts/xgboost.sh"
 # Downloads only what the volume does not have yet.
 docker run --rm "${mounts[@]}" -w /src "$go_image" go run -tags duckdb_arrow ./cmd/igloo install-extensions /ext
@@ -59,6 +60,11 @@ docker run --rm "${mounts[@]}" -e RB_CACHE=/rb/cache -w /src "$go_image" extensi
 # Docker's build cache keeps it until extensions/iceberg's build changes).
 docker build -q --target iceberg -t igloo-iceberg-build "$root" >/dev/null
 docker run --rm -v igloo-iceberg-extension:/iceberg igloo-iceberg-build cp /out/iceberg/iceberg.duckdb_extension /iceberg/
+# Igloo's build of DuckDB's postgres extension, which the tests attach
+# PostgreSQL and Snowflake connections with: the Dockerfile's postgres stage
+# (minutes the first time).
+docker build -q --target postgres -t igloo-postgres-build "$root" >/dev/null
+docker run --rm -v igloo-postgres-extension:/postgres igloo-postgres-build cp /out/postgres/postgres_scanner.duckdb_extension /postgres/
 
 # MySQL first starts without networking to initialize; wait for TCP.
 ready "$name-mysql" docker exec "$name-mysql" mysql -h127.0.0.1 -uroot -ptest -e 'SELECT 1' igloo_test
@@ -76,4 +82,5 @@ docker run --rm ${cpus[@]+"${cpus[@]}"} --network "$name" \
   -e IGLOO_TEST_EXTENSION_DIR=/ext \
   -e IGLOO_TEST_RB_EXTENSION=/rb/rb.duckdb_extension \
   -e IGLOO_TEST_ICEBERG_EXTENSION=/iceberg/iceberg.duckdb_extension \
+  -e IGLOO_TEST_POSTGRES_EXTENSION=/postgres/postgres_scanner.duckdb_extension \
   "${mounts[@]}" -w /src "$go_image" go test -tags duckdb_arrow "${@:-./...}"

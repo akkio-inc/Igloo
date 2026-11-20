@@ -20,6 +20,26 @@ RUN --mount=type=cache,target=/root/.cache/igloo \
 FROM scratch AS iceberg-out
 COPY --from=iceberg /out/iceberg /
 
+# DuckDB's postgres extension with Igloo's patches (extensions/postgres),
+# which PostgreSQL and Snowflake connections are attached with: like iceberg,
+# a stage only its build script and patches reach. It compiles nothing of
+# DuckDB's, and takes minutes; bison and flex are for libpq's build.
+FROM debian:bookworm AS postgres
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      build-essential cmake ninja-build pkg-config autoconf automake autoconf-archive libtool bison flex \
+      curl zip unzip tar git rsync python3 perl ca-certificates linux-libc-dev ccache && \
+    rm -rf /var/lib/apt/lists/*
+COPY extensions/jobs.sh /src/extensions/
+COPY extensions/postgres/build.sh /src/extensions/postgres/
+COPY extensions/postgres/patches /src/extensions/postgres/patches
+RUN --mount=type=cache,target=/root/.cache/igloo \
+    /src/extensions/postgres/build.sh /out/postgres
+
+# The extension alone, for the tests: docker build --target postgres-out
+# --output type=local,dest=DIR writes it to DIR.
+FROM scratch AS postgres-out
+COPY --from=postgres /out/postgres /
+
 # XGBoost's library (third_party/xgboost), which IGLOO.ML.XGBOOST trains and
 # scores with and the binary links statically: like iceberg, a stage only its
 # build script reaches, built again when its release or the script changes.
@@ -53,24 +73,25 @@ COPY . .
 # would otherwise embed, and write out and load at runtime, only to report
 # its version to Snowflake (Igloo turns it off at runtime too).
 # The rb extension (extensions/rb) is built first, in the same step as the
-# binary, which carries its file's SHA-256, and the iceberg extension's, and
-# refuses any other file: the binary and the files cannot come from
-# different builds.
+# binary, which carries its file's SHA-256, and the iceberg and postgres
+# extensions', and refuses any other file: the binary and the files cannot
+# come from different builds.
 COPY --from=iceberg /out/iceberg /out/iceberg
+COPY --from=postgres /out/postgres /out/postgres
 COPY --from=xgboost-out / /out/xgboost
 ENV PKG_CONFIG_PATH=/out/xgboost/lib/pkgconfig
 RUN --mount=type=cache,target=/go/pkg/mod --mount=type=cache,target=/root/.cache/go-build \
     --mount=type=cache,target=/root/.cache/igloo \
     extensions/rb/build.sh /out/rb && \
     go build -tags duckdb_arrow,minicore_disabled -trimpath \
-      -ldflags="-s -w -X main.version=${VERSION} -X github.com/akkio-inc/igloo/internal/engine.rbSHA256=$(cat /out/rb/rb.duckdb_extension.sha256) -X github.com/akkio-inc/igloo/internal/engine.icebergSHA256=$(cat /out/iceberg/iceberg.duckdb_extension.sha256)" \
+      -ldflags="-s -w -X main.version=${VERSION} -X github.com/akkio-inc/igloo/internal/engine.rbSHA256=$(cat /out/rb/rb.duckdb_extension.sha256) -X github.com/akkio-inc/igloo/internal/engine.icebergSHA256=$(cat /out/iceberg/iceberg.duckdb_extension.sha256) -X github.com/akkio-inc/igloo/internal/engine.postgresSHA256=$(cat /out/postgres/postgres_scanner.duckdb_extension.sha256)" \
       -o /out/igloo ./cmd/igloo
 
 # Bake DuckDB's extensions into the image so the server never downloads code
 # at runtime, then check that this binary loads its own.
 RUN /out/igloo install-extensions /out/extensions && \
     mkdir -p /out/extensions/igloo /out/tmp /out/cache /out/empty && \
-    cp /out/rb/rb.duckdb_extension /out/iceberg/iceberg.duckdb_extension /out/extensions/igloo/ && \
+    cp /out/rb/rb.duckdb_extension /out/iceberg/iceberg.duckdb_extension /out/postgres/postgres_scanner.duckdb_extension /out/extensions/igloo/ && \
     /out/igloo check-extensions /out/extensions
 
 # distroless/cc has the glibc DuckDB links against, CA certificates for

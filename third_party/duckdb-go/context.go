@@ -125,7 +125,7 @@ func interrupterRoutine(ctx context.Context, conn mapping.Connection, done <-cha
 		case <-done:
 			return
 		default:
-			interrupt(conn) // Igloo patch: with the connection's hook (see SetInterruptHook).
+			mapping.Interrupt(conn)
 		}
 
 		select {

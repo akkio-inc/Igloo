@@ -40,6 +40,9 @@ type relay struct {
 	// the session takes note (see takeDropped).
 	dropped bool
 	closed  bool
+	// settled wakes those who wait for the remote database to owe DuckDB
+	// no answer (see settle).
+	settled *sync.Cond
 }
 
 // newRelay relays client; upstream is set once there is one.
@@ -47,7 +50,19 @@ func newRelay(client net.Conn, timeout time.Duration) *relay {
 	if timeout > 0 {
 		timeout += silenceGrace
 	}
-	return &relay{client: client, timeout: timeout}
+	r := &relay{client: client, timeout: timeout}
+	r.settled = sync.NewCond(&r.mu)
+	return r
+}
+
+// settle waits until the remote database owes DuckDB no answer, or the
+// relay is closed.
+func (r *relay) settle() {
+	r.mu.Lock()
+	for r.pending > 0 && !r.closed {
+		r.settled.Wait()
+	}
+	r.mu.Unlock()
 }
 
 // setUpstream gives the relay its connection to the remote database.
@@ -89,6 +104,9 @@ func (r *relay) end() {
 	r.mu.Lock()
 	if r.pending > 0 {
 		r.pending--
+	}
+	if r.pending == 0 {
+		r.settled.Broadcast()
 	}
 	r.deadline()
 	up := r.dropNow()
@@ -169,6 +187,7 @@ func (r *relay) close() {
 	r.mu.Lock()
 	already, up := r.closed, r.upstream
 	r.closed = true
+	r.settled.Broadcast()
 	r.mu.Unlock()
 	if !already {
 		_ = r.client.Close()

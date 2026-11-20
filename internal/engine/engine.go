@@ -109,8 +109,12 @@ type Engine struct {
 	// releaseTempDir lets go of the spill directory; see claimTempDir.
 	releaseTempDir func()
 	// bitmaps says the rb extension is loaded, and icebergOwn Igloo's build
-	// of the iceberg extension (see loadOwn).
+	// of the iceberg extension (see loadOwn). onDemand are Igloo's own
+	// extensions that are loaded when a BeforeLockdown hook asks, and
+	// loadedOnDemand those that were (see LoadExtension).
 	bitmaps, icebergOwn bool
+	onDemand            []extensionFile
+	loadedOnDemand      map[string]bool
 	log                 *slog.Logger
 	// cfg is what it was opened with, and isBackground says it is the
 	// second DuckDB of a process, for heavy statements (see background.go);
@@ -745,11 +749,11 @@ func (e *Engine) setup(ctx context.Context, cfg config.Config, log *slog.Logger,
 	if err := configure(cfg, serverThreadsPerCore, exec, query); err != nil {
 		return err
 	}
-	own, err := loadOwn(cfg, log, exec, query)
+	own, onDemand, err := loadOwn(cfg, log, exec, query)
 	if err != nil {
 		return err
 	}
-	e.bitmaps, e.icebergOwn = own["rb"], own["iceberg"]
+	e.bitmaps, e.icebergOwn, e.onDemand = own["rb"], own["iceberg"], onDemand
 	if e.local, err = queryString(ctx, conn, "SELECT current_database()"); err != nil {
 		return fmt.Errorf("read database name: %w", err)
 	}
@@ -797,7 +801,7 @@ func (e *Engine) setup(ctx context.Context, cfg config.Config, log *slog.Logger,
 				}
 			}
 		}
-		if err := beforeLockdown(ctx, conn, o); err != nil {
+		if err := e.runBeforeLockdown(ctx, conn, o, exec); err != nil {
 			return err
 		}
 		return e.lockDown(exec, cfg, o.sandboxDirs())
@@ -895,7 +899,7 @@ func (e *Engine) setup(ctx context.Context, cfg config.Config, log *slog.Logger,
 	}
 	e.catalog = cfg.Catalog.Name
 
-	if err := beforeLockdown(ctx, conn, o); err != nil {
+	if err := e.runBeforeLockdown(ctx, conn, o, exec); err != nil {
 		return err
 	}
 	if err := e.lockDown(exec, cfg, o.sandboxDirs()); err != nil {

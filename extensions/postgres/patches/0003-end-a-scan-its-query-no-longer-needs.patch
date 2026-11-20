@@ -1,0 +1,298 @@
+End a scan its query no longer needs.
+
+The reader of a scan waited for the server inside libpq (PQexec for the
+COPY to begin, PQgetCopyData for each row), where nothing looks for the
+query's interrupt, and nothing ended a COPY the reader left unread: libpq
+reads the rest of it before the connection takes its next command, the
+COMMIT or ROLLBACK that ends the query included. A query that was canceled,
+that failed, or that had the rows it needed (a LIMIT above a filter, a
+semi-join) went on until the server had sent every row of every scan.
+
+The reader now waits for the server itself, a tenth of a second at a time,
+and throws once the query is interrupted. When it is destroyed with its
+COPY unfinished, it has the server cancel the COPY, as psql does on Ctrl-C,
+and reads to the end of the command, which the cancel brings: the
+connection is ready for its next command when the scan is gone. So does
+any command sent on a connection whose COPY is still in flight, such as
+the ROLLBACK of a session that ends inside a transaction, which DuckDB
+sends before it destroys the query's readers. The request goes to the
+server process of that connection alone, and is repeated each second the
+command goes on, as one that arrives before the command is lost. A server
+that takes no cancel requests is read to the end, as before. A wait that a
+signal ends early goes on: the runtime of a Go program signals its threads,
+the one that runs the query among them.
+
+diff --git a/src/include/postgres_binary_reader.hpp b/src/include/postgres_binary_reader.hpp
+index 26f89fb..9c4395c 100644
+--- a/src/include/postgres_binary_reader.hpp
++++ b/src/include/postgres_binary_reader.hpp
+@@ -26,10 +26,27 @@ public:
+ private:
+ 	bool FetchNextBuffer();
+ 	void FreeBuffer();
++	//! Igloo: waits until the server has sent more, and throws once the query is interrupted
++	void WaitForInput();
++	//! Igloo: ends the COPY the reader leaves unread, and reads to the end of its command
++	void EndCopy() noexcept;
+ 
+ private:
++	//! Igloo: how far the reader's COPY is
++	enum class CopyState : uint8_t {
++		//! No COPY of the reader's is in flight
++		NONE,
++		//! The server has yet to end the COPY
++		RUNNING,
++		//! The COPY has ended, and what follows it is yet to be read
++		ENDED
++	};
++
+ 	PostgresBinaryParser parser;
+ 	data_ptr_t buffer = nullptr;
++	//! Igloo: the query the COPY is read for
++	optional_ptr<ClientContext> context;
++	CopyState copy_state = CopyState::NONE;
+ };
+ 
+ } // namespace duckdb
+diff --git a/src/include/postgres_connection.hpp b/src/include/postgres_connection.hpp
+index 8d5cc7b..e02c7ff 100644
+--- a/src/include/postgres_connection.hpp
++++ b/src/include/postgres_connection.hpp
+@@ -70,6 +70,9 @@ public:
+ 	void FinishCopyTo(PostgresCopyState &state);
+ 
+ 	void BeginCopyFrom(ClientContext &context, const string &query, ExecStatusType expected_result);
++	//! Igloo: reads to the end of the command in flight, if there is one, dropping what its COPY still sends. With
++	//! cancel, the server is asked to stop the command first.
++	void EndCommand(bool cancel) noexcept;
+ 
+ 	bool IsOpen();
+ 	void Close();
+diff --git a/src/postgres_binary_reader.cpp b/src/postgres_binary_reader.cpp
+index c12a691..10e29df 100644
+--- a/src/postgres_binary_reader.cpp
++++ b/src/postgres_binary_reader.cpp
+@@ -1,8 +1,27 @@
+ #include "postgres_binary_reader.hpp"
+ #include "postgres_scanner.hpp"
++#include "postgres_logging.hpp"
++#include "duckdb/main/client_context.hpp"
++#include "duckdb/common/printer.hpp"
++
++#include <cerrno>
++#include <chrono>
++#include <cstring>
+ 
+ namespace duckdb {
+ 
++// Igloo: the reader gives its COPY up when its query no longer needs it. It
++// waited for the server inside libpq, where no interrupt was looked for, and
++// a COPY it left unread was read to its end before the connection took its
++// next command: a query that was canceled, that failed, or that had the rows
++// it needed went on until the server had sent every row. The reader now
++// waits for the server itself, looking for the query's interrupt as it does,
++// and has the server cancel a COPY it leaves unread (see
++// PostgresConnection::EndCommand).
++
++//! How often a reader that waits for the server looks for an interrupt
++static constexpr pg_usec_time_t INTERRUPT_CHECK_USEC = 100000;
++
+ PostgresBinaryReader::PostgresBinaryReader(PostgresConnection &con_p, const vector<column_t> &column_ids,
+                                            const PostgresBindData &bind_data)
+     : PostgresResultReader(con_p, column_ids, bind_data),
+@@ -11,10 +30,68 @@ PostgresBinaryReader::PostgresBinaryReader(PostgresConnection &con_p, const vect
+ 
+ PostgresBinaryReader::~PostgresBinaryReader() {
+ 	FreeBuffer();
++	EndCopy();
++}
++
++void PostgresBinaryReader::EndCopy() noexcept {
++	if (copy_state == CopyState::NONE) {
++		return;
++	}
++	auto cancel = copy_state == CopyState::RUNNING;
++	copy_state = CopyState::NONE;
++	con.EndCommand(cancel);
++}
++
++void PostgresBinaryReader::WaitForInput() {
++	auto conn = con.GetConn();
++	while (true) {
++		if (context && context->interrupted) {
++			throw InterruptException();
++		}
++		auto ready = PQsocketPoll(PQsocket(conn), 1, 0, PQgetCurrentTimeUSec() + INTERRUPT_CHECK_USEC);
++		// a signal the thread handled ends the wait early (EINTR), as the runtime of a Go program sends its
++		// threads: the reader waits again
++		if (ready < 0 && errno != EINTR) {
++			throw IOException("Unable to wait for COPY data from Postgres: %s", string(strerror(errno)));
++		}
++		if (ready > 0) {
++			break;
++		}
++	}
++	if (!PQconsumeInput(conn)) {
++		throw IOException("Unable to read binary COPY data from Postgres: %s", string(PQerrorMessage(conn)));
++	}
+ }
+ 
+-void PostgresBinaryReader::BeginCopy(ClientContext &context, const string &sql) {
+-	con.BeginCopyFrom(context, sql, PGRES_COPY_OUT);
++void PostgresBinaryReader::BeginCopy(ClientContext &context_p, const string &sql) {
++	context = context_p;
++	auto conn = con.GetConn();
++	if (PostgresConnection::DebugPrintQueries()) {
++		Printer::Print(sql + "\n");
++	}
++	int64_t start_time = std::chrono::time_point_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now())
++	                         .time_since_epoch()
++	                         .count();
++	// a command still in flight is one nobody reads any more
++	con.EndCommand(true);
++	if (!PQsendQuery(conn, sql.c_str())) {
++		throw std::runtime_error("Failed to prepare COPY \"" + sql + "\": " + string(PQerrorMessage(conn)));
++	}
++	copy_state = CopyState::RUNNING;
++	while (PQisBusy(conn)) {
++		WaitForInput();
++	}
++	PostgresResult pg_res(PQgetResult(conn));
++	auto result = pg_res.res;
++	int64_t end_time = std::chrono::time_point_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now())
++	                       .time_since_epoch()
++	                       .count();
++	DUCKDB_LOG(context_p, PostgresQueryLogType, sql, end_time - start_time);
++	if (!result || PQresultStatus(result) != PGRES_COPY_OUT) {
++		copy_state = CopyState::ENDED;
++		auto error = result ? PQresultErrorMessage(result) : PQerrorMessage(conn);
++		throw std::runtime_error("Failed to prepare COPY \"" + sql + "\": " + string(error));
++	}
+ 	if (!FetchNextBuffer()) {
+ 		throw IOException("Failed to fetch header for COPY \"%s\"", sql);
+ 	}
+@@ -36,11 +113,15 @@ PostgresReadResult PostgresBinaryReader::Read(DataChunk &output) {
+ 
+ bool PostgresBinaryReader::FetchNextBuffer() {
+ 	char *out_buffer;
+-	int len = PQgetCopyData(con.GetConn(), &out_buffer, 0);
++	int len;
++	while ((len = PQgetCopyData(con.GetConn(), &out_buffer, 1)) == 0) {
++		WaitForInput();
++	}
+ 	auto new_buffer = data_ptr_cast(out_buffer);
+ 
+ 	// len -1 signals end
+ 	if (len == -1) {
++		copy_state = CopyState::ENDED;
+ 		// consume all available results
+ 		while (true) {
+ 			PostgresResult pg_res(PQgetResult(con.GetConn()));
+@@ -52,6 +133,7 @@ bool PostgresBinaryReader::FetchNextBuffer() {
+ 				throw IOException("Failed to fetch header for COPY: %s", string(PQresultErrorMessage(final_result)));
+ 			}
+ 		}
++		copy_state = CopyState::NONE;
+ 		return false;
+ 	}
+ 
+diff --git a/src/postgres_connection.cpp b/src/postgres_connection.cpp
+index 2f91230..9073016 100644
+--- a/src/postgres_connection.cpp
++++ b/src/postgres_connection.cpp
+@@ -7,6 +7,8 @@
+ #include "duckdb/common/shared_ptr.hpp"
+ #include "duckdb/common/helper.hpp"
+ 
++#include <cerrno>
++
+ namespace duckdb {
+ 
+ static bool debug_postgres_print_queries = false;
+@@ -61,6 +63,77 @@ static bool ResultHasError(PGresult *result) {
+ 	}
+ }
+ 
++// Igloo: a command in flight when the connection is wanted for another is a COPY whose reader the query has left
++// behind. libpq reads such a COPY to its end before it sends the next command, however long the server takes to send
++// it: the server is asked to cancel it instead, as psql does on Ctrl-C.
++
++//! How long a command may go on after the server was asked to cancel it, before it is asked again
++static constexpr pg_usec_time_t CANCEL_AGAIN_USEC = 1000000;
++
++static void RequestCancel(PGconn *conn) noexcept {
++	auto cancel = PQcancelCreate(conn);
++	if (!cancel) {
++		return;
++	}
++	PQcancelBlocking(cancel);
++	PQcancelFinish(cancel);
++}
++
++void PostgresConnection::EndCommand(bool cancel) noexcept {
++	if (!connection || !connection->connection) {
++		return;
++	}
++	auto conn = connection->connection;
++	if (PQtransactionStatus(conn) != PQTRANS_ACTIVE) {
++		// no command is in flight
++		return;
++	}
++	// The request goes to the server process of this connection alone. It is repeated each second the command goes
++	// on: one that reaches a server before the command does is lost.
++	pg_usec_time_t cancel_at = 0;
++	while (true) {
++		if (cancel && PQgetCurrentTimeUSec() >= cancel_at) {
++			RequestCancel(conn);
++			cancel_at = PQgetCurrentTimeUSec() + CANCEL_AGAIN_USEC;
++		}
++		if (!PQisBusy(conn)) {
++			auto res = PQgetResult(conn);
++			if (!res) {
++				// the command has ended
++				return;
++			}
++			auto status = PQresultStatus(res);
++			PQclear(res);
++			if (status == PGRES_COPY_IN || status == PGRES_COPY_BOTH) {
++				return;
++			}
++			if (status != PGRES_COPY_OUT) {
++				continue;
++			}
++			char *data;
++			int len;
++			while ((len = PQgetCopyData(conn, &data, 1)) > 0) {
++				PQfreemem(data);
++			}
++			if (len == -1) {
++				// the COPY has ended: its result follows
++				continue;
++			}
++			if (len < 0) {
++				return;
++			}
++		}
++		auto ready = PQsocketPoll(PQsocket(conn), 1, 0, PQgetCurrentTimeUSec() + CANCEL_AGAIN_USEC);
++		if (ready < 0 && errno == EINTR) {
++			// a signal the thread handled ended the wait early
++			continue;
++		}
++		if (ready < 0 || (ready > 0 && !PQconsumeInput(conn))) {
++			return;
++		}
++	}
++}
++
+ PGresult *PostgresConnection::PQExecute(optional_ptr<ClientContext> context, const string &query,
+                                         const PostgresParameters &params) {
+ 	if (PostgresConnection::DebugPrintQueries()) {
+@@ -72,6 +145,8 @@ PGresult *PostgresConnection::PQExecute(optional_ptr<ClientContext> context, con
+ 
+ 	PGconn *conn = GetConn();
+ 	PGresult *res = nullptr;
++	// Igloo: a command still in flight is one nobody reads any more
++	EndCommand(true);
+ 
+ 	if (params.Empty()) {
+ 		res = PQexec(GetConn(), query.c_str());

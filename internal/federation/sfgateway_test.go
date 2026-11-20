@@ -3,12 +3,12 @@ package federation
 import (
 	"bufio"
 	"context"
+	"database/sql/driver"
 	"errors"
 	"fmt"
-	"io"
-	"log/slog"
 	"net"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -19,6 +19,8 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/apache/arrow-go/v18/arrow/memory"
 	"github.com/duckdb/duckdb-go/v2"
+
+	"github.com/akkio-inc/igloo/internal/engine"
 )
 
 // fakeSnowflake stands in for Snowflake behind a gateway: it serves a
@@ -294,7 +296,10 @@ func TestSnowflakeGateway(t *testing.T) {
 	}
 	m, eng := startEngine(t, store)
 	if got := m.Catalogs(); got["sf"] != Snowflake {
-		t.Fatalf("not attached: %v", got)
+		// With why: this failed once in a run of the whole package, and
+		// the reason went unseen.
+		list, _ := m.List(context.Background())
+		t.Fatalf("not attached: %v; connections: %+v", got, list)
 	}
 
 	// Snowflake's names, as DuckDB sees them, and their types.
@@ -478,19 +483,27 @@ func (b waitingBatch) fetch(ctx context.Context) ([]arrow.Record, error) {
 
 // TestSnowflakeScansEndWithTheirStatement checks that the scans of a
 // canceled statement end with it, and no other's. DuckDB's postgres
-// extension looks for no interrupt while it waits for a scan's rows, and
-// reads the rest of every scan before its connection takes another command:
+// extension looked for no interrupt while it waited for a scan's rows, and
+// read the rest of every scan before its connection took another command:
 // with a timeout of 60 s, statements through a Snowflake connection ended up
 // to 161 s after it, their DuckDB connections busy and Snowflake still at
-// work. A linked DuckDB connection (Manager.LinkScans) has its scans ended
-// when its statement's context ends, while the same scans, of the same
-// table at the same time, go on for other connections, linked or not.
+// work. Igloo's build of the extension (extensions/postgres) looks for the
+// interrupt and asks the gateway to cancel the scan, on that scan's own
+// connection: the same scans, of the same table at the same time, go on for
+// other DuckDB connections. A scan with a LIMIT of its own, which the
+// extension reads in one task on the transaction's connection, ends the same
+// way, as does one the extension downloads before the statement starts, as
+// it does a LIMIT scan of a statement with several scans.
 func TestSnowflakeScansEndWithTheirStatement(t *testing.T) {
 	installExtensions(t)
+	ownPostgres(t)
 	cols := t1Columns(t)
 	const (
-		one = "SELECT count(id) FROM sf.tpch.t1 WHERE amt < 0"
-		two = "SELECT count(*) FROM (SELECT id FROM sf.tpch.t1 WHERE amt < 0 UNION ALL SELECT id FROM sf.tpch.t1 WHERE f > 1)"
+		one     = "SELECT count(id) FROM sf.tpch.t1 WHERE amt < 0"
+		two     = "SELECT count(*) FROM (SELECT id FROM sf.tpch.t1 WHERE amt < 0 UNION ALL SELECT id FROM sf.tpch.t1 WHERE f > 1)"
+		limited = "SELECT count(id) FROM (SELECT id FROM sf.tpch.t1 LIMIT 100)"
+		// The LIMIT scan is read whole before the other starts.
+		limitedOfTwo = "SELECT count(*) FROM (SELECT id FROM (SELECT id FROM sf.tpch.t1 LIMIT 100) UNION ALL SELECT id FROM sf.tpch.t1 WHERE f > 1)"
 	)
 	for _, tc := range []struct {
 		name string
@@ -498,13 +511,19 @@ func TestSnowflakeScansEndWithTheirStatement(t *testing.T) {
 		// slowly; otherwise it never answers.
 		streams bool
 		sql     string
-		scans   int32
-		want    string
+		// scans is how many of the statement's scans reach Snowflake while
+		// it waits.
+		scans int32
+		want  string
 	}{
 		{"one scan Snowflake never answers", false, one, 1, "1"},
 		{"two scans Snowflake never answers", false, two, 2, "4"},
 		{"one scan Snowflake delivers slowly", true, one, 1, "4"},
 		{"two scans Snowflake delivers slowly", true, two, 2, "16"},
+		{"a LIMIT scan Snowflake never answers", false, limited, 1, "1"},
+		{"a LIMIT scan Snowflake delivers slowly", true, limited, 1, "4"},
+		{"a LIMIT scan of two Snowflake never answers", false, limitedOfTwo, 1, "4"},
+		{"a LIMIT scan of two Snowflake delivers slowly", true, limitedOfTwo, 1, "16"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			fake := &fakeSnowflake{cat: testCatalog(t)}
@@ -537,44 +556,8 @@ func TestSnowflakeScansEndWithTheirStatement(t *testing.T) {
 				}
 				return out, nil
 			}
-			open := openSnowflake
-			openSnowflake = func(Connection, string) sfBackend { return fake }
-			t.Cleanup(func() { openSnowflake = open })
-			store := NewMemoryStore()
-			c := New("sf", Snowflake)
-			c.Account, c.User, c.Database, c.Password = "myorg-acct", "u", "db", "pw"
-			c.QueryTimeout = time.Minute
-			if err := store.Create(context.Background(), c); err != nil {
-				t.Fatal(err)
-			}
-			m, eng := startEngine(t, store)
-			connect := func(link bool) *duckdb.Conn {
-				conn, err := eng.Connect(context.Background())
-				if err != nil {
-					t.Fatal(err)
-				}
-				t.Cleanup(func() { _ = conn.Close() })
-				if link {
-					unlink, err := m.LinkScans(context.Background(), conn)
-					if err != nil {
-						t.Fatal(err)
-					}
-					t.Cleanup(unlink)
-				}
-				return conn
-			}
-			type answer struct {
-				got string
-				err error
-			}
-			run := func(ctx context.Context, conn *duckdb.Conn) chan answer {
-				done := make(chan answer, 1)
-				go func() {
-					got, err := queryOn(ctx, conn, tc.sql)
-					done <- answer{got, err}
-				}()
-				return done
-			}
+			eng := startSnowflake(t, fake)
+			run := func(ctx context.Context) chan answer { return runStatement(t, eng, ctx, tc.sql) }
 			reached := func(n int32) {
 				t.Helper()
 				for deadline := time.Now().Add(10 * time.Second); started.Load() < n && time.Now().Before(deadline); {
@@ -585,13 +568,13 @@ func TestSnowflakeScansEndWithTheirStatement(t *testing.T) {
 				}
 			}
 
-			// The same statement for two other connections, one linked and
-			// one not, then for the one that is canceled.
-			others := []chan answer{run(context.Background(), connect(true)), run(context.Background(), connect(false))}
+			// The same statement for two other connections, then for the
+			// one that is canceled.
+			others := []chan answer{run(context.Background()), run(context.Background())}
 			reached(2 * tc.scans)
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
-			canceled := run(ctx, connect(true))
+			canceled := run(ctx)
 			reached(3 * tc.scans)
 			time.Sleep(300 * time.Millisecond)
 			cancel()
@@ -623,57 +606,277 @@ func TestSnowflakeScansEndWithTheirStatement(t *testing.T) {
 					t.Fatal("another connection's statement did not return")
 				}
 			}
-			// The canceled connection runs its next statement, whose scans
-			// nothing ends.
-			if got, err := queryOn(context.Background(), connect(true), tc.sql); err != nil || got != tc.want {
+			// A statement after the canceled one reads its scans whole.
+			if got, err := queryOn(context.Background(), connect(t, eng), tc.sql); err != nil || got != tc.want {
 				t.Errorf("a statement after the canceled one: got %q, %v; want %q", got, err, tc.want)
 			}
 		})
 	}
 }
 
-// TestScanTags checks the tags LinkScans hands out: each a pg_pages_per_task
-// that gives the gateway's tables two tasks at a time, none handed out twice
-// at once, and a connection left unlinked when none is free or no Snowflake
-// connection is attached.
-func TestScanTags(t *testing.T) {
-	m := NewManager(NewMemoryStore(), Options{}, slog.New(slog.NewTextHandler(io.Discard, nil)))
-	if tag := m.takeScanTag(); tag != 0 {
-		t.Errorf("tag %d with no Snowflake connection attached", tag)
+// startSnowflake starts an engine with one Snowflake connection, sf, which
+// fake answers.
+func startSnowflake(t *testing.T, fake *fakeSnowflake) *engine.Engine {
+	t.Helper()
+	open := openSnowflake
+	openSnowflake = func(Connection, string) sfBackend { return fake }
+	t.Cleanup(func() { openSnowflake = open })
+	store := NewMemoryStore()
+	c := New("sf", Snowflake)
+	c.Account, c.User, c.Database, c.Password = "myorg-acct", "u", "db", "pw"
+	c.QueryTimeout = time.Minute
+	if err := store.Create(context.Background(), c); err != nil {
+		t.Fatal(err)
 	}
-	m.attached["sf"] = &attachment{ep: &sfGateway{}}
-	seen := map[int]bool{}
-	for range scanTagMax - scanTagMin + 1 {
-		tag := m.takeScanTag()
-		if tag < scanTagMin || tag > scanTagMax || seen[tag] || scanPages/tag != 2 || tag >= 1000 {
-			t.Fatalf("tag %d: taken before %v, or not one that gives %d pages two tasks, or the extension's default", tag, seen[tag], scanPages)
-		}
-		seen[tag] = true
+	_, eng := startEngine(t, store)
+	// A scan that waits for Snowflake holds one of DuckDB's threads, of which
+	// there is one a core unless told otherwise: three statements of two
+	// scans each, as these tests hold at once, left one scan of the third
+	// unstarted on a machine of four cores, where the release run of
+	// 1.0.0-rc.14 failed for it. The threads wait and use no core.
+	if _, err := queryOn(context.Background(), connect(t, eng), "SET threads = 16"); err != nil {
+		t.Fatal(err)
 	}
-	if tag := m.takeScanTag(); tag != 0 {
-		t.Errorf("tag %d with every tag taken", tag)
-	}
-	m.tagsFree = append(m.tagsFree, 700, 800)
-	if a, b, c := m.takeScanTag(), m.takeScanTag(), m.takeScanTag(); a != 700 || b != 800 || c != 0 {
-		t.Errorf("tags %d, %d, %d after 700 and 800 were given back, want them and then none", a, b, c)
-	}
+	return eng
+}
 
-	// The tag of a scan is where its first task's pages end.
-	for st, want := range map[string]int{
-		`COPY (SELECT "ID" FROM "TPCH"."T1" WHERE ctid BETWEEN '(0,0)'::tid AND '(700,0)'::tid) TO STDOUT (FORMAT "binary");`:        700,
-		`COPY (SELECT "ID" FROM "TPCH"."T1" WHERE ctid BETWEEN '(700,0)'::tid AND '(1400,0)'::tid) TO STDOUT (FORMAT "binary");`:     0,
-		`COPY (SELECT "ID" FROM "TPCH"."T1" WHERE ctid BETWEEN '(0,0)'::tid AND '(1000,0)'::tid) TO STDOUT (FORMAT "binary");`:       0,
-		`COPY (SELECT "ID" FROM "TPCH"."T1" WHERE ctid BETWEEN '(0,0)'::tid AND '(4294967295,0)'::tid) TO STDOUT (FORMAT "binary");`: 0,
-		`COPY (SELECT "ID" FROM "TPCH"."T1" LIMIT 5) TO STDOUT (FORMAT "binary");`:                                                   0,
-	} {
-		q, err := parseScan(st)
+// answer is what a statement returned.
+type answer struct {
+	got string
+	err error
+}
+
+// runStatement runs sql under ctx on a connection of its own, and returns
+// where its answer arrives. The test ends the statement and waits for it
+// before it closes the connection and the engine: a test that failed with
+// statements still running closed DuckDB under them, which corrupted the
+// heap and aborted the whole test binary in place of the failure ("free():
+// chunks in smallbin corrupted", in the release run of 1.0.0-rc.14).
+func runStatement(t *testing.T, eng *engine.Engine, ctx context.Context, sql string) chan answer {
+	t.Helper()
+	conn := connect(t, eng)
+	ctx, cancel := context.WithCancel(ctx)
+	done := make(chan answer, 1)
+	returned := make(chan struct{})
+	go func() {
+		defer close(returned)
+		got, err := queryOn(ctx, conn, sql)
+		done <- answer{got, err}
+	}()
+	// Registered after the connection's cleanup, so run before it.
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case <-returned:
+		case <-time.After(30 * time.Second):
+			t.Error("a statement was still running 30 s after the test stopped it")
+		}
+	})
+	return done
+}
+
+// connect opens a DuckDB connection the test closes.
+func connect(t *testing.T, eng *engine.Engine) *duckdb.Conn {
+	t.Helper()
+	conn, err := eng.Connect(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+	return conn
+}
+
+// repeated is rec's rows n times over, as one record.
+func repeated(t *testing.T, rec arrow.Record, n int) arrow.Record {
+	t.Helper()
+	cols := make([]arrow.Array, rec.NumCols())
+	for i := range cols {
+		parts := make([]arrow.Array, n)
+		for j := range parts {
+			parts[j] = rec.Column(i)
+		}
+		col, err := array.Concatenate(parts, memory.NewGoAllocator())
 		if err != nil {
 			t.Fatal(err)
 		}
-		if got := q.scanTag(); got != want {
-			t.Errorf("tag %d of %s, want %d", got, st, want)
+		cols[i] = col
+	}
+	return array.NewRecord(rec.Schema(), cols, rec.NumRows()*int64(n))
+}
+
+// TestSnowflakeScansEndWhenTheirStatementNeedsNoMore checks that a statement
+// that has what it needs of a scan returns then, and that the scan ends at
+// Snowflake: one with the rows its LIMIT asks for, above a filter DuckDB
+// applies itself, one whose EXISTS has found a row, one that failed on a
+// row, and one whose session ends with rows of its result unread. The
+// extension read the rest of such a scan before the statement returned, as
+// libpq does before a connection takes its next command, which is the
+// COMMIT or ROLLBACK that ends the statement: each took as long as Snowflake
+// took to deliver the whole table.
+// Igloo's build asks the gateway to cancel a scan it leaves unread. The same
+// scan goes on for another connection, and the statement's own connection
+// reads on after it, inside a transaction block too: there the rest of the
+// scan was read by the block's next statement, and a session that ended in
+// one rolled back before DuckDB let go of the scan.
+func TestSnowflakeScansEndWhenTheirStatementNeedsNoMore(t *testing.T) {
+	installExtensions(t)
+	ownPostgres(t)
+	cols := t1Columns(t)
+	for _, tc := range []struct {
+		name, sql, want string
+		// fails says the statement fails, on the first row it reads.
+		fails bool
+		// leaves says the session reads one row of the result and ends.
+		// DuckDB hands a result's first rows over once it has a megabyte
+		// of them, or its scan returns, so Snowflake goes on delivering
+		// here, a part every 40 ms for 4 s.
+		leaves bool
+	}{
+		{name: "a LIMIT above a filter", sql: "SELECT id FROM sf.tpch.t1 WHERE name LIKE '%a%' LIMIT 10", want: strings.Repeat("1\n", 9) + "1"},
+		{name: "EXISTS", sql: "SELECT 'found' WHERE EXISTS (SELECT 1 FROM sf.tpch.t1 WHERE name LIKE '%a%')", want: "found"},
+		{name: "a failure", sql: "SELECT name::INT FROM sf.tpch.t1", fails: true},
+		{name: "a session that leaves", sql: "SELECT id FROM sf.tpch.t1", want: "1", leaves: true},
+	} {
+		for _, block := range []bool{false, true} {
+			name := tc.name
+			if block {
+				name += " in a transaction block"
+			}
+			t.Run(name, func(t *testing.T) {
+				testScanEndsEarly(t, cols, tc.sql, tc.want, tc.fails, tc.leaves, block)
+			})
 		}
 	}
+}
+
+// testScanEndsEarly runs one statement of
+// TestSnowflakeScansEndWhenTheirStatementNeedsNoMore, in a transaction block
+// or alone.
+func testScanEndsEarly(t *testing.T, cols map[string]arrow.Array, sql, want string, fails, leaves, block bool) {
+	const whole = "SELECT count(id) FROM sf.tpch.t1"
+	fake := &fakeSnowflake{cat: testCatalog(t)}
+	// Snowflake delivers 4,000 rows of a table at once, more than a
+	// statement here needs, and the other parts when released, or
+	// one by one.
+	const first = 2000
+	rest, every := 3, time.Duration(0)
+	if leaves {
+		rest, every = 100, 40*time.Millisecond
+	}
+	var started, ended atomic.Int32
+	release := make(chan struct{})
+	fake.batches = func(ctx context.Context, q string) ([]sfBatch, error) {
+		started.Add(1)
+		from := time.Now()
+		var once sync.Once
+		rec := repeated(t, recordFor(t, cols, q, 2), first)
+		out := []sfBatch{fakeBatch{rec}}
+		for i := range rest {
+			released := (<-chan time.Time)(nil)
+			if every > 0 {
+				released = time.After(time.Until(from.Add(time.Duration(i+1) * every)))
+			}
+			out = append(out, waitingBatch{rec, func(ctx context.Context) error {
+				select {
+				case <-release:
+					return nil
+				case <-released:
+					return nil
+				case <-ctx.Done():
+					once.Do(func() { ended.Add(1) })
+					return context.Cause(ctx)
+				}
+			}})
+		}
+		return out, nil
+	}
+	eng := startSnowflake(t, fake)
+	wholeCount := strconv.Itoa(first * (1 + rest))
+
+	// Another connection reads the whole table meanwhile.
+	other := runStatement(t, eng, context.Background(), whole)
+	for deadline := time.Now().Add(10 * time.Second); started.Load() < 1 && time.Now().Before(deadline); {
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	// The statement's connection reads the table again after it.
+	conn := connect(t, eng)
+	if block {
+		if _, err := queryOn(context.Background(), conn, "BEGIN"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	at := time.Now()
+	var got string
+	var err error
+	if leaves {
+		if got, err = firstRow(conn, sql); err == nil {
+			err = conn.Close()
+		}
+	} else {
+		got, err = queryOn(context.Background(), conn, sql)
+	}
+	took := time.Since(at)
+	switch {
+	case fails && err == nil:
+		t.Errorf("got %q, want a failure", got)
+	case !fails && (err != nil || got != want):
+		t.Errorf("got %q, %v; want %q", got, err, want)
+	}
+	// DuckDB applies the statement's filter and LIMIT itself:
+	// Snowflake is asked for the whole table.
+	if q := fake.sent(); len(q) != 2 || strings.Contains(q[1], "WHERE") || strings.Contains(q[1], "LIMIT") {
+		t.Errorf("Snowflake was sent %q, want two reads of the whole table", q)
+	}
+	if took > 3*time.Second {
+		t.Errorf("the statement returned after %s, with Snowflake still delivering the table", took)
+	}
+	time.Sleep(200 * time.Millisecond)
+	if n := ended.Load(); n != 1 {
+		t.Errorf("%d scans ended at Snowflake, want the statement's 1", n)
+	}
+
+	close(release)
+	select {
+	case a := <-other:
+		if a.err != nil || a.got != wholeCount {
+			t.Errorf("another connection's statement: got %q, %v; want %s", a.got, a.err, wholeCount)
+		}
+	case <-time.After(20 * time.Second):
+		t.Fatal("another connection's statement did not return")
+	}
+	if leaves || fails && block {
+		// DuckDB ended the block with the statement that failed.
+		return
+	}
+	if got, err := queryOn(context.Background(), conn, whole); err != nil || got != wholeCount {
+		t.Errorf("the connection's next statement: got %q, %v; want %s", got, err, wholeCount)
+	}
+	if block {
+		if _, err := queryOn(context.Background(), conn, "COMMIT"); err != nil {
+			t.Error(err)
+		}
+	}
+}
+
+// firstRow runs sql with its result streamed, reads the first row and
+// closes the result.
+func firstRow(conn *duckdb.Conn, sql string) (string, error) {
+	stmt, err := conn.PrepareContext(context.Background(), sql)
+	if err != nil {
+		return "", err
+	}
+	defer stmt.Close() //nolint:errcheck
+	rows, err := stmt.(*duckdb.Stmt).QueryStreamContext(context.Background(), nil)
+	if err != nil {
+		return "", err
+	}
+	defer rows.Close() //nolint:errcheck
+	dest := make([]driver.Value, len(rows.Columns()))
+	if err := rows.Next(dest); err != nil {
+		return "", err
+	}
+	return toString(dest[0]), nil
 }
 
 // countingBatch is a batch of one record that counts its downloads.

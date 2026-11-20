@@ -1,0 +1,27 @@
+Build the postgres extension alone.
+
+DuckDB-Postgres's own build configuration also builds the tpch, tpcds and
+json extensions its tests load, which Igloo's build has no use for.
+
+diff --git a/extension_config.cmake b/extension_config.cmake
+index 04f1fa8..c4126b1 100644
+--- a/extension_config.cmake
++++ b/extension_config.cmake
+@@ -1,15 +1,6 @@
+-# This file is included by DuckDB's build system. It specifies which extension to load
+-
+-# Extension from this repo
++# Igloo's build of the postgres extension against DuckDB v1.5.6: the
++# extension from this tree, with Igloo's patches, and nothing its tests load.
+ duckdb_extension_load(postgres_scanner
+     SOURCE_DIR ${CMAKE_CURRENT_LIST_DIR}
+     DONT_LINK
+ )
+-
+-duckdb_extension_load(tpch)
+-duckdb_extension_load(tpcds)
+-duckdb_extension_load(json)
+-# duckdb_extension_load(aws)
+-
+-# Any extra extensions that should be built
+-# e.g.: duckdb_extension_load(json)

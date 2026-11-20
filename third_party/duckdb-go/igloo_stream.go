@@ -159,7 +159,7 @@ func interruptUntil(ctx context.Context, conn mapping.Connection) (stop func()) 
 		t := time.NewTicker(interruptInterval)
 		defer t.Stop()
 		for {
-			interrupt(conn)
+			mapping.Interrupt(conn)
 			select {
 			case <-done:
 				return

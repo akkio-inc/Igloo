@@ -93,6 +93,9 @@ type proxy struct {
 	current  Connection
 	sessions map[*relay]bool
 	closed   bool
+	// pg are the PostgreSQL sessions, which DuckDB's cancel requests
+	// name (see cancelPostgres).
+	pg map[*pgSession]bool
 	// params are what a PostgreSQL server reported the last time Igloo
 	// signed in (see servePostgres); greeting and status are what a MySQL
 	// server did (see serveMySQL).
@@ -107,11 +110,11 @@ func (p *proxy) probe() error {
 	c := p.settings()
 	switch c.Type {
 	case Postgres:
-		conn, _, _, _, err := p.signInPostgres(c, nil)
+		hj, err := p.signInPostgres(c, nil)
 		if err != nil {
 			return err
 		}
-		return conn.Close()
+		return hj.Conn.Close()
 	case MySQL:
 		up, g, err := p.dialMySQL(c)
 		if err != nil {
@@ -147,15 +150,30 @@ func newProxy(c Connection, token, secrets string, log *slog.Logger) (*proxy, er
 // maxPort is the highest port DuckDB's MySQL extension accepts.
 const maxPort = 65353
 
+// listenAny listens on a port of 127.0.0.1 that the system picks. A
+// variable, for tests.
+var listenAny = func() (net.Listener, error) { return net.Listen("tcp", "127.0.0.1:0") }
+
 // listenLoopback listens on a free port of 127.0.0.1 that DuckDB's
-// extensions accept.
+// extensions accept. A system that hands its ports out in order, as macOS
+// does, offers every port above maxPort in turn once it has reached them:
+// each one offered is kept until the search ends, so the system has to
+// offer another, and there are fewer of them than tries. Twenty tries,
+// each port given back at once, found none while macOS was at port 65435,
+// and no connection was attached.
 func listenLoopback() (net.Listener, error) {
-	for range 20 {
-		ln, err := net.Listen("tcp", "127.0.0.1:0")
+	var high []net.Listener
+	defer func() {
+		for _, ln := range high {
+			_ = ln.Close()
+		}
+	}()
+	for range 65535 - maxPort + 1 {
+		ln, err := listenAny()
 		if err != nil || ln.Addr().(*net.TCPAddr).Port <= maxPort {
 			return ln, err
 		}
-		_ = ln.Close()
+		high = append(high, ln)
 	}
 	return nil, errors.New("no free port")
 }
