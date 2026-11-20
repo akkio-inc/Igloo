@@ -9,6 +9,37 @@ The release workflow publishes the section whose heading matches the tag
 
 ## [Unreleased]
 
+### Fixed
+
+- A statement stops reading a PostgreSQL connection's tables as soon as it no
+  longer needs them, and PostgreSQL stops working on them: when it is
+  canceled, when it has the rows it asked for and when it fails, as
+  statements through Snowflake connections do since 1.0.0-rc.15. Igloo passes
+  the cancel for a read the statement has left on to PostgreSQL, for that
+  session alone. It ends the query the read is: a view, a partitioned table
+  and a table PostgreSQL has not analyzed yet are read as one query, an
+  analyzed table 1,000 pages at a time. Over a view of a 30-million-row table
+  that takes 3.8 s to read, a `LIMIT 10` above a filter Igloo applies
+  returned after 4.0 s and returns after 0.1 s; an `EXISTS` after 3.9 s and
+  after 0.1 s; a statement that fails on its first row after 4.0 s and after
+  0.07 s; and one with a `statement_timeout` of 200 ms ended at 4.4 s and
+  ends at 0.3 s. Over a link of 50 MB/s, where the view takes 32 s, the first
+  three took 33 to 37 s and take 0.4 to 0.5 s. Over the table itself the same
+  statements took 0.03 to 0.27 s and still do. A transaction block reads on
+  after a statement that left a read early, from the snapshot it began with:
+  each read runs inside a savepoint, so the query PostgreSQL cancels does not
+  fail the block's transaction.
+- The rows of a PostgreSQL read reach their statement as PostgreSQL sends
+  them. Up to 64 kB of them waited inside Igloo whenever PostgreSQL paused
+  in the middle of a row, as it does while a read is slow to find its next
+  rows, and a statement with a `LIMIT` waited with them.
+- A statement that reads through a PostgreSQL or Snowflake connection no
+  longer fails now and then with `Unable to wait for COPY data from
+  Postgres: Interrupted system call`, as it could in 1.0.0-rc.15. A signal
+  that reached a thread while it waited for a table's rows, as Igloo's own
+  runtime sends its threads, was taken for a failure of the read: 2 of
+  about 30 statements over a 30-million-row PostgreSQL table failed so.
+
 ## [1.0.0-rc.15] - 2026-11-20
 
 ### Fixed

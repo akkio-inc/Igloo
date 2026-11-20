@@ -18,7 +18,9 @@ the ROLLBACK of a session that ends inside a transaction, which DuckDB
 sends before it destroys the query's readers. The request goes to the
 server process of that connection alone, and is repeated each second the
 command goes on, as one that arrives before the command is lost. A server
-that takes no cancel requests is read to the end, as before.
+that takes no cancel requests is read to the end, as before. A wait that a
+signal ends early goes on: the runtime of a Go program signals its threads,
+the one that runs the query among them.
 
 diff --git a/src/include/postgres_binary_reader.hpp b/src/include/postgres_binary_reader.hpp
 index 26f89fb..9c4395c 100644
@@ -67,7 +69,7 @@ index 8d5cc7b..e02c7ff 100644
  	bool IsOpen();
  	void Close();
 diff --git a/src/postgres_binary_reader.cpp b/src/postgres_binary_reader.cpp
-index c12a691..45533bb 100644
+index c12a691..10e29df 100644
 --- a/src/postgres_binary_reader.cpp
 +++ b/src/postgres_binary_reader.cpp
 @@ -1,8 +1,27 @@
@@ -98,7 +100,7 @@ index c12a691..45533bb 100644
  PostgresBinaryReader::PostgresBinaryReader(PostgresConnection &con_p, const vector<column_t> &column_ids,
                                             const PostgresBindData &bind_data)
      : PostgresResultReader(con_p, column_ids, bind_data),
-@@ -11,10 +30,66 @@ PostgresBinaryReader::PostgresBinaryReader(PostgresConnection &con_p, const vect
+@@ -11,10 +30,68 @@ PostgresBinaryReader::PostgresBinaryReader(PostgresConnection &con_p, const vect
  
  PostgresBinaryReader::~PostgresBinaryReader() {
  	FreeBuffer();
@@ -121,7 +123,9 @@ index c12a691..45533bb 100644
 +			throw InterruptException();
 +		}
 +		auto ready = PQsocketPoll(PQsocket(conn), 1, 0, PQgetCurrentTimeUSec() + INTERRUPT_CHECK_USEC);
-+		if (ready < 0) {
++		// a signal the thread handled ends the wait early (EINTR), as the runtime of a Go program sends its
++		// threads: the reader waits again
++		if (ready < 0 && errno != EINTR) {
 +			throw IOException("Unable to wait for COPY data from Postgres: %s", string(strerror(errno)));
 +		}
 +		if (ready > 0) {
@@ -167,7 +171,7 @@ index c12a691..45533bb 100644
  	if (!FetchNextBuffer()) {
  		throw IOException("Failed to fetch header for COPY \"%s\"", sql);
  	}
-@@ -36,11 +111,15 @@ PostgresReadResult PostgresBinaryReader::Read(DataChunk &output) {
+@@ -36,11 +113,15 @@ PostgresReadResult PostgresBinaryReader::Read(DataChunk &output) {
  
  bool PostgresBinaryReader::FetchNextBuffer() {
  	char *out_buffer;
@@ -184,7 +188,7 @@ index c12a691..45533bb 100644
  		// consume all available results
  		while (true) {
  			PostgresResult pg_res(PQgetResult(con.GetConn()));
-@@ -52,6 +131,7 @@ bool PostgresBinaryReader::FetchNextBuffer() {
+@@ -52,6 +133,7 @@ bool PostgresBinaryReader::FetchNextBuffer() {
  				throw IOException("Failed to fetch header for COPY: %s", string(PQresultErrorMessage(final_result)));
  			}
  		}
@@ -193,10 +197,19 @@ index c12a691..45533bb 100644
  	}
  
 diff --git a/src/postgres_connection.cpp b/src/postgres_connection.cpp
-index 2f91230..157fce1 100644
+index 2f91230..9073016 100644
 --- a/src/postgres_connection.cpp
 +++ b/src/postgres_connection.cpp
-@@ -61,6 +61,73 @@ static bool ResultHasError(PGresult *result) {
+@@ -7,6 +7,8 @@
+ #include "duckdb/common/shared_ptr.hpp"
+ #include "duckdb/common/helper.hpp"
+ 
++#include <cerrno>
++
+ namespace duckdb {
+ 
+ static bool debug_postgres_print_queries = false;
+@@ -61,6 +63,77 @@ static bool ResultHasError(PGresult *result) {
  	}
  }
  
@@ -261,6 +274,10 @@ index 2f91230..157fce1 100644
 +			}
 +		}
 +		auto ready = PQsocketPoll(PQsocket(conn), 1, 0, PQgetCurrentTimeUSec() + CANCEL_AGAIN_USEC);
++		if (ready < 0 && errno == EINTR) {
++			// a signal the thread handled ended the wait early
++			continue;
++		}
 +		if (ready < 0 || (ready > 0 && !PQconsumeInput(conn))) {
 +			return;
 +		}
@@ -270,7 +287,7 @@ index 2f91230..157fce1 100644
  PGresult *PostgresConnection::PQExecute(optional_ptr<ClientContext> context, const string &query,
                                          const PostgresParameters &params) {
  	if (PostgresConnection::DebugPrintQueries()) {
-@@ -72,6 +139,8 @@ PGresult *PostgresConnection::PQExecute(optional_ptr<ClientContext> context, con
+@@ -72,6 +145,8 @@ PGresult *PostgresConnection::PQExecute(optional_ptr<ClientContext> context, con
  
  	PGconn *conn = GetConn();
  	PGresult *res = nullptr;

@@ -296,7 +296,10 @@ func TestSnowflakeGateway(t *testing.T) {
 	}
 	m, eng := startEngine(t, store)
 	if got := m.Catalogs(); got["sf"] != Snowflake {
-		t.Fatalf("not attached: %v", got)
+		// With why: this failed once in a run of the whole package, and
+		// the reason went unseen.
+		list, _ := m.List(context.Background())
+		t.Fatalf("not attached: %v; connections: %+v", got, list)
 	}
 
 	// Snowflake's names, as DuckDB sees them, and their types.

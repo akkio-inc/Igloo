@@ -93,6 +93,9 @@ type proxy struct {
 	current  Connection
 	sessions map[*relay]bool
 	closed   bool
+	// pg are the PostgreSQL sessions, which DuckDB's cancel requests
+	// name (see cancelPostgres).
+	pg map[*pgSession]bool
 	// params are what a PostgreSQL server reported the last time Igloo
 	// signed in (see servePostgres); greeting and status are what a MySQL
 	// server did (see serveMySQL).
@@ -107,11 +110,11 @@ func (p *proxy) probe() error {
 	c := p.settings()
 	switch c.Type {
 	case Postgres:
-		conn, _, _, _, err := p.signInPostgres(c, nil)
+		hj, err := p.signInPostgres(c, nil)
 		if err != nil {
 			return err
 		}
-		return conn.Close()
+		return hj.Conn.Close()
 	case MySQL:
 		up, g, err := p.dialMySQL(c)
 		if err != nil {
