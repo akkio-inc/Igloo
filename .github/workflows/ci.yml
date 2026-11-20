@@ -33,7 +33,8 @@ jobs:
   # the tests and the image use: the Dockerfile's iceberg stage, built once
   # for each architecture, 10 to 15 minutes cold, over half of them vcpkg's
   # libraries. Its cache holds it until the build script or the patches
-  # change, and the Go jobs take the file it built as an artifact.
+  # change, and the Go jobs and the image job take the file it built, with
+  # its SHA-256 beside it, as an artifact.
   iceberg:
     name: Iceberg extension (${{ matrix.arch }})
     runs-on: ${{ matrix.runner }}
@@ -71,15 +72,15 @@ jobs:
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: iceberg-extension-${{ matrix.arch }}
-          path: ${{ runner.temp }}/iceberg/iceberg.duckdb_extension
+          path: ${{ runner.temp }}/iceberg
           if-no-files-found: error
           retention-days: 1
 
   # Igloo's build of DuckDB's postgres extension (extensions/postgres), which
   # the tests and the image use: the Dockerfile's postgres stage, built once
   # for each architecture, a few minutes cold. Its cache holds it until the
-  # build script or the patches change, and the Go jobs take the file it
-  # built as an artifact.
+  # build script or the patches change, and the Go jobs and the image job
+  # take the file it built, with its SHA-256 beside it, as an artifact.
   postgres:
     name: Postgres extension (${{ matrix.arch }})
     runs-on: ${{ matrix.runner }}
@@ -114,7 +115,7 @@ jobs:
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: postgres-extension-${{ matrix.arch }}
-          path: ${{ runner.temp }}/postgres/postgres_scanner.duckdb_extension
+          path: ${{ runner.temp }}/postgres
           if-no-files-found: error
           retention-days: 1
 
@@ -315,12 +316,11 @@ jobs:
     # Each architecture builds on its own native runner: cross-compiling cgo
     # and DuckDB under QEMU is slow and fragile.
     runs-on: ${{ matrix.runner }}
-    # A build that misses the extension jobs' caches, as one that starts
-    # right after those jobs can, builds the extensions again and takes 15
-    # to 25 minutes in all. It took 45 while the iceberg extension's build
-    # compiled DuckDB (amd64 in 1.0.0-rc.6's release, and past its limit of
-    # 45 in rc.7's).
-    timeout-minutes: 75
+    # 4 to 6 minutes when it compiles Igloo. It builds no extension: while it
+    # did, whenever it missed the extension jobs' caches, it took 14 to 24
+    # minutes, and 31 to 45 while the iceberg extension's build compiled
+    # DuckDB.
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -338,8 +338,26 @@ jobs:
 
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
-      # The XGBoost library the xgboost job built, which the build takes in
-      # place of the Dockerfile's xgboost-out stage rather than build it again.
+      # The two extensions and the XGBoost library the jobs before this one
+      # built, which the build takes in place of the Dockerfile's iceberg-out,
+      # postgres-out and xgboost-out stages, so it builds none of the three
+      # again. Each extension comes with its SHA-256, which the binary is
+      # linked with; check-extensions, in the build and below, fails if the
+      # file is not the one the hash names. The extensions used to come from
+      # their jobs' layer caches, which a build that starts right after those
+      # jobs misses: this job built them again in three runs of three.
+      - name: Fetch the iceberg extension
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: iceberg-extension-${{ matrix.arch }}
+          path: ${{ runner.temp }}/iceberg
+
+      - name: Fetch the postgres extension
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: postgres-extension-${{ matrix.arch }}
+          path: ${{ runner.temp }}/postgres
+
       - name: Fetch the XGBoost library
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
@@ -350,7 +368,10 @@ jobs:
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
-          build-contexts: xgboost-out=${{ runner.temp }}/xgboost
+          build-contexts: |
+            iceberg-out=${{ runner.temp }}/iceberg
+            postgres-out=${{ runner.temp }}/postgres
+            xgboost-out=${{ runner.temp }}/xgboost
           platforms: linux/${{ matrix.arch }}
           build-args: VERSION=${{ env.VERSION }}
           tags: igloo:ci
@@ -358,10 +379,7 @@ jobs:
           push: false
           provenance: false
           sbom: false
-          cache-from: |
-            type=gha,scope=image-${{ matrix.arch }}
-            type=gha,scope=iceberg-${{ matrix.arch }}
-            type=gha,scope=postgres-${{ matrix.arch }}
+          cache-from: type=gha,scope=image-${{ matrix.arch }}
           cache-to: type=gha,scope=image-${{ matrix.arch }},mode=max
 
       - name: Check that the binary reports its version
