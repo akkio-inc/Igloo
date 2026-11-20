@@ -3,7 +3,9 @@
 # DuckDB's Iceberg extension with Igloo's patches (extensions/iceberg). It has
 # a stage of its own, which only its build script and patches reach, so that
 # changing the rest of Igloo does not build it again; the cache keeps vcpkg's
-# packages and the compiler's work between builds of it.
+# packages and the compiler's work between builds of it. It compiles nothing
+# of DuckDB's but its mbedtls, and takes 10 to 15 minutes on four cores, over
+# half of them vcpkg's libraries (the AWS SDK and OpenSSL most of all).
 FROM debian:bookworm AS iceberg
 RUN apt-get update && apt-get install -y --no-install-recommends \
       build-essential cmake ninja-build pkg-config autoconf automake autoconf-archive libtool \
@@ -15,8 +17,11 @@ COPY extensions/iceberg/patches /src/extensions/iceberg/patches
 RUN --mount=type=cache,target=/root/.cache/igloo \
     /src/extensions/iceberg/build.sh /out/iceberg
 
-# The extension alone, for the tests: docker build --target iceberg-out
-# --output type=local,dest=DIR writes it to DIR.
+# The extension and its SHA-256 alone, for the tests and CI's jobs: docker
+# build --target iceberg-out --output type=local,dest=DIR writes them to DIR.
+# CI's image job gives the build the ones its iceberg job built in place of
+# this stage (--build-context iceberg-out=DIR), so it never builds the stage
+# above.
 FROM scratch AS iceberg-out
 COPY --from=iceberg /out/iceberg /
 
@@ -35,8 +40,10 @@ COPY extensions/postgres/patches /src/extensions/postgres/patches
 RUN --mount=type=cache,target=/root/.cache/igloo \
     /src/extensions/postgres/build.sh /out/postgres
 
-# The extension alone, for the tests: docker build --target postgres-out
-# --output type=local,dest=DIR writes it to DIR.
+# The extension and its SHA-256 alone, for the tests and CI's jobs: docker
+# build --target postgres-out --output type=local,dest=DIR writes them to
+# DIR. CI's image job gives the build the ones its postgres job built in place
+# of this stage (--build-context postgres-out=DIR).
 FROM scratch AS postgres-out
 COPY --from=postgres /out/postgres /
 
@@ -76,8 +83,8 @@ COPY . .
 # binary, which carries its file's SHA-256, and the iceberg and postgres
 # extensions', and refuses any other file: the binary and the files cannot
 # come from different builds.
-COPY --from=iceberg /out/iceberg /out/iceberg
-COPY --from=postgres /out/postgres /out/postgres
+COPY --from=iceberg-out / /out/iceberg
+COPY --from=postgres-out / /out/postgres
 COPY --from=xgboost-out / /out/xgboost
 ENV PKG_CONFIG_PATH=/out/xgboost/lib/pkgconfig
 RUN --mount=type=cache,target=/go/pkg/mod --mount=type=cache,target=/root/.cache/go-build \

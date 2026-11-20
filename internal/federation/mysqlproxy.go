@@ -102,6 +102,31 @@ const (
 // Resetting a session that ran statements goes to the server, which then
 // forgets that the session is read-only, so the proxy makes it so again
 // before the next command.
+//
+// # Kill requests
+//
+// MySQL's protocol has no message that cancels a statement. A client ends
+// one by sending KILL QUERY on another connection, with the ID of the
+// statement's session, which the server's greeting told it. DuckDB's mysql
+// extension does so when it drops a result it has not read to its end,
+// because the statement was canceled, failed, or has its rows
+// (MySQLResult::TryCancelQuery), and then reads what the server still
+// sends: little, once the server has stopped.
+//
+// The proxy greets DuckDB before it has a session with the server, so the
+// ID in its greeting cannot be the server's. It is one of the proxy's own,
+// which names the DuckDB session and nothing at the server, and a KILL
+// QUERY of DuckDB's never reaches the server as written: the proxy finds
+// the session it names and asks the server, on a connection of its own, to
+// kill the statement that session is at (see killMySQL). Until it did, its
+// greeting carried the ID of whichever session had signed in to the server
+// last, and DuckDB's KILL QUERY went to the server with it: the scan it was
+// meant for ran to its end, as long as reading the whole table, and a
+// statement of the session it did name was killed in its place.
+//
+// A statement the server kills fails alone. Its transaction goes on, with
+// the snapshot it had, so the proxy has nothing to mend before the
+// session's next statement, as it has for PostgreSQL.
 
 // serveMySQL signs DuckDB's MySQL client in with the token and runs its
 // session.
@@ -132,7 +157,8 @@ func (p *proxy) serveMySQL(client net.Conn, c Connection) error {
 	// of the proxy's own and without the capabilities it strips.
 	scramble := newScramble()
 	caps := greeting.caps&^strippedCaps | capProtocol41 | capSecureConnection | capPluginAuth
-	if err := cl.writePacket(0, buildGreeting(greeting, scramble, caps)); err != nil {
+	s.id = p.nextMySQLID()
+	if err := cl.writePacket(0, buildGreeting(greeting, scramble, caps, s.id)); err != nil {
 		return errClientGone
 	}
 	resp, seq, err := cl.readPacket()
@@ -167,7 +193,7 @@ func (p *proxy) serveMySQL(client net.Conn, c Connection) error {
 			return err
 		}
 		p.signedIn(nil)
-		s.started(up)
+		s.started(up, greeting.connID)
 	}
 	s.t.status = status
 	if err := cl.writePacket(seq+1, okPacket(status, s.flags)); err != nil {
@@ -180,8 +206,25 @@ func (p *proxy) serveMySQL(client net.Conn, c Connection) error {
 		return errors.New("connection dropped")
 	}
 	defer p.untrack(s.r)
+	// DuckDB names the session by its ID in a KILL QUERY.
+	p.mu.Lock()
+	if p.my == nil {
+		p.my = map[uint32]*mysqlSession{}
+	}
+	p.my[s.id] = s
+	p.mu.Unlock()
+	defer func() {
+		p.mu.Lock()
+		delete(p.my, s.id)
+		p.mu.Unlock()
+	}()
 	err = s.run(cl.r)
 	s.r.close()
+	s.r.mu.Lock()
+	if k := s.kill; k != nil {
+		k.stop()
+	}
+	s.r.mu.Unlock()
 	if s.up != nil {
 		if upErr := <-s.upDone; errors.Is(err, errClientGone) && upErr != nil {
 			err = upErr
@@ -211,6 +254,9 @@ type mysqlSession struct {
 	t      *mysqlTracker
 	hs     *handshakeResponse
 	flags  uint32
+	// id is what DuckDB names the session by in a KILL QUERY: the
+	// connection ID of the proxy's greeting.
+	id uint32
 
 	// outMu serializes writes to DuckDB; run writes only while the server
 	// owes DuckDB nothing.
@@ -237,12 +283,23 @@ type mysqlSession struct {
 	// dirty is set once the server ran a command since the session was
 	// last reset.
 	dirty bool
+
+	// These are under r.mu.
+	// thread is the session's thread on the server, while there is one.
+	thread *mysqlThread
+	// kill is a KILL QUERY for the statement the server is at, while it is
+	// on its way to the server.
+	kill *mysqlKill
 }
 
-// started relays the server's packets once signed in.
-func (s *mysqlSession) started(up *packetConn) {
+// started relays the server's packets once signed in. id is the session's
+// connection ID at the server.
+func (s *mysqlSession) started(up *packetConn, id uint32) {
 	s.up, s.dirty, s.setUp = up, false, false
 	s.upOut = bufio.NewWriterSize(up.conn, 64<<10)
+	s.r.mu.Lock()
+	s.thread = &mysqlThread{addr: up.conn.RemoteAddr(), id: id}
+	s.r.mu.Unlock()
 	s.r.setUpstream(up.conn)
 	done := make(chan error, 1)
 	s.upDone = done
@@ -274,7 +331,7 @@ func (s *mysqlSession) connect() error {
 	if err != nil {
 		return fmt.Errorf("cannot sign in to %s: %w", c.Address(), err)
 	}
-	s.started(up)
+	s.started(up, g.connID)
 	s.replayNames = s.names != ""
 	return nil
 }
@@ -286,6 +343,9 @@ func (s *mysqlSession) dropped() {
 	if s.up != nil && s.r.takeDropped() {
 		<-s.upDone
 		s.up, s.upOut = nil, nil
+		s.r.mu.Lock()
+		s.thread = nil
+		s.r.mu.Unlock()
 	}
 }
 
@@ -301,6 +361,10 @@ const (
 // setNames matches the character set statement of DuckDB's MySQL client,
 // normalized.
 var setNames = regexp.MustCompile(`^SET NAMES [A-Z0-9_]+( COLLATE [A-Z0-9_]+)?$`)
+
+// killQuery matches the statement DuckDB's MySQL client ends a session's
+// statement with, normalized.
+var killQuery = regexp.MustCompile(`^KILL QUERY ([0-9]+)$`)
 
 // normalizeMySQL is a statement's text in capitals, with its whitespace
 // collapsed and no trailing semicolons.
@@ -357,15 +421,36 @@ func (s *mysqlSession) run(in *bufio.Reader) error {
 			return errClientGone
 		}
 		if cmd == comQuery {
-			if q := normalizeMySQL(pkt[5:]); setNames.MatchString(q) {
+			q := normalizeMySQL(pkt[5:])
+			if setNames.MatchString(q) {
 				s.names = q
+			}
+			if m := killQuery.FindStringSubmatch(q); m != nil {
+				// It names a session of the proxy's, and is never the
+				// server's to see as written (see killMySQL). DuckDB is
+				// answered at once, and reads on while the request
+				// travels.
+				if id, err := strconv.ParseUint(m[1], 10, 32); err == nil {
+					s.p.killMySQL(uint32(id))
+				}
+				s.r.settle()
+				status := s.t.lastStatus() &^ statusStateChanged
+				if s.held != nil {
+					status |= statusInTrans
+				}
+				if s.writeClient(okPacket(status, s.flags)) != nil {
+					return errClientGone
+				}
+				continue
 			}
 		}
 		if s.r.idle() && s.answer(cmd, pkt) {
 			continue
 		}
 
-		// A command for the server.
+		// A command for the server, which goes after a KILL QUERY for the
+		// statement before it.
+		s.awaitKill()
 		if s.up == nil {
 			if err := s.connect(); err != nil {
 				// Failed as the server fails a command, the session goes
@@ -500,14 +585,20 @@ func (s *mysqlSession) replay() error {
 
 // dialMySQL connects to the remote server and reads its greeting.
 func (p *proxy) dialMySQL(c Connection) (*packetConn, *mysqlGreeting, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), c.ConnectTimeout)
+	return p.dialMySQLAt(context.Background(), c, c.Address())
+}
+
+// dialMySQLAt connects to the remote server at addr, within ctx, and reads
+// its greeting.
+func (p *proxy) dialMySQLAt(ctx context.Context, c Connection, addr string) (*packetConn, *mysqlGreeting, error) {
+	ctx, cancel := context.WithTimeout(ctx, c.ConnectTimeout)
 	defer cancel()
-	conn, err := dial(ctx, c)
+	conn, err := dial(ctx, c, addr)
 	if err != nil {
 		return nil, nil, err
 	}
 	_ = conn.SetDeadline(time.Now().Add(c.ConnectTimeout))
-	up := &packetConn{conn: conn, r: bufio.NewReader(conn), w: conn}
+	up := &packetConn{conn: conn, r: bufio.NewReaderSize(conn, upstreamBuffer), w: conn}
 	pkt, _, err := up.readPacket()
 	if err != nil {
 		_ = conn.Close()
@@ -542,17 +633,27 @@ func (p *proxy) mysqlSetup(c Connection) []string {
 // with statements limited to query_timeout. It returns the server's
 // status flags.
 func (p *proxy) signInMySQL(up *packetConn, g *mysqlGreeting, c Connection, flags uint32, hs *handshakeResponse) (uint16, error) {
+	if err := p.authenticateMySQL(up, g, c, flags, hs); err != nil {
+		return 0, err
+	}
+	return p.setUpMySQLSession(up, g, c)
+}
+
+// authenticateMySQL answers the remote server's greeting as the
+// connection's user, with the capabilities flags, encrypted as the
+// connection's tls mode says, and returns once the server has let it in.
+func (p *proxy) authenticateMySQL(up *packetConn, g *mysqlGreeting, c Connection, flags uint32, hs *handshakeResponse) error {
 	password, err := p.password(c)
 	if err != nil {
-		return 0, err
+		return err
 	}
 	tlsCfg, err := tlsConfig(&c)
 	if err != nil {
-		return 0, err
+		return err
 	}
 	useTLS := tlsCfg != nil && g.caps&capSSL != 0
 	if tlsCfg != nil && !useTLS && c.TLS != TLSPrefer {
-		return 0, errors.New("the server does not support TLS, which the connection's tls mode requires")
+		return errors.New("the server does not support TLS, which the connection's tls mode requires")
 	}
 
 	caps := flags&^(capConnectAttrs|capLocalFiles|capCompress) | capProtocol41 | capSecureConnection |
@@ -561,20 +662,20 @@ func (p *proxy) signInMySQL(up *packetConn, g *mysqlGreeting, c Connection, flag
 	if useTLS {
 		caps |= capSSL
 		if err := up.writePacket(seq, responseHeader(caps, hs)); err != nil {
-			return 0, err
+			return err
 		}
 		seq++
 		tc := tls.Client(up.conn, tlsCfg)
 		if err := tc.Handshake(); err != nil {
-			return 0, fmt.Errorf("TLS: %w", err)
+			return fmt.Errorf("TLS: %w", err)
 		}
-		up.conn, up.r, up.w = tc, bufio.NewReader(tc), tc
+		up.conn, up.r, up.w = tc, bufio.NewReaderSize(tc, upstreamBuffer), tc
 	}
 
 	plugin := g.plugin
 	auth, err := authResponse(plugin, password, g.scramble, useTLS)
 	if err != nil {
-		return 0, err
+		return err
 	}
 	resp := responseHeader(caps, hs)
 	resp = append(append(resp, c.User...), 0)
@@ -587,32 +688,32 @@ func (p *proxy) signInMySQL(up *packetConn, g *mysqlGreeting, c Connection, flag
 	resp = append(append(resp, c.Database...), 0)
 	resp = append(append(resp, plugin...), 0)
 	if err := up.writePacket(seq, resp); err != nil {
-		return 0, err
+		return err
 	}
 
 	scramble := g.scramble
 	for {
 		pkt, s, err := up.readPacket()
 		if err != nil {
-			return 0, err
+			return err
 		}
 		if len(pkt) == 0 {
-			return 0, errors.New("empty packet while signing in")
+			return errors.New("empty packet while signing in")
 		}
 		seq = s + 1
 		switch pkt[0] {
 		case 0x00:
-			return p.setUpMySQLSession(up, g, c)
+			return nil
 		case 0xff:
-			return 0, parseErrPacket(pkt)
+			return parseErrPacket(pkt)
 		case 0xfe: // switch to another authentication method
 			name, data, _ := cutNul(pkt[1:])
 			plugin, scramble = string(name), bytes.TrimRight(data, "\x00")
 			if auth, err = authResponse(plugin, password, scramble, useTLS); err != nil {
-				return 0, err
+				return err
 			}
 			if err := up.writePacket(seq, auth); err != nil {
-				return 0, err
+				return err
 			}
 		case 0x01: // more data for the current method
 			var reply []byte
@@ -627,16 +728,16 @@ func (p *proxy) signInMySQL(up *packetConn, g *mysqlGreeting, c Connection, flag
 				}
 			case plugin == "caching_sha2_password" || plugin == "sha256_password":
 				if reply, err = encryptPassword(password, scramble, pkt[1:]); err != nil {
-					return 0, err
+					return err
 				}
 			default:
-				return 0, fmt.Errorf("unexpected data from authentication method %s", plugin)
+				return fmt.Errorf("unexpected data from authentication method %s", plugin)
 			}
 			if err := up.writePacket(seq, reply); err != nil {
-				return 0, err
+				return err
 			}
 		default:
-			return 0, fmt.Errorf("unexpected packet 0x%02x while signing in", pkt[0])
+			return fmt.Errorf("unexpected packet 0x%02x while signing in", pkt[0])
 		}
 	}
 }
@@ -676,32 +777,58 @@ func (p *proxy) setUpMySQLSession(up *packetConn, g *mysqlGreeting, c Connection
 	return status, nil
 }
 
+// upstreamBuffer is how much of the server's answer the proxy reads at
+// once. fromServer sends DuckDB what it has each time it has read all of
+// that, so a small one makes for many small writes: with bufio's default
+// of 4 kB, a read of 3 million rows (120 MB) took 570 to 670 ms, and with
+// this it takes 410 ms.
+const upstreamBuffer = 64 << 10
+
 // errLocalInfile ends a session whose server asked for a local file.
 var errLocalInfile = errors.New("the remote server asked for a local file (LOAD DATA LOCAL INFILE); refused")
 
 // fromServer relays the server's packets to DuckDB, following the shape of
 // each answer, but for the answers to what replay sent, which must all
-// succeed.
+// succeed. DuckDB has every packet the server has sent whole before
+// fromServer waits for the server, as on the PostgreSQL side (see
+// pgSession.fromServer): MySQL sends a result a buffer at a time, 16 kB
+// unless set otherwise, which seldom ends where a row does, and up to
+// 64 kB of the rows before the one it paused in waited here.
 func (s *mysqlSession) fromServer(in *bufio.Reader) error {
 	continued := false
+	flush := func() error {
+		s.outMu.Lock()
+		defer s.outMu.Unlock()
+		return s.out.Flush()
+	}
 	for {
+		if in.Buffered() < 4 {
+			if err := flush(); err != nil {
+				return err
+			}
+		}
 		n, header, err := readHeader(in)
 		if err != nil {
 			return err
 		}
-		if !continued && s.t.swallowing() {
-			head, err := in.Peek(min(n, 1))
-			if err != nil {
+		if in.Buffered() < n {
+			if err := flush(); err != nil {
 				return err
 			}
-			if _, err := in.Discard(n); err != nil {
+		}
+		if !continued && s.t.swallowing() {
+			head, err := in.Peek(min(n, 32))
+			if err != nil {
 				return err
 			}
 			if len(head) == 0 || head[0] != 0x00 {
 				s.p.log.Warn("closed a session whose setup failed on the remote database")
 				return errors.New("the remote database refused the session's setup")
 			}
-			s.t.swallowed()
+			s.t.swallowed(okStatus(head))
+			if _, err := in.Discard(n); err != nil {
+				return err
+			}
 			s.r.end()
 			continue
 		}
@@ -717,12 +844,17 @@ func (s *mysqlSession) fromServer(in *bufio.Reader) error {
 			}
 		}
 		continued = n == maxPacketPayload
+		if done {
+			// Before DuckDB has the end, and can send the next statement.
+			s.answered()
+		}
 		s.outMu.Lock()
 		_, err = s.out.Write(header[:])
 		if err == nil {
 			_, err = io.CopyN(s.out, in, int64(n))
 		}
-		if err == nil && in.Buffered() == 0 {
+		if err == nil && done {
+			// The end of an answer goes out at once.
 			err = s.out.Flush()
 		}
 		s.outMu.Unlock()
@@ -735,6 +867,167 @@ func (s *mysqlSession) fromServer(in *bufio.Reader) error {
 			s.r.progress()
 		}
 	}
+}
+
+// mysqlThread is a session's thread on the remote server, as KILL QUERY
+// names it, and the address the session reached the server at.
+type mysqlThread struct {
+	addr net.Addr
+	id   uint32
+}
+
+// mysqlKill is a KILL QUERY on its way to the server.
+type mysqlKill struct {
+	// stop gives up on reaching the server.
+	stop context.CancelFunc
+	// done is closed once the request is over: the server has acted on it,
+	// or will never see it.
+	done chan struct{}
+	// These are under the session's r.mu: sent is set before the statement
+	// is written, and moot when the statement it is for ended before that.
+	sent, moot bool
+}
+
+// nextMySQLID returns the connection ID of a new session's greeting, which
+// no other session of the proxy has.
+func (p *proxy) nextMySQLID() uint32 {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.myID++
+	if p.myID == 0 {
+		p.myID++
+	}
+	return p.myID
+}
+
+// killMySQL acts on a KILL QUERY of DuckDB's, which names one of the
+// proxy's sessions: it asks the server to kill the statement that session
+// is at, on a connection of its own, to the address the session reached the
+// server at.
+//
+// The request travels while DuckDB reads on, as a cancel request for
+// PostgreSQL does (see cancelPostgres), and for the same reasons. It goes
+// after a moment in which the statement may end by itself, as a scan of a
+// small table does once DuckDB reads out what the server has sent: signing
+// in to the server takes several round trips, and a session of its
+// connection limit. A request the statement's end overtakes is given up,
+// and one already written is waited for before the session's next
+// statement goes to the server (see awaitKill), so no request reaches the
+// server for a later statement than the one it was sent for. One that
+// reaches the server after its statement has ended there finds the session
+// idle, which MySQL and MariaDB leave alone.
+func (p *proxy) killMySQL(id uint32) {
+	p.mu.Lock()
+	s := p.my[id]
+	p.mu.Unlock()
+	if s == nil {
+		return
+	}
+	c := p.settings()
+	ctx, stop := context.WithTimeout(context.Background(), c.ConnectTimeout)
+	k := &mysqlKill{stop: stop, done: make(chan struct{})}
+	thread := s.killable(k)
+	if thread == nil {
+		stop()
+		return
+	}
+	go func() {
+		select {
+		case <-time.After(cancelGrace):
+		case <-ctx.Done():
+		}
+		err := p.killThread(ctx, c, *thread, func() bool {
+			s.r.mu.Lock()
+			defer s.r.mu.Unlock()
+			k.sent = !k.moot
+			return k.sent
+		})
+		if err != nil && ctx.Err() == nil {
+			p.log.Debug("a KILL QUERY did not reach the remote database", "err", err)
+		}
+		stop()
+		s.r.mu.Lock()
+		if s.kill == k {
+			s.kill = nil
+		}
+		s.r.mu.Unlock()
+		close(k.done)
+	}()
+}
+
+// killable returns the session's thread on the server if the server is at
+// a statement of DuckDB's and no other request is on its way, and notes k
+// as the request on its way.
+func (s *mysqlSession) killable(k *mysqlKill) *mysqlThread {
+	s.r.mu.Lock()
+	defer s.r.mu.Unlock()
+	if s.r.closed || s.kill != nil || s.thread == nil || s.r.pending == 0 || s.t.swallowing() {
+		return nil
+	}
+	s.kill = k
+	return s.thread
+}
+
+// answered notes the end of the server's answer to a statement of
+// DuckDB's: a KILL QUERY for it that has not been written is given up.
+func (s *mysqlSession) answered() {
+	s.r.mu.Lock()
+	defer s.r.mu.Unlock()
+	if k := s.kill; k != nil && !k.sent {
+		k.moot, s.kill = true, nil
+		k.stop()
+	}
+}
+
+// awaitKill waits for a KILL QUERY on its way to the server to be over,
+// before the session sends the server anything more.
+func (s *mysqlSession) awaitKill() {
+	s.r.mu.Lock()
+	k := s.kill
+	s.r.mu.Unlock()
+	if k != nil {
+		<-k.done
+	}
+}
+
+// killThread signs in to the server at the thread's address, as the
+// connection's user, and asks it to kill the statement the thread is at.
+// It writes the request only if send, called once signed in, says so, and
+// returns once the server has answered.
+func (p *proxy) killThread(ctx context.Context, c Connection, thread mysqlThread, send func() bool) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	up, g, err := p.dialMySQLAt(ctx, c, thread.addr.String())
+	if err != nil {
+		return err
+	}
+	// Giving up closes the connection, which ends whatever waits on it.
+	// Signing in may wrap up.conn in TLS: this is what it wraps.
+	conn := up.conn
+	defer conn.Close() //nolint:errcheck
+	defer context.AfterFunc(ctx, func() { _ = conn.Close() })()
+	// A client's answer, with utf8mb4 (45) as the character set.
+	hs := &handshakeResponse{maxPacket: 1 << 24, charset: 45}
+	flags := g.caps & (capProtocol41 | capSecureConnection | capPluginAuth | capPluginAuthLenenc)
+	if err := p.authenticateMySQL(up, g, c, flags, hs); err != nil {
+		return err
+	}
+	if !send() {
+		return up.writePacket(0, []byte{comQuit})
+	}
+	if err := up.writePacket(0, append([]byte{comQuery}, "KILL QUERY "+strconv.FormatUint(uint64(thread.id), 10)...)); err != nil {
+		return err
+	}
+	pkt, _, err := up.readPacket()
+	if err != nil {
+		return err
+	}
+	_ = up.writePacket(0, []byte{comQuit})
+	if len(pkt) > 0 && pkt[0] == 0xff {
+		return parseErrPacket(pkt)
+	}
+	return nil
 }
 
 // mysqlTracker follows which command's answer the server is sending and
@@ -775,9 +1068,17 @@ func (t *mysqlTracker) swallowing() bool {
 	return t.swallow > 0
 }
 
-func (t *mysqlTracker) swallowed() {
+// swallowed notes the server's answer to a statement of the proxy's own,
+// with the status it reports: after a START TRANSACTION the proxy held,
+// that the session is in a transaction. The statement DuckDB sent behind
+// it ends without a status when it fails or is killed, and a session taken
+// to have no transaction open gets a new session with the server when the
+// connection's settings change or the server's side goes away: the rest of
+// a transaction block would read there, outside its transaction.
+func (t *mysqlTracker) swallowed(status uint16) {
 	t.mu.Lock()
 	t.swallow--
+	t.status = status
 	t.mu.Unlock()
 }
 
@@ -1033,12 +1334,13 @@ func parseGreeting(p []byte) (*mysqlGreeting, error) {
 }
 
 // buildGreeting greets DuckDB's client with the remote server's version,
-// connection ID, character set and status, and the proxy's own scramble
-// and capabilities. MariaDB's extended capabilities are offered as none.
-func buildGreeting(g *mysqlGreeting, scramble []byte, caps uint32) []byte {
+// character set and status, and the proxy's own scramble, capabilities and
+// connection ID, which names the session in a KILL QUERY (see killMySQL).
+// MariaDB's extended capabilities are offered as none.
+func buildGreeting(g *mysqlGreeting, scramble []byte, caps uint32, id uint32) []byte {
 	b := append([]byte{10}, g.version...)
 	b = append(b, 0)
-	b = binary.LittleEndian.AppendUint32(b, g.connID)
+	b = binary.LittleEndian.AppendUint32(b, id)
 	b = append(b, scramble[:8]...)
 	b = append(b, 0)
 	b = binary.LittleEndian.AppendUint16(b, uint16(caps))

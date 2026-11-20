@@ -1,0 +1,25 @@
+Link DuckDB's mbedtls into the extension.
+
+Igloo builds the extension without DuckDB linked into it
+(EXTENSION_STATIC_BUILD=0), so it takes DuckDB's functions from the binary
+that loads it. DuckDB compiles its mbedtls with hidden visibility, and no
+binary exports MbedTlsWrapper's ComputeSha256Hash and Hmac256, which sign
+requests to AWS (src/catalog/rest/storage/aws.cpp): the extension did not
+load for want of them. It links DuckDB's mbedtls library itself, 23 files.
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index babdb36..3af8ee9 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -161,6 +161,11 @@ endif()
+ target_link_libraries(${EXTENSION_NAME} PUBLIC roaring::roaring roaring::roaring-headers roaring::roaring-headers-cpp)
+ target_link_libraries(${TARGET_NAME}_loadable_extension roaring::roaring roaring::roaring-headers roaring::roaring-headers-cpp)
+ 
++# Igloo builds the extension without DuckDB linked into it, and DuckDB hides
++# its mbedtls from extensions: the SHA-256 and HMAC that sign requests to AWS
++# come from this copy.
++target_link_libraries(${TARGET_NAME}_loadable_extension duckdb_mbedtls)
++
+ install(
+   TARGETS ${EXTENSION_NAME} ${TARGET_NAME}_loadable_extension
+   EXPORT "${DUCKDB_EXPORT_SET}"

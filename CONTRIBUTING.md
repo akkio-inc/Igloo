@@ -71,7 +71,7 @@ runners have it: a few tests expect it.
 ```sh
 dir=~/.cache/igloo/test
 extensions/rb/build.sh $dir/rb             # seconds
-extensions/iceberg/build.sh $dir/iceberg   # 6 to 30 minutes the first time, by cores
+extensions/iceberg/build.sh $dir/iceberg   # 6 to 15 minutes the first time, by cores
 extensions/postgres/build.sh $dir/postgres # a few minutes the first time
 go run -tags duckdb_arrow ./cmd/igloo install-extensions $dir/duckdb-extensions
 export IGLOO_TEST_RB_EXTENSION=$dir/rb/rb.duckdb_extension
@@ -85,7 +85,7 @@ The iceberg and postgres builds also need CMake, Ninja and pkg-config (on
 macOS, `brew install cmake ninja pkg-config`), and the postgres build the
 autotools, which build libpq (`brew install autoconf automake libtool
 autoconf-archive`). The iceberg build keeps its sources, libraries and
-compiler cache, about 5 GB, in `~/.cache/igloo/iceberg`, the postgres build
+compiler cache, about 4 GB, in `~/.cache/igloo/iceberg`, the postgres build
 about 1.5 GB in `~/.cache/igloo/postgres`, and XGBoost's about 100 MB in
 `~/.cache/igloo/xgboost`.
 

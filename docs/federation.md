@@ -571,6 +571,11 @@ from showing a password, and lets Igloo:
   statement returns then. Each scan runs inside a savepoint, which keeps
   the canceled query from failing its transaction: a transaction block
   reads on after such a statement, from the snapshot it began with;
+- stop a MySQL scan at the database in the same cases. DuckDB's `mysql`
+  extension ends a scan its statement has left with MySQL's `KILL QUERY`,
+  and Igloo has MySQL kill the scan's query, in that session alone. MySQL
+  fails only the query it kills, so a transaction block reads on after
+  such a statement, from the snapshot it began with;
 - make every remote session read-only, and refuse requests for local files.
 
 Startup checks every connection's database at once, so it waits at most
@@ -609,6 +614,10 @@ read](#how-iceberg-rest-catalogs-are-read).
   canceled statement cost the database what was read by then, whatever is
   read: a `LIMIT 10` above a filter over a view of a 30-million-row table
   returns in 0.1 s, where reading the view takes 3.8 s.
+- A statement that reads one MySQL table or view reads it as one query,
+  as it arrives, and ends that query at the database once it needs no
+  more: a `LIMIT 10` above a filter over a 20-million-row table returns in
+  0.1 s, where reading the table takes 2.7 s.
 - DuckDB keeps a pool of sessions per connection and reuses them, so most
   queries do not sign in again; listing tables costs the remote database
   nothing.

@@ -56,7 +56,7 @@ docker run --rm "${mounts[@]}" -w /src "$go_image" go run -tags duckdb_arrow ./c
 # headers stay in the volume).
 docker run --rm "${mounts[@]}" -e RB_CACHE=/rb/cache -w /src "$go_image" extensions/rb/build.sh /rb
 # Igloo's build of DuckDB's iceberg extension, which the tests attach catalogs
-# with: the Dockerfile's iceberg stage (most of an hour the first time;
+# with: the Dockerfile's iceberg stage (a quarter of an hour the first time;
 # Docker's build cache keeps it until extensions/iceberg's build changes).
 docker build -q --target iceberg -t igloo-iceberg-build "$root" >/dev/null
 docker run --rm -v igloo-iceberg-extension:/iceberg igloo-iceberg-build cp /out/iceberg/iceberg.duckdb_extension /iceberg/

@@ -96,6 +96,11 @@ type proxy struct {
 	// pg are the PostgreSQL sessions, which DuckDB's cancel requests
 	// name (see cancelPostgres).
 	pg map[*pgSession]bool
+	// my are the MySQL sessions by the connection IDs the proxy greeted
+	// DuckDB with, which DuckDB's KILL QUERY names (see killMySQL), and
+	// myID is the last one handed out.
+	my   map[uint32]*mysqlSession
+	myID uint32
 	// params are what a PostgreSQL server reported the last time Igloo
 	// signed in (see servePostgres); greeting and status are what a MySQL
 	// server did (see serveMySQL).
@@ -288,10 +293,11 @@ func readPassword(c Connection, secrets string) (string, error) {
 	return strings.TrimRight(string(b), "\r\n"), nil
 }
 
-// dial connects to c's remote database, giving up after c.ConnectTimeout.
-func dial(ctx context.Context, c Connection) (net.Conn, error) {
+// dial connects to c's remote database at addr, giving up after
+// c.ConnectTimeout.
+func dial(ctx context.Context, c Connection, addr string) (net.Conn, error) {
 	d := net.Dialer{Timeout: c.ConnectTimeout, KeepAlive: keepAlive}
-	return d.DialContext(ctx, "tcp", c.Address())
+	return d.DialContext(ctx, "tcp", addr)
 }
 
 // track registers a session, unless the proxy is closed.
