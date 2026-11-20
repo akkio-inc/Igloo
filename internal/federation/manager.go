@@ -17,6 +17,8 @@ import (
 	"time"
 
 	"github.com/duckdb/duckdb-go/v2"
+
+	"github.com/akkio-inc/igloo/internal/engine"
 )
 
 // syncInterval is how often a replica picks up connections that other
@@ -120,10 +122,22 @@ type endpoint interface {
 
 // newEndpoint listens for DuckDB's connections for c.
 func newEndpoint(c Connection, token, secrets string, log *slog.Logger) (endpoint, error) {
+	// A gateway or proxy that could not start is no endpoint: returned as
+	// it is, a nil pointer would be an endpoint that is not nil, which
+	// Attach closes, and Igloo would stop where it should start without
+	// the connection.
 	if c.Type == Snowflake {
-		return newSnowflakeGateway(c, token, secrets, log)
+		g, err := newSnowflakeGateway(c, token, secrets, log)
+		if err != nil {
+			return nil, err
+		}
+		return g, nil
 	}
-	return newProxy(c, token, secrets, log)
+	p, err := newProxy(c, token, secrets, log)
+	if err != nil {
+		return nil, err
+	}
+	return p, nil
 }
 
 // NewManager returns a manager for the connections in store.
@@ -223,7 +237,10 @@ func (m *Manager) Attach(ctx context.Context, conn *duckdb.Conn) error {
 	loaded := map[string]error{}
 	for _, c := range conns {
 		if _, ok := loaded[c.Type.extension()]; !ok {
-			loaded[c.Type.extension()] = exec(ctx, conn, "LOAD "+c.Type.extension())
+			// Igloo's own build of the postgres extension, where the
+			// process has one: it ends a scan its statement no longer
+			// needs (see sfGateway).
+			loaded[c.Type.extension()] = engine.LoadExtension(ctx, conn, c.Type.extension())
 			if c.Type == Iceberg && loaded["iceberg"] == nil {
 				// DuckDB reaches the catalog and the files over HTTP.
 				loaded["iceberg"] = exec(ctx, conn, "LOAD httpfs")

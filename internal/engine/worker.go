@@ -58,11 +58,17 @@ func (e *Engine) setupWorker(ctx context.Context, cfg config.Config, log *slog.L
 	if err := configure(cfg, workerThreadsPerCore, exec, query); err != nil {
 		return err
 	}
-	own, err := loadOwn(cfg, log, exec, query)
+	own, onDemand, err := loadOwn(cfg, log, exec, query)
 	if err != nil {
 		return err
 	}
-	e.bitmaps, e.icebergOwn, e.postgresOwn = own["rb"], own["iceberg"], own[postgresName]
+	e.bitmaps, e.icebergOwn = own["rb"], own["iceberg"]
+	if len(onDemand) > 0 {
+		// A worker attaches no connection: nothing asks for them.
+		if err := noMoreUnsigned(exec); err != nil {
+			return err
+		}
+	}
 	if e.local, err = queryString(ctx, conn, "SELECT current_database()"); err != nil {
 		return fmt.Errorf("read database name: %w", err)
 	}

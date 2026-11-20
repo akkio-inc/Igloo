@@ -554,19 +554,7 @@ func TestSnowflakeScansEndWithTheirStatement(t *testing.T) {
 				return out, nil
 			}
 			eng := startSnowflake(t, fake)
-			type answer struct {
-				got string
-				err error
-			}
-			run := func(ctx context.Context) chan answer {
-				conn := connect(t, eng)
-				done := make(chan answer, 1)
-				go func() {
-					got, err := queryOn(ctx, conn, tc.sql)
-					done <- answer{got, err}
-				}()
-				return done
-			}
+			run := func(ctx context.Context) chan answer { return runStatement(t, eng, ctx, tc.sql) }
 			reached := func(n int32) {
 				t.Helper()
 				for deadline := time.Now().Add(10 * time.Second); started.Load() < n && time.Now().Before(deadline); {
@@ -638,7 +626,50 @@ func startSnowflake(t *testing.T, fake *fakeSnowflake) *engine.Engine {
 		t.Fatal(err)
 	}
 	_, eng := startEngine(t, store)
+	// A scan that waits for Snowflake holds one of DuckDB's threads, of which
+	// there is one a core unless told otherwise: three statements of two
+	// scans each, as these tests hold at once, left one scan of the third
+	// unstarted on a machine of four cores, where the release run of
+	// 1.0.0-rc.14 failed for it. The threads wait and use no core.
+	if _, err := queryOn(context.Background(), connect(t, eng), "SET threads = 16"); err != nil {
+		t.Fatal(err)
+	}
 	return eng
+}
+
+// answer is what a statement returned.
+type answer struct {
+	got string
+	err error
+}
+
+// runStatement runs sql under ctx on a connection of its own, and returns
+// where its answer arrives. The test ends the statement and waits for it
+// before it closes the connection and the engine: a test that failed with
+// statements still running closed DuckDB under them, which corrupted the
+// heap and aborted the whole test binary in place of the failure ("free():
+// chunks in smallbin corrupted", in the release run of 1.0.0-rc.14).
+func runStatement(t *testing.T, eng *engine.Engine, ctx context.Context, sql string) chan answer {
+	t.Helper()
+	conn := connect(t, eng)
+	ctx, cancel := context.WithCancel(ctx)
+	done := make(chan answer, 1)
+	returned := make(chan struct{})
+	go func() {
+		defer close(returned)
+		got, err := queryOn(ctx, conn, sql)
+		done <- answer{got, err}
+	}()
+	// Registered after the connection's cleanup, so run before it.
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case <-returned:
+		case <-time.After(30 * time.Second):
+			t.Error("a statement was still running 30 s after the test stopped it")
+		}
+	})
+	return done
 }
 
 // connect opens a DuckDB connection the test closes.
@@ -760,15 +791,7 @@ func testScanEndsEarly(t *testing.T, cols map[string]arrow.Array, sql, want stri
 	wholeCount := strconv.Itoa(first * (1 + rest))
 
 	// Another connection reads the whole table meanwhile.
-	type answer struct {
-		got string
-		err error
-	}
-	other := make(chan answer, 1)
-	go func() {
-		got, err := queryOn(context.Background(), connect(t, eng), whole)
-		other <- answer{got, err}
-	}()
+	other := runStatement(t, eng, context.Background(), whole)
 	for deadline := time.Now().Add(10 * time.Second); started.Load() < 1 && time.Now().Before(deadline); {
 		time.Sleep(5 * time.Millisecond)
 	}

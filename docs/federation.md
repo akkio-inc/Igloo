@@ -37,9 +37,10 @@ use `CREATE TABLE ... AS SELECT` from the connection.
 | `iceberg` | Iceberg REST catalogs: Snowflake's Horizon Catalog, Databricks' Iceberg shares and Unity Catalog, Apache Polaris and Snowflake Open Catalog, AWS Glue and S3 Tables, Lakekeeper. Tested with a Databricks share, Snowflake's Horizon Catalog (signing in) and Lakekeeper 0.14. | DuckDB's `iceberg` extension, as for Igloo's own catalog (see [Iceberg REST catalogs](#iceberg-rest-catalogs)) |
 
 The extensions are DuckDB's own core extensions, built for linux/amd64 and
-linux/arm64 and baked into the image like the others. The `postgres`
-extension, which PostgreSQL and Snowflake connections are attached with, is
-built with the image from DuckDB's source with Igloo's patches
+linux/arm64 and baked into the image like the others; Igloo loads them only
+when a connection needs them. The `postgres` extension, which PostgreSQL
+and Snowflake connections are attached with, is built with the image from
+DuckDB's source with Igloo's patches
 ([`extensions/postgres`](../extensions/postgres)), which end a scan as soon
 as its statement no longer needs it. The extensions are MIT-licensed. The
 `postgres` extension links libpq (PostgreSQL License); the `mysql` extension

@@ -13,6 +13,8 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/duckdb/duckdb-go/v2"
+
 	"github.com/akkio-inc/igloo/internal/config"
 )
 
@@ -24,9 +26,11 @@ import (
 // carries the files Igloo's build wrote, and the binary their SHA-256s from
 // that same build. Igloo checks each file against its hash, loads it before
 // DuckDB's lockdown, and turns unsigned loading off again; once external
-// access is off, nothing can load another file. The iceberg and postgres
-// extensions are loaded before anything asks DuckDB for them by name, which
-// then finds them loaded.
+// access is off, nothing can load another file. The iceberg extension is
+// loaded before anything asks DuckDB for iceberg by name, which then finds
+// it loaded. The postgres extension is loaded when a connection needs it
+// (see LoadExtension), as DuckDB's own was: a process with no such
+// connection does not hold it, 13 MB once loaded.
 
 // ownExtension is one of Igloo's own extensions.
 type ownExtension struct {
@@ -48,6 +52,10 @@ type ownExtension struct {
 	// directory as it loads, as iceberg loads avro, so it loads only in a
 	// process that has one.
 	pack bool
+	// alias, if set, is another name DuckDB loads the extension by, and
+	// says the extension is loaded only when something asks for it by
+	// either name before lockdown (see LoadExtension).
+	alias string
 }
 
 var (
@@ -72,15 +80,16 @@ const (
 var ownExtensions = []ownExtension{
 	{name: "rb", file: rbFile, sha256: &rbSHA256, testEnv: rbTestEnv},
 	{name: "iceberg", file: icebergFile, sha256: &icebergSHA256, testEnv: "IGLOO_TEST_ICEBERG_EXTENSION", pack: true},
-	{name: postgresName, file: postgresFile, sha256: &postgresSHA256, testEnv: PostgresTestEnv},
+	{name: postgresName, file: postgresFile, sha256: &postgresSHA256, testEnv: PostgresTestEnv, alias: "postgres"},
 }
 
 // extensionFile is an extension file to load, and the hash it must have
-// ("" when it is a test build's unchecked file).
+// ("" when it is a test build's unchecked file); alias is its extension's.
 type extensionFile struct {
 	name   string
 	path   string
 	sha256 string
+	alias  string
 }
 
 // ownToLoad returns the extensions of Igloo's own this process loads.
@@ -89,10 +98,10 @@ func ownToLoad(cfg config.Config) []extensionFile {
 	for _, x := range ownExtensions {
 		if *x.sha256 != "" {
 			if cfg.DuckDB.ExtensionDir != "" {
-				files = append(files, extensionFile{name: x.name, path: filepath.Join(cfg.DuckDB.ExtensionDir, x.file), sha256: *x.sha256})
+				files = append(files, extensionFile{name: x.name, path: filepath.Join(cfg.DuckDB.ExtensionDir, x.file), sha256: *x.sha256, alias: x.alias})
 			}
 		} else if p := os.Getenv(x.testEnv); p != "" && (!x.pack || cfg.DuckDB.ExtensionDir != "") {
-			files = append(files, extensionFile{name: x.name, path: p})
+			files = append(files, extensionFile{name: x.name, path: p, alias: x.alias})
 		}
 	}
 	return files
@@ -157,39 +166,114 @@ func checkFile(f extensionFile, duckdbVersion, platform string) error {
 	return nil
 }
 
-// loadOwn loads Igloo's own extensions this process has (see ownToLoad)
-// before lockdown, and reports which it loaded, by name. A file that fails
-// its checks stops Igloo from starting.
-func loadOwn(cfg config.Config, log *slog.Logger, exec func(string) error, query func(string) (string, error)) (map[string]bool, error) {
+// loadOwn checks Igloo's own extensions this process has (see ownToLoad)
+// and loads them before lockdown, but for those loaded on demand, which it
+// returns: LoadExtension loads one of them when a BeforeLockdown hook asks,
+// and unsigned loading stays on for them until noMoreUnsigned. It reports
+// which it loaded, by name. A file that fails its checks stops Igloo from
+// starting, whether it is loaded or not.
+func loadOwn(cfg config.Config, log *slog.Logger, exec func(string) error, query func(string) (string, error)) (map[string]bool, []extensionFile, error) {
 	files := ownToLoad(cfg)
 	if len(files) == 0 {
-		return nil, nil
+		return nil, nil, nil
 	}
 	version, err := query("SELECT library_version FROM pragma_version()")
 	if err != nil {
-		return nil, fmt.Errorf("read DuckDB's version: %w", err)
+		return nil, nil, fmt.Errorf("read DuckDB's version: %w", err)
 	}
 	platform, err := query("SELECT platform FROM pragma_platform()")
 	if err != nil {
-		return nil, fmt.Errorf("read DuckDB's platform: %w", err)
+		return nil, nil, fmt.Errorf("read DuckDB's platform: %w", err)
 	}
 	loaded := map[string]bool{}
+	var onDemand []extensionFile
 	for _, f := range files {
 		if err := checkFile(f, version, platform); err != nil {
-			return nil, fmt.Errorf("%s extension: %w", f.name, err)
+			return nil, nil, fmt.Errorf("%s extension: %w", f.name, err)
+		}
+		if f.alias != "" {
+			onDemand = append(onDemand, f)
+			continue
 		}
 		if f.sha256 == "" && log != nil {
 			log.Warn("loading an extension unchecked (a build without its hash)", "extension", f.name, "path", f.path)
 		}
 		if err := exec("LOAD " + literal(f.path)); err != nil {
-			return nil, fmt.Errorf("load the %s extension: %w", f.name, err)
+			return nil, nil, fmt.Errorf("load the %s extension: %w", f.name, err)
 		}
 		loaded[f.name] = true
 	}
-	if err := exec("SET allow_unsigned_extensions = false"); err != nil {
-		return nil, fmt.Errorf("turn unsigned extensions off: %w", err)
+	if len(onDemand) == 0 {
+		if err := noMoreUnsigned(exec); err != nil {
+			return nil, nil, err
+		}
 	}
-	return loaded, nil
+	return loaded, onDemand, nil
+}
+
+// noMoreUnsigned turns the loading of unsigned extensions off, for good:
+// DuckDB does not let it be turned on again.
+func noMoreUnsigned(exec func(string) error) error {
+	if err := exec("SET allow_unsigned_extensions = false"); err != nil {
+		return fmt.Errorf("turn unsigned extensions off: %w", err)
+	}
+	return nil
+}
+
+// settingUp is the context key of the engine whose BeforeLockdown hooks
+// are running.
+type settingUp struct{}
+
+// LoadExtension loads the DuckDB extension name on conn, the setup
+// connection of a BeforeLockdown hook running under ctx: Igloo's own build
+// of it, if this process has one (the postgres extension, which
+// PostgreSQL and Snowflake connections are attached with), and DuckDB's
+// otherwise.
+func LoadExtension(ctx context.Context, conn *duckdb.Conn, name string) error {
+	load := func(what string) error {
+		_, err := conn.ExecContext(ctx, "LOAD "+what, nil)
+		return err
+	}
+	if e, ok := ctx.Value(settingUp{}).(*Engine); ok {
+		for _, f := range e.onDemand {
+			if name != f.name && name != f.alias {
+				continue
+			}
+			if e.loadedOnDemand[f.name] {
+				return nil
+			}
+			if f.sha256 == "" {
+				e.log.Warn("loading an extension unchecked (a build without its hash)", "extension", f.name, "path", f.path)
+			}
+			if err := load(literal(f.path)); err != nil {
+				return fmt.Errorf("load the %s extension: %w", f.name, err)
+			}
+			e.loadedOnDemand[f.name] = true
+			return nil
+		}
+	}
+	return load(name)
+}
+
+// runBeforeLockdown runs the BeforeLockdown hooks, which may load Igloo's
+// own extensions that are loaded on demand, and then turns the loading of
+// unsigned extensions off.
+func (e *Engine) runBeforeLockdown(ctx context.Context, conn *duckdb.Conn, o options, exec func(string) error) error {
+	if len(e.onDemand) == 0 {
+		return beforeLockdown(ctx, conn, o)
+	}
+	e.loadedOnDemand = map[string]bool{}
+	err := beforeLockdown(context.WithValue(ctx, settingUp{}, e), conn, o)
+	if off := noMoreUnsigned(exec); err == nil {
+		err = off
+	}
+	return err
+}
+
+// PostgresLoaded reports whether DuckDB has Igloo's build of the postgres
+// extension: a connection asked for it as Igloo started.
+func (e *Engine) PostgresLoaded() bool {
+	return e.loadedOnDemand[postgresName]
 }
 
 // BitmapsLoaded reports whether DuckDB has the rb extension's bitmap
@@ -208,7 +292,9 @@ func CheckExtensions(ctx context.Context, dir string) (string, error) {
 			return "", fmt.Errorf("this igloo was built without the %s extension's hash", x.name)
 		}
 	}
-	e, err := Open(ctx, config.Config{DuckDB: config.DuckDB{ExtensionDir: dir}}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	// The postgres extension is loaded when a connection asks for it.
+	e, err := Open(ctx, config.Config{DuckDB: config.DuckDB{ExtensionDir: dir}}, slog.New(slog.NewTextHandler(io.Discard, nil)),
+		BeforeLockdown(func(ctx context.Context, conn *duckdb.Conn) error { return LoadExtension(ctx, conn, "postgres") }))
 	if err != nil {
 		return "", err
 	}
@@ -231,7 +317,7 @@ func CheckExtensions(ctx context.Context, dir string) (string, error) {
 	if !e.icebergOwn {
 		return "", fmt.Errorf("the iceberg extension did not load from %s", dir)
 	}
-	if !e.postgresOwn {
+	if !e.PostgresLoaded() {
 		return "", fmt.Errorf("the postgres extension did not load from %s", dir)
 	}
 	return fmt.Sprintf("rb extension %s loads and counts; iceberg extension %s loads; postgres extension %s loads",

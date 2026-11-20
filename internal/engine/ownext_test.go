@@ -179,9 +179,11 @@ func TestIcebergExtensionIsIgloos(t *testing.T) {
 
 // TestPostgresExtensionIsIgloos checks that an image's igloo loads its own
 // build of the postgres extension (extensions/postgres), checked against the
-// build's hash, that loading postgres by name, as attaching a connection
-// does, then finds that one loaded and reads no other, and that igloo
-// refuses another file in its place.
+// build's hash, when a connection asks for postgres by name as Igloo starts,
+// and no other: DuckDB then finds it loaded and reads no file. A process
+// nothing asks holds no postgres extension, as before Igloo built its own,
+// and loads no unsigned extension afterwards in either case. Igloo refuses
+// another file in the extension's place, asked for or not.
 func TestPostgresExtensionIsIgloos(t *testing.T) {
 	p := os.Getenv(PostgresTestEnv)
 	if p == "" {
@@ -196,27 +198,45 @@ func TestPostgresExtensionIsIgloos(t *testing.T) {
 	}
 	dir, sha := imageLayout(t, postgresFile, data, true)
 	withHash(t, &postgresSHA256, sha)
-	e, err := Open(context.Background(), config.Config{DuckDB: config.DuckDB{ExtensionDir: dir}}, quietLog())
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer e.Close() //nolint:errcheck
-	if !e.postgresOwn {
-		t.Fatal("Igloo's postgres extension did not load")
-	}
-	conn, err := e.Connect(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer conn.Close() //nolint:errcheck
-	// DuckDB reads no file once it is locked down: it finds the extension
-	// loaded.
-	if _, err := conn.ExecContext(context.Background(), "LOAD postgres", nil); err != nil {
-		t.Fatalf("LOAD postgres with Igloo's build loaded: %v", err)
+	cfg := config.Config{DuckDB: config.DuckDB{ExtensionDir: dir}}
+	asked := BeforeLockdown(func(ctx context.Context, conn *duckdb.Conn) error { return LoadExtension(ctx, conn, "postgres") })
+	for _, tc := range []struct {
+		name string
+		opts []Option
+		want bool
+	}{{"a connection asks", []Option{asked}, true}, {"nothing asks", nil, false}} {
+		t.Run(tc.name, func(t *testing.T) {
+			e, err := Open(context.Background(), cfg, quietLog(), tc.opts...)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer e.Close() //nolint:errcheck
+			if got := e.PostgresLoaded(); got != tc.want {
+				t.Fatalf("Igloo's postgres extension loaded: %v, want %v", got, tc.want)
+			}
+			conn, err := e.Connect(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer conn.Close() //nolint:errcheck
+			if got := queryOne(t, conn, "SELECT count(*) FROM duckdb_functions() WHERE function_name = 'postgres_scan'"); (got != "0") != tc.want {
+				t.Errorf("%s postgres_scan functions, with the extension loaded: %v", got, tc.want)
+			}
+			// DuckDB reads no file once it is locked down: it finds the
+			// extension loaded, or loads none.
+			_, err = conn.ExecContext(context.Background(), "LOAD postgres", nil)
+			if tc.want && err != nil {
+				t.Errorf("LOAD postgres with Igloo's build loaded: %v", err)
+			} else if !tc.want && (err == nil || !strings.Contains(err.Error(), "disabled")) {
+				t.Errorf("LOAD postgres after lockdown: %v, want it refused", err)
+			}
+			if got := queryOne(t, conn, "SELECT current_setting('allow_unsigned_extensions')::VARCHAR"); got != "false" {
+				t.Errorf("allow_unsigned_extensions is %s after Igloo started", got)
+			}
+		})
 	}
 	withHash(t, &postgresSHA256, strings.Repeat("cd", 32))
-	if _, err := Open(context.Background(), config.Config{DuckDB: config.DuckDB{ExtensionDir: dir}}, quietLog()); err == nil ||
-		!strings.Contains(err.Error(), "SHA-256") {
+	if _, err := Open(context.Background(), cfg, quietLog()); err == nil || !strings.Contains(err.Error(), "SHA-256") {
 		t.Fatalf("got %v, want a SHA-256 mismatch", err)
 	}
 }
@@ -270,7 +290,7 @@ func TestRBLockdownHolds(t *testing.T) {
 		// nothing loads or installs, unsigned or signed, by path or by name
 		try("LOAD "+literal(evil), "disabled")
 		try("LOAD mysql", "disabled")
-		try("LOAD tpcds", "disabled")
+		try("LOAD postgres", "disabled")
 		try("INSTALL "+literal(evil), "disabled")
 		try("INSTALL rb FROM "+literal(dir), "disabled")
 		try("FORCE INSTALL httpfs", "disabled")

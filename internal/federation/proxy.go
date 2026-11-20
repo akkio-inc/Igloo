@@ -147,15 +147,30 @@ func newProxy(c Connection, token, secrets string, log *slog.Logger) (*proxy, er
 // maxPort is the highest port DuckDB's MySQL extension accepts.
 const maxPort = 65353
 
+// listenAny listens on a port of 127.0.0.1 that the system picks. A
+// variable, for tests.
+var listenAny = func() (net.Listener, error) { return net.Listen("tcp", "127.0.0.1:0") }
+
 // listenLoopback listens on a free port of 127.0.0.1 that DuckDB's
-// extensions accept.
+// extensions accept. A system that hands its ports out in order, as macOS
+// does, offers every port above maxPort in turn once it has reached them:
+// each one offered is kept until the search ends, so the system has to
+// offer another, and there are fewer of them than tries. Twenty tries,
+// each port given back at once, found none while macOS was at port 65435,
+// and no connection was attached.
 func listenLoopback() (net.Listener, error) {
-	for range 20 {
-		ln, err := net.Listen("tcp", "127.0.0.1:0")
+	var high []net.Listener
+	defer func() {
+		for _, ln := range high {
+			_ = ln.Close()
+		}
+	}()
+	for range 65535 - maxPort + 1 {
+		ln, err := listenAny()
 		if err != nil || ln.Addr().(*net.TCPAddr).Port <= maxPort {
 			return ln, err
 		}
-		_ = ln.Close()
+		high = append(high, ln)
 	}
 	return nil, errors.New("no free port")
 }

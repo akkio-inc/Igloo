@@ -31,6 +31,13 @@ The release workflow publishes the section whose heading matches the tag
   extension (`extensions/postgres`), which looks for the cancel and has
   Igloo's gateway to Snowflake cancel a read it leaves; the image builds it
   in minutes, as it compiles none of DuckDB.
+- Igloo starts without a connection whose proxy or gateway cannot open its
+  port on the loopback interface, and keeps the reason with the connection:
+  it stopped at start with a nil dereference. Where the system hands its
+  ports out in order, as macOS does, Igloo also finds a port once the
+  system has reached those above 65353, the highest DuckDB's extensions
+  accept: 20 tries met 20 such ports in a row, and no connection was
+  attached.
 
 ## [1.0.0-rc.14] - 2026-11-20
 
