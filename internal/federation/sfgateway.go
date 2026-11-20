@@ -58,8 +58,9 @@ import (
 const gatewayVersion = "17.0"
 
 // scanPages is how many pages the gateway says every table has: twice what
-// the extension gives one task of a scan (its pg_pages_per_task, 1000), so a
-// scan has two tasks. A table of fewer pages the extension reads in one
+// the extension gives one task of a scan (its pg_pages_per_task, 1000 unless
+// a connection has a scan tag below that), so a scan has two tasks at a
+// time. A table of fewer pages the extension reads in one
 // task, and a statement that scans the connection more than once (a join of
 // two Snowflake tables) then has every such table downloaded whole, one
 // after the other, in the call that prepares the statement: before it
@@ -69,6 +70,35 @@ const gatewayVersion = "17.0"
 // its own. The task whose pages start at 0 reads the table; the other reads
 // nothing (see copyOut).
 const scanPages = 2000
+
+// A scan's tag says which DuckDB connection the scan is for, so that the
+// scans of a statement Igloo stops can be ended with it (see
+// Manager.LinkScans). The extension tells the gateway nothing about the
+// statement a scan belongs to, and its connections to the gateway come from
+// a pool all of DuckDB's connections share. But one setting of a DuckDB
+// connection is written into every scan it starts, whichever of the pool's
+// connections carries the scan: pg_pages_per_task, where the pages of the
+// scan's first task end (ctid BETWEEN '(0,0)'::tid AND '(tag,0)'::tid). So a
+// linked DuckDB connection has a pg_pages_per_task of its own, its tag: at
+// most scanTagMax, below the extension's default, which the scans of
+// connections without a tag have, and at least scanTagMin, as the pages of
+// a table must still make two tasks at a time (scanPages / tag is the
+// extension's count; a third task, of the pages past twice the tag, is
+// answered empty like the second).
+const (
+	scanTagMin = scanPages/3 + 1
+	scanTagMax = scanPages/2 - 1
+)
+
+// scanTag is the tag of a scan's first task, or 0 for a scan without one:
+// a connection that is not linked, or a scan the extension reads in one
+// task, with its LIMIT or whole.
+func (q *scanQuery) scanTag() int {
+	if q.ctid && q.ctidFrom == 0 && q.ctidTo >= scanTagMin && q.ctidTo <= scanTagMax {
+		return int(q.ctidTo)
+	}
+	return 0
+}
 
 // scanPrefetch is how many result batches of one scan may be downloading,
 // downloaded or being sent to DuckDB at once (see sharedPrefetch).
@@ -362,6 +392,20 @@ func (g *sfGateway) handle(conn net.Conn) {
 	s.run()
 }
 
+// cancelScans ends the scans running for the DuckDB connection with that
+// tag, as a cancel request for each of their sessions would.
+func (g *sfGateway) cancelScans(tag int) {
+	g.mu.Lock()
+	sessions := make([]*sfSession, 0, len(g.sessions))
+	for s := range g.sessions {
+		sessions = append(sessions, s)
+	}
+	g.mu.Unlock()
+	for _, s := range sessions {
+		s.cancelTagged(tag)
+	}
+}
+
 // cancelRequest cancels the scan of the session with that key, as
 // PostgreSQL cancels a backend's statement.
 func (g *sfGateway) cancelRequest(pid uint32, key []byte) {
@@ -393,8 +437,10 @@ type sfSession struct {
 	skipping bool
 
 	mu sync.Mutex
-	// cancel ends the scan running, if any.
+	// cancel ends the scan running, if any, and tag is that scan's (see
+	// scanTagMin).
 	cancel context.CancelFunc
+	tag    int
 }
 
 // pgMessage is a message from DuckDB.
@@ -811,16 +857,32 @@ func (s *sfSession) tables(st string) error {
 	return nil
 }
 
-// setCancel sets the function that ends the scan running.
-func (s *sfSession) setCancel(f context.CancelFunc) {
+// setCancel sets the function that ends the scan running, and the scan's
+// tag.
+func (s *sfSession) setCancel(tag int, f context.CancelFunc) {
 	s.mu.Lock()
-	s.cancel = f
+	s.cancel, s.tag = f, tag
 	s.mu.Unlock()
 }
 
 func (s *sfSession) cancelScan() {
 	s.mu.Lock()
 	f := s.cancel
+	s.mu.Unlock()
+	if f != nil {
+		f()
+	}
+}
+
+// cancelTagged ends the scan running if it has that tag. A session's next
+// scan may be another DuckDB connection's: f ends only the scan that had
+// the tag.
+func (s *sfSession) cancelTagged(tag int) {
+	s.mu.Lock()
+	f := s.cancel
+	if s.tag != tag {
+		f = nil
+	}
 	s.mu.Unlock()
 	if f != nil {
 		f()
@@ -852,8 +914,8 @@ func (s *sfSession) copyOut(ctx context.Context, st string) error {
 	}
 	ctx, cancel := context.WithCancelCause(ctx)
 	defer cancel(nil)
-	s.setCancel(func() { cancel(errCanceled) })
-	defer s.setCancel(nil)
+	s.setCancel(q.scanTag(), func() { cancel(errCanceled) })
+	defer s.setCancel(0, nil)
 
 	c := s.g.settings()
 	started := time.Now()
@@ -876,10 +938,16 @@ func (s *sfSession) copyOut(ctx context.Context, st string) error {
 
 	if scan.count {
 		n, err := countResult(ctx, res, c.QueryTimeout)
-		if err != nil {
-			return failf("XX000", "%v", err)
+		if err == nil {
+			err = s.sendNulls(ctx, n)
 		}
-		return s.sendNulls(n)
+		switch {
+		case err == nil || errors.Is(err, errClientGone):
+			return err
+		case context.Cause(ctx) == errCanceled:
+			return failf("57014", "%v", errCanceled)
+		}
+		return failf("XX000", "%v", err)
 	}
 	rows, err := s.stream(ctx, res, scan, c.QueryTimeout)
 	if err != nil {
@@ -1013,8 +1081,8 @@ func (s *sfSession) copyData(payload []byte) error {
 	return nil
 }
 
-// sendNulls sends n rows of one NULL, for SELECT NULL.
-func (s *sfSession) sendNulls(n int64) error {
+// sendNulls sends n rows of one NULL, for SELECT NULL, until ctx ends.
+func (s *sfSession) sendNulls(ctx context.Context, n int64) error {
 	s.copyStart(1)
 	row := []byte{0, 1, 0xff, 0xff, 0xff, 0xff}
 	first := append(slices.Clone(copyHeader), row...)
@@ -1025,6 +1093,9 @@ func (s *sfSession) sendNulls(n int64) error {
 		}
 		if err := s.copyData(msg); err != nil {
 			return err
+		}
+		if i%65536 == 65535 && ctx.Err() != nil {
+			return ctx.Err()
 		}
 	}
 	return s.copyEnd(n, n > 0)
@@ -1173,6 +1244,11 @@ func (s *sfSession) sendRecords(ctx context.Context, recs []arrow.Record, scan *
 			*sentHeader = true
 			buf = buf[:0]
 			*rows++
+			// A canceled scan ends here, not at the end of a record of
+			// a hundred megabytes.
+			if r%1024 == 1023 && ctx.Err() != nil {
+				return buf, ctx.Err()
+			}
 		}
 		if ctx.Err() != nil {
 			return buf, ctx.Err()

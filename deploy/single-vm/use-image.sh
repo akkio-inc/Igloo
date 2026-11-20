@@ -13,18 +13,39 @@ here="$(cd "$(dirname "$0")" && pwd)"
 env_file="$here/.env"
 image="${1:?usage: use-image.sh release|<image>}"
 
+# unpublished IMAGE: the registry says it has no such image, as while a
+# release is building, or for a tag whose release never passed. An image
+# that is here already, or a registry that cannot be asked, does not count.
+unpublished() {
+  docker image inspect "$1" >/dev/null 2>&1 && return 1
+  docker manifest inspect "$1" 2>&1 >/dev/null | grep -qi 'manifest unknown'
+}
+
 if [ "$image" = release ]; then
-  # The newest release tag this checkout holds. A shallow clone holds none,
-  # and takes the newest one of the repository it came from. A release sorts
-  # above its own candidates: 1.0.0 above 1.0.0-rc.12.
-  tag="$(git -C "$here" -c versionsort.suffix=- tag --merged HEAD --sort=-v:refname --list 'v[0-9]*' 2>/dev/null |
-    head -n 1)"
-  if [ -z "$tag" ]; then
-    tag="$(git -C "$here" -c versionsort.suffix=- ls-remote --tags --refs --sort=-v:refname origin 'v[0-9]*' 2>/dev/null |
-      head -n 1 | sed 's|.*refs/tags/||')"
+  # The newest release tag this checkout holds whose image is published. A
+  # shallow clone holds at most the tag of the commit it is at, and takes
+  # those of the repository it came from. A release sorts above its own
+  # candidates: 1.0.0 above 1.0.0-rc.12.
+  tags=
+  if [ "$(git -C "$here" rev-parse --is-shallow-repository 2>/dev/null)" != true ]; then
+    tags="$(git -C "$here" -c versionsort.suffix=- tag --merged HEAD --sort=-v:refname --list 'v[0-9]*' 2>/dev/null |
+      head -n 5)"
   fi
+  if [ -z "$tags" ]; then
+    tags="$(git -C "$here" -c versionsort.suffix=- ls-remote --tags --refs --sort=-v:refname origin 'v[0-9]*' 2>/dev/null |
+      head -n 5 | sed 's|.*refs/tags/||')"
+  fi
+  tag=
+  for candidate in $tags; do
+    if unpublished "ghcr.io/akkio-inc/igloo:${candidate#v}"; then
+      echo "$candidate is tagged and its image is not published: taking the release before it." >&2
+      continue
+    fi
+    tag="$candidate"
+    break
+  done
   if [ -z "$tag" ]; then
-    echo "No release tag found for this checkout. Fetch them with \`git fetch --tags\`," >&2
+    echo "No published release found for this checkout. Fetch its tags with \`git fetch --tags\`," >&2
     echo "name an image with \`make up IMAGE=ghcr.io/akkio-inc/igloo:<version>\`," >&2
     echo "or build Igloo from source with \`make dev\`." >&2
     exit 1

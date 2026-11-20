@@ -9,14 +9,36 @@ The release workflow publishes the section whose heading matches the tag
 
 ## [Unreleased]
 
+### Fixed
+
+- `make up` in a shallow clone made at a release's own commit, while that
+  release's image was not published yet, found no release to start: such a
+  clone holds that one tag. A shallow clone now always takes the tags of
+  the repository it came from.
+- A statement stops reading Snowflake's tables through a connection when it
+  is canceled, by its `statement_timeout`, a cancel request or the memory
+  watch, and Snowflake stops working on its queries. With a 15 s timeout, a
+  read of a table of 36 million rows ended 181 s after the timeout, once
+  Snowflake had delivered every row, and its client's connection was closed
+  at 45 s; it ends at 15.0 s, as a `UNION ALL` and a join of two such
+  tables do, and a cancel request stops one at once. The same statement run
+  by two sessions at once stopped at its timeout for the one that had one
+  and finished for the other. DuckDB's postgres extension, which reads
+  these tables, does not look for a cancel while it waits for a table's
+  rows, so Igloo now ends the statement's reads itself.
+
+## [1.0.0-rc.13] - 2026-11-19
+
 ### Changed
 
 - `make up` starts the single-machine stack on the released image, where it
   built Igloo from source first, which takes CI about 50 minutes without a
   cache. From a new clone on an Apple laptop with none of the five images
   present, `make up` took 125 seconds and the first query answered 3 seconds
-  later, on 1.0.0-rc.12. It runs the newest release the checkout holds (a
-  shallow clone, which holds no tags, asks the repository it came from),
+  later, on 1.0.0-rc.12. It runs the newest release the checkout holds whose
+  image is published, so a release still building, or a tag whose release
+  never passed, is passed over for the one before it (a shallow clone, which
+  holds no tags, asks the repository it came from),
   and writes that image to `IGLOO_IMAGE` in `deploy/single-vm/.env`, which
   every later `docker compose` command reads, so `make psql` and
   `make load-tpch` leave the running stack as it is. `make up IMAGE=<image>`
