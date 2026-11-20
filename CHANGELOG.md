@@ -9,6 +9,8 @@ The release workflow publishes the section whose heading matches the tag
 
 ## [Unreleased]
 
+## [1.0.0-rc.16] - 2026-11-20
+
 ### Changed
 
 - Igloo's build of DuckDB's Iceberg extension (`extensions/iceberg`) no
