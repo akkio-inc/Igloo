@@ -72,7 +72,10 @@ func (p *proxy) servePostgres(client net.Conn, c Connection) error {
 		case *pgproto3.StartupMessage:
 			startup = m
 		default:
-			// Cancel requests: the extension does not send them.
+			// Cancel requests, which Igloo's build of the extension sends
+			// for a scan its statement no longer needs (see sfGateway):
+			// the proxy passes none on, and the extension reads such a
+			// scan to its end, as it always did.
 			return nil
 		}
 	}

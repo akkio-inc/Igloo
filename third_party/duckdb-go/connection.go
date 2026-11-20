@@ -177,7 +177,6 @@ func (conn *Conn) Close() error {
 		return errClosedCon
 	}
 	conn.closed = true
-	interruptHooks.Delete(conn.conn) // Igloo patch (see SetInterruptHook).
 	mapping.Disconnect(&conn.conn)
 	conn.ctxStore.delete(conn.id)
 

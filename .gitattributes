@@ -1,0 +1,3 @@
+# A patch's lines keep the whitespace of the lines they change: git diff
+# --check has nothing to say about them.
+extensions/*/patches/*.patch -whitespace

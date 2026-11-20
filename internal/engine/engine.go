@@ -108,10 +108,11 @@ type Engine struct {
 	catShared atomic.Int64
 	// releaseTempDir lets go of the spill directory; see claimTempDir.
 	releaseTempDir func()
-	// bitmaps says the rb extension is loaded, and icebergOwn Igloo's build
-	// of the iceberg extension (see loadOwn).
-	bitmaps, icebergOwn bool
-	log                 *slog.Logger
+	// bitmaps says the rb extension is loaded, and icebergOwn and
+	// postgresOwn Igloo's builds of the iceberg and postgres extensions
+	// (see loadOwn).
+	bitmaps, icebergOwn, postgresOwn bool
+	log                              *slog.Logger
 	// cfg is what it was opened with, and isBackground says it is the
 	// second DuckDB of a process, for heavy statements (see background.go);
 	// bg is that one, opened at its first use, and the rest its upkeep.
@@ -749,7 +750,7 @@ func (e *Engine) setup(ctx context.Context, cfg config.Config, log *slog.Logger,
 	if err != nil {
 		return err
 	}
-	e.bitmaps, e.icebergOwn = own["rb"], own["iceberg"]
+	e.bitmaps, e.icebergOwn, e.postgresOwn = own["rb"], own["iceberg"], own[postgresName]
 	if e.local, err = queryString(ctx, conn, "SELECT current_database()"); err != nil {
 		return fmt.Errorf("read database name: %w", err)
 	}

@@ -75,6 +75,49 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
+  # Igloo's build of DuckDB's postgres extension (extensions/postgres), which
+  # the tests and the image use: the Dockerfile's postgres stage, built once
+  # for each architecture, a few minutes cold. Its cache holds it until the
+  # build script or the patches change, and the Go jobs take the file it
+  # built as an artifact.
+  postgres:
+    name: Postgres extension (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Build
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          target: postgres-out
+          platforms: linux/${{ matrix.arch }}
+          outputs: type=local,dest=${{ runner.temp }}/postgres
+          provenance: false
+          sbom: false
+          cache-from: type=gha,scope=postgres-${{ matrix.arch }}
+          cache-to: type=gha,scope=postgres-${{ matrix.arch }},mode=max
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: postgres-extension-${{ matrix.arch }}
+          path: ${{ runner.temp }}/postgres/postgres_scanner.duckdb_extension
+          if-no-files-found: error
+          retention-days: 1
+
   # XGBoost's library (third_party/xgboost), which every build of Igloo
   # links: the Dockerfile's xgboost stage, built once for each architecture
   # and handed to the jobs that link Igloo as an artifact. Its cache is kept
@@ -123,7 +166,7 @@ jobs:
 
   go:
     name: Go (${{ matrix.part }})
-    needs: [iceberg, xgboost]
+    needs: [iceberg, postgres, xgboost]
     runs-on: ubuntu-latest
     timeout-minutes: 30
     strategy:
@@ -203,6 +246,16 @@ jobs:
       - name: Use the iceberg extension
         run: echo "IGLOO_TEST_ICEBERG_EXTENSION=$RUNNER_TEMP/iceberg/iceberg.duckdb_extension" >>"$GITHUB_ENV"
 
+      # The postgres extension the postgres job built.
+      - name: Fetch the postgres extension
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: postgres-extension-amd64
+          path: ${{ runner.temp }}/postgres
+
+      - name: Use the postgres extension
+        run: echo "IGLOO_TEST_POSTGRES_EXTENSION=$RUNNER_TEMP/postgres/postgres_scanner.duckdb_extension" >>"$GITHUB_ENV"
+
       # The spatial and sketch tests load the extensions the image ships.
       - name: Install DuckDB extensions
         run: |
@@ -258,7 +311,7 @@ jobs:
 
   image:
     name: Image (${{ matrix.arch }})
-    needs: [iceberg, xgboost]
+    needs: [iceberg, postgres, xgboost]
     # Each architecture builds on its own native runner: cross-compiling cgo
     # and DuckDB under QEMU is slow and fragile.
     runs-on: ${{ matrix.runner }}
@@ -306,6 +359,7 @@ jobs:
           cache-from: |
             type=gha,scope=image-${{ matrix.arch }}
             type=gha,scope=iceberg-${{ matrix.arch }}
+            type=gha,scope=postgres-${{ matrix.arch }}
           cache-to: type=gha,scope=image-${{ matrix.arch }},mode=max
 
       - name: Check that the binary reports its version

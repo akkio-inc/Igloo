@@ -9,6 +9,29 @@ The release workflow publishes the section whose heading matches the tag
 
 ## [Unreleased]
 
+### Fixed
+
+- A statement stops reading Snowflake's tables through a connection as soon
+  as it no longer needs them, and Snowflake stops working on its queries:
+  when it has the rows it asked for and when it fails, as when it is
+  canceled. It read every table it had started on to the end first. On a
+  table of 36 million rows, a `LIMIT 10` above a filter Igloo applies
+  returned after 74.0 s and returns after 3.9 s, when Snowflake delivers
+  its first rows (0.5 s from Snowflake's result cache); an `EXISTS` after
+  20.4 s and after 3.9 s; and a statement that fails on one of its first
+  rows after 9.8 s and after 2.0 s. A canceled statement also stops a read
+  with a `LIMIT` of its own: `LIMIT 30000000` under a 5 s timeout ended at
+  97.5 s, its client's connection closed at 35 s, and ends at 5.0 s. Reads
+  without one end at their timeout as in 1.0.0-rc.14, in any number of
+  sessions at once, and a transaction block reads on after a statement that
+  stopped a read early. DuckDB's postgres extension, which reads these
+  tables, waited for a table's rows without looking for a cancel, and read
+  the rest of a table it had left before it did anything else. Igloo now
+  attaches PostgreSQL and Snowflake connections with its own build of that
+  extension (`extensions/postgres`), which looks for the cancel and has
+  Igloo's gateway to Snowflake cancel a read it leaves; the image builds it
+  in minutes, as it compiles none of DuckDB.
+
 ## [1.0.0-rc.14] - 2026-11-20
 
 ### Fixed

@@ -54,18 +54,6 @@ were removed; the code is otherwise unchanged except for these patches:
   `createScalarFunc` with the connection's context store passed in rather
   than taken from a `*sql.Conn`.
 
-- `Conn.SetInterruptHook` in `igloo_interrupt.go`, with `interrupt` called
-  in place of `mapping.Interrupt` in `interrupterRoutine` (`context.go`),
-  `interruptUntil` (`igloo_stream.go`) and `Conn.Interrupt`, and the hook
-  dropped in `Conn.Close` (`connection.go`): a function the connection runs
-  each time its query is asked to stop. DuckDB's interrupt reaches only
-  the threads that look for it, and a thread of the postgres extension
-  that waits for a scan's rows looks for none until the rows end, so a
-  canceled statement that read another database went on until that
-  database had answered every scan. Igloo ends those scans from the hook
-  (see `Manager.LinkScans` in `internal/federation`). Upstream has no way
-  to run code when it interrupts a query.
-
 - `igloo_stream.go` (new) and `mapping/igloo_stream.go` (new):
   `Stmt.QueryStreamContext`, a query whose result DuckDB streams, computing
   rows as `Next` reads them (`duckdb_pending_prepared_streaming`), with

@@ -66,6 +66,21 @@ func installExtensions(t *testing.T) {
 	}
 }
 
+// ownPostgres skips a test that needs Igloo's build of the postgres
+// extension (extensions/postgres/build.sh), which an engine loads from the
+// file engine.PostgresTestEnv names. CI always builds it, so there a test
+// that needs it fails without it.
+func ownPostgres(t *testing.T) {
+	t.Helper()
+	if os.Getenv(engine.PostgresTestEnv) != "" {
+		return
+	}
+	if os.Getenv("CI") != "" {
+		t.Fatalf("%s is not set: CI builds the postgres extension (extensions/postgres/build.sh) before the tests", engine.PostgresTestEnv)
+	}
+	t.Skipf("%s is not set; build the extension with extensions/postgres/build.sh", engine.PostgresTestEnv)
+}
+
 // useExtensionDir returns the statement that points a DuckDB connection at
 // IGLOO_TEST_EXTENSION_DIR, if it is set.
 func useExtensionDir() []string {

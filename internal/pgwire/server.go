@@ -933,10 +933,6 @@ type session struct {
 	pid, secret int32
 	added       time.Time
 	conn        *duckdb.Conn
-	// unlinkScans, when set, undoes the link of conn to the scans its
-	// statements read through Snowflake connections (see
-	// federation.Manager.LinkScans), once conn is closed.
-	unlinkScans func()
 	// left is set once the session has left the server (see leave).
 	left atomic.Bool
 	// callGuard runs each call of the session's connections into DuckDB
@@ -1257,17 +1253,6 @@ func (s *Server) openSession(ctx context.Context) (context.Context, error) {
 	}
 	s.sessions.connected(sess, conn)
 	sess.wl.meter, sess.wl.controller = meter, s.workload
-	// What the session's statements read through a Snowflake connection
-	// stops when they are stopped: DuckDB's interrupt does not reach it.
-	if s.fed != nil {
-		unlink, err := s.fed.LinkScans(ctx, conn)
-		if err != nil {
-			s.sessions.remove(sess)
-			s.releaseConn()
-			return ctx, errors.Join(fmt.Errorf("open session: %w", err), meter.Close())
-		}
-		sess.unlinkScans = unlink
-	}
 	// Binding a statement looks its tables up, and DuckDB binds a statement
 	// that reads the catalog again each time it runs, not only when it is
 	// prepared. Hold the catalog lock shared for every bind on this
@@ -1303,11 +1288,7 @@ func (s *Server) openSession(ctx context.Context) (context.Context, error) {
 		if err != nil {
 			s.sessions.remove(sess)
 			s.releaseConn()
-			err = errors.Join(fmt.Errorf("set up session catalog: %w", err), meter.Close())
-			if sess.unlinkScans != nil {
-				sess.unlinkScans()
-			}
-			return ctx, err
+			return ctx, errors.Join(fmt.Errorf("set up session catalog: %w", err), meter.Close())
 		}
 	}
 	s.metrics.sessionOpened(string(sess.user.Role))
@@ -1333,11 +1314,7 @@ func (s *Server) closeSession(ctx context.Context) error {
 		errs = append(errs, sess.release(ps))
 	}
 	errs = append(errs, sess.closeBackgroundConn())
-	err := errors.Join(append(errs, sess.wl.meter.Close())...)
-	if sess.unlinkScans != nil {
-		sess.unlinkScans()
-	}
-	return err
+	return errors.Join(append(errs, sess.wl.meter.Close())...)
 }
 
 // leave takes sess out of the server's sessions and gives back its

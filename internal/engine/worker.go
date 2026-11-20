@@ -62,7 +62,7 @@ func (e *Engine) setupWorker(ctx context.Context, cfg config.Config, log *slog.L
 	if err != nil {
 		return err
 	}
-	e.bitmaps, e.icebergOwn = own["rb"], own["iceberg"]
+	e.bitmaps, e.icebergOwn, e.postgresOwn = own["rb"], own["iceberg"], own[postgresName]
 	if e.local, err = queryString(ctx, conn, "SELECT current_database()"); err != nil {
 		return fmt.Errorf("read database name: %w", err)
 	}

@@ -45,7 +45,11 @@ import (
 //     query with the same columns, filters and limit (sfscan.go), runs with
 //     Snowflake's Go driver, and streams back as binary COPY data
 //     (sfcopy.go), a batch of Snowflake's Arrow results at a time, while
-//     the next few download.
+//     the next few download;
+//   - cancel requests, which end the scan of the session they name, and
+//     its Snowflake query: Igloo's build of the extension
+//     (extensions/postgres) sends one for a scan its statement no longer
+//     needs, because it was canceled, it failed or it has its rows.
 //
 // Doing so through the postgres extension, rather than a table function of
 // Igloo's, gives Snowflake's tables everything a PostgreSQL connection's
@@ -58,47 +62,16 @@ import (
 const gatewayVersion = "17.0"
 
 // scanPages is how many pages the gateway says every table has: twice what
-// the extension gives one task of a scan (its pg_pages_per_task, 1000 unless
-// a connection has a scan tag below that), so a scan has two tasks at a
-// time. A table of fewer pages the extension reads in one
+// the extension gives one task of a scan (its pg_pages_per_task, 1000), so a
+// scan has two tasks. A table of fewer pages the extension reads in one
 // task, and a statement that scans the connection more than once (a join of
 // two Snowflake tables) then has every such table downloaded whole, one
 // after the other, in the call that prepares the statement: before it
-// starts, where neither its timeout nor a cancel request stops it, with the
-// tables held in memory and the catalog lock held for as long as Snowflake
-// takes. Scans of two tasks run with the statement, each on connections of
-// its own. The task whose pages start at 0 reads the table; the other reads
-// nothing (see copyOut).
+// starts, with the tables held in memory and the catalog lock held for as
+// long as Snowflake takes. Scans of two tasks run with the statement, each
+// on connections of its own. The task whose pages start at 0 reads the
+// table; the other reads nothing (see copyOut).
 const scanPages = 2000
-
-// A scan's tag says which DuckDB connection the scan is for, so that the
-// scans of a statement Igloo stops can be ended with it (see
-// Manager.LinkScans). The extension tells the gateway nothing about the
-// statement a scan belongs to, and its connections to the gateway come from
-// a pool all of DuckDB's connections share. But one setting of a DuckDB
-// connection is written into every scan it starts, whichever of the pool's
-// connections carries the scan: pg_pages_per_task, where the pages of the
-// scan's first task end (ctid BETWEEN '(0,0)'::tid AND '(tag,0)'::tid). So a
-// linked DuckDB connection has a pg_pages_per_task of its own, its tag: at
-// most scanTagMax, below the extension's default, which the scans of
-// connections without a tag have, and at least scanTagMin, as the pages of
-// a table must still make two tasks at a time (scanPages / tag is the
-// extension's count; a third task, of the pages past twice the tag, is
-// answered empty like the second).
-const (
-	scanTagMin = scanPages/3 + 1
-	scanTagMax = scanPages/2 - 1
-)
-
-// scanTag is the tag of a scan's first task, or 0 for a scan without one:
-// a connection that is not linked, or a scan the extension reads in one
-// task, with its LIMIT or whole.
-func (q *scanQuery) scanTag() int {
-	if q.ctid && q.ctidFrom == 0 && q.ctidTo >= scanTagMin && q.ctidTo <= scanTagMax {
-		return int(q.ctidTo)
-	}
-	return 0
-}
 
 // scanPrefetch is how many result batches of one scan may be downloading,
 // downloaded or being sent to DuckDB at once (see sharedPrefetch).
@@ -392,20 +365,6 @@ func (g *sfGateway) handle(conn net.Conn) {
 	s.run()
 }
 
-// cancelScans ends the scans running for the DuckDB connection with that
-// tag, as a cancel request for each of their sessions would.
-func (g *sfGateway) cancelScans(tag int) {
-	g.mu.Lock()
-	sessions := make([]*sfSession, 0, len(g.sessions))
-	for s := range g.sessions {
-		sessions = append(sessions, s)
-	}
-	g.mu.Unlock()
-	for _, s := range sessions {
-		s.cancelTagged(tag)
-	}
-}
-
 // cancelRequest cancels the scan of the session with that key, as
 // PostgreSQL cancels a backend's statement.
 func (g *sfGateway) cancelRequest(pid uint32, key []byte) {
@@ -437,10 +396,8 @@ type sfSession struct {
 	skipping bool
 
 	mu sync.Mutex
-	// cancel ends the scan running, if any, and tag is that scan's (see
-	// scanTagMin).
+	// cancel ends the scan running, if any.
 	cancel context.CancelFunc
-	tag    int
 }
 
 // pgMessage is a message from DuckDB.
@@ -548,7 +505,12 @@ func (s *sfSession) simpleQuery(ctx context.Context, text string) {
 				code = se.code
 			}
 			s.send(gatewayError(code, "connection "+s.g.name+": "+err.Error()))
-			if s.inTx {
+			// A scan DuckDB canceled leaves the transaction as it was:
+			// DuckDB cancels the scan of a statement that has the rows
+			// it needs, and the next statement of its transaction reads
+			// on, where PostgreSQL would refuse everything up to a
+			// ROLLBACK. The gateway's transactions hold nothing to undo.
+			if s.inTx && code != canceledCode {
 				s.failed = true
 			}
 			break
@@ -857,11 +819,10 @@ func (s *sfSession) tables(st string) error {
 	return nil
 }
 
-// setCancel sets the function that ends the scan running, and the scan's
-// tag.
-func (s *sfSession) setCancel(tag int, f context.CancelFunc) {
+// setCancel sets the function that ends the scan running.
+func (s *sfSession) setCancel(f context.CancelFunc) {
 	s.mu.Lock()
-	s.cancel, s.tag = f, tag
+	s.cancel = f
 	s.mu.Unlock()
 }
 
@@ -874,23 +835,11 @@ func (s *sfSession) cancelScan() {
 	}
 }
 
-// cancelTagged ends the scan running if it has that tag. A session's next
-// scan may be another DuckDB connection's: f ends only the scan that had
-// the tag.
-func (s *sfSession) cancelTagged(tag int) {
-	s.mu.Lock()
-	f := s.cancel
-	if s.tag != tag {
-		f = nil
-	}
-	s.mu.Unlock()
-	if f != nil {
-		f()
-	}
-}
-
-// errCanceled ends a scan whose statement DuckDB canceled.
+// errCanceled ends a scan whose statement DuckDB canceled, with
+// canceledCode, PostgreSQL's query_canceled.
 var errCanceled = errors.New("canceling statement due to user request")
+
+const canceledCode = "57014"
 
 // copyOut runs a scan: COPY (SELECT ...) TO STDOUT (FORMAT "binary").
 func (s *sfSession) copyOut(ctx context.Context, st string) error {
@@ -914,8 +863,8 @@ func (s *sfSession) copyOut(ctx context.Context, st string) error {
 	}
 	ctx, cancel := context.WithCancelCause(ctx)
 	defer cancel(nil)
-	s.setCancel(q.scanTag(), func() { cancel(errCanceled) })
-	defer s.setCancel(0, nil)
+	s.setCancel(func() { cancel(errCanceled) })
+	defer s.setCancel(nil)
 
 	c := s.g.settings()
 	started := time.Now()
@@ -928,7 +877,7 @@ func (s *sfSession) copyOut(ctx context.Context, st string) error {
 	}
 	if err != nil {
 		if context.Cause(ctx) == errCanceled {
-			return failf("57014", "%v", errCanceled)
+			return failf(canceledCode, "%v", errCanceled)
 		}
 		return failf("XX000", "%v", err)
 	}
@@ -945,7 +894,7 @@ func (s *sfSession) copyOut(ctx context.Context, st string) error {
 		case err == nil || errors.Is(err, errClientGone):
 			return err
 		case context.Cause(ctx) == errCanceled:
-			return failf("57014", "%v", errCanceled)
+			return failf(canceledCode, "%v", errCanceled)
 		}
 		return failf("XX000", "%v", err)
 	}
@@ -960,7 +909,7 @@ func (s *sfSession) copyOut(ctx context.Context, st string) error {
 		}
 		code := "XX000"
 		if errors.Is(err, errCanceled) {
-			code = "57014"
+			code = canceledCode
 		}
 		return failf(code, "%v", err)
 	}
@@ -1181,7 +1130,17 @@ func (s *sfSession) stream(ctx context.Context, res *sfResult, scan *sfScan, tim
 	buf := slices.Clone(copyHeader)
 	sentHeader := false
 	for i := range res.batches {
-		f := <-results[i]
+		var f fetched
+		select {
+		case f = <-results[i]:
+		default:
+			// The batch is still downloading: DuckDB gets the rows before
+			// it meanwhile, which may be all its statement needs.
+			if s.flush() != nil {
+				return rows, errClientGone
+			}
+			f = <-results[i]
+		}
 		close(results[i])
 		err := f.err
 		if err == nil {

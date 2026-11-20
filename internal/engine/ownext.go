@@ -16,16 +16,17 @@ import (
 	"github.com/akkio-inc/igloo/internal/config"
 )
 
-// Igloo builds two of DuckDB's extensions itself, with the image, rather
+// Igloo builds three of DuckDB's extensions itself, with the image, rather
 // than download them: rb (extensions/rb), which counts distinct integer IDs
-// exactly in roaring bitmaps, and iceberg (extensions/iceberg), DuckDB's
-// Iceberg extension with Igloo's patches. DuckDB cannot check a signature
-// on either: the image carries the files Igloo's build wrote, and the
-// binary their SHA-256s from that same build. Igloo checks each file
-// against its hash, loads it before DuckDB's lockdown, and turns unsigned
-// loading off again; once external access is off, nothing can load another
-// file. The iceberg extension is loaded before anything asks DuckDB for
-// iceberg by name, which then finds it loaded.
+// exactly in roaring bitmaps, and iceberg (extensions/iceberg) and postgres
+// (extensions/postgres), DuckDB's Iceberg and postgres extensions with
+// Igloo's patches. DuckDB cannot check a signature on any of them: the image
+// carries the files Igloo's build wrote, and the binary their SHA-256s from
+// that same build. Igloo checks each file against its hash, loads it before
+// DuckDB's lockdown, and turns unsigned loading off again; once external
+// access is off, nothing can load another file. The iceberg and postgres
+// extensions are loaded before anything asks DuckDB for them by name, which
+// then finds them loaded.
 
 // ownExtension is one of Igloo's own extensions.
 type ownExtension struct {
@@ -50,19 +51,28 @@ type ownExtension struct {
 }
 
 var (
-	rbSHA256      string
-	icebergSHA256 string
+	rbSHA256       string
+	icebergSHA256  string
+	postgresSHA256 string
 )
 
 const (
 	rbFile      = "igloo/rb.duckdb_extension"
 	rbTestEnv   = "IGLOO_TEST_RB_EXTENSION"
 	icebergFile = "igloo/iceberg.duckdb_extension"
+	// postgresName is the postgres extension's own name; LOAD postgres
+	// names it by an alias.
+	postgresName = "postgres_scanner"
+	postgresFile = "igloo/postgres_scanner.duckdb_extension"
+	// PostgresTestEnv names Igloo's build of the postgres extension for
+	// builds without its hash, as Go tests are.
+	PostgresTestEnv = "IGLOO_TEST_POSTGRES_EXTENSION"
 )
 
 var ownExtensions = []ownExtension{
 	{name: "rb", file: rbFile, sha256: &rbSHA256, testEnv: rbTestEnv},
 	{name: "iceberg", file: icebergFile, sha256: &icebergSHA256, testEnv: "IGLOO_TEST_ICEBERG_EXTENSION", pack: true},
+	{name: postgresName, file: postgresFile, sha256: &postgresSHA256, testEnv: PostgresTestEnv},
 }
 
 // extensionFile is an extension file to load, and the hash it must have
@@ -190,7 +200,7 @@ func (e *Engine) BitmapsLoaded() bool {
 
 // CheckExtensions opens DuckDB as the server does, with the extensions in
 // dir, and checks that Igloo's own extensions load: that rb counts, and
-// that the iceberg extension loads. The image build
+// that the iceberg and postgres extensions load. The image build
 // and CI run it against the very binary and files they ship.
 func CheckExtensions(ctx context.Context, dir string) (string, error) {
 	for _, x := range ownExtensions {
@@ -221,5 +231,9 @@ func CheckExtensions(ctx context.Context, dir string) (string, error) {
 	if !e.icebergOwn {
 		return "", fmt.Errorf("the iceberg extension did not load from %s", dir)
 	}
-	return fmt.Sprintf("rb extension %s loads and counts; iceberg extension %s loads", rbSHA256, icebergSHA256), nil
+	if !e.postgresOwn {
+		return "", fmt.Errorf("the postgres extension did not load from %s", dir)
+	}
+	return fmt.Sprintf("rb extension %s loads and counts; iceberg extension %s loads; postgres extension %s loads",
+		rbSHA256, icebergSHA256, postgresSHA256), nil
 }

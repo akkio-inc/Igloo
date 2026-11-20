@@ -37,8 +37,11 @@ use `CREATE TABLE ... AS SELECT` from the connection.
 | `iceberg` | Iceberg REST catalogs: Snowflake's Horizon Catalog, Databricks' Iceberg shares and Unity Catalog, Apache Polaris and Snowflake Open Catalog, AWS Glue and S3 Tables, Lakekeeper. Tested with a Databricks share, Snowflake's Horizon Catalog (signing in) and Lakekeeper 0.14. | DuckDB's `iceberg` extension, as for Igloo's own catalog (see [Iceberg REST catalogs](#iceberg-rest-catalogs)) |
 
 The extensions are DuckDB's own core extensions, built for linux/amd64 and
-linux/arm64 and baked into the image like the others; Igloo loads them only
-when a connection needs them. The extensions are MIT-licensed. The
+linux/arm64 and baked into the image like the others. The `postgres`
+extension, which PostgreSQL and Snowflake connections are attached with, is
+built with the image from DuckDB's source with Igloo's patches
+([`extensions/postgres`](../extensions/postgres)), which end a scan as soon
+as its statement no longer needs it. The extensions are MIT-licensed. The
 `postgres` extension links libpq (PostgreSQL License); the `mysql` extension
 links MariaDB Connector/C, which is LGPL-2.1. Snowflake's Go driver,
 [gosnowflake](https://github.com/snowflakedb/gosnowflake), is under the
@@ -718,11 +721,16 @@ just enough of PostgreSQL's protocol for the extension and nothing more:
   ahead, a part taking up to about 160 MB. `count(*)` becomes
   `COUNT(*)` in Snowflake, which Snowflake answers from its metadata
   without a warehouse when there is no filter.
-- **Timeouts.** Signing in is bounded by `connect_timeout`; Snowflake stops
-  a query at `query_timeout` itself (its `STATEMENT_TIMEOUT_IN_SECONDS`),
-  and Igloo cancels it there too, so the warehouse does not go on working
-  for nothing. The sessions are tagged `QUERY_TAG = 'igloo connection
-  <name>'`, so Snowflake's query history shows each query Igloo sent:
+- **Timeouts and cancels.** Signing in is bounded by `connect_timeout`;
+  Snowflake stops a query at `query_timeout` itself (its
+  `STATEMENT_TIMEOUT_IN_SECONDS`), and Igloo cancels it there too, so the
+  warehouse does not go on working for nothing. A statement that no longer
+  needs a scan cancels the scan's Snowflake query at once and returns: one
+  canceled by its `statement_timeout`, a cancel request or the memory
+  watch, one that fails, and one that has the rows it asked for, as a
+  `LIMIT` above a filter Igloo applies has. The sessions are tagged
+  `QUERY_TAG = 'igloo connection <name>'`, so Snowflake's query history
+  shows each query Igloo sent:
 
   ```sql
   SELECT start_time, query_text, execution_status, total_elapsed_time
