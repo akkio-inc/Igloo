@@ -44,7 +44,8 @@ The release workflow publishes the section whose heading matches the tag
 - The rows of a PostgreSQL read reach their statement as PostgreSQL sends
   them. Up to 64 kB of them waited inside Igloo whenever PostgreSQL paused
   in the middle of a row, as it does while a read is slow to find its next
-  rows, and a statement with a `LIMIT` waited with them.
+  rows, and a statement with a `LIMIT` waited with them. The rows of a
+  MySQL read no longer wait so either.
 - A statement that reads through a PostgreSQL or Snowflake connection no
   longer fails now and then with `Unable to wait for COPY data from
   Postgres: Interrupted system call`, as it could in 1.0.0-rc.15. A signal

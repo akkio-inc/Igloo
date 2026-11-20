@@ -507,7 +507,7 @@ func (p *proxy) dialMySQL(c Connection) (*packetConn, *mysqlGreeting, error) {
 		return nil, nil, err
 	}
 	_ = conn.SetDeadline(time.Now().Add(c.ConnectTimeout))
-	up := &packetConn{conn: conn, r: bufio.NewReader(conn), w: conn}
+	up := &packetConn{conn: conn, r: bufio.NewReaderSize(conn, upstreamBuffer), w: conn}
 	pkt, _, err := up.readPacket()
 	if err != nil {
 		_ = conn.Close()
@@ -568,7 +568,7 @@ func (p *proxy) signInMySQL(up *packetConn, g *mysqlGreeting, c Connection, flag
 		if err := tc.Handshake(); err != nil {
 			return 0, fmt.Errorf("TLS: %w", err)
 		}
-		up.conn, up.r, up.w = tc, bufio.NewReader(tc), tc
+		up.conn, up.r, up.w = tc, bufio.NewReaderSize(tc, upstreamBuffer), tc
 	}
 
 	plugin := g.plugin
@@ -676,18 +676,44 @@ func (p *proxy) setUpMySQLSession(up *packetConn, g *mysqlGreeting, c Connection
 	return status, nil
 }
 
+// upstreamBuffer is how much of the server's answer the proxy reads at
+// once. fromServer sends DuckDB what it has each time it has read all of
+// that, so a small one makes for many small writes: with bufio's default
+// of 4 kB, a read of 3 million rows (120 MB) took 570 to 670 ms, and with
+// this it takes 410 ms.
+const upstreamBuffer = 64 << 10
+
 // errLocalInfile ends a session whose server asked for a local file.
 var errLocalInfile = errors.New("the remote server asked for a local file (LOAD DATA LOCAL INFILE); refused")
 
 // fromServer relays the server's packets to DuckDB, following the shape of
 // each answer, but for the answers to what replay sent, which must all
-// succeed.
+// succeed. DuckDB has every packet the server has sent whole before
+// fromServer waits for the server, as on the PostgreSQL side (see
+// pgSession.fromServer): MySQL sends a result a buffer at a time, 16 kB
+// unless set otherwise, which seldom ends where a row does, and up to
+// 64 kB of the rows before the one it paused in waited here.
 func (s *mysqlSession) fromServer(in *bufio.Reader) error {
 	continued := false
+	flush := func() error {
+		s.outMu.Lock()
+		defer s.outMu.Unlock()
+		return s.out.Flush()
+	}
 	for {
+		if in.Buffered() < 4 {
+			if err := flush(); err != nil {
+				return err
+			}
+		}
 		n, header, err := readHeader(in)
 		if err != nil {
 			return err
+		}
+		if in.Buffered() < n {
+			if err := flush(); err != nil {
+				return err
+			}
 		}
 		if !continued && s.t.swallowing() {
 			head, err := in.Peek(min(n, 1))
@@ -722,7 +748,8 @@ func (s *mysqlSession) fromServer(in *bufio.Reader) error {
 		if err == nil {
 			_, err = io.CopyN(s.out, in, int64(n))
 		}
-		if err == nil && in.Buffered() == 0 {
+		if err == nil && done {
+			// The end of an answer goes out at once.
 			err = s.out.Flush()
 		}
 		s.outMu.Unlock()

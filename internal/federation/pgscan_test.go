@@ -10,6 +10,7 @@ import (
 	"net"
 	"os"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -472,6 +473,37 @@ func TestPostgresRowsArriveWhileTheServerPauses(t *testing.T) {
 		got := make([]byte, 3*len(row))
 		_ = duckdb.SetReadDeadline(time.Now().Add(5 * time.Second))
 		if _, err := io.ReadFull(duckdb, got); err != nil || !bytes.Equal(got, bytes.Repeat(row, 3)) {
+			t.Errorf("with %d bytes of the next row sent, DuckDB got %q, %v; want the three rows before it", part, got, err)
+		}
+		for _, c := range []net.Conn{client, duckdb, proxy, server} {
+			_ = c.Close()
+		}
+	}
+}
+
+// TestMySQLRowsArriveWhileTheServerPauses checks the same of the MySQL
+// proxy, whose server sends a result a buffer of 16 kB at a time.
+func TestMySQLRowsArriveWhileTheServerPauses(t *testing.T) {
+	packet := func(seq byte, payload ...byte) []byte {
+		return append([]byte{byte(len(payload)), 0, 0, seq}, payload...)
+	}
+	// A result of one column: the column count, the column, the end of
+	// the columns, then rows.
+	head := slices.Concat(packet(1, 1), packet(2, 3, 'd', 'e', 'f'), packet(3, 0xfe, 0, 0, 2, 0))
+	rows := slices.Concat(packet(4, 3, 'o', 'n', 'e'), packet(5, 3, 't', 'w', 'o'), packet(6, 3, 's', 'i', 'x'))
+	next := packet(7, 5, 'e', 'i', 'g', 'h', 't')
+	// The server pauses inside a row's header, and inside its body.
+	for _, part := range []int{2, 6} {
+		client, duckdb := net.Pipe()
+		proxy, server := net.Pipe()
+		s := &mysqlSession{client: client, out: bufio.NewWriterSize(client, 64<<10), r: newRelay(client, 0), t: &mysqlTracker{}}
+		s.t.command(comQuery)
+		go func() { _ = s.fromServer(bufio.NewReaderSize(proxy, 64<<10)) }()
+		go func() { _, _ = server.Write(slices.Concat(head, rows, next[:part])) }()
+		want := slices.Concat(head, rows)
+		got := make([]byte, len(want))
+		_ = duckdb.SetReadDeadline(time.Now().Add(5 * time.Second))
+		if _, err := io.ReadFull(duckdb, got); err != nil || !bytes.Equal(got, want) {
 			t.Errorf("with %d bytes of the next row sent, DuckDB got %q, %v; want the three rows before it", part, got, err)
 		}
 		for _, c := range []net.Conn{client, duckdb, proxy, server} {
