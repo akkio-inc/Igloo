@@ -9,6 +9,8 @@ The release workflow publishes the section whose heading matches the tag
 
 ## [Unreleased]
 
+## [1.0.0-rc.14] - 2026-11-20
+
 ### Fixed
 
 - `make up` in a shallow clone made at a release's own commit, while that
