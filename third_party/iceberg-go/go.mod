@@ -40,7 +40,7 @@ require (
 	github.com/stretchr/testify v1.11.1
 	github.com/substrait-io/substrait-go/v8 v8.1.0
 	github.com/testcontainers/testcontainers-go/modules/compose v0.42.0
-	github.com/twmb/avro v1.7.2
+	github.com/twmb/avro v1.8.0
 	github.com/twmb/murmur3 v1.1.8
 	github.com/uptrace/bun v1.2.18
 	github.com/uptrace/bun/dialect/mssqldialect v1.2.18

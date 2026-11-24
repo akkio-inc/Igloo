@@ -49,6 +49,15 @@ The release workflow publishes the section whose heading matches the tag
   Igloo took such a session to have no transaction open and moved it to a
   new one, where the rest of the block read outside its transaction.
 
+### Security
+
+- Go modules with fixes for the advisories that reach Igloo's code: gRPC
+  1.84.0, which no longer panics on a request without an authority header
+  (GO-2026-6443), and golang.org/x/net 0.62.0, which fixes five HTTP/2
+  server and transport bugs, both reachable through the Flight SQL port;
+  brotli 1.2.7 against oversized allocations from crafted streams;
+  klauspost/compress 1.20.3 and the OpenTelemetry SDK 1.47.0.
+
 ## [1.0.0-rc.16] - 2026-11-20
 
 ### Changed

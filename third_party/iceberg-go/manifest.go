@@ -392,7 +392,7 @@ func getFieldIDMap(sc *avro.Schema) (map[string]int, map[int]string, map[int]int
 	logicalTypes := make(map[int]string)
 	fixedSizes := make(map[int]int)
 
-	entryField := getField(root, "data_file")
+	entryField := getField(*root, "data_file")
 	partitionField := getField(entryField.Type, "partition")
 
 	for _, field := range partitionField.Type.Fields {
@@ -400,6 +400,8 @@ func getFieldIDMap(sc *avro.Schema) (map[string]int, map[int]string, map[int]int
 		switch v := field.Props["field-id"].(type) {
 		case int:
 			fid = v
+		case int64:
+			fid = int(v)
 		case float64:
 			fid = int(v)
 		default:

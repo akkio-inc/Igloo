@@ -181,6 +181,13 @@ compact large tables within `IGLOO_MAINTENANCE_MEMORY`:
   properties give no credentials take them from one provider for the process, as
   `SetDefaultCredentials` does for S3.
 
+- `internal/avro_schemas.go` and `manifest.go`, `getFieldIDMap`: built
+  against twmb/avro 1.8, as upstream did in apache/iceberg-go c2105090.
+  `Schema.Root()` returns a pointer, and a field's `field-id` property
+  decodes as `int64` where 1.7 gave `float64`. Without the `int64` case
+  every partition field was skipped, and manifests were written and read
+  without their partition values, with no error.
+
 Drop this copy and the `replace` directive once an iceberg-go release reads
 DuckDB-written tables, lets callers choose these Parquet writer defaults,
 no longer needs an MPL-licensed dependency and can rewrite manifests.

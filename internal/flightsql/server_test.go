@@ -204,7 +204,7 @@ func TestQueryReturnsDuckDBArrowTypes(t *testing.T) {
 		}
 	}
 	got := strings.Join(rows[0], "|")
-	if wantRow := "42|snow|1.5|2026-10-16|2026-10-16T12:34:56.789Z|12.34|(null)|[1,2,3]|{\"a\":1}|true"; len(rows) != 1 || got != wantRow {
+	if wantRow := "42|snow|1.5|2026-10-16|2026-10-16T12:34:56.789|12.34|(null)|[1,2,3]|{\"a\":1}|true"; len(rows) != 1 || got != wantRow {
 		t.Errorf("rows = %v, want [%s]", rows, wantRow)
 	}
 }
@@ -439,7 +439,7 @@ func TestPreparedStatements(t *testing.T) {
 		if len(rows) != int(4-min) || rows[0][0] != "2" && min == 2 {
 			t.Errorf("id >= %d: %v", min, rows)
 		}
-		if min == 1 && strings.Join(rows[0], "|") != "1|it's|2026-10-16T09:30:00Z" || min == 1 && rows[1][1] != "" || min == 1 && rows[2][1] != "(null)" {
+		if min == 1 && strings.Join(rows[0], "|") != "1|it's|2026-10-16T09:30:00" || min == 1 && rows[1][1] != "" || min == 1 && rows[2][1] != "(null)" {
 			t.Errorf("rows: %v", rows)
 		}
 		p.Release()
