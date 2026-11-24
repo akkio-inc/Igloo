@@ -570,7 +570,7 @@ workers:
 | `networkPolicy.enabled` | `true` | Ingress policies described above |
 | `networkPolicy.sqlFrom`, `networkPolicy.metricsFrom` | `[]` | NetworkPolicy peers for the SQL, console, Flight SQL and Iceberg REST ports (5432, 8443, 31337, 8181) and for 8080; empty: everyone |
 | `networkPolicy.objectStorageFrom` | `[]` | NetworkPolicy peers, besides igloo and Lakekeeper, for the bundled object store: engines using the Iceberg REST catalog's credentials; empty: none |
-| `catalog.image.repository` / `tag` / `pullPolicy` | `quay.io/lakekeeper/catalog` / `v0.14.0` / `IfNotPresent` | |
+| `catalog.image.repository` / `tag` / `pullPolicy` | `quay.io/lakekeeper/catalog` / `v0.15.1` / `IfNotPresent` | |
 | `catalog.replicaCount` | `1` | Lakekeeper pods (a PodDisruptionBudget is added above 1) |
 | `catalog.warehouse` | `igloo` | `IGLOO_CATALOG_WAREHOUSE` |
 | `catalog.database.existingSecret` | `""` | Secret with key `url` for `LAKEKEEPER__PG_DATABASE_URL_READ/WRITE` |
@@ -587,11 +587,11 @@ workers:
 | `postgresql.persistence.size` / `storageClass` | `10Gi` / `""` | |
 | `postgresql.resources` | `250m` / `256Mi`, limit `1Gi` | |
 | `objectStorage.enabled` | `false` | Bundled RustFS (development and on-prem) |
-| `objectStorage.image` | `rustfs/rustfs:1.0.1` | |
+| `objectStorage.image` | `rustfs/rustfs:1.0.6` | |
 | `objectStorage.bucket` | `igloo` | Bucket created before Igloo starts |
 | `objectStorage.persistence.size` / `storageClass` | `50Gi` / `""` | |
 | `objectStorage.resources` | `250m` / `512Mi`, limit `2Gi` | |
-| `objectStorage.initImage` | `curlimages/curl:8.16.0` | Image of the bucket-creating init container |
+| `objectStorage.initImage` | `curlimages/curl:8.23.0` | Image of the bucket-creating init container |
 | `tests.image` | `postgres:17` | Image of the `helm test` pod |
 
 `values.schema.json` checks types and enumerations, so typos in keys fail

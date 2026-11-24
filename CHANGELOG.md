@@ -9,6 +9,19 @@ The release workflow publishes the section whose heading matches the tag
 
 ## [Unreleased]
 
+### Changed
+
+- The catalog is Lakekeeper 0.15.1, up from 0.14.0, in Docker Compose and
+  in the Helm chart. It migrates its database on the first start, and the
+  migration cannot be undone: Lakekeeper 0.14 then refuses to start
+  (`migration … was previously applied but is missing`). Back up the
+  catalog's PostgreSQL before upgrading. A stack with TPC-H at scale 1,
+  views, a clone, tags and a materialized view upgraded in 41 ms with every
+  row count and sum unchanged. New table and view names can no longer hold
+  `+` or control characters; Lakekeeper 0.14 accepted `+` in a view's name
+  and then could not find the view. The bundled RustFS object store is
+  1.0.6 and the curl image 8.23.0.
+
 ### Fixed
 
 - A statement stops reading a MySQL connection's table as soon as it no

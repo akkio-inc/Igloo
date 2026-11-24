@@ -129,7 +129,7 @@ expect() {
 
 echo "waiting for Keycloak"
 deadline=$((SECONDS + 300))
-until docker run --rm --network "$network" -v "$work/tls:/e2e-tls:ro" curlimages/curl:8.22.0 \
+until docker run --rm --network "$network" -v "$work/tls:/e2e-tls:ro" curlimages/curl:8.23.0 \
   -fs --cacert /e2e-tls/cert.pem -o /dev/null https://keycloak:8443/realms/igloo/.well-known/openid-configuration; do
   if [ "$SECONDS" -ge "$deadline" ]; then
     echo "Keycloak did not start"
@@ -206,7 +206,7 @@ scim_token="$(psql_admin -c "CREATE TOKEN scim FOR USER okta_scim EXPIRES '1d'" 
 # scim METHOD PATH [JSON] prints the response body, then its status alone
 # on the last line.
 scim() {
-  docker run --rm --network "$network" -v "$work/tls:/e2e-tls:ro" curlimages/curl:8.22.0 -sS --cacert /e2e-tls/cert.pem \
+  docker run --rm --network "$network" -v "$work/tls:/e2e-tls:ro" curlimages/curl:8.23.0 -sS --cacert /e2e-tls/cert.pem \
     -H "Authorization: Bearer $scim_token" -H 'Content-Type: application/scim+json' -X "$1" "https://igloo:8443/scim/v2$2" \
     ${3:+-d "$3"} -w '\n%{http_code}'
 }
@@ -227,7 +227,7 @@ got="$(scim PATCH "/Groups/$group_id" '{"schemas":["urn:ietf:params:scim:api:mes
 if [ "$(status_of "$got")" = 204 ] && ! psql_admin -c "SHOW ROLES" | grep -q 'dana'; then pass "leaving a SCIM group takes its role away"; else fail "SCIM group removal: $got"; fi
 psql_admin -c "CREATE USER scim_reader TYPE SERVICE ROLE reader" >/dev/null
 reader_token="$(psql_admin -c "CREATE TOKEN t FOR USER scim_reader EXPIRES '1d'" | cut -d'|' -f3)"
-got="$(docker run --rm --network "$network" -v "$work/tls:/e2e-tls:ro" curlimages/curl:8.22.0 -sS --cacert /e2e-tls/cert.pem \
+got="$(docker run --rm --network "$network" -v "$work/tls:/e2e-tls:ro" curlimages/curl:8.23.0 -sS --cacert /e2e-tls/cert.pem \
   -H "Authorization: Bearer $reader_token" -o /dev/null -w '%{http_code}' https://igloo:8443/scim/v2/Users)"
 if [ "$got" = 401 ] || [ "$got" = 403 ]; then pass "SCIM refuses a non-admin's token"; else fail "SCIM with a reader's token: $got"; fi
 

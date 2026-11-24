@@ -676,7 +676,7 @@ compose up -d --wait worker >/dev/null 2>&1 || compose up -d --wait --scale work
 # What the killed worker had uploaded goes with the statement, though no listing
 # of files shows it, and tasks' last writes a minute after that.
 s3_uploads() {
-  docker run --rm --network "$network" curlimages/curl:8.22.0 -sS \
+  docker run --rm --network "$network" curlimages/curl:8.23.0 -sS \
     --aws-sigv4 "aws:amz:$(grep '^S3_REGION=' "$env_file" | cut -d= -f2):s3" \
     --user "$(grep '^S3_ACCESS_KEY_ID=' "$env_file" | cut -d= -f2):$(grep '^S3_SECRET_ACCESS_KEY=' "$env_file" | cut -d= -f2)" \
     "http://storage:9000/$(grep '^S3_BUCKET=' "$env_file" | cut -d= -f2)?uploads&prefix=warehouse/"
@@ -733,7 +733,7 @@ got="$(workers_of "query_text LIKE '/* masked */%'")"
 if [ "${got:-0}" -ge 1 ]; then pass "and runs on workers"; else fail "a protected table ran on $got workers"; fi
 
 echo "worker endpoint"
-if docker run --rm --network "$network" curlimages/curl:8.22.0 -sk --max-time 10 "https://worker:7433/v1/status" >/dev/null 2>&1; then
+if docker run --rm --network "$network" curlimages/curl:8.23.0 -sk --max-time 10 "https://worker:7433/v1/status" >/dev/null 2>&1; then
   fail "a client without the worker secret reached a worker"
 else
   pass "workers refuse clients without the worker secret"

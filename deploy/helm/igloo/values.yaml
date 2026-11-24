@@ -574,7 +574,7 @@ networkPolicy:
 catalog:
   image:
     repository: quay.io/lakekeeper/catalog
-    tag: v0.14.0
+    tag: v0.15.1
     pullPolicy: IfNotPresent
   replicaCount: 1
   # Warehouse name in the catalog -> IGLOO_CATALOG_WAREHOUSE.
@@ -623,7 +623,7 @@ postgresql:
 # Bundled S3-compatible store (RustFS), for development and on-prem only.
 objectStorage:
   enabled: false
-  image: rustfs/rustfs:1.0.1
+  image: rustfs/rustfs:1.0.6
   bucket: igloo
   persistence:
     size: 50Gi
@@ -632,7 +632,7 @@ objectStorage:
     requests: { cpu: 250m, memory: 512Mi }
     limits: { memory: 2Gi }
   # Creates the bucket from an init container of each igloo pod.
-  initImage: curlimages/curl:8.16.0
+  initImage: curlimages/curl:8.23.0
 
 # `helm test` connects through the SQL Service with psql.
 tests:

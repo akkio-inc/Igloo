@@ -158,7 +158,7 @@ docker run -d --name "$project-reference" --network "$network" --network-alias r
   "$reference_image" -- --config /config/server.yaml >/dev/null
 ready=""
 for _ in $(seq 1 60); do
-  if docker run --rm --network "$network" curlimages/curl:8.22.0 -fsS -o /dev/null \
+  if docker run --rm --network "$network" curlimages/curl:8.23.0 -fsS -o /dev/null \
     -H "Authorization: Bearer $reference_token" http://reference:8080/delta-sharing/shares 2>/dev/null; then
     ready=1
     break

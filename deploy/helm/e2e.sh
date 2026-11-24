@@ -355,7 +355,7 @@ spec:
   securityContext: {runAsNonRoot: true, runAsUser: 100, seccompProfile: {type: RuntimeDefault}}
   containers:
     - name: curl
-      image: curlimages/curl:8.16.0
+      image: curlimages/curl:8.23.0
       command: ["sleep", "infinity"]
       securityContext: {allowPrivilegeEscalation: false, capabilities: {drop: ["ALL"]}}
 EOF

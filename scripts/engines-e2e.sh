@@ -97,7 +97,7 @@ pass "set up (Igloo's UPDATE and DELETE leave position deletes for the engines t
 
 echo "Apache Spark ($spark_image, Iceberg $iceberg_version)"
 docker volume create "$jars" >/dev/null
-docker run --rm -u 0 -v "$jars:/jars" -w /jars curlimages/curl:8.22.0 sh -c "
+docker run --rm -u 0 -v "$jars:/jars" -w /jars curlimages/curl:8.23.0 sh -c "
   for jar in iceberg-spark-runtime-3.5_2.12 iceberg-aws-bundle; do
     curl -fsSLO https://repo1.maven.org/maven2/org/apache/iceberg/\$jar/$iceberg_version/\$jar-$iceberg_version.jar || exit 1
   done; chmod 644 /jars/*.jar"

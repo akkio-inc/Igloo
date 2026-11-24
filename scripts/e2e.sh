@@ -1388,7 +1388,7 @@ s3_as() {
   local creds=$1 prefix
   shift
   prefix="$(field prefix "$creds")"
-  docker run --rm --network "$network" curlimages/curl:8.22.0 -s -o /dev/null -w '%{http_code}' "$@" \
+  docker run --rm --network "$network" curlimages/curl:8.23.0 -s -o /dev/null -w '%{http_code}' "$@" \
     --aws-sigv4 "aws:amz:$(grep '^S3_REGION=' "$env_file" | cut -d= -f2):s3" \
     --user "$(field s3.access-key-id "$creds"):$(field s3.secret-access-key "$creds")" \
     -H "x-amz-security-token: $(field s3.session-token "$creds")" "http://storage:9000/${prefix#s3://}/e2e-junk"
@@ -1719,7 +1719,7 @@ fi
 # recovered: an upload under a tagged table holds the person's rows, one under a
 # table the request does not erase from holds another table's.
 s3_curl() {
-  docker run --rm --network "$network" curlimages/curl:8.22.0 -sS --aws-sigv4 "aws:amz:$(grep '^S3_REGION=' "$env_file" | cut -d= -f2):s3" \
+  docker run --rm --network "$network" curlimages/curl:8.23.0 -sS --aws-sigv4 "aws:amz:$(grep '^S3_REGION=' "$env_file" | cut -d= -f2):s3" \
     --user "$s3_access_key:$s3_secret_key" "$@"
 }
 # stopped_upload KEY uploads a part of the person's rows to KEY, and stops.
