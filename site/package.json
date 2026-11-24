@@ -5,7 +5,7 @@
   "description": "Igloo's website and documentation, built from the repository's markdown",
   "license": "Apache-2.0",
   "engines": {
-    "node": ">=22.12.0"
+    "node": ">=22.23.4"
   },
   "scripts": {
     "sync": "node scripts/sync-docs.mjs",
@@ -15,10 +15,10 @@
     "preview": "ASTRO_TELEMETRY_DISABLED=1 astro preview"
   },
   "dependencies": {
-    "@astrojs/markdown-remark": "7.3.3",
-    "@astrojs/starlight": "0.42.6",
+    "@astrojs/markdown-remark": "7.3.9",
+    "@astrojs/starlight": "0.43.1",
     "@fontsource-variable/inter": "5.3.0",
-    "astro": "7.3.8",
+    "astro": "7.4.12",
     "mdast-util-from-markdown": "2.1.0",
     "mdast-util-gfm": "3.1.0",
     "micromark-extension-gfm": "3.0.0",

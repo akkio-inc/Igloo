@@ -143,7 +143,7 @@ repository's markdown, so there is nothing to keep in sync by hand: edit
 
 `make site` builds it in a pinned Node container and fails on a broken link;
 `make site-dev` serves it at `http://localhost:4321` and reloads as you edit
-the docs. With Node 22.12 or later installed, `npm ci` and then
+the docs. With Node 22.23.4 or later installed, `npm ci` and then
 `npm run build` or `npm run dev` in `site/` do the same without Docker
 (`npm ci` again when switching between the two, since `node_modules` holds
 platform-specific binaries).
